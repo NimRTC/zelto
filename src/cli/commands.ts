@@ -7,7 +7,7 @@ import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
 import { EventStream } from '../core/events/stream.js';
 import type { PolicyConfig } from '../core/policy/types.js';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ZELTO_DIR = '.zelto';
@@ -358,11 +358,101 @@ register('next', async () => {
   return 0;
 });
 
+register('summary', async () => {
+  // ── Project meta ──
+  let pkg: Record<string, unknown> = {};
+  try {
+    pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
+  } catch { /* ignore */ }
+
+  const name = (pkg.name as string) ?? 'zelto';
+  const version = (pkg.version as string) ?? '?';
+
+  // ── Build status ──
+  const distOk = existsSync('dist/cli/index.js');
+  const distTestOk = existsSync('dist-test/tests');
+
+  // ── Git status ──
+  let gitBranch = '?';
+  let gitCommit = '?';
+  let gitDirty = false;
+  try {
+    gitBranch = readFileSync('.git/HEAD', 'utf-8').trim().replace('ref: refs/heads/', '');
+    gitCommit = readFileSync('.git/refs/heads/' + gitBranch, 'utf-8').trim().slice(0, 7);
+    // Check dirty — quick heuristic: diff-index
+    const { execSync } = await import('node:child_process');
+    const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 3000 });
+    gitDirty = status.trim().length > 0;
+  } catch { /* ignore */ }
+
+  // ── Module detection ──
+  const coreModules: string[] = [];
+  if (existsSync('src/core')) {
+    for (const entry of readdirSync('src/core', { withFileTypes: true })) {
+      if (entry.isDirectory() && existsSync(`src/core/${entry.name}/index.ts`)) {
+        coreModules.push(entry.name);
+      }
+    }
+  }
+
+  // ── Empty placeholder dirs ──
+  const placeholderDirs: string[] = [];
+  const checkPlaceholder = (dir: string) => {
+    if (existsSync(dir)) {
+      const items = readdirSync(dir);
+      if (items.length === 0 || (items.length === 1 && items[0] === '.gitkeep')) {
+        placeholderDirs.push(dir);
+      }
+    }
+  };
+  checkPlaceholder('src/adapters');
+  checkPlaceholder('src/llm');
+  checkPlaceholder('src/mcp');
+  checkPlaceholder('src/ui');
+  checkPlaceholder('tests/acceptance');
+
+  // ── CLI commands ──
+  const cmdCount = Object.keys(commands).length;
+
+  // ── Hook ──
+  const hookExists = existsSync('src/hook/index.ts');
+  let hookLines = 0;
+  if (hookExists) {
+    try {
+      hookLines = readFileSync('src/hook/index.ts', 'utf-8').split('\n').length;
+    } catch { /* ignore */ }
+  }
+
+  // ── Runtime dir ──
+  const zeltoExists = existsSync('.zelto');
+  let sliceCount = 0;
+  if (zeltoExists && existsSync('.zelto/slices')) {
+    try {
+      sliceCount = readdirSync('.zelto/slices').filter((f) => f.endsWith('.json')).length;
+    } catch { /* ignore */ }
+  }
+
+  // ── Output ──
+  console.log(`
+Project: ${name} v${version}
+Build:   ${distOk ? '✅ dist/' : '❌ dist/'} ${distTestOk ? '✅ dist-test/' : '❌ dist-test/'}
+Git:     ${gitBranch} @ ${gitCommit}${gitDirty ? ' (dirty)' : ' (clean)'}
+Modules: ${coreModules.length} core/ — ${coreModules.join(', ')}
+CLI:     ${cmdCount} commands
+Hook:    ${hookLines > 0 ? `✅ ${hookLines} lines` : '❌ missing'}
+Runtime: ${zeltoExists ? '✅ .zelto/' : '❌ .zelto/ (not initialized)'}
+Slices:  ${sliceCount} created
+Empty:   ${placeholderDirs.join(', ') || '(none)'}
+`);
+  return 0;
+});
+
 register('help', async () => {
   console.log(`
 zelto — AI Programming Cockpit
 
 Commands:
+  summary                   Show project summary
   slices                    List all slices
   next                      Show recommended next slice
   check <id>                Run gate① (deterministic checks)

@@ -162,8 +162,11 @@ function main() {
 
   // Read input from stdin
   const chunks: Buffer[] = [];
+  let processed = false;
 
   function processStdinData(): void {
+    if (processed) return;
+    processed = true;
     try {
       const raw = Buffer.concat(chunks).toString('utf-8');
       if (!raw.trim()) {
@@ -221,8 +224,8 @@ function main() {
     processStdinData();
   });
   process.stdin.on('close', () => {
-    // On some platforms (Windows), 'end' may not fire with piped input.
-    // 'close' is a reliable fallback.
+    // On some platforms (Windows), both 'end' and 'close' fire with piped input.
+    // processStdinData guards against double-processing via `processed` flag.
     if (chunks.length > 0) {
       clearTimeout(safetyTimer);
       processStdinData();
