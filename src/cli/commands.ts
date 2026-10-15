@@ -7,7 +7,7 @@ import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
 import { EventStream } from '../core/events/stream.js';
 import type { PolicyConfig } from '../core/policy/types.js';
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const ZELTO_DIR = '.zelto';
@@ -239,7 +239,13 @@ register('gate', async (args) => {
 
     if (report.passed) {
       console.log(`  Result:   ✅ Gate passed (${report.totalDurationMs.toFixed(0)}ms)`);
-      // Signal that sign is needed
+      // Transition to completed
+      await store.transit(id, 'GATE_PASS');
+      console.log(`  State:    ✅ Slice transitioned to "completed"`);
+      // Auto-create sign request
+      const signManager = new SignManager(ZELTO_DIR, events);
+      const signReq = await signManager.request(id, 'zelto');
+      console.log(`  Sign:     📋 Sign request created (${signReq.id})`);
       console.log(`  Next:     Run "zelto sign ${id} --approve" to approve`);
     } else {
       console.log(`  Result:   ❌ Gate failed (${report.totalDurationMs.toFixed(0)}ms)`);
@@ -358,6 +364,53 @@ register('next', async () => {
   return 0;
 });
 
+register('init', async () => {
+  const dirs = [
+    join(ZELTO_DIR, 'slices'),
+    join(ZELTO_DIR, 'events'),
+    join(ZELTO_DIR, 'locks'),
+  ];
+
+  const configPath = join(ZELTO_DIR, 'config.yaml');
+  const defaultConfig = `# zelto project configuration
+# Created by \`zelto init\`
+
+gate:
+  commands:
+    - name: test
+      run: pnpm test
+    - name: lint
+      run: pnpm lint
+  timeoutSec: 120
+  retry:
+    max: 2
+`;
+
+  if (existsSync(ZELTO_DIR)) {
+    console.log(`zelto init — ⚠️  .zelto/ already exists, skipping.`);
+    console.log(`  Use --force to reinitialize (will overwrite config.yaml).`);
+    return 0;
+  }
+
+  // Create directories
+  for (const dir of dirs) {
+    mkdirSync(dir, { recursive: true });
+  }
+
+  // Write default config
+  if (!existsSync(configPath)) {
+    writeFileSync(configPath, defaultConfig, 'utf-8');
+  }
+
+  console.log(`zelto init — ✅ .zelto/ initialized`);
+  console.log(`  Created:`);
+  for (const dir of dirs) {
+    console.log(`    ${dir}/`);
+  }
+  console.log(`    ${configPath}`);
+  return 0;
+});
+
 register('summary', async () => {
   // ── Project meta ──
   let pkg: Record<string, unknown> = {};
@@ -453,6 +506,7 @@ zelto — AI Programming Cockpit
 
 Commands:
   summary                   Show project summary
+  init                      Initialize .zelto/ runtime directory
   slices                    List all slices
   next                      Show recommended next slice
   check <id>                Run gate① (deterministic checks)

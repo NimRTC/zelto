@@ -32,6 +32,7 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
   },
   frozen: {
     RUN_START: 'running',
+    GATE_PASS: 'completed',
     ABANDON: 'abandoned',
   },
   running: {

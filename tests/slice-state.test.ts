@@ -28,6 +28,7 @@ describe('SliceState', () => {
       ['clarifying', 'CLARIFY_CONVERGED', 'draft'],
       ['draft', 'FREEZE', 'frozen'],
       ['frozen', 'RUN_START', 'running'],
+      ['frozen', 'GATE_PASS', 'completed'],
       ['running', 'RUN_FINISH', 'frozen'],
       ['frozen', 'ABANDON', 'abandoned'],
     ];
