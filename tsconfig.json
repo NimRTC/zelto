@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "types": ["node"],
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "paths": {
+      "@zelto/core/*": ["./src/core/*"],
+      "@zelto/llm/*": ["./src/llm/*"],
+      "@zelto/adapters/*": ["./src/adapters/*"],
+      "@zelto/cli/*": ["./src/cli/*"],
+      "@zelto/hook/*": ["./src/hook/*"],
+      "@zelto/schemas/*": ["./contracts/schemas/*"]
+    }
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

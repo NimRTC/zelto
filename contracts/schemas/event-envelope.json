@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Event Envelope",
+  "description": "Unified event envelope for all zelto events",
+  "type": "object",
+  "required": ["ts", "runSeq", "slice", "type", "actor", "payload"],
+  "properties": {
+    "ts": { "type": "string", "format": "date-time", "description": "ISO 8601 timestamp" },
+    "runSeq": { "type": "integer", "minimum": 1, "description": "Per-run monotonic sequence number" },
+    "slice": { "type": "string", "description": "Slice identifier" },
+    "run": { "type": ["string", "null"], "description": "Run identifier" },
+    "type": {
+      "type": "string",
+      "enum": [
+        "slice.state.changed", "slice.drift_detected",
+        "spec.drafted", "spec.checked", "spec.frozen",
+        "clarify.question", "clarify.answer",
+        "run.started", "run.resumed", "run.stalled", "run.finished", "run.aborted",
+        "policy.decision", "policy.anchor_mismatch",
+        "gate.executed", "gate.result", "gate.retry",
+        "stall.classified",
+        "budget.spent", "llm.called",
+        "queue.enqueued", "queue.dequeued",
+        "sign.requested", "sign.approved", "sign.rejected",
+        "merge.completed",
+        "sched.admitted", "sched.blocked", "merge.stale_base"
+      ]
+    },
+    "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },
+    "payload": { "type": "object", "description": "Event-specific payload" }
+  }
+}

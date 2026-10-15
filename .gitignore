@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-test/
+*.tsbuildinfo
+.zelto/events/detail/
+.zelto/locks/regions/
+.env
+.env.local
+*.log
+.DS_Store
+Thumbs.db

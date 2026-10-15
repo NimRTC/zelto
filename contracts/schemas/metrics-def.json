@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Metrics Definition",
+  "description": "zelto metrics definition format — each file declares how a metric is computed from events",
+  "type": "object",
+  "required": ["name", "version", "description", "reads", "parameters"],
+  "properties": {
+    "name": { "type": "string" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "description": { "type": "string" },
+    "reads": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Event types this metric depends on"
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "description": "Metric-specific parameters (e.g., N days for rework rate)",
+      "additionalProperties": true
+    },
+    "lastHash": {
+      "type": ["string", "null"],
+      "description": "Last computed hash for change detection"
+    }
+  }
+}

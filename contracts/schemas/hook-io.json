@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "zelto-hook/1 Input/Output",
+  "description": "Schema for the zelto-hook/1 protocol — deterministic permission decision process",
+  "definitions": {
+    "decision": {
+      "type": "string",
+      "enum": ["allow", "deny", "ask"],
+      "description": "Permission decision: allow=proceed, deny=rejected, ask=needs human review"
+    },
+    "hookInput": {
+      "type": "object",
+      "required": ["path", "operation", "harness"],
+      "properties": {
+        "path": { "type": "string", "description": "Target file path (relative to project root)" },
+        "operation": { "type": "string", "enum": ["read", "write", "execute"] },
+        "harness": { "type": "string", "description": "Calling harness identifier" },
+        "proposed_content": { "type": "string", "description": "Content to be written (optional, for write operations)" },
+        "slice_id": { "type": "string", "description": "Current slice ID if applicable" }
+      }
+    },
+    "hookOutput": {
+      "type": "object",
+      "required": ["decision", "decision_id", "basis", "policy_version"],
+      "properties": {
+        "decision": { "$ref": "#/definitions/decision" },
+        "decision_id": { "type": "string", "description": "Unique decision identifier for auditing" },
+        "basis": { "type": "string", "description": "Reference to the rule that produced this decision" },
+        "guidance": {
+          "type": "string",
+          "description": "Human-readable guidance on why this decision was made and what alternatives exist"
+        },
+        "policy_version": { "type": "string", "description": "Policy version hash" },
+        "matched_rule": { "type": "string", "description": "ID of the matched rule" }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/definitions/hookInput" },
+    { "$ref": "#/definitions/hookOutput" }
+  ]
+}

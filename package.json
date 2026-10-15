@@ -1,0 +1,32 @@
+{
+  "name": "zelto",
+  "version": "0.1.0",
+  "description": "AI Programming Cockpit — let machines watch the machines",
+  "type": "module",
+  "bin": {
+    "zelto": "./dist/cli/index.js",
+    "zelto-hook": "./dist/hook/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
+    "test:quick": "node --test \"dist-test/tests/**/*.test.js\"",
+    "test:watch": "node --test --watch",
+    "lint": "biome check src/",
+    "lint:fix": "biome check --write src/",
+    "format": "biome format --write src/",
+    "clean": "rm -rf dist dist-test",
+    "prepublishOnly": "pnpm clean && pnpm build && pnpm test"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "biome": "^0.3.3",
+    "typescript": "^7.0.2"
+  }
+}

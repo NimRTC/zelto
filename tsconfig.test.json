@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist-test",
+    "paths": {
+      "@zelto/core/*": ["./src/core/*"],
+      "@zelto/llm/*": ["./src/llm/*"],
+      "@zelto/adapters/*": ["./src/adapters/*"],
+      "@zelto/cli/*": ["./src/cli/*"],
+      "@zelto/hook/*": ["./src/hook/*"],
+      "@zelto/schemas/*": ["./contracts/schemas/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"],
+  "exclude": ["node_modules", "dist", "dist-test"]
+}

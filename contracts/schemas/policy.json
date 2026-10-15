@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Policy Configuration",
+  "description": "zelto policy.yaml structure",
+  "type": "object",
+  "required": ["rules"],
+  "properties": {
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "match", "action", "basis"],
+        "properties": {
+          "id": { "type": "string" },
+          "description": { "type": "string" },
+          "match": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Glob pattern for path matching" },
+              "operation": { "type": "string", "enum": ["read", "write", "execute"] },
+              "harness": { "type": "string" }
+            },
+            "minProperties": 1
+          },
+          "action": { "type": "string", "enum": ["allow", "deny", "ask"] },
+          "basis": { "type": "string" },
+          "guidance": { "type": "string" },
+          "priority": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "protected": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Additional protected paths beyond the built-in defaults"
+    }
+  }
+}

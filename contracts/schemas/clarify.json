@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Clarify Data Contract",
+  "description": "Clarify dialogue engine input/output contract",
+  "type": "object",
+  "properties": {
+    "input": {
+      "type": "object",
+      "required": ["sliceId", "intent"],
+      "properties": {
+        "sliceId": { "type": "string" },
+        "intent": { "type": "string" },
+        "upstream": {
+          "type": "object",
+          "properties": {
+            "requirements": { "type": "array", "items": { "type": "string" } },
+            "contracts": { "type": "array", "items": { "type": "string" } },
+            "adrs": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "repoFacts": { "type": "object" },
+        "semanticFindings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "question": {
+      "type": "object",
+      "required": ["id", "text", "candidates", "default", "impact", "reversibility", "basis"],
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": { "type": "string" }
+        },
+        "default": { "type": "string" },
+        "ifUndecided": { "type": "string" },
+        "impact": { "type": "string", "enum": ["high", "medium", "low"] },
+        "reversibility": { "type": "string", "enum": ["high", "medium", "low"] },
+        "basis": { "type": "string" },
+        "selfAnswered": { "type": "boolean" }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["round", "questions", "converged"],
+      "properties": {
+        "round": { "type": "integer", "minimum": 1 },
+        "questions": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/question" }
+        },
+        "converged": { "type": "boolean" },
+        "unresolved": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "question": {
+      "type": "object",
+      "required": ["id", "text", "candidates", "default", "impact", "reversibility", "basis"],
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" },
+        "candidates": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 4,
+          "items": { "type": "string" }
+        },
+        "default": { "type": "string" },
+        "ifUndecided": { "type": "string" },
+        "impact": { "type": "string", "enum": ["high", "medium", "low"] },
+        "reversibility": { "type": "string", "enum": ["high", "medium", "low"] },
+        "basis": { "type": "string" },
+        "selfAnswered": { "type": "boolean" }
+      }
+    }
+  }
+}

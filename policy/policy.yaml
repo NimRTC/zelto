@@ -1,0 +1,42 @@
+# zelto policy — v1
+# Default policy for zelto-managed projects
+
+rules:
+  # Allow writing to source code
+  - id: allow-src-ts
+    match: { path: "src/**/*.ts", operation: "write" }
+    action: allow
+    basis: "policy.yaml#allow-src-ts"
+
+  # Allow writing to test files
+  - id: allow-tests
+    match: { path: "tests/**/*.ts", operation: "write" }
+    action: allow
+    basis: "policy.yaml#allow-tests"
+
+  # Deny direct modification of acceptance tests
+  - id: deny-acceptance-direct
+    match: { path: "tests/acceptance/**", operation: "write" }
+    action: deny
+    basis: "AGENTS.md#禁区-5"
+    guidance: "Acceptance tests are frozen with the spec. Modify the spec instead."
+
+  # Allow reading all project files
+  - id: allow-read-all
+    match: { path: "**", operation: "read" }
+    action: allow
+    basis: "policy.yaml#allow-read-all"
+    priority: 0
+
+  # Allow docs edits
+  - id: allow-docs
+    match: { path: "docs/**", operation: "write" }
+    action: allow
+    basis: "policy.yaml#allow-docs"
+
+  # Allow config edits (with human oversight)
+  - id: allow-config
+    match: { path: ".zelto/config.yaml", operation: "write" }
+    action: ask
+    basis: "policy.yaml#allow-config"
+    guidance: "Changing project configuration requires human review."

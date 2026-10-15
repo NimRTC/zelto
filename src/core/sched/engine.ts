@@ -1,0 +1,204 @@
+// Scheduler engine — parallel admission control
+// C3: deterministic only — no model calls, no network
+// C1: state in files only — reads from SliceStore
+
+import type { SliceData, SliceStore } from '../slice/store.js';
+import type { EventStream, EventType } from '../events/stream.js';
+import type { PolicyConfig, PolicyRule } from '../policy/types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle } from './types.js';
+
+export class Scheduler {
+  private readonly store: SliceStore;
+  private readonly events: EventStream;
+  private readonly policy: PolicyConfig;
+
+  constructor(store: SliceStore, events: EventStream, policy: PolicyConfig) {
+    this.store = store;
+    this.events = events;
+    this.policy = policy;
+  }
+
+  /**
+   * Check if a slice can be admitted for parallel execution.
+   * A slice is blocked if its write-set overlaps with another running slice's write-set.
+   */
+  async admit(sliceId: string, actor: string = 'zelto'): Promise<SchedResult> {
+    const slice = await this.store.read(sliceId);
+
+    // Must be frozen or completed to run
+    if (slice.state !== 'frozen' && slice.state !== 'completed') {
+      return {
+        sliceId,
+        decision: 'blocked',
+        reason: `Slice is in state "${slice.state}", must be "frozen" or "completed"`,
+        blockedBy: [],
+      };
+    }
+
+    // Must have a frozen spec
+    if (!slice.spec.frozenHash) {
+      return {
+        sliceId,
+        decision: 'blocked',
+        reason: 'Slice has not been frozen (no frozenHash)',
+        blockedBy: [],
+      };
+    }
+
+    // Check write-set conflicts with running slices
+    const allSlices = await this.store.list();
+    const runningWrites = new Map<string, string[]>(); // sliceId → writes
+    const blockedBy: string[] = [];
+
+    for (const id of allSlices) {
+      if (id === sliceId) continue;
+      try {
+        const s = await this.store.read(id);
+        if (s.state === 'running') {
+          runningWrites.set(id, s.writes);
+        }
+      } catch {
+        // Skip unreadable slices
+      }
+    }
+
+    // Check for write-set overlap
+    for (const [runningId, writes] of runningWrites) {
+      if (this.hasOverlap(slice.writes, writes)) {
+        blockedBy.push(runningId);
+      }
+    }
+
+    if (blockedBy.length > 0) {
+      const block: SchedBlock = {
+        sliceId,
+        blockedBy,
+        blockedAt: new Date().toISOString(),
+        reason: `Write-set conflicts with: ${blockedBy.join(', ')}`,
+      };
+
+      await this.appendEvent(sliceId, 'sched.blocked', actor, block as unknown as Record<string, unknown>);
+
+      return {
+        sliceId,
+        decision: 'blocked',
+        reason: block.reason,
+        blockedBy,
+      };
+    }
+
+    await this.appendEvent(sliceId, 'sched.admitted', actor, { sliceId });
+
+    return {
+      sliceId,
+      decision: 'admitted',
+      reason: null,
+      blockedBy: [],
+    };
+  }
+
+  /**
+   * Build a constraint bundle for an agent session.
+   * Contains: spec path, frozen hash, acceptance dir, write-set, protected paths, policy rules.
+   */
+  buildConstraints(slice: SliceData): ConstraintBundle {
+    // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
+    const relevantRules = this.policy.rules.filter((r) => {
+      // Include rules that match the slice's write paths or are general allow/deny
+      if (!r.match.path) return true;
+      return slice.writes.some((w) => this.pathMatches(w, r.match.path!));
+    });
+
+    return {
+      sliceId: slice.id,
+      specPath: slice.spec.path,
+      frozenHash: slice.spec.frozenHash,
+      acceptanceDir: slice.acceptance.dir,
+      writes: slice.writes,
+      protectedPaths: [
+        'policy/**',
+        '.zelto/**',
+        'AGENTS.md',
+        '.cursor/rules/**',
+      ],
+      policyRules: relevantRules,
+      instructions: this.buildInstructions(slice),
+    };
+  }
+
+  /**
+   * Mark a slice as running and record the admission.
+   */
+  async startRun(sliceId: string, actor: string = 'zelto'): Promise<SliceData> {
+    return this.store.transit(sliceId, 'RUN_START', actor);
+  }
+
+  private hasOverlap(a: string[], b: string[]): boolean {
+    // Check if any path in 'a' overlaps with any path in 'b'
+    for (const pa of a) {
+      for (const pb of b) {
+        if (this.pathsOverlap(pa, pb)) return true;
+      }
+    }
+    return false;
+  }
+
+  private pathsOverlap(a: string, b: string): boolean {
+    // Simple overlap: exact match, or one is a parent directory of the other
+    if (a === b) return true;
+    if (a.endsWith('/') && b.startsWith(a)) return true;
+    if (b.endsWith('/') && a.startsWith(b)) return true;
+    return false;
+  }
+
+  private pathMatches(filePath: string, pattern: string): boolean {
+    // Simple glob matching (same logic as policy engine's matchPath)
+    const regexStr = pattern
+      .replace(/\./g, '\\.')
+      .replace(/\*\*/g, '<<<DOUBLESTAR>>>')
+      .replace(/\*/g, '[^/]*')
+      .replace(/<<<DOUBLESTAR>>>/g, '.*');
+    return new RegExp(`^${regexStr}$`).test(filePath);
+  }
+
+  private buildInstructions(slice: SliceData): string {
+    return [
+      `You are implementing slice "${slice.id}": ${slice.title}`,
+      '',
+      `## Spec`,
+      `Read the spec at \`${slice.spec.path}\` (frozen at ${slice.spec.frozenHash ?? 'N/A'}).`,
+      '',
+      `## Write-set`,
+      `You may only modify these paths:`,
+      ...slice.writes.map((w) => `  - \`${w}\``),
+      '',
+      `## Protected paths (DO NOT MODIFY)`,
+      `  - policy/`,
+      `  - .zelto/`,
+      `  - AGENTS.md`,
+      `  - .cursor/rules/`,
+      '',
+      `## Acceptance tests`,
+      `Run \`${slice.acceptance.dir}\` tests to verify your implementation.`,
+      '',
+      `## Rules`,
+      `1. Do not modify files outside your write-set.`,
+      `2. Do not modify protected paths.`,
+      `3. All code must trace back to the spec.`,
+      `4. Run acceptance tests before declaring completion.`,
+    ].join('\n');
+  }
+
+  private async appendEvent(
+    sliceId: string,
+    type: EventType,
+    actor: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      await this.events.append(sliceId, type, actor, payload);
+    } catch {
+      // Event stream failure is non-fatal
+    }
+  }
+}
