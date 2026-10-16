@@ -1,10 +1,10 @@
 // CLI command dispatcher
 
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { ClaudeAgentAdapter } from '../adapters/claude-agent/index.js';
 import { EventStream } from '../core/events/stream.js';
 import { ClarifyEngine } from '../core/clarify/engine.js';
 import { GateExecutor } from '../core/gate/executor.js';
@@ -443,17 +443,14 @@ register('start', async (args) => {
     console.log(`  Bundle:        ${bundlePath}`);
     console.log('');
 
-    // Spawn agent
-    const child = spawn(agentName, [], {
+    // Spawn agent via adapter
+    const adapter = new ClaudeAgentAdapter({
       cwd: process.cwd(),
-      stdio: ['inherit', 'inherit', 'inherit'],
-      shell: true,
-      env: {
-        ...process.env,
-        ZELTO_BUNDLE: bundlePath,
-        ZELTO_SLICE_ID: id,
-        ZELTO_PROJECT_ROOT: process.cwd(),
-      },
+      agentCommand: agentName,
+    });
+    const { sessionId } = await adapter.start({
+      sliceId: id,
+      prompt: bundlePath,
     });
 
     await events.append(id, 'run.started', 'zelto', {
@@ -463,13 +460,7 @@ register('start', async (args) => {
       writes: bundle.writes,
     });
 
-    const exitCode = await new Promise<number>((resolve) => {
-      child.on('close', resolve);
-      child.on('error', (err) => {
-        console.error(`  ❌ Agent failed to start: ${err.message}`);
-        resolve(1);
-      });
-    });
+    const exitCode = await adapter.waitForExit(sessionId);
 
     if (exitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
@@ -837,17 +828,14 @@ register('run', async (args) => {
     console.log(`  Bundle:        ${bundlePath}`);
     console.log('');
 
-    // Spawn agent as a child process
-    const child = spawn(agentName, [], {
+    // Spawn agent via adapter
+    const adapter = new ClaudeAgentAdapter({
       cwd: process.cwd(),
-      stdio: ['inherit', 'inherit', 'inherit'],
-      shell: true,
-      env: {
-        ...process.env,
-        ZELTO_BUNDLE: bundlePath,
-        ZELTO_SLICE_ID: id,
-        ZELTO_PROJECT_ROOT: process.cwd(),
-      },
+      agentCommand: agentName,
+    });
+    const { sessionId } = await adapter.start({
+      sliceId: id,
+      prompt: bundlePath,
     });
 
     // Record run.started event
@@ -859,13 +847,7 @@ register('run', async (args) => {
     });
 
     // Wait for agent to complete
-    const exitCode = await new Promise<number>((resolve) => {
-      child.on('close', resolve);
-      child.on('error', (err) => {
-        console.error(`  ❌ Agent failed to start: ${err.message}`);
-        resolve(1);
-      });
-    });
+    const exitCode = await adapter.waitForExit(sessionId);
 
     if (exitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
