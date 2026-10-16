@@ -8,6 +8,7 @@ import { SliceStore } from '../core/slice/store.js';
 import { EventStream } from '../core/events/stream.js';
 import type { PolicyConfig } from '../core/policy/types.js';
 import { readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 const ZELTO_DIR = '.zelto';
@@ -125,6 +126,95 @@ register('create', async (args) => {
   return 0;
 });
 
+register('start', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto start <slice-id> [--title <title>]');
+    return 1;
+  }
+
+  const titleIdx = args.indexOf('--title');
+  const title = titleIdx >= 0 ? args.slice(titleIdx + 1).join(' ') : id;
+
+  try {
+    // Step 1: Create if not exists
+    if (!(await store.exists(id))) {
+      if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+        console.error(`Invalid slice ID: "${id}".`);
+        return 1;
+      }
+      const slice = store.create(id, title);
+      await store.write(slice);
+      await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title });
+      console.log(`  ✅ Slice "${id}" created`);
+    } else {
+      console.log(`  ℹ️  Slice "${id}" already exists`);
+    }
+
+    const slice = await store.read(id);
+
+    // Step 2: Check state — running is an error
+    if (slice.state === 'running') {
+      console.error(`  ❌ Slice "${id}" is already running.`);
+      return 1;
+    }
+
+    // Step 3: Check (gate①) — warn only, don't block
+    const issues: string[] = [];
+    if (slice.trace.requirements.length === 0) issues.push('No requirements traced');
+    if (slice.trace.contracts.length === 0) issues.push('No contracts traced');
+    if (slice.trace.tests.length === 0) issues.push('No tests traced');
+    if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
+    if (issues.length > 0) {
+      console.log(`  ⚠️  Gate① issues: ${issues.join(', ')}`);
+    } else {
+      console.log(`  ✅ Gate① passed`);
+    }
+
+    // Step 4: Freeze if not frozen
+    if (slice.state === 'draft' || slice.state === 'clarifying') {
+      // Set frozen hash before transit (transit reads fresh from disk)
+      const current = await store.read(id);
+      current.spec.frozenHash = `sha256:${Date.now()}`;
+      current.spec.frozenAt = new Date().toISOString();
+      await store.write(current);
+      await store.transit(id, 'FREEZE');
+      console.log(`  ✅ Slice frozen`);
+    } else {
+      console.log(`  ℹ️  Slice already ${slice.state}, skipping freeze`);
+    }
+
+    // Step 5: Run (admit + start)
+    const policy = loadPolicyConfig();
+    const scheduler = new Scheduler(store, events, policy);
+
+    const admitResult = await scheduler.admit(id);
+    if (admitResult.decision !== 'admitted') {
+      console.error(`  ❌ Cannot run: ${admitResult.reason}`);
+      if (admitResult.blockedBy.length > 0) {
+        console.error(`     Blocked by: ${admitResult.blockedBy.join(', ')}`);
+      }
+      return 1;
+    }
+
+    await scheduler.startRun(id);
+    console.log(`  ✅ Slice admitted and started execution`);
+
+    // Re-read to get latest state (frozenHash, etc.)
+    const updatedSlice = await store.read(id);
+    const bundle = scheduler.buildConstraints(updatedSlice);
+    console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
+    console.log(`  Policy rules:  ${bundle.policyRules.length}`);
+
+    console.log(`\nzelto start ${id} — ✅ Done. Slice is now running.`);
+    console.log(`  After execution: zelto gate ${id}`);
+    return 0;
+  } catch (err) {
+    console.error(`Error in start "${id}": ${err}`);
+    return 1;
+  }
+});
+
 register('check', async (args) => {
   const [id] = args;
   if (!id) {
@@ -174,9 +264,10 @@ register('freeze', async (args) => {
       return 1;
     }
 
-    // Update frozen hash
+    // Update frozen hash and save before transit
     slice.spec.frozenHash = `sha256:${Date.now()}`; // Placeholder — real hash from spec file
     slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
 
     // Transition state via store
     await store.transit(id, 'FREEZE');
@@ -301,27 +392,87 @@ register('gate', async (args) => {
   return 0;
 });
 
-register('inbox', async () => {
+register('inbox', async (args) => {
   const signManager = new SignManager(ZELTO_DIR, events);
   const pending = await signManager.list('pending');
 
-  if (pending.length === 0) {
-    console.log('Inbox is empty. Nothing pending.');
+  // Non-interactive mode: --list flag or piped output
+  if (args.includes('--list') || !process.stdout.isTTY) {
+    if (pending.length === 0) {
+      console.log('Inbox is empty. Nothing pending.');
+      return 0;
+    }
+    console.log('Inbox — Pending Sign Requests:');
+    console.log('');
+    for (const req of pending) {
+      console.log(`  [${req.id}]`);
+      console.log(`    Slice:    ${req.sliceId}`);
+      console.log(`    Requested: ${req.requestedAt}`);
+      console.log(`    By:        ${req.requestedBy}`);
+      console.log(`    Action:    zelto sign ${req.sliceId} --approve | --reject`);
+      console.log('');
+    }
+    console.log(`${pending.length} pending request(s).`);
     return 0;
   }
 
-  console.log('Inbox — Pending Sign Requests:');
-  console.log('');
-  for (const req of pending) {
-    console.log(`  [${req.id}]`);
-    console.log(`    Slice:    ${req.sliceId}`);
-    console.log(`    Requested: ${req.requestedAt}`);
-    console.log(`    By:        ${req.requestedBy}`);
-    console.log(`    Action:    zelto sign ${req.sliceId} --approve | --reject`);
-    console.log('');
+  // Interactive mode
+  if (pending.length === 0) {
+    console.log('📋 Inbox is empty. Nothing pending.');
+    return 0;
   }
 
-  console.log(`${pending.length} pending request(s).`);
+  console.log('📋 Inbox — Pending Sign Requests:');
+  console.log('');
+  for (let i = 0; i < pending.length; i++) {
+    const req = pending[i];
+    console.log(`  ${i + 1}. [${req.sliceId}] — requested ${req.requestedAt.slice(0, 10)}`);
+  }
+  console.log('');
+  console.log('Enter number to review, or q to quit.');
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+  const answer = await new Promise<string>((resolve) => {
+    rl.question('> ', resolve);
+  });
+  rl.close();
+
+  const idx = Number.parseInt(answer, 10) - 1;
+  if (Number.isNaN(idx) || idx < 0 || idx >= pending.length) {
+    if (answer === 'q' || answer === 'Q') {
+      console.log('Bye.');
+      return 0;
+    }
+    console.log('Invalid selection.');
+    return 1;
+  }
+
+  const req = pending[idx];
+  console.log('');
+  console.log(`  Slice:    ${req.sliceId}`);
+  console.log(`  Request:  ${req.requestedAt}`);
+  console.log(`  By:       ${req.requestedBy}`);
+
+  const rl2 = createInterface({ input: process.stdin, output: process.stdout });
+  const decision = await new Promise<string>((resolve) => {
+    rl2.question('  Approve? [Y/n] ', resolve);
+  });
+  rl2.close();
+
+  if (decision === '' || decision.toLowerCase() === 'y' || decision.toLowerCase() === 'yes') {
+    await signManager.approve(req.id, 'human', null);
+    console.log(`  ✅ ${req.sliceId} approved`);
+  } else {
+    const rl3 = createInterface({ input: process.stdin, output: process.stdout });
+    const comment = await new Promise<string>((resolve) => {
+      rl3.question('  Rejection comment: ', resolve);
+    });
+    rl3.close();
+    await signManager.reject(req.id, 'human', comment || null);
+    console.log(`  ❌ ${req.sliceId} rejected`);
+  }
+
   return 0;
 });
 
@@ -553,13 +704,13 @@ Commands:
   init                      Initialize .zelto/ runtime directory
   slices                    List all slices
   create <id>               Create a new slice
-  next                      Show recommended next slice
+  start <id>                One-click: create→check→freeze→run
   check <id>                Run gate① (deterministic checks)
   freeze <id>               Freeze slice baseline
   run <id> [--agent <n>]    Execute slice (with parallel admission check)
   run <id> --dry-run        Check admission without executing
   gate <id>                 Run gate② (acceptance tests)
-  inbox                     Show pending sign queue
+  inbox                     Interactive sign queue (--list for non-interactive)
   sign <id> --approve       Approve slice
   sign <id> --reject        Reject slice
   help                      Show this help
