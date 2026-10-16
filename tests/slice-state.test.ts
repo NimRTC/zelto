@@ -29,7 +29,9 @@ describe('SliceState', () => {
       ['draft', 'FREEZE', 'frozen'],
       ['frozen', 'RUN_START', 'running'],
       ['frozen', 'GATE_PASS', 'completed'],
+      ['frozen', 'SIGN_APPROVE', 'completed'],
       ['running', 'RUN_FINISH', 'frozen'],
+      ['completed', 'SIGN_REJECT', 'frozen'],
       ['frozen', 'ABANDON', 'abandoned'],
     ];
     for (const [from, event, expected] of cases) {

@@ -5,6 +5,7 @@ import { readFile, writeFile, mkdir, readdir, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { EventStream, EventType } from '../events/stream.js';
+import type { SliceStore } from '../slice/store.js';
 
 export interface SignRequest {
   id: string;
@@ -20,10 +21,12 @@ export interface SignRequest {
 export class SignManager {
   private readonly locksDir: string;
   private readonly events: EventStream;
+  private readonly store: SliceStore;
 
-  constructor(baseDir: string, events: EventStream) {
+  constructor(baseDir: string, events: EventStream, store: SliceStore) {
     this.locksDir = join(baseDir, 'locks');
     this.events = events;
+    this.store = store;
   }
 
   private path(id: string): string {
@@ -74,6 +77,13 @@ export class SignManager {
       comment,
     });
 
+    // Transition slice state
+    try {
+      await this.store.transit(req.sliceId, 'SIGN_APPROVE');
+    } catch {
+      // Non-fatal: slice may already be in completed state
+    }
+
     return req;
   }
 
@@ -95,6 +105,13 @@ export class SignManager {
       sliceId: req.sliceId,
       comment,
     });
+
+    // Transition slice state back to frozen for rework
+    try {
+      await this.store.transit(req.sliceId, 'SIGN_REJECT');
+    } catch {
+      // Non-fatal: slice may not be in completed state
+    }
 
     return req;
   }

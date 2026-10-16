@@ -33,6 +33,7 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
   frozen: {
     RUN_START: 'running',
     GATE_PASS: 'completed',
+    SIGN_APPROVE: 'completed',
     ABANDON: 'abandoned',
   },
   running: {
@@ -40,6 +41,7 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
     ABANDON: 'abandoned',
   },
   completed: {
+    SIGN_REJECT: 'frozen',
     RUN_START: 'running',
     ABANDON: 'abandoned',
   },

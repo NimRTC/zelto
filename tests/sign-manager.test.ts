@@ -1,23 +1,31 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { SignManager, type SignRequest } from '../src/core/gate/sign.js';
 import { EventStream, type EventEnvelope } from '../src/core/events/stream.js';
+import { SliceStore } from '../src/core/slice/store.js';
 
 const TEST_DIR = join(tmpdir(), `zelto-sign-test-${Date.now()}`);
 const EVENTS_DIR = join(TEST_DIR, 'events');
+const SLICES_DIR = join(TEST_DIR, 'slices');
+const LOCKS_DIR = join(TEST_DIR, 'locks');
 
 describe('SignManager', () => {
   let events: EventStream;
+  let store: SliceStore;
   let manager: SignManager;
 
   before(async () => {
     await mkdir(EVENTS_DIR, { recursive: true });
+    await mkdir(SLICES_DIR, { recursive: true });
+    await mkdir(LOCKS_DIR, { recursive: true });
     events = new EventStream(EVENTS_DIR);
-    manager = new SignManager(TEST_DIR, events);
+    store = new SliceStore(SLICES_DIR);
+    manager = new SignManager(TEST_DIR, events, store);
   });
 
   after(async () => {
@@ -81,5 +89,59 @@ describe('SignManager', () => {
     const types = evts.map((e: EventEnvelope) => e.type);
     assert.ok(types.includes('sign.requested'));
     assert.ok(types.includes('sign.approved'));
+  });
+
+  it('transitions slice to completed on approve', async () => {
+    // Create a slice and set it up for sign
+    const slice = store.create('sign-approve-test', 'Sign Approve Test');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'sha256:test';
+    slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
+
+    // Transition through gate to completed
+    await store.transit('sign-approve-test', 'GATE_PASS');
+
+    // Now approve
+    const req = await manager.request('sign-approve-test', 'agent');
+    await manager.approve(req.id, 'human');
+
+    const updated = await store.read('sign-approve-test');
+    assert.equal(updated.state, 'completed');
+  });
+
+  it('transitions slice back to frozen on reject', async () => {
+    const slice = store.create('sign-reject-test', 'Sign Reject Test');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'sha256:test';
+    slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
+
+    // Transition through gate to completed
+    await store.transit('sign-reject-test', 'GATE_PASS');
+
+    // Now reject
+    const req = await manager.request('sign-reject-test', 'agent');
+    await manager.reject(req.id, 'human', 'Needs rework');
+
+    const updated = await store.read('sign-reject-test');
+    assert.equal(updated.state, 'frozen');
+  });
+
+  it('does not fail when approving already-completed slice', async () => {
+    const slice = store.create('sign-already-completed', 'Already Completed');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'sha256:test';
+    slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
+
+    // Gate pass to completed
+    await store.transit('sign-already-completed', 'GATE_PASS');
+
+    // Approve — should not throw even though slice is already completed
+    const req = await manager.request('sign-already-completed', 'agent');
+    await assert.doesNotReject(async () => {
+      await manager.approve(req.id, 'human');
+    });
   });
 });

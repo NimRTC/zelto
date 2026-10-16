@@ -718,7 +718,7 @@ register('gate', async (args) => {
       await store.transit(id, 'GATE_PASS');
       console.log(`  State:    ✅ Slice transitioned to "completed"`);
       // Auto-create sign request
-      const signManager = new SignManager(ZELTO_DIR, events);
+      const signManager = new SignManager(ZELTO_DIR, events, store);
       const signReq = await signManager.request(id, 'zelto');
       console.log(`  Sign:     📋 Sign request created (${signReq.id})`);
       console.log(`  Next:     Run "zelto sign ${id} --approve" to approve`);
@@ -733,7 +733,7 @@ register('gate', async (args) => {
 });
 
 register('inbox', async (args) => {
-  const signManager = new SignManager(ZELTO_DIR, events);
+  const signManager = new SignManager(ZELTO_DIR, events, store);
   const pending = await signManager.list('pending');
 
   // Non-interactive mode: --list flag or piped output
@@ -823,7 +823,7 @@ register('sign', async (args) => {
     return 1;
   }
 
-  const signManager = new SignManager(ZELTO_DIR, events);
+  const signManager = new SignManager(ZELTO_DIR, events, store);
   const commentIndex = args.indexOf('--comment');
   const comment = commentIndex >= 0 ? args[commentIndex + 1] : null;
 
