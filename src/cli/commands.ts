@@ -687,6 +687,41 @@ register('clarify', async (args) => {
   }
 });
 
+register('abandon', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto abandon <slice-id>');
+    return 1;
+  }
+
+  try {
+    const slice = await store.read(id);
+    if (slice.state === 'abandoned') {
+      console.error(`Slice "${id}" is already abandoned.`);
+      return 1;
+    }
+
+    const prevState = slice.state;
+    await store.transit(id, 'ABANDON');
+
+    // Emit state change event
+    await events.append(id, 'slice.state.changed', 'cli', {
+      sliceId: id,
+      from: prevState,
+      to: 'abandoned',
+      event: 'ABANDON',
+    });
+
+    console.log(`zelto abandon ${id} — ✅ Slice abandoned`);
+    console.log(`  Previous state: ${prevState}`);
+    console.log(`  Now:            abandoned`);
+    return 0;
+  } catch (err) {
+    console.error(`Error abandoning slice "${id}": ${err}`);
+    return 1;
+  }
+});
+
 register('freeze', async (args) => {
   const [id] = args;
   if (!id) {
