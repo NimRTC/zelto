@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { EventStream } from '../core/events/stream.js';
+import { ClarifyEngine } from '../core/clarify/engine.js';
 import { GateExecutor } from '../core/gate/executor.js';
 import { SignManager } from '../core/gate/sign.js';
 import type { GateConfig } from '../core/gate/types.js';
@@ -535,6 +536,155 @@ register('check', async (args) => {
     return 1;
   }
   return 0;
+});
+
+register('clarify', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto clarify <slice-id> [--auto] [--dry-run]');
+    return 1;
+  }
+
+  const isAuto = args.includes('--auto');
+  const isDryRun = args.includes('--dry-run');
+
+  try {
+    const slice = await store.read(id);
+    if (slice.state !== 'draft' && slice.state !== 'clarifying') {
+      console.error(`Slice "${id}" is in state "${slice.state}". Only draft/clarifying slices can be clarified.`);
+      return 1;
+    }
+
+    const engine = new ClarifyEngine(events);
+
+    // Transition to clarifying if draft
+    if (slice.state === 'draft') {
+      if (!isDryRun) {
+        await store.transit(id, 'CLARIFY_START');
+        console.log(`zelto clarify ${id} — entering clarification...`);
+      } else {
+        console.log(`zelto clarify ${id} — dry-run (no changes made)...`);
+      }
+    } else {
+      console.log(`zelto clarify ${id} — continuing clarification...`);
+    }
+
+    // Re-read to get fresh state
+    const current = isDryRun ? slice : await store.read(id);
+    const round = (current.runs?.length ?? 0) + 1;
+
+    if (isAuto || isDryRun) {
+      // Non-interactive mode
+      const result = engine.generateQuestions(current, round);
+
+      if (result.converged) {
+        console.log('  ✅ No open questions — slice is already complete.');
+        return 0;
+      }
+
+      console.log(`  Questions: ${result.questions.length}`);
+      for (const q of result.questions) {
+        console.log(`    [${q.id}] ${q.text}`);
+        console.log(`           Default: ${q.default}`);
+      }
+
+      if (isDryRun) {
+        console.log(`\n  Run without --dry-run to auto-answer with defaults.`);
+        return 0;
+      }
+
+      // Auto-answer with defaults
+      for (const q of result.questions) {
+        const answer = { questionId: q.id, answer: q.default, answeredBy: 'zelto' };
+        engine.applyAnswers(current, [answer]);
+        await events.append(id, 'clarify.answer', 'zelto', {
+          questionId: q.id, answer: q.default, selfAnswered: true,
+        });
+      }
+
+      await store.write(current);
+      console.log(`  ✅ All questions auto-answered.`);
+
+      // Converge and freeze
+      await store.transit(id, 'CLARIFY_CONVERGED');
+      const afterConverge = await store.read(id);
+
+      // Now freeze
+      const specHash = hashSpecFile(afterConverge.spec.path);
+      afterConverge.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
+      afterConverge.spec.frozenAt = new Date().toISOString();
+      await store.write(afterConverge);
+      await store.transit(id, 'FREEZE');
+
+      console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
+      console.log(`  Next: zelto run ${id} --dry-run`);
+      return 0;
+    }
+
+    // Interactive mode
+    const result = engine.generateQuestions(current, round);
+
+    if (result.converged) {
+      console.log('  ✅ No open questions — slice is already complete.');
+      return 0;
+    }
+
+    console.log('');
+    const answers: Array<{ questionId: string; answer: string; answeredBy: string }> = [];
+
+    for (let i = 0; i < result.questions.length; i++) {
+      const q = result.questions[i];
+      console.log(`  ${i + 1}/${result.questions.length}: ${q.text}`);
+      console.log(`    Candidates: ${q.candidates.join(', ')}`);
+      console.log(`    Default: ${q.default}`);
+      console.log(`    Impact: ${q.impact}, Reversibility: ${q.reversibility}`);
+
+      if (!process.stdout.isTTY) {
+        // Non-TTY fallback: use default
+        console.log(`    → Using default (non-TTY): ${q.default}`);
+        answers.push({ questionId: q.id, answer: q.default, answeredBy: 'zelto' });
+      } else {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const input = await new Promise<string>((resolve) => {
+          rl.question('    > ', resolve);
+        });
+        rl.close();
+        const chosen = input.trim() || q.default;
+        answers.push({ questionId: q.id, answer: chosen, answeredBy: 'human' });
+      }
+      console.log('');
+    }
+
+    // Apply answers
+    engine.applyAnswers(current, answers);
+    await store.write(current);
+
+    // Log answer events
+    for (const a of answers) {
+      await events.append(id, 'clarify.answer', a.answeredBy, {
+        questionId: a.questionId, answer: a.answer,
+      });
+    }
+
+    console.log(`  ✅ All questions answered.`);
+
+    // Converge and freeze
+    await store.transit(id, 'CLARIFY_CONVERGED');
+    const afterConverge = await store.read(id);
+
+    const specHash = hashSpecFile(afterConverge.spec.path);
+    afterConverge.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
+    afterConverge.spec.frozenAt = new Date().toISOString();
+    await store.write(afterConverge);
+    await store.transit(id, 'FREEZE');
+
+    console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
+    console.log(`  Next: zelto run ${id} --dry-run`);
+    return 0;
+  } catch (err) {
+    console.error(`Error clarifying slice "${id}": ${err}`);
+    return 1;
+  }
 });
 
 register('freeze', async (args) => {
