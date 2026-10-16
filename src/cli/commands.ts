@@ -6,8 +6,9 @@ import type { GateConfig } from '../core/gate/types.js';
 import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
 import { EventStream } from '../core/events/stream.js';
-import type { PolicyConfig } from '../core/policy/types.js';
+import type { PolicyConfig, PolicyRule, Decision } from '../core/policy/types.js';
 import { readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
@@ -17,6 +18,24 @@ const LOCKS_DIR = join(ZELTO_DIR, 'locks');
 const EVENTS_DIR = join(ZELTO_DIR, 'events');
 
 function loadPolicyConfig(): PolicyConfig {
+  // Try to read from policy/policy.yaml
+  const policyPath = join('policy', 'policy.yaml');
+  if (existsSync(policyPath)) {
+    try {
+      const content = readFileSync(policyPath, 'utf-8');
+      const parsed = parsePolicyYaml(content);
+      if (parsed.rules.length > 0) {
+        return {
+          rules: parsed.rules,
+          protected: ['policy/**', '.zelto/**', 'AGENTS.md', '.cursor/rules/**'],
+        };
+      }
+    } catch {
+      // Fall through to defaults
+    }
+  }
+
+  // Fallback: hardcoded defaults
   return {
     rules: [
       { id: 'allow-src-ts', match: { path: 'src/**/*.ts', operation: 'write' }, action: 'allow', basis: 'policy.yaml#allow-src-ts' },
@@ -33,6 +52,15 @@ function loadPolicyConfig(): PolicyConfig {
 const store = new SliceStore(SLICES_DIR);
 const events = new EventStream(EVENTS_DIR);
 
+function hashSpecFile(specPath: string): string | null {
+  try {
+    const content = readFileSync(specPath, 'utf-8');
+    return `sha256:${createHash('sha256').update(content).digest('hex')}`;
+  } catch {
+    return null;
+  }
+}
+
 function loadConfig(): { gate: { commands: Array<{ name: string; run: string }>; timeoutSec: number; retry: { max: number } } } {
   const configPath = join(ZELTO_DIR, 'config.yaml');
   const defaultConfig = {
@@ -46,13 +74,121 @@ function loadConfig(): { gate: { commands: Array<{ name: string; run: string }>;
   }
 
   try {
-    // Simple YAML-like parse for gate config
     const content = readFileSync(configPath, 'utf-8');
-    // For now, just return defaults — proper YAML parsing comes later
+    const parsed = parseConfigYaml(content);
+    if (parsed) {
+      return { gate: parsed };
+    }
     return { gate: defaultConfig };
   } catch {
     return { gate: defaultConfig };
   }
+}
+
+function parseConfigYaml(content: string): { commands: Array<{ name: string; run: string }>; timeoutSec: number; retry: { max: number } } | null {
+  const defaultCfg = { commands: [{ name: 'test', run: 'pnpm test' }], timeoutSec: 120, retry: { max: 2 } };
+  let commands: Array<{ name: string; run: string }> = [];
+  let timeoutSec = 120;
+  let retryMax = 2;
+  let currentCommand: { name: string; run: string } | null = null;
+
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#') || trimmed === '') continue;
+
+    // commands list item
+    if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
+      if (currentCommand) commands.push(currentCommand);
+      currentCommand = { name: trimmed.slice(7).trim(), run: '' };
+      continue;
+    }
+
+    if (trimmed.startsWith('run:')) {
+      if (currentCommand) {
+        currentCommand.run = trimmed.slice(4).trim().replace(/^"|"$/g, '');
+      }
+      continue;
+    }
+
+    if (trimmed.startsWith('timeoutSec:')) {
+      timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
+      continue;
+    }
+
+    if (trimmed.startsWith('max:')) {
+      retryMax = Number.parseInt(trimmed.slice(4).trim(), 10) || 2;
+      continue;
+    }
+  }
+
+  if (currentCommand) commands.push(currentCommand);
+
+  return commands.length > 0
+    ? { commands, timeoutSec, retry: { max: retryMax } }
+    : null;
+}
+
+// YAML parser for policy/policy.yaml (same format as hook's parser)
+function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
+  const rules: PolicyRule[] = [];
+  let currentRule: any = null;
+
+  const lines = content.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#') || trimmed === '') continue;
+
+    if (trimmed.startsWith('- id:')) {
+      if (currentRule?.id) rules.push(currentRule);
+      currentRule = { id: trimmed.slice(5).trim(), match: {} };
+      continue;
+    }
+
+    if (!currentRule) continue;
+
+    const matchInline = trimmed.match(/^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/);
+    if (matchInline) {
+      currentRule.match = {
+        path: matchInline[1],
+        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
+      };
+      continue;
+    }
+
+    if (trimmed.startsWith('path:')) {
+      currentRule.match = { ...currentRule.match, path: trimmed.slice(5).trim().replace(/^"|"$/g, '') };
+      continue;
+    }
+
+    if (trimmed.startsWith('operation:')) {
+      currentRule.match = { ...currentRule.match, operation: trimmed.slice(10).trim().replace(/^"|"$/g, '') };
+      continue;
+    }
+
+    if (trimmed.startsWith('action:')) {
+      currentRule.action = trimmed.slice(7).trim() as Decision;
+      continue;
+    }
+
+    if (trimmed.startsWith('basis:')) {
+      currentRule.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
+      continue;
+    }
+
+    if (trimmed.startsWith('guidance:')) {
+      currentRule.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
+      continue;
+    }
+
+    if (trimmed.startsWith('priority:')) {
+      currentRule.priority = Number.parseInt(trimmed.slice(9).trim(), 10);
+      continue;
+    }
+  }
+
+  if (currentRule?.id) rules.push(currentRule);
+  return { rules };
 }
 
 type Command = (args: string[]) => Promise<number>;
@@ -175,7 +311,8 @@ register('start', async (args) => {
     if (slice.state === 'draft' || slice.state === 'clarifying') {
       // Set frozen hash before transit (transit reads fresh from disk)
       const current = await store.read(id);
-      current.spec.frozenHash = `sha256:${Date.now()}`;
+      const specHash = hashSpecFile(current.spec.path);
+      current.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
       current.spec.frozenAt = new Date().toISOString();
       await store.write(current);
       await store.transit(id, 'FREEZE');
@@ -237,6 +374,18 @@ register('check', async (args) => {
     if (slice.trace.tests.length === 0) issues.push('No tests traced');
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 
+    // Spec hash verification
+    if (slice.spec.frozenHash) {
+      const currentHash = hashSpecFile(slice.spec.path);
+      if (currentHash && currentHash !== slice.spec.frozenHash) {
+        issues.push('Spec file has changed since freeze (hash mismatch)');
+      } else if (!currentHash) {
+        issues.push('Spec file not found');
+      } else {
+        console.log(`  Spec hash: ✅ ${slice.spec.frozenHash.slice(0, 12)}...`);
+      }
+    }
+
     if (issues.length === 0) {
       console.log('  Result:  ✅ All checks passed');
     } else {
@@ -264,8 +413,9 @@ register('freeze', async (args) => {
       return 1;
     }
 
-    // Update frozen hash and save before transit
-    slice.spec.frozenHash = `sha256:${Date.now()}`; // Placeholder — real hash from spec file
+    // Update frozen hash from spec file and save before transit
+    const specHash = hashSpecFile(slice.spec.path);
+    slice.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
     slice.spec.frozenAt = new Date().toISOString();
     await store.write(slice);
 
