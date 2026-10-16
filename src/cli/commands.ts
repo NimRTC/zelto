@@ -518,12 +518,25 @@ register('check', async (args) => {
       const currentHash = hashSpecFile(slice.spec.path);
       if (currentHash && currentHash !== slice.spec.frozenHash) {
         issues.push('Spec file has changed since freeze (hash mismatch)');
+        await events.append(id, 'slice.drift_detected', 'cli', {
+          sliceId: id,
+          expectedHash: slice.spec.frozenHash,
+          actualHash: currentHash,
+          reason: 'Spec file hash mismatch after freeze',
+        });
       } else if (!currentHash) {
         issues.push('Spec file not found');
       } else {
         console.log(`  Spec hash: ✅ ${slice.spec.frozenHash.slice(0, 12)}...`);
       }
     }
+
+    await events.append(id, 'spec.checked', 'cli', {
+      sliceId: id,
+      issues: issues.length,
+      passed: issues.length === 0,
+      details: issues,
+    });
 
     if (issues.length === 0) {
       console.log('  Result:  ✅ All checks passed');
@@ -615,6 +628,11 @@ register('clarify', async (args) => {
       afterConverge.spec.frozenAt = new Date().toISOString();
       await store.write(afterConverge);
       await store.transit(id, 'FREEZE');
+      await events.append(id, 'spec.frozen', 'zelto', {
+        sliceId: id,
+        frozenHash: afterConverge.spec.frozenHash,
+        frozenAt: afterConverge.spec.frozenAt,
+      });
 
       console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
       console.log(`  Next: zelto run ${id} --dry-run`);
@@ -677,6 +695,11 @@ register('clarify', async (args) => {
     afterConverge.spec.frozenAt = new Date().toISOString();
     await store.write(afterConverge);
     await store.transit(id, 'FREEZE');
+    await events.append(id, 'spec.frozen', 'human', {
+      sliceId: id,
+      frozenHash: afterConverge.spec.frozenHash,
+      frozenAt: afterConverge.spec.frozenAt,
+    });
 
     console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
     console.log(`  Next: zelto run ${id} --dry-run`);
@@ -744,6 +767,11 @@ register('freeze', async (args) => {
 
     // Transition state via store
     await store.transit(id, 'FREEZE');
+    await events.append(id, 'spec.frozen', 'cli', {
+      sliceId: id,
+      frozenHash: slice.spec.frozenHash,
+      frozenAt: slice.spec.frozenAt,
+    });
     console.log(`zelto freeze ${id} — ✅ Slice frozen at ${slice.spec.frozenAt}`);
   } catch (err) {
     console.error(`Error freezing slice "${id}": ${err}`);
