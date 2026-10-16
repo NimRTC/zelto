@@ -459,7 +459,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 | 操作 | 耗时 |
 |---|---|
 | `pnpm build` | ~2s |
-| `pnpm test` (62 tests) | ~500ms |
+| `pnpm test` (101 tests) | ~14s |
 | Hook 单次判定 | < 10ms |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |

@@ -132,7 +132,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **Scheduler** | `src/core/sched/engine.ts` | 并行准入、写集冲突检测、约束分发 |
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
-| **Audit Trail** | `src/core/audit/trail.ts` | 30 种事件摘要、可读审计报告 |
+| **Audit Trail** | `src/core/audit/trail.ts` | 29 种事件摘要、可读审计报告 |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
@@ -140,16 +140,22 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 | 命令 | 用途 | 对应流程阶段 |
 |---|---|---|
+| `zelto init` | 初始化 `.zelto/` 运行时目录 | 通用 |
 | `zelto slices` | 列出所有切片 | 通用 |
+| `zelto create <id>` | 创建新切片 | create |
 | `zelto next` | 推荐下一步动作 | 通用 |
 | `zelto check <id>` | 门禁① 确定性检查 | freeze 前 |
+| `zelto clarify <id>` | 澄清切片规格 | clarify |
 | `zelto freeze <id>` | 冻结切片基线 | freeze |
+| `zelto start <id>` | 一键执行：create→check→freeze→run | run |
 | `zelto run <id>` | 执行切片（含并行准入） | run |
 | `zelto run <id> --dry-run` | 模拟准入检查 | run 前 |
 | `zelto gate <id>` | 门禁② 验收测试 | gate |
 | `zelto inbox` | 待签名队列 | sign 前 |
 | `zelto sign <id> --approve` | 审批切片 | sign |
 | `zelto sign <id> --reject` | 拒绝切片 | sign |
+| `zelto abandon <id>` | 废弃切片 | 通用 |
+| `zelto summary` | 项目概况 | 通用 |
 | `zelto help` | 帮助 | 通用 |
 
 ### 3.3 独立 Hook
@@ -244,7 +250,15 @@ zelto/
 │   ├── clarify-engine.test.ts
 │   ├── metrics-collector.test.ts
 │   ├── audit-trail.test.ts
-│   └── hook-executable.test.ts
+│   ├── hook-executable.test.ts
+│   ├── config-loading.test.ts
+│   ├── create-command.test.ts
+│   ├── init-command.test.ts
+│   ├── start-command.test.ts
+│   ├── clarify-command.test.ts
+│   ├── abandon-command.test.ts
+│   ├── event-emission.test.ts
+│   └── agent-execution.test.ts
 └── .zelto/                运行时状态
     ├── slices/            切片文件
     ├── events/            事件日志
@@ -258,17 +272,25 @@ zelto/
 
 | 测试文件 | 测试数 | 覆盖模块 |
 |---|---|---|
-| `tests/policy-engine.test.ts` | 13 | PolicyEngine, matchPath, checkAnchor, hashPolicy |
+| `tests/policy-engine.test.ts` | 14 | PolicyEngine, matchPath, checkAnchor, hashPolicy |
 | `tests/slice-state.test.ts` | 5 | SliceState 状态机 |
 | `tests/stall-classifier.test.ts` | 5 | StallClassifier |
-| `tests/sign-manager.test.ts` | 7 | SignManager |
+| `tests/sign-manager.test.ts` | 10 | SignManager |
 | `tests/gate-executor.test.ts` | 3 | GateExecutor |
 | `tests/scheduler.test.ts` | 6 | Scheduler |
 | `tests/clarify-engine.test.ts` | 5 | ClarifyEngine |
 | `tests/metrics-collector.test.ts` | 5 | MetricsCollector |
 | `tests/audit-trail.test.ts` | 5 | AuditTrail |
 | `tests/hook-executable.test.ts` | 7 | Hook 可执行体 |
-| **总计** | **62** | **15 suites** |
+| `tests/abandon-command.test.ts` | 6 | abandon 命令 |
+| `tests/clarify-command.test.ts` | 6 | clarify 命令 |
+| `tests/config-loading.test.ts` | 5 | 配置加载 |
+| `tests/create-command.test.ts` | 5 | create 命令 |
+| `tests/init-command.test.ts` | 3 | init 命令 |
+| `tests/start-command.test.ts` | 3 | start 命令 |
+| `tests/event-emission.test.ts` | 4 | 事件发射 |
+| `tests/agent-execution.test.ts` | 4 | agent 执行流程 |
+| **总计** | **101** | **23 suites** |
 
 ---
 
@@ -290,7 +312,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（62 tests, 15 suites）
+pnpm test           # 编译 + 运行测试（101 tests, 23 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
