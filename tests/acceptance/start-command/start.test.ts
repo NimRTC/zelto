@@ -29,7 +29,7 @@ describe('acceptance: zelto start', () => {
     await mkdir(BASE_DIR, { recursive: true });
     await mkdir(join(BASE_DIR, '.zelto', 'slices'), { recursive: true });
     await mkdir(join(BASE_DIR, '.zelto', 'events'), { recursive: true });
-    // Write config with echo as agent so it doesn't hang
+    // Use echo as agent so it doesn't hang
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
@@ -54,7 +54,7 @@ describe('acceptance: zelto start', () => {
     assert.ok(stdout.includes('created'), 'should show created');
     assert.ok(stdout.includes('frozen'), 'should mention frozen');
     assert.ok(stdout.includes('Agent:'), 'should show agent info');
-    assert.ok(stdout.includes('completed'), 'should show completion');
+    assert.ok(stdout.includes('completed successfully'), 'should show completion');
   });
 
   it('skips create for existing draft slice', async () => {
