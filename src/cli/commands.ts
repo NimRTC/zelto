@@ -1,20 +1,21 @@
 // CLI command dispatcher
 
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { EventStream } from '../core/events/stream.js';
 import { GateExecutor } from '../core/gate/executor.js';
 import { SignManager } from '../core/gate/sign.js';
 import type { GateConfig } from '../core/gate/types.js';
+import type { Decision, PolicyConfig, PolicyRule } from '../core/policy/types.js';
 import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
-import { EventStream } from '../core/events/stream.js';
-import type { PolicyConfig, PolicyRule, Decision } from '../core/policy/types.js';
-import { readFileSync, existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { createInterface } from 'node:readline';
-import { join } from 'node:path';
 
 const ZELTO_DIR = '.zelto';
 const SLICES_DIR = join(ZELTO_DIR, 'slices');
-const LOCKS_DIR = join(ZELTO_DIR, 'locks');
+const _LOCKS_DIR = join(ZELTO_DIR, 'locks');
 const EVENTS_DIR = join(ZELTO_DIR, 'events');
 
 function loadPolicyConfig(): PolicyConfig {
@@ -38,12 +39,44 @@ function loadPolicyConfig(): PolicyConfig {
   // Fallback: hardcoded defaults
   return {
     rules: [
-      { id: 'allow-src-ts', match: { path: 'src/**/*.ts', operation: 'write' }, action: 'allow', basis: 'policy.yaml#allow-src-ts' },
-      { id: 'allow-tests', match: { path: 'tests/**/*.ts', operation: 'write' }, action: 'allow', basis: 'policy.yaml#allow-tests' },
-      { id: 'allow-read-all', match: { path: '**', operation: 'read' }, action: 'allow', basis: 'policy.yaml#allow-read-all', priority: 0 },
-      { id: 'allow-docs', match: { path: 'docs/**', operation: 'write' }, action: 'allow', basis: 'policy.yaml#allow-docs' },
-      { id: 'allow-config', match: { path: '.zelto/config.yaml', operation: 'write' }, action: 'ask', basis: 'policy.yaml#allow-config' },
-      { id: 'deny-acceptance-direct', match: { path: 'tests/acceptance/**', operation: 'write' }, action: 'deny', basis: 'AGENTS.md#禁区-5', guidance: 'Acceptance tests are frozen with the spec.' },
+      {
+        id: 'allow-src-ts',
+        match: { path: 'src/**/*.ts', operation: 'write' },
+        action: 'allow',
+        basis: 'policy.yaml#allow-src-ts',
+      },
+      {
+        id: 'allow-tests',
+        match: { path: 'tests/**/*.ts', operation: 'write' },
+        action: 'allow',
+        basis: 'policy.yaml#allow-tests',
+      },
+      {
+        id: 'allow-read-all',
+        match: { path: '**', operation: 'read' },
+        action: 'allow',
+        basis: 'policy.yaml#allow-read-all',
+        priority: 0,
+      },
+      {
+        id: 'allow-docs',
+        match: { path: 'docs/**', operation: 'write' },
+        action: 'allow',
+        basis: 'policy.yaml#allow-docs',
+      },
+      {
+        id: 'allow-config',
+        match: { path: '.zelto/config.yaml', operation: 'write' },
+        action: 'ask',
+        basis: 'policy.yaml#allow-config',
+      },
+      {
+        id: 'deny-acceptance-direct',
+        match: { path: 'tests/acceptance/**', operation: 'write' },
+        action: 'deny',
+        basis: 'AGENTS.md#禁区-5',
+        guidance: 'Acceptance tests are frozen with the spec.',
+      },
     ],
     protected: ['policy/**', '.zelto/**', 'AGENTS.md', '.cursor/rules/**'],
   };
@@ -61,78 +94,124 @@ function hashSpecFile(specPath: string): string | null {
   }
 }
 
-function loadConfig(): { gate: { commands: Array<{ name: string; run: string }>; timeoutSec: number; retry: { max: number } } } {
+function loadConfig(): {
+  gate: {
+    commands: Array<{ name: string; run: string }>;
+    timeoutSec: number;
+    retry: { max: number };
+  };
+  agent: { command: string };
+} {
   const configPath = join(ZELTO_DIR, 'config.yaml');
   const defaultConfig = {
-    commands: [{ name: 'test', run: 'pnpm test' }, { name: 'lint', run: 'pnpm lint' }],
-    timeoutSec: 120,
-    retry: { max: 2 },
+    gate: {
+      commands: [
+        { name: 'test', run: 'pnpm test' },
+        { name: 'lint', run: 'pnpm lint' },
+      ],
+      timeoutSec: 120,
+      retry: { max: 2 },
+    },
+    agent: {
+      command: 'npx claude-code',
+    },
   };
 
   if (!existsSync(configPath)) {
-    return { gate: defaultConfig };
+    return defaultConfig;
   }
 
   try {
     const content = readFileSync(configPath, 'utf-8');
     const parsed = parseConfigYaml(content);
     if (parsed) {
-      return { gate: parsed };
+      return {
+        gate: parsed.gate,
+        agent: parsed.agent ?? defaultConfig.agent,
+      };
     }
-    return { gate: defaultConfig };
+    return defaultConfig;
   } catch {
-    return { gate: defaultConfig };
+    return defaultConfig;
   }
 }
 
-function parseConfigYaml(content: string): { commands: Array<{ name: string; run: string }>; timeoutSec: number; retry: { max: number } } | null {
-  const defaultCfg = { commands: [{ name: 'test', run: 'pnpm test' }], timeoutSec: 120, retry: { max: 2 } };
-  let commands: Array<{ name: string; run: string }> = [];
+function parseConfigYaml(content: string): {
+  gate: {
+    commands: Array<{ name: string; run: string }>;
+    timeoutSec: number;
+    retry: { max: number };
+  };
+  agent: { command: string };
+} | null {
+  const commands: Array<{ name: string; run: string }> = [];
   let timeoutSec = 120;
   let retryMax = 2;
+  let agentCommand = 'npx claude-code';
   let currentCommand: { name: string; run: string } | null = null;
+  let inGateSection = false;
+  let inAgentSection = false;
 
   const lines = content.split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
-    // commands list item
-    if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
-      if (currentCommand) commands.push(currentCommand);
-      currentCommand = { name: trimmed.slice(7).trim(), run: '' };
+    if (trimmed === 'gate:') {
+      inGateSection = true;
+      inAgentSection = false;
+      continue;
+    }
+    if (trimmed === 'agent:') {
+      inAgentSection = true;
+      inGateSection = false;
       continue;
     }
 
-    if (trimmed.startsWith('run:')) {
-      if (currentCommand) {
-        currentCommand.run = trimmed.slice(4).trim().replace(/^"|"$/g, '');
+    if (inGateSection) {
+      if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
+        if (currentCommand) commands.push(currentCommand);
+        currentCommand = { name: trimmed.slice(7).trim(), run: '' };
+        continue;
       }
-      continue;
+
+      if (trimmed.startsWith('run:')) {
+        if (currentCommand) {
+          currentCommand.run = trimmed.slice(4).trim().replace(/^"|"$/g, '');
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith('timeoutSec:')) {
+        timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
+        continue;
+      }
+
+      if (trimmed.startsWith('max:')) {
+        retryMax = Number.parseInt(trimmed.slice(4).trim(), 10) || 2;
+        continue;
+      }
     }
 
-    if (trimmed.startsWith('timeoutSec:')) {
-      timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
-      continue;
-    }
-
-    if (trimmed.startsWith('max:')) {
-      retryMax = Number.parseInt(trimmed.slice(4).trim(), 10) || 2;
-      continue;
+    if (inAgentSection && trimmed.startsWith('command:')) {
+      agentCommand = trimmed.slice(8).trim().replace(/^"|"$/g, '');
     }
   }
 
   if (currentCommand) commands.push(currentCommand);
 
   return commands.length > 0
-    ? { commands, timeoutSec, retry: { max: retryMax } }
+    ? {
+        gate: { commands, timeoutSec, retry: { max: retryMax } },
+        agent: { command: agentCommand },
+      }
     : null;
 }
 
 // YAML parser for policy/policy.yaml (same format as hook's parser)
 function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
   const rules: PolicyRule[] = [];
-  let currentRule: any = null;
+  let currentRule: Record<string, unknown> | null = null;
 
   const lines = content.split('\n');
   for (const line of lines) {
@@ -140,14 +219,16 @@ function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
     if (trimmed.startsWith('- id:')) {
-      if (currentRule?.id) rules.push(currentRule);
+      if (currentRule?.id) rules.push(currentRule as unknown as PolicyRule);
       currentRule = { id: trimmed.slice(5).trim(), match: {} };
       continue;
     }
 
     if (!currentRule) continue;
 
-    const matchInline = trimmed.match(/^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/);
+    const matchInline = trimmed.match(
+      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
+    );
     if (matchInline) {
       currentRule.match = {
         path: matchInline[1],
@@ -157,12 +238,18 @@ function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
     }
 
     if (trimmed.startsWith('path:')) {
-      currentRule.match = { ...currentRule.match, path: trimmed.slice(5).trim().replace(/^"|"$/g, '') };
+      currentRule.match = {
+        ...(currentRule.match as Record<string, unknown>),
+        path: trimmed.slice(5).trim().replace(/^"|"$/g, ''),
+      };
       continue;
     }
 
     if (trimmed.startsWith('operation:')) {
-      currentRule.match = { ...currentRule.match, operation: trimmed.slice(10).trim().replace(/^"|"$/g, '') };
+      currentRule.match = {
+        ...(currentRule.match as Record<string, unknown>),
+        operation: trimmed.slice(10).trim().replace(/^"|"$/g, ''),
+      };
       continue;
     }
 
@@ -183,11 +270,10 @@ function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
 
     if (trimmed.startsWith('priority:')) {
       currentRule.priority = Number.parseInt(trimmed.slice(9).trim(), 10);
-      continue;
     }
   }
 
-  if (currentRule?.id) rules.push(currentRule);
+  if (currentRule?.id) rules.push(currentRule as unknown as PolicyRule);
   return { rules };
 }
 
@@ -231,7 +317,9 @@ register('create', async (args) => {
 
   // Validate ID format
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-    console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+    console.error(
+      `Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`,
+    );
     return 1;
   }
 
@@ -337,15 +425,63 @@ register('start', async (args) => {
     await scheduler.startRun(id);
     console.log(`  ✅ Slice admitted and started execution`);
 
-    // Re-read to get latest state (frozenHash, etc.)
+    // Re-read to get latest state
     const updatedSlice = await store.read(id);
     const bundle = scheduler.buildConstraints(updatedSlice);
-    console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
-    console.log(`  Policy rules:  ${bundle.policyRules.length}`);
 
-    console.log(`\nzelto start ${id} — ✅ Done. Slice is now running.`);
-    console.log(`  After execution: zelto gate ${id}`);
-    return 0;
+    // Write constraint bundle
+    const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
+    writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
+
+    // Determine agent command
+    const cfg = loadConfig();
+    const agentCmd = cfg.agent.command;
+    const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : agentCmd;
+
+    console.log(`  Agent:         ${agentName}`);
+    console.log(`  Bundle:        ${bundlePath}`);
+    console.log('');
+
+    // Spawn agent
+    const child = spawn(agentName, [], {
+      cwd: process.cwd(),
+      stdio: ['inherit', 'inherit', 'inherit'],
+      shell: true,
+      env: {
+        ...process.env,
+        ZELTO_BUNDLE: bundlePath,
+        ZELTO_SLICE_ID: id,
+        ZELTO_PROJECT_ROOT: process.cwd(),
+      },
+    });
+
+    await events.append(id, 'run.started', 'zelto', {
+      sliceId: id,
+      agent: agentName,
+      bundlePath,
+      writes: bundle.writes,
+    });
+
+    const exitCode = await new Promise<number>((resolve) => {
+      child.on('close', resolve);
+      child.on('error', (err) => {
+        console.error(`  ❌ Agent failed to start: ${err.message}`);
+        resolve(1);
+      });
+    });
+
+    if (exitCode === 0) {
+      await store.transit(id, 'RUN_FINISH');
+      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
+      console.log(`\nzelto start ${id} — ✅ Agent completed successfully (exit 0)`);
+      console.log(`  Next: zelto gate ${id}`);
+      return 0;
+    } else {
+      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      console.log(`\nzelto start ${id} — ❌ Agent exited with code ${exitCode}`);
+      console.log(`  Slice remains in "running" state.`);
+      return 1;
+    }
   } catch (err) {
     console.error(`Error in start "${id}": ${err}`);
     return 1;
@@ -365,7 +501,9 @@ register('check', async (args) => {
     console.log(`  Slice:   ${slice.title}`);
     console.log(`  State:   ${slice.state}`);
     console.log(`  Spec:    ${slice.spec.path}`);
-    console.log(`  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts, ${slice.trace.tests.length} tests`);
+    console.log(
+      `  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts, ${slice.trace.tests.length} tests`,
+    );
 
     // Gate① checks: verify trace completeness, spec existence, drift status
     const issues: string[] = [];
@@ -467,16 +605,66 @@ register('run', async (args) => {
     // Start run
     await scheduler.startRun(id);
 
-    console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
-    console.log(`  Agent:   ${args.includes('--agent') ? args[args.indexOf('--agent') + 1] : 'default'}`);
-    console.log(`  Run ID:  ${slice.runs.length + 1}`);
-
-    // Show constraints
     const bundle = scheduler.buildConstraints(slice);
-    console.log(`  Constraints:`);
-    console.log(`    Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
-    console.log(`    Protected:     ${bundle.protectedPaths.join(', ')}`);
-    console.log(`    Policy rules:  ${bundle.policyRules.length}`);
+    console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
+    console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
+    console.log(`  Protected:     ${bundle.protectedPaths.join(', ')}`);
+    console.log(`  Policy rules:  ${bundle.policyRules.length}`);
+
+    // Write constraint bundle to temp file for the agent
+    const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
+    writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
+
+    // Determine agent command
+    const cfg = loadConfig();
+    const agentCmd = cfg.agent.command;
+    const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : agentCmd;
+
+    console.log(`  Agent:         ${agentName}`);
+    console.log(`  Bundle:        ${bundlePath}`);
+    console.log('');
+
+    // Spawn agent as a child process
+    const child = spawn(agentName, [], {
+      cwd: process.cwd(),
+      stdio: ['inherit', 'inherit', 'inherit'],
+      shell: true,
+      env: {
+        ...process.env,
+        ZELTO_BUNDLE: bundlePath,
+        ZELTO_SLICE_ID: id,
+        ZELTO_PROJECT_ROOT: process.cwd(),
+      },
+    });
+
+    // Record run.started event
+    await events.append(id, 'run.started', 'zelto', {
+      sliceId: id,
+      agent: agentName,
+      bundlePath,
+      writes: bundle.writes,
+    });
+
+    // Wait for agent to complete
+    const exitCode = await new Promise<number>((resolve) => {
+      child.on('close', resolve);
+      child.on('error', (err) => {
+        console.error(`  ❌ Agent failed to start: ${err.message}`);
+        resolve(1);
+      });
+    });
+
+    if (exitCode === 0) {
+      await store.transit(id, 'RUN_FINISH');
+      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
+      console.log(`\n✅ Agent completed successfully (exit 0)`);
+      console.log(`  Next: zelto gate ${id}`);
+    } else {
+      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      console.log(`\n❌ Agent exited with code ${exitCode}`);
+      console.log(`  Slice remains in "running" state for investigation.`);
+      console.log(`  To reset: manually update slice state or re-freeze.`);
+    }
   } catch (err) {
     console.error(`Error running slice "${id}": ${err}`);
     return 1;
@@ -515,7 +703,9 @@ register('gate', async (args) => {
     console.log(`  Commands: ${report.results.length}`);
     for (const r of report.results) {
       const icon = r.passed ? '✅' : '❌';
-      console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
+      console.log(
+        `    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`,
+      );
     }
 
     if (report.retryCount > 0) {
@@ -680,7 +870,14 @@ register('next', async () => {
   }
 
   // Find the first slice in earliest actionable state
-  const priority: Array<string> = ['draft', 'clarifying', 'frozen', 'running', 'completed', 'abandoned'];
+  const priority: Array<string> = [
+    'draft',
+    'clarifying',
+    'frozen',
+    'running',
+    'completed',
+    'abandoned',
+  ];
   for (const state of priority) {
     for (const id of list) {
       try {
@@ -710,11 +907,7 @@ register('next', async () => {
 });
 
 register('init', async () => {
-  const dirs = [
-    join(ZELTO_DIR, 'slices'),
-    join(ZELTO_DIR, 'events'),
-    join(ZELTO_DIR, 'locks'),
-  ];
+  const dirs = [join(ZELTO_DIR, 'slices'), join(ZELTO_DIR, 'events'), join(ZELTO_DIR, 'locks')];
 
   const configPath = join(ZELTO_DIR, 'config.yaml');
   const defaultConfig = `# zelto project configuration
@@ -761,7 +954,9 @@ register('summary', async () => {
   let pkg: Record<string, unknown> = {};
   try {
     pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 
   const name = (pkg.name as string) ?? 'zelto';
   const version = (pkg.version as string) ?? '?';
@@ -776,12 +971,14 @@ register('summary', async () => {
   let gitDirty = false;
   try {
     gitBranch = readFileSync('.git/HEAD', 'utf-8').trim().replace('ref: refs/heads/', '');
-    gitCommit = readFileSync('.git/refs/heads/' + gitBranch, 'utf-8').trim().slice(0, 7);
+    gitCommit = readFileSync(`.git/refs/heads/${gitBranch}`, 'utf-8').trim().slice(0, 7);
     // Check dirty — quick heuristic: diff-index
     const { execSync } = await import('node:child_process');
     const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 3000 });
     gitDirty = status.trim().length > 0;
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 
   // ── Module detection ──
   const coreModules: string[] = [];
@@ -818,7 +1015,9 @@ register('summary', async () => {
   if (hookExists) {
     try {
       hookLines = readFileSync('src/hook/index.ts', 'utf-8').split('\n').length;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   // ── Runtime dir ──
@@ -827,7 +1026,9 @@ register('summary', async () => {
   if (zeltoExists && existsSync('.zelto/slices')) {
     try {
       sliceCount = readdirSync('.zelto/slices').filter((f) => f.endsWith('.json')).length;
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   // ── Output ──
@@ -872,7 +1073,7 @@ export async function runCLI(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
 
   if (!cmd || cmd === 'help' || cmd === '--help') {
-    return commands.help!([]);
+    return commands.help?.([]);
   }
 
   const handler = commands[cmd];
