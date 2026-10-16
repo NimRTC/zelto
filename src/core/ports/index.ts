@@ -3,6 +3,8 @@
 
 import type { EventEnvelope, EventType } from '../events/index.js';
 
+export { type ExecutorAdapter, type AdapterMeta } from './executor.js';
+
 export interface SessionPort {
   start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }>;
   resume(sessionId: string, patch: string): Promise<void>;

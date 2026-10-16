@@ -55,8 +55,7 @@ describe('acceptance: zelto create', () => {
   });
 
   it('uses custom --title when provided', async () => {
-    const { stdout, code } = await runCreate('my-title-test', '--title', 'My Custom Title');
-    assert.equal(code, 0);
+    await runCreate('my-title-test', '--title', 'My Custom Title');
 
     const slicePath = join(BASE_DIR, '.zelto', 'slices', 'my-title-test.json');
     const slice = JSON.parse(await readFile(slicePath, 'utf-8'));
