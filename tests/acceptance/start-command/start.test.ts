@@ -24,16 +24,12 @@ function zelto(...args: string[]): Promise<{ stdout: string; code: number }> {
   });
 }
 
-async function readSlice(id: string): Promise<any> {
-  return JSON.parse(await readFile(join(BASE_DIR, '.zelto', 'slices', `${id}.json`), 'utf-8'));
-}
-
 describe('acceptance: zelto start', () => {
   before(async () => {
     await mkdir(BASE_DIR, { recursive: true });
     await mkdir(join(BASE_DIR, '.zelto', 'slices'), { recursive: true });
     await mkdir(join(BASE_DIR, '.zelto', 'events'), { recursive: true });
-    // Write config with echo as agent command so it doesn't hang
+    // Write config with echo as agent so it doesn't hang
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
@@ -55,8 +51,6 @@ describe('acceptance: zelto start', () => {
   it('runs full start flow on a new slice', async () => {
     const { stdout, code } = await zelto('start', 'new-slice', '--title', 'New Slice');
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
-
-    // Should show all stages
     assert.ok(stdout.includes('created'), 'should show created');
     assert.ok(stdout.includes('frozen'), 'should mention frozen');
     assert.ok(stdout.includes('Agent:'), 'should show agent info');
