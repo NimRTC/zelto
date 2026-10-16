@@ -81,6 +81,50 @@ register('slices', async () => {
   return 0;
 });
 
+register('create', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto create <slice-id> [--title <title>]');
+    return 1;
+  }
+
+  // Parse options
+  const titleIdx = args.indexOf('--title');
+  const title = titleIdx >= 0 ? args.slice(titleIdx + 1).join(' ') : id;
+
+  // Validate ID format
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+    return 1;
+  }
+
+  // Check if already exists
+  if (await store.exists(id)) {
+    console.error(`Slice "${id}" already exists.`);
+    return 1;
+  }
+
+  const slice = store.create(id, title);
+
+  // Write to disk
+  await store.write(slice);
+
+  // Emit spec.drafted event
+  await events.append(id, 'spec.drafted', 'cli', {
+    sliceId: id,
+    title,
+    specPath: slice.spec.path,
+  });
+
+  console.log(`zelto create ${id} — ✅ Slice created`);
+  console.log(`  ID:      ${id}`);
+  console.log(`  Title:   ${title}`);
+  console.log(`  State:   ${slice.state}`);
+  console.log(`  Spec:    ${slice.spec.path}`);
+  console.log(`  Next:    zelto check ${id}`);
+  return 0;
+});
+
 register('check', async (args) => {
   const [id] = args;
   if (!id) {
@@ -508,6 +552,7 @@ Commands:
   summary                   Show project summary
   init                      Initialize .zelto/ runtime directory
   slices                    List all slices
+  create <id>               Create a new slice
   next                      Show recommended next slice
   check <id>                Run gate① (deterministic checks)
   freeze <id>               Freeze slice baseline
