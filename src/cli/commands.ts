@@ -915,7 +915,15 @@ register('gate', async (args) => {
     if (report.passed) {
       console.log(`  Result:   ✅ Gate passed (${report.totalDurationMs.toFixed(0)}ms)`);
       // Transition to completed
+      const prevState = slice.state;
       await store.transit(id, 'GATE_PASS');
+      // Emit state change event
+      await events.append(id, 'slice.state.changed', 'cli', {
+        sliceId: id,
+        from: prevState,
+        to: 'completed',
+        event: 'GATE_PASS',
+      });
       console.log(`  State:    ✅ Slice transitioned to "completed"`);
       // Auto-create sign request
       const signManager = new SignManager(ZELTO_DIR, events, store);
