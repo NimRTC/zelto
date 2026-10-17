@@ -570,6 +570,13 @@ register('clarify', async (args) => {
     if (slice.state === 'draft') {
       if (!isDryRun) {
         await store.transit(id, 'CLARIFY_START');
+        // Emit state change event
+        await events.append(id, 'slice.state.changed', 'cli', {
+          sliceId: id,
+          from: 'draft',
+          to: 'clarifying',
+          event: 'CLARIFY_START',
+        });
         console.log(`zelto clarify ${id} — entering clarification...`);
       } else {
         console.log(`zelto clarify ${id} — dry-run (no changes made)...`);
@@ -616,6 +623,13 @@ register('clarify', async (args) => {
 
       // Converge and freeze
       await store.transit(id, 'CLARIFY_CONVERGED');
+      // Emit state change event
+      await events.append(id, 'slice.state.changed', 'cli', {
+        sliceId: id,
+        from: 'clarifying',
+        to: 'draft',
+        event: 'CLARIFY_CONVERGED',
+      });
       const afterConverge = await store.read(id);
 
       // Now freeze
