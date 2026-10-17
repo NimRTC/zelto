@@ -405,6 +405,11 @@ register('start', async (args) => {
       current.spec.frozenAt = new Date().toISOString();
       await store.write(current);
       await store.transit(id, 'FREEZE');
+      await events.append(id, 'spec.frozen', 'zelto', {
+        sliceId: id,
+        frozenHash: current.spec.frozenHash,
+        frozenAt: current.spec.frozenAt,
+      });
       console.log(`  ✅ Slice frozen`);
     } else {
       console.log(`  ℹ️  Slice already ${slice.state}, skipping freeze`);
