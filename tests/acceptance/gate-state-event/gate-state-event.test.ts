@@ -49,12 +49,12 @@ describe('acceptance: gate-state-event', () => {
     await mkdir(join(BASE_DIR, '.zelto', 'events'), { recursive: true });
     await mkdir(join(BASE_DIR, 'specs', 'slices'), { recursive: true });
 
-    // Write config with echo as mock gate commands
+    // Write config with node -e as mock gate commands
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
-      '    - { name: test, run: "echo ok" }',
-      '    - { name: lint, run: "echo ok" }',
+      '    - { name: test, run: "node -e process.exit(0)" }',
+      '    - { name: lint, run: "node -e process.exit(0)" }',
       '  timeoutSec: 30',
       '  retry:',
       '    max: 1',
