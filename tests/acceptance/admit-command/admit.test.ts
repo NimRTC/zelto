@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 
-const ZELTO_CLI = join(import.meta.dirname, '..', '..', '..', 'dist', 'cli', 'index.js');
+const ZELTO_CLI = join(import.meta.dirname, '..', '..', '..', '..', 'dist', 'cli', 'index.js');
 const TEST_DIR = join(tmpdir(), `zelto-accept-admit-${Date.now()}`);
 const SLICES_DIR = join(TEST_DIR, 'slices');
 const EVENTS_DIR = join(TEST_DIR, 'events');
