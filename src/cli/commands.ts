@@ -1253,13 +1253,93 @@ register('summary', async () => {
   // ── Runtime dir ──
   const zeltoExists = existsSync('.zelto');
   let sliceCount = 0;
+  const stateCounts: Record<string, number> = {};
   if (zeltoExists && existsSync('.zelto/slices')) {
     try {
-      sliceCount = readdirSync('.zelto/slices').filter((f) => f.endsWith('.json')).length;
+      const sliceFiles = readdirSync('.zelto/slices').filter((f) => f.endsWith('.json'));
+      sliceCount = sliceFiles.length;
+      for (const f of sliceFiles) {
+        try {
+          const content = readFileSync(join('.zelto/slices', f), 'utf-8');
+          const slice = JSON.parse(content) as { state: string };
+          stateCounts[slice.state] = (stateCounts[slice.state] ?? 0) + 1;
+        } catch {
+          /* skip unreadable */
+        }
+      }
     } catch {
       /* ignore */
     }
   }
+
+  // ── Event count ──
+  let eventTotal = 0;
+  if (zeltoExists && existsSync('.zelto/events')) {
+    try {
+      const sliceDirs = readdirSync('.zelto/events', { withFileTypes: true });
+      for (const dir of sliceDirs) {
+        if (dir.isDirectory()) {
+          const eventsFile = join('.zelto/events', dir.name, 'events.jsonl');
+          if (existsSync(eventsFile)) {
+            try {
+              const content = readFileSync(eventsFile, 'utf-8');
+              eventTotal += content.split('\n').filter(Boolean).length;
+            } catch {
+              /* skip */
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── Pending sign requests ──
+  let pendingSigns = 0;
+  if (zeltoExists && existsSync('.zelto/locks')) {
+    try {
+      const lockFiles = readdirSync('.zelto/locks').filter((f) => f.endsWith('.json'));
+      for (const f of lockFiles) {
+        try {
+          const content = readFileSync(join('.zelto/locks', f), 'utf-8');
+          const req = JSON.parse(content) as { status: string };
+          if (req.status === 'pending') pendingSigns++;
+        } catch {
+          /* skip */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── Acceptance tests ──
+  let acceptanceTests = 0;
+  let acceptanceSuites = 0;
+  if (existsSync('tests/acceptance')) {
+    try {
+      const acceptDirs = readdirSync('tests/acceptance', { withFileTypes: true });
+      for (const dir of acceptDirs) {
+        if (dir.isDirectory()) {
+          const testFiles = readdirSync(join('tests/acceptance', dir.name))
+            .filter((f) => f.endsWith('.test.ts'));
+          if (testFiles.length > 0) {
+            acceptanceSuites++;
+            acceptanceTests += testFiles.length;
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── Build state breakdown string ──
+  const stateOrder = ['draft', 'clarifying', 'frozen', 'running', 'completed', 'abandoned'];
+  const stateParts = stateOrder
+    .filter((s) => (stateCounts[s] ?? 0) > 0)
+    .map((s) => `${s}: ${stateCounts[s]}`);
 
   // ── Output ──
   console.log(`
@@ -1270,7 +1350,18 @@ Modules: ${coreModules.length} core/ — ${coreModules.join(', ')}
 CLI:     ${cmdCount} commands
 Hook:    ${hookLines > 0 ? `✅ ${hookLines} lines` : '❌ missing'}
 Runtime: ${zeltoExists ? '✅ .zelto/' : '❌ .zelto/ (not initialized)'}
-Slices:  ${sliceCount} created
+
+Slices:
+  Total:   ${sliceCount} created
+  States:  ${stateParts.join(', ') || '(none)'}
+  Events:  ${eventTotal} total
+
+Sign:
+  Pending: ${pendingSigns} request(s)
+
+Tests:
+  Acceptance: ${acceptanceSuites} suites, ${acceptanceTests} test files
+
 Empty:   ${placeholderDirs.join(', ') || '(none)'}
 `);
   return 0;
