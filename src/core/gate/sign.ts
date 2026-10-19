@@ -114,7 +114,7 @@ export class SignManager {
       comment,
     });
 
-    // Transition slice state back to frozen for rework
+    // Transition slice state to abandoned
     try {
       const slice = await this.store.read(req.sliceId);
       const prevState = slice.state;

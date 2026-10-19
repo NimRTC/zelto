@@ -41,7 +41,8 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
     ABANDON: 'abandoned',
   },
   completed: {
-    SIGN_REJECT: 'frozen',
+    SIGN_APPROVE: 'completed',
+    SIGN_REJECT: 'abandoned',
     RUN_START: 'running',
     ABANDON: 'abandoned',
   },
