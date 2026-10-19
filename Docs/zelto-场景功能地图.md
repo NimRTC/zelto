@@ -150,11 +150,13 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto start <id>` | 一键执行：create→check→freeze→run | run |
 | `zelto run <id>` | 执行切片（含并行准入） | run |
 | `zelto run <id> --dry-run` | 模拟准入检查 | run 前 |
+| `zelto admit <id>` | 准入检查 | run 前 |
 | `zelto gate <id>` | 门禁② 验收测试 | gate |
 | `zelto inbox` | 待签名队列 | sign 前 |
 | `zelto sign <id> --approve` | 审批切片 | sign |
 | `zelto sign <id> --reject` | 拒绝切片 | sign |
 | `zelto abandon <id>` | 废弃切片 | 通用 |
+| `zelto events <id>` | 查看切片事件流 | 通用 |
 | `zelto summary` | 项目概况 | 通用 |
 | `zelto help` | 帮助 | 通用 |
 
@@ -291,7 +293,9 @@ zelto/
 | `tests/executor-adapter.test.ts` | 7 | ExecutorAdapter |
 | `tests/event-emission.test.ts` | 4 | 事件发射 |
 | `tests/agent-execution.test.ts` | 4 | agent 执行流程 |
-| **总计** | **150** | **36 suites** |
+| `tests/admit-command.test.ts` | 5 | Admit 命令 |
+| `tests/acceptance/admit-command/admit.test.ts` | 5 | Admit 命令验收测试 |
+| **总计** | **165** | **39 suites** |
 
 ---
 
@@ -313,7 +317,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（150 tests, 36 suites）
+pnpm test           # 编译 + 运行测试（165 tests, 39 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查

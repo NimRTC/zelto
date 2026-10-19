@@ -24,9 +24,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 150
-ℹ suites 36
-ℹ pass 150
+ℹ tests 165
+ℹ suites 39
+ℹ pass 165
 ℹ fail 0
 ```
 
@@ -459,7 +459,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 | 操作 | 耗时 |
 |---|---|
 | `pnpm build` | ~2s |
-| `pnpm test` (150 tests) | ~26s |
+| `pnpm test` (160 tests) | ~26s |
 | Hook 单次判定 | < 10ms |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |
