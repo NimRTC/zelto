@@ -170,6 +170,14 @@ function parseConfigYaml(content: string): {
     }
 
     if (inGateSection) {
+      // Inline format: - { name: X, run: "Y" }
+      const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
+      if (inlineMatch) {
+        if (currentCommand) commands.push(currentCommand);
+        currentCommand = { name: inlineMatch[1], run: inlineMatch[2] };
+        continue;
+      }
+
       if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
         if (currentCommand) commands.push(currentCommand);
         currentCommand = { name: trimmed.slice(7).trim(), run: '' };
