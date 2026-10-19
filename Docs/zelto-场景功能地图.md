@@ -236,11 +236,11 @@ zelto/
 │   │   └── ports/         端口接口定义
 │   ├── cli/               CLI 命令实现
 │   ├── hook/              独立可执行判定进程
-│   └── adapters/          执行器适配器（预留）
+│   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（预留）
+│   ├── acceptance/        验收测试（12 suites, 42 tests）
 │   ├── policy-engine.test.ts
 │   ├── slice-state.test.ts
 │   ├── stall-classifier.test.ts
@@ -288,9 +288,10 @@ zelto/
 | `tests/create-command.test.ts` | 5 | create 命令 |
 | `tests/init-command.test.ts` | 3 | init 命令 |
 | `tests/start-command.test.ts` | 3 | start 命令 |
+| `tests/executor-adapter.test.ts` | 7 | ExecutorAdapter |
 | `tests/event-emission.test.ts` | 4 | 事件发射 |
 | `tests/agent-execution.test.ts` | 4 | agent 执行流程 |
-| **总计** | **101** | **23 suites** |
+| **总计** | **150** | **36 suites** |
 
 ---
 
@@ -312,7 +313,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（101 tests, 23 suites）
+pnpm test           # 编译 + 运行测试（150 tests, 36 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查

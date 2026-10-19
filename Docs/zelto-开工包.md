@@ -24,9 +24,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 123
-ℹ suites 29
-ℹ pass 62
+ℹ tests 150
+ℹ suites 36
+ℹ pass 150
 ℹ fail 0
 ```
 
@@ -197,7 +197,7 @@ zelto/
 │   │   └── ports/         端口接口
 │   ├── cli/               CLI 实现
 │   ├── hook/              独立 hook
-│   └── adapters/          适配器（预留）
+│   └── adapters/          适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema（6 个）
 ├── policy/                策略文件
 ├── tests/                 测试文件（22 个）
@@ -459,7 +459,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 | 操作 | 耗时 |
 |---|---|
 | `pnpm build` | ~2s |
-| `pnpm test` (123 tests) | ~16s |
+| `pnpm test` (150 tests) | ~26s |
 | Hook 单次判定 | < 10ms |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |
