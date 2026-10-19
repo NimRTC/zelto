@@ -110,7 +110,7 @@ describe('SignManager', () => {
     assert.equal(updated.state, 'completed');
   });
 
-  it('transitions slice back to frozen on reject', async () => {
+  it('transitions slice to abandoned on reject', async () => {
     const slice = store.create('sign-reject-test', 'Sign Reject Test');
     slice.state = 'frozen';
     slice.spec.frozenHash = 'sha256:test';
@@ -125,7 +125,7 @@ describe('SignManager', () => {
     await manager.reject(req.id, 'human', 'Needs rework');
 
     const updated = await store.read('sign-reject-test');
-    assert.equal(updated.state, 'frozen');
+    assert.equal(updated.state, 'abandoned');
   });
 
   it('does not fail when approving already-completed slice', async () => {
