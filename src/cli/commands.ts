@@ -13,6 +13,8 @@ import type { GateConfig } from '../core/gate/types.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../core/policy/types.js';
 import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
+import { AuditTrail } from '../core/audit/trail.js';
+import { MetricsCollector } from '../core/metrics/collector.js';
 
 const ZELTO_DIR = '.zelto';
 const SLICES_DIR = join(ZELTO_DIR, 'slices');
@@ -1254,6 +1256,7 @@ register('summary', async () => {
   const zeltoExists = existsSync('.zelto');
   let sliceCount = 0;
   const stateCounts: Record<string, number> = {};
+  const sliceIds: string[] = [];
   if (zeltoExists && existsSync('.zelto/slices')) {
     try {
       const sliceFiles = readdirSync('.zelto/slices').filter((f) => f.endsWith('.json'));
@@ -1261,7 +1264,8 @@ register('summary', async () => {
       for (const f of sliceFiles) {
         try {
           const content = readFileSync(join('.zelto/slices', f), 'utf-8');
-          const slice = JSON.parse(content) as { state: string };
+          const slice = JSON.parse(content) as { id: string; state: string };
+          sliceIds.push(slice.id);
           stateCounts[slice.state] = (stateCounts[slice.state] ?? 0) + 1;
         } catch {
           /* skip unreadable */
@@ -1341,6 +1345,63 @@ register('summary', async () => {
     .filter((s) => (stateCounts[s] ?? 0) > 0)
     .map((s) => `${s}: ${stateCounts[s]}`);
 
+  // ── Audit & Metrics ──
+  let auditLine = '';
+  let reworkLine = '';
+  let cycleLine = '';
+  let stallLine = '';
+  if (sliceIds.length > 0) {
+    try {
+      const audit = new AuditTrail(events);
+      const metrics = new MetricsCollector(events);
+
+      // Latest event per slice
+      const sliceSummaries: string[] = [];
+      for (const id of sliceIds) {
+        try {
+          const report = await audit.forSlice(id);
+          if (report.totalEvents > 0) {
+            const last = report.entries[report.entries.length - 1];
+            sliceSummaries.push(`${id}: ${last.eventType}`);
+          } else {
+            sliceSummaries.push(`${id}: (no events)`);
+          }
+        } catch {
+          sliceSummaries.push(`${id}: (error reading)`);
+        }
+      }
+      auditLine = `  Latest:   ${sliceSummaries.join(', ')}`;
+
+      // Overall metrics
+      const report = await metrics.generateReport(sliceIds);
+      let totalRework = 0;
+      let reworkCount = 0;
+      let totalCycle = 0;
+      let cycleCount = 0;
+      let totalStalls = 0;
+      for (const m of report.metrics) {
+        if (m.name === 'rework_rate') {
+          totalRework += m.value;
+          reworkCount++;
+        } else if (m.name === 'cycle_time') {
+          totalCycle += m.value;
+          cycleCount++;
+        } else if (m.name === 'stall_counts') {
+          totalStalls += m.value;
+        }
+      }
+      reworkLine = reworkCount > 0
+        ? `  Rework:   ${(totalRework / reworkCount).toFixed(2)} avg rate`
+        : '  Rework:   (no data)';
+      cycleLine = cycleCount > 0
+        ? `  Cycle:    ${(totalCycle / cycleCount).toFixed(0)}s avg`
+        : '  Cycle:    (no data)';
+      stallLine = `  Stalls:   ${totalStalls} total`;
+    } catch {
+      auditLine = '  (error reading audit/metrics)';
+    }
+  }
+
   // ── Output ──
   console.log(`
 Project: ${name} v${version}
@@ -1356,6 +1417,12 @@ Slices:
   States:  ${stateParts.join(', ') || '(none)'}
   Events:  ${eventTotal} total
 
+Audit & Metrics:
+${auditLine || '  (no slices)'}
+${reworkLine || '  (no slices)'}
+${cycleLine || '  (no slices)'}
+${stallLine || '  (no slices)'}
+
 Sign:
   Pending: ${pendingSigns} request(s)
 
@@ -1367,11 +1434,86 @@ Empty:   ${placeholderDirs.join(', ') || '(none)'}
   return 0;
 });
 
+register('events', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto events <slice-id> [--json] [--tail N]');
+    return 1;
+  }
+
+  const isJson = args.includes('--json');
+  const tailIdx = args.indexOf('--tail');
+  const tailN = tailIdx >= 0 ? Number(args[tailIdx + 1]) : undefined;
+
+  try {
+    // Verify slice exists
+    await store.read(id);
+
+    const allEvents = await events.read(id);
+
+    if (allEvents.length === 0) {
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, events: [] }));
+      } else {
+        console.log(`No events for slice: ${id}`);
+      }
+      return 0;
+    }
+
+    const displayEvents =
+      tailN != null && !Number.isNaN(tailN)
+        ? allEvents.slice(-tailN)
+        : allEvents;
+
+    if (isJson) {
+      console.log(
+        JSON.stringify({
+          sliceId: id,
+          total: allEvents.length,
+          displayed: displayEvents.length,
+          events: displayEvents,
+        }),
+      );
+    } else {
+      for (const evt of displayEvents) {
+        const time = evt.ts
+          ? new Date(evt.ts).toISOString().slice(11, 19)
+          : '--:--:--';
+        console.log(`  ${time}  ${evt.type.padEnd(24)} ${evt.actor ?? ''}`);
+      }
+      if (displayEvents.length < allEvents.length) {
+        console.log(
+          `  (showing last ${displayEvents.length} of ${allEvents.length} events)`,
+        );
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.toLowerCase().includes('not found') || msg.includes('ENOENT')) {
+      console.log(
+        isJson
+          ? JSON.stringify({ error: `Slice not found: ${id}` })
+          : `❌ Slice not found: ${id}`,
+      );
+      return 1;
+    }
+    console.log(
+      isJson
+        ? JSON.stringify({ error: msg })
+        : `❌ Error: ${msg}`,
+    );
+    return 1;
+  }
+
+  return 0;
+});
+
 register('help', async () => {
   console.log(`
 zelto — AI Programming Cockpit
 
 Commands:
+  events <id> [--json] [--tail N]   Show slice event stream
   summary                   Show project summary
   init                      Initialize .zelto/ runtime directory
   slices                    List all slices
