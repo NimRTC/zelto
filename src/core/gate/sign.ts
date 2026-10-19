@@ -79,7 +79,15 @@ export class SignManager {
 
     // Transition slice state
     try {
+      const slice = await this.store.read(req.sliceId);
+      const prevState = slice.state;
       await this.store.transit(req.sliceId, 'SIGN_APPROVE');
+      await this.appendEvent(req.sliceId, 'slice.state.changed', decidedBy, {
+        sliceId: req.sliceId,
+        from: prevState,
+        to: 'completed',
+        event: 'SIGN_APPROVE',
+      });
     } catch {
       // Non-fatal: slice may already be in completed state
     }
@@ -108,7 +116,15 @@ export class SignManager {
 
     // Transition slice state back to frozen for rework
     try {
+      const slice = await this.store.read(req.sliceId);
+      const prevState = slice.state;
       await this.store.transit(req.sliceId, 'SIGN_REJECT');
+      await this.appendEvent(req.sliceId, 'slice.state.changed', decidedBy, {
+        sliceId: req.sliceId,
+        from: prevState,
+        to: 'abandoned',
+        event: 'SIGN_REJECT',
+      });
     } catch {
       // Non-fatal: slice may not be in completed state
     }
