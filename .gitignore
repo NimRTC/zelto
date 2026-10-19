@@ -6,3 +6,7 @@ dist-test
 .zelto/locks/
 .DS_Store
 *.log
+*.tsbuildinfo
+.env
+.env.local
+.claude/plans/
