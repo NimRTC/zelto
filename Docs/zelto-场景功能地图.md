@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.1.0 · 最后更新: 2026-10-15
+> 版本: v0.1.0 · 最后更新: 2026-10-19
 
 ---
 
@@ -233,16 +233,18 @@ zelto/
 │   │   ├── stall/         停机分类器
 │   │   ├── sched/         并行准入 + 约束分发
 │   │   ├── clarify/       澄清引擎
-│   │   ├── metrics/       度量收集
-│   │   ├── audit/         审计追踪
+│   │   ├── metrics/       度量收集（rework rate, cycle time, stall counts）
+│   │   ├── audit/         审计追踪（29 种事件摘要）
+│   │   ├── budget/        预算跟踪（getSpent, getLimit, isExhausted）
 │   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现
+│   ├── cli/               CLI 命令实现（17 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（12 suites, 42 tests）
+│   ├── acceptance/        验收测试（13 suites）
+│   │   ├── e2e-full-cycle/  端到端全生命周期测试
 │   ├── policy-engine.test.ts
 │   ├── slice-state.test.ts
 │   ├── stall-classifier.test.ts
