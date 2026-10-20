@@ -4,6 +4,8 @@ dist-test
 .zelto/slices/
 .zelto/events/
 .zelto/locks/
+.zelto/config.yaml
+.zelto/*.json
 .DS_Store
 *.log
 *.tsbuildinfo
