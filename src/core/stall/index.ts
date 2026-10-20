@@ -1,1 +1,9 @@
-export { classifyStall, isAutoResolvable, type StallClass, type StallEvent, type StallResolution } from './classifier.js';
+export {
+  classifyStall,
+  isAutoResolvable,
+  isSliceStalled,
+  type StallClass,
+  type StallEvent,
+  type StallInfo,
+  type StallResolution,
+} from './classifier.js';

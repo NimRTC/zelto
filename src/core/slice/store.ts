@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { type SliceState, transitionSlice, type SliceEvent } from './state.js';
+import type { StallInfo } from '../stall/types.js';
 
 export interface SliceSpec {
   path: string;
@@ -41,11 +42,7 @@ export interface SliceData {
   traceWaiver: string | null;
   writes: string[];
   runs: string[];
-  stall: {
-    class: string | null;
-    autoResolved: number;
-    gateRetries: number;
-  };
+  stall: StallInfo;
   createdAt: string;
   updatedAt: string;
 }

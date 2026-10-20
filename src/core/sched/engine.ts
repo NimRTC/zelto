@@ -133,6 +133,45 @@ export class Scheduler {
     return this.store.transit(sliceId, 'RUN_START', actor);
   }
 
+  /**
+   * Resume a stalled slice.
+   *
+   * @param sliceId - The slice to resume
+   * @param options - Resume options
+   * @param options.skip - If true, mark the stall as resolved without re-execution
+   * @param options.abandon - If true, abandon the slice instead of resuming
+   */
+  async resume(
+    sliceId: string,
+    options: { skip?: boolean; abandon?: boolean },
+  ): Promise<void> {
+    const slice = await this.store.read(sliceId);
+
+    if (slice.stall.class === null) {
+      throw new Error(`Slice "${sliceId}" is not stalled`);
+    }
+
+    if (options.abandon) {
+      await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
+        resolution: 'manual_abandon',
+        previousStallClass: slice.stall.class,
+      });
+      await this.store.transit(sliceId, 'ABANDON');
+      return;
+    }
+
+    const resolution = options.skip ? 'manual_skip' : 'manual_retry';
+
+    await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
+      resolution,
+      previousStallClass: slice.stall.class,
+    });
+
+    // Clear stall info for retry or skip
+    slice.stall.class = null;
+    await this.store.write(slice);
+  }
+
   private hasOverlap(a: string[], b: string[]): boolean {
     // Check if any path in 'a' overlaps with any path in 'b'
     for (const pa of a) {

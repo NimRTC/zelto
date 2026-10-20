@@ -159,6 +159,8 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto events <id>` | 查看切片事件流 | 通用 |
 | `zelto summary` | 项目概况 | 通用 |
 | `zelto help` | 帮助 | 通用 |
+| `zelto stall [id] [--auto-resolved]` | 列出 stalled slices / 查看详情 | 通用 |
+| `zelto resume <id> [--skip|--abandon]` | 恢复 stalled slice | run |
 
 ### 3.3 独立 Hook
 

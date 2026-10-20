@@ -9,9 +9,10 @@ import { EventStream } from '../core/events/stream.js';
 import { ClarifyEngine } from '../core/clarify/engine.js';
 import { GateExecutor } from '../core/gate/executor.js';
 import { SignManager } from '../core/gate/sign.js';
+import { Scheduler } from '../core/sched/engine.js';
+import { isSliceStalled } from '../core/stall/index.js';
 import type { GateConfig } from '../core/gate/types.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../core/policy/types.js';
-import { Scheduler } from '../core/sched/engine.js';
 import { SliceStore } from '../core/slice/store.js';
 import { AuditTrail } from '../core/audit/trail.js';
 import { MetricsCollector } from '../core/metrics/collector.js';
@@ -427,7 +428,7 @@ register('start', async (args) => {
 
     // Step 5: Run (admit + start)
     const policy = loadPolicyConfig();
-    const scheduler = new Scheduler(store, events, policy);
+    const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
     const admitResult = await scheduler.admit(id);
     if (admitResult.decision !== 'admitted') {
@@ -809,7 +810,7 @@ register('run', async (args) => {
 
   try {
     const policy = loadPolicyConfig();
-    const scheduler = new Scheduler(store, events, policy);
+    const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
     // Check admission
     const result = await scheduler.admit(id);
@@ -1531,6 +1532,8 @@ Commands:
   hook --uninstall          Remove zelto git hooks
   hook --status             Show git hook installation status
   help                      Show this help
+  stall [id] [--auto-resolved]  List stalled slices
+  resume <id> [--skip|--abandon]  Resume a stalled slice
 `);
   return 0;
 });
@@ -1674,6 +1677,98 @@ fi
       return 1;
     }
   }
+});
+
+register('stall', async (args) => {
+  const [id] = args;
+  const showAutoResolved = args.includes('--auto-resolved');
+
+  if (id && !id.startsWith('--')) {
+    try {
+      const slice = await store.read(id);
+      if (!isSliceStalled(slice) && !showAutoResolved) {
+        console.log(`Slice "${id}" is not stalled.`);
+        return 0;
+      }
+      console.log(`Slice:  ${id}`);
+      console.log(`Title:  ${slice.title}`);
+      console.log(`State:  ${slice.state}`);
+      if (slice.stall.class) {
+        console.log(`Stall class:    ${slice.stall.class}`);
+        console.log(`Auto-resolved:  ${slice.stall.autoResolved}`);
+        console.log(`Gate retries:   ${slice.stall.gateRetries}`);
+      } else {
+        console.log('Stall:  (auto-resolved, no active stall)');
+      }
+      return 0;
+    } catch {
+      console.error(`Slice "${id}" not found.`);
+      return 1;
+    }
+  }
+
+  const allIds = await store.list();
+  const stalled: Array<{ id: string; stallClass: string; autoResolved: number }> = [];
+
+  for (const sid of allIds) {
+    try {
+      const s = await store.read(sid);
+      if (!showAutoResolved && isSliceStalled(s)) {
+        stalled.push({ id: sid, stallClass: s.stall.class!, autoResolved: s.stall.autoResolved });
+      } else if (showAutoResolved && s.stall.autoResolved > 0) {
+        stalled.push({ id: sid, stallClass: s.stall.class ?? '(resolved)', autoResolved: s.stall.autoResolved });
+      }
+    } catch {
+      // skip unreadable slices
+    }
+  }
+
+  if (stalled.length === 0) {
+    console.log('No stalled slices found.');
+    return 0;
+  }
+
+  console.log('Stalled slices:');
+  for (const s of stalled) {
+    console.log(`  ${s.id.padEnd(20)} ${s.stallClass.padEnd(25)} auto-resolved: ${s.autoResolved}`);
+  }
+  return 0;
+});
+
+register('resume', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto resume <slice-id> [--skip] [--abandon]');
+    return 1;
+  }
+
+  const skip = args.includes('--skip');
+  const abandon = args.includes('--abandon');
+
+  try {
+    await store.read(id);
+  } catch {
+    console.error(`Slice "${id}" not found.`);
+    return 1;
+  }
+
+  const scheduler = new Scheduler(store, events, loadPolicyConfig());
+
+  try {
+    await scheduler.resume(id, { skip, abandon });
+  } catch (err) {
+    console.error(`Error: ${(err as Error).message}`);
+    return 1;
+  }
+
+  if (abandon) {
+    console.log(`zelto resume ${id} --abandon -- Slice abandoned`);
+  } else if (skip) {
+    console.log(`zelto resume ${id} --skip -- Stall resolved, slice not re-executed`);
+  } else {
+    console.log(`zelto resume ${id} -- Slice resumed for re-execution`);
+  }
+  return 0;
 });
 
 export async function runCLI(argv: string[]): Promise<number> {
