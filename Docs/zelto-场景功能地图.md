@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.1.0 · 最后更新: 2026-10-21
+> 版本: v0.1.0 · 最后更新: 2026-10-21（文档同步至代码当前状态）
 
 ---
 
@@ -161,7 +161,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto summary` | 项目概况 | 通用 |
 | `zelto help` | 帮助 | 通用 |
 | `zelto stall [id] [--auto-resolved]` | 列出 stalled slices / 查看详情 | 通用 |
-| `zelto resume <id> [--skip|--abandon]` | 恢复 stalled slice | run |
+| `zelto resume <id> [--skip\|--abandon]` | 恢复 stalled slice | run |
 
 ### 3.3 独立 Hook
 

@@ -1,6 +1,6 @@
 # zelto 开工包
 
-> 版本: v0.1.0 · 最后更新: 2026-10-15
+> 版本: v0.1.0 · 最后更新: 2026-10-21
 
 ---
 
@@ -24,9 +24,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 165
-ℹ suites 39
-ℹ pass 165
+ℹ tests 204
+ℹ suites 44
+ℹ pass 204
 ℹ fail 0
 ```
 
@@ -192,15 +192,20 @@ zelto/
 │   │   ├── stall/         停机分类
 │   │   ├── sched/         调度 + 约束
 │   │   ├── clarify/       澄清引擎
+│   │   ├── budget/        预算跟踪
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
-│   │   └── ports/         端口接口
-│   ├── cli/               CLI 实现
+│   │   ├── ports/         端口接口
+│   │   ├── artifacts/     制品管理
+│   │   ├── contracts/     契约管理
+│   │   ├── route/         路由
+│   │   └── spec/          规格引擎
+│   ├── cli/               CLI 实现（21 命令 + help）
 │   ├── hook/              独立 hook
 │   └── adapters/          适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema（6 个）
 ├── policy/                策略文件
-├── tests/                 测试文件（22 个）
+├── tests/                 测试文件（24 个单元 + 15 验收 suites）
 └── .zelto/                运行时状态
 ```
 
@@ -459,7 +464,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 | 操作 | 耗时 |
 |---|---|
 | `pnpm build` | ~2s |
-| `pnpm test` (160 tests) | ~26s |
+| `pnpm test` (204 tests) | ~47s |
 | Hook 单次判定 | < 10ms |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |

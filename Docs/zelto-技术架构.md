@@ -1,6 +1,6 @@
 # zelto 技术架构
 
-> 版本: v0.1.0 · 最后更新: 2026-10-15
+> 版本: v0.1.0 · 最后更新: 2026-10-21
 
 ---
 
@@ -9,7 +9,7 @@
 ```
                     ┌──────────────────────────────────────┐
                     │            CLI (src/cli/)             │
-                    │   commands.ts — 14 个命令 + help       │
+                    │   commands.ts — 21 个命令 + help       │
                     └──────────────┬───────────────────────┘
                                    │
               ┌────────────────────┼────────────────────┐
@@ -208,7 +208,8 @@ type StallClass =
   | 'context_exhaustion'   // max_turns 耗尽
   | 'cognitive_stuck'      // 同种失败 ≥ 3 次
   | 'plan_gate'            // agent 请求计划审批
-  | 'budget_exhausted';    // 预算超限
+  | 'budget_exhausted'     // 预算超限
+  | 'gate_retry';          // 门禁重试耗尽
 
 function classifyStall(signal): StallClass
 function isAutoResolvable(stallClass): boolean
@@ -223,12 +224,14 @@ function isAutoResolvable(stallClass): boolean
 1. 准入控制 — 切片必须 frozen 且有 frozenHash
 2. 写集冲突检测 — 不能与 running 切片有路径重叠
 3. 约束分发 — 生成 ConstraintBundle 供 agent 使用
+4. 恢复执行 — `resume()` 方法处理 stalled slice 恢复
 
 ```typescript
 class Scheduler {
   async admit(sliceId, actor): SchedResult
   buildConstraints(slice): ConstraintBundle
   async startRun(sliceId, actor): SliceData
+  async resume(sliceId, options): void  // skip/abandon/retry
 }
 ```
 
@@ -305,7 +308,7 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 
 **文件**: `commands.ts`
 
-14 个命令 + help，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
+21 个命令 + help，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
 
 ---
 
@@ -439,7 +442,7 @@ C:\path     → deny
 
 ### 7.3 当前覆盖
 
-- **101 tests, 23 suites, 全部通过**
+- **204 tests, 44 suites, 全部通过**
 - 核心模块覆盖率 > 90%
 - Hook 可执行体 7 个集成测试
 
@@ -496,10 +499,12 @@ SignManager.reject(id, decidedBy, comment): SignRequest
 // Stall
 classifyStall(signal): StallClass
 isAutoResolvable(stallClass): boolean
+isSliceStalled(slice): boolean
 
 // Sched
 Scheduler.admit(sliceId, actor): SchedResult
 Scheduler.buildConstraints(slice): ConstraintBundle
+Scheduler.resume(sliceId, options): void
 
 // Clarify
 ClarifyEngine.generateQuestions(slice, round): ClarifyRound
