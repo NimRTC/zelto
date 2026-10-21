@@ -12,3 +12,4 @@ dist-test
 .env
 .env.local
 .claude/plans/
+.claude/worktrees/
