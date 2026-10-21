@@ -1,17 +1,18 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execSync, spawnSync } from 'node:child_process';
 
-const ZELTO_CLI = join(import.meta.dirname, '..', '..', '..', '..', 'dist', 'cli', 'index.js');
+const ZELTO_CLI = join(process.cwd(), 'dist', 'cli', 'index.js');
 const TEST_DIR = join(tmpdir(), `zelto-accept-admit-${Date.now()}`);
-const SLICES_DIR = join(TEST_DIR, 'slices');
-const EVENTS_DIR = join(TEST_DIR, 'events');
-const LOCKS_DIR = join(TEST_DIR, 'locks');
-const CONFIG_PATH = join(TEST_DIR, 'config.yaml');
+const ZELTO_DIR = join(TEST_DIR, '.zelto');
+const SLICES_DIR = join(ZELTO_DIR, 'slices');
+const EVENTS_DIR = join(ZELTO_DIR, 'events');
+const LOCKS_DIR = join(ZELTO_DIR, 'locks');
+const CONFIG_PATH = join(ZELTO_DIR, 'config.yaml');
 const SPEC_DIR = join(TEST_DIR, 'specs', 'slices');
 const POLICY_DIR = join(TEST_DIR, 'policy');
 
@@ -93,6 +94,16 @@ gate:
   after(async () => {
     await rm(TEST_DIR, { recursive: true, force: true });
   });
+
+  afterEach(cleanupSlices);
+
+  // Clean up slice files between tests to avoid write-set cross-contamination
+  async function cleanupSlices() {
+    const entries = await readdir(SLICES_DIR).catch(() => []);
+    for (const entry of entries) {
+      await rm(join(SLICES_DIR, entry), { force: true });
+    }
+  }
 
   it('admits a frozen slice', async () => {
     await setupSlice('test-admit-frozen', 'Frozen slice', ['src/**/*.ts'], 'frozen');

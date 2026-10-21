@@ -1,6 +1,6 @@
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -28,13 +28,21 @@ describe('admit command', () => {
   before(async () => {
     await mkdir(SLICES_DIR, { recursive: true });
     await mkdir(EVENTS_DIR, { recursive: true });
-    store = new SliceStore(SLICES_DIR);
-    events = new EventStream(EVENTS_DIR);
-    scheduler = new Scheduler(store, events, samplePolicy);
   });
 
   after(async () => {
     await rm(TEST_DIR, { recursive: true, force: true });
+  });
+
+  // Clean up slice files between tests to avoid write-set cross-contamination
+  beforeEach(async () => {
+    const entries = await readdir(SLICES_DIR).catch(() => []);
+    for (const entry of entries) {
+      await rm(join(SLICES_DIR, entry), { force: true });
+    }
+    store = new SliceStore(SLICES_DIR);
+    events = new EventStream(EVENTS_DIR);
+    scheduler = new Scheduler(store, events, samplePolicy);
   });
 
   it('admits a frozen slice with no conflicts', async () => {

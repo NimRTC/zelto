@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.1.0 · 最后更新: 2026-10-19
+> 版本: v0.1.0 · 最后更新: 2026-10-21
 
 ---
 
@@ -131,6 +131,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **Stall Classifier** | `src/core/stall/classifier.ts` | 6 类停机分类 |
 | **Scheduler** | `src/core/sched/engine.ts` | 并行准入、写集冲突检测、约束分发 |
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
+| **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
 | **Audit Trail** | `src/core/audit/trail.ts` | 29 种事件摘要、可读审计报告 |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
@@ -185,6 +186,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | cognitive_stuck | 同种失败 ≥ 3 次 | ❌ |
 | plan_gate | agent 请求计划审批 | ❌ |
 | budget_exhausted | 预算超限 | ❌ |
+| gate_retry | 门禁重试耗尽 | ❌ |
 
 ---
 
@@ -204,6 +206,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | 签名 | `sign.requested`, `sign.approved`, `sign.rejected` |
 | 合并 | `merge.completed`, `merge.stale_base` |
 | 调度 | `sched.admitted`, `sched.blocked` |
+| 预算 | `budget.spent` |
 
 ---
 
@@ -235,36 +238,24 @@ zelto/
 │   │   ├── stall/         停机分类器
 │   │   ├── sched/         并行准入 + 约束分发
 │   │   ├── clarify/       澄清引擎
-│   │   ├── metrics/       度量收集（rework rate, cycle time, stall counts）
-│   │   ├── audit/         审计追踪（29 种事件摘要）
-│   │   ├── budget/        预算跟踪（getSpent, getLimit, isExhausted）
+│   │   ├── budget/        预算跟踪
+│   │   ├── metrics/       度量收集
+│   │   ├── audit/         审计追踪
 │   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现（17 个命令）
+│   ├── cli/               CLI 命令实现（19 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（13 suites）
+│   ├── acceptance/        验收测试（15 suites）
 │   │   ├── e2e-full-cycle/  端到端全生命周期测试
-│   ├── policy-engine.test.ts
-│   ├── slice-state.test.ts
-│   ├── stall-classifier.test.ts
-│   ├── sign-manager.test.ts
-│   ├── gate-executor.test.ts
-│   ├── scheduler.test.ts
-│   ├── clarify-engine.test.ts
-│   ├── metrics-collector.test.ts
-│   ├── audit-trail.test.ts
-│   ├── hook-executable.test.ts
-│   ├── config-loading.test.ts
-│   ├── create-command.test.ts
-│   ├── init-command.test.ts
-│   ├── start-command.test.ts
-│   ├── clarify-command.test.ts
-│   ├── abandon-command.test.ts
-│   ├── event-emission.test.ts
-│   └── agent-execution.test.ts
+│   │   ├── events-command/  事件命令验收测试
+│   │   ├── admit-command/   准入命令验收测试
+│   │   ├── event-emission/  事件发射验收测试
+│   │   ├── ... (15 acceptance test suites total)
+│   ├── *.test.ts          单元测试（29 个文件）
+│   └── ...
 └── .zelto/                运行时状态
     ├── slices/            切片文件
     ├── events/            事件日志
@@ -287,19 +278,25 @@ zelto/
 | `tests/clarify-engine.test.ts` | 5 | ClarifyEngine |
 | `tests/metrics-collector.test.ts` | 5 | MetricsCollector |
 | `tests/audit-trail.test.ts` | 5 | AuditTrail |
+| `tests/budget-collector.test.ts` | 10 | BudgetCollector |
 | `tests/hook-executable.test.ts` | 7 | Hook 可执行体 |
+| `tests/admit-command.test.ts` | 5 | Admit 命令 |
 | `tests/abandon-command.test.ts` | 6 | abandon 命令 |
 | `tests/clarify-command.test.ts` | 6 | clarify 命令 |
 | `tests/config-loading.test.ts` | 5 | 配置加载 |
 | `tests/create-command.test.ts` | 5 | create 命令 |
 | `tests/init-command.test.ts` | 3 | init 命令 |
 | `tests/start-command.test.ts` | 3 | start 命令 |
+| `tests/stall-command.test.ts` | 7 | stall 命令 |
+| `tests/resume-command.test.ts` | 5 | resume 命令 |
+| `tests/events-command.test.ts` | 5 | events 命令 |
 | `tests/executor-adapter.test.ts` | 7 | ExecutorAdapter |
 | `tests/event-emission.test.ts` | 4 | 事件发射 |
 | `tests/agent-execution.test.ts` | 4 | agent 执行流程 |
-| `tests/admit-command.test.ts` | 5 | Admit 命令 |
-| `tests/acceptance/admit-command/admit.test.ts` | 5 | Admit 命令验收测试 |
-| **总计** | **165** | **39 suites** |
+| `tests/summary-command.test.ts` | 3 | summary 命令 |
+| `tests/events-summary.test.ts` | 5 | 事件与摘要集成 |
+| `tests/acceptance/*/` | 49 (15 suites) | 验收测试 |
+| **总计** | **204** | **44 suites** |
 
 ---
 
@@ -321,7 +318,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（165 tests, 39 suites）
+pnpm test           # 编译 + 运行测试（204 tests, 44 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查

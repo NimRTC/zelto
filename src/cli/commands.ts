@@ -897,6 +897,49 @@ register('run', async (args) => {
   return 0;
 });
 
+register('admit', async (args) => {
+  const [id] = args;
+  if (!id || id.startsWith('--')) {
+    console.error('Usage: zelto admit <slice-id> [--json]');
+    return 1;
+  }
+
+  const isJson = args.includes('--json');
+
+  try {
+    const policy = loadPolicyConfig();
+    const scheduler = new Scheduler(store, events, policy);
+
+    const result = await scheduler.admit(id);
+    if (result.decision !== 'admitted') {
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, decision: 'blocked', reason: result.reason, blockedBy: result.blockedBy }));
+      } else {
+        console.log(`❌ Blocked: ${result.reason}`);
+        if (result.blockedBy.length > 0) {
+          console.log(`  Blocked by: ${result.blockedBy.join(', ')}`);
+        }
+      }
+      return 1;
+    }
+
+    if (isJson) {
+      console.log(JSON.stringify({ sliceId: id, decision: 'admitted', reason: null, blockedBy: [] }));
+    } else {
+      console.log(`✅ Admitted: ${id}`);
+    }
+    return 0;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isJson) {
+      console.log(JSON.stringify({ error: msg }));
+    } else {
+      console.error(`Error: ${msg}`);
+    }
+    return 1;
+  }
+});
+
 register('gate', async (args) => {
   const [id] = args;
   if (!id) {

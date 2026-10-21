@@ -183,10 +183,32 @@ export class Scheduler {
   }
 
   private pathsOverlap(a: string, b: string): boolean {
-    // Simple overlap: exact match, or one is a parent directory of the other
+    // Exact match
     if (a === b) return true;
+
+    // Directory prefix: a/b/ matches a/b/anything
     if (a.endsWith('/') && b.startsWith(a)) return true;
     if (b.endsWith('/') && a.startsWith(b)) return true;
+
+    // Glob match: check if glob pattern matches the other path or vice versa
+    const hasGlobA = a.includes('*');
+    const hasGlobB = b.includes('*');
+
+    if (hasGlobA && !hasGlobB) {
+      return this.pathMatches(b, a);
+    }
+    if (!hasGlobA && hasGlobB) {
+      return this.pathMatches(a, b);
+    }
+    if (hasGlobA && hasGlobB) {
+      // Both are globs: check if their directory prefixes overlap
+      const dirA = a.includes('/') ? a.slice(0, a.indexOf('*')) : '';
+      const dirB = b.includes('/') ? b.slice(0, b.indexOf('*')) : '';
+      if (dirA && dirB) {
+        return dirA === dirB || dirA.startsWith(dirB) || dirB.startsWith(dirA);
+      }
+    }
+
     return false;
   }
 
