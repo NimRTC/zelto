@@ -11,7 +11,7 @@
 2. `zelto check <id>` 时发射 `spec.checked` 事件
 3. `zelto check <id>` 检测到 drift 时发射 `slice.drift_detected` 事件
 4. `zelto start <id>` 中自动 freeze 时也发射 `spec.frozen` 事件
-5. 已有测试全部通过（94+）
+5. 已有测试全部通过（204+）
 6. 新增 3+ 测试验证事件被正确记录
 
 ## 不包含

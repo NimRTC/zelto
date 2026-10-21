@@ -15,7 +15,7 @@
 4. 完成后自动 transition 到 frozen（`CLARIFY_CONVERGED` → `draft` → `FREEZE` → `frozen`）
 5. 非交互模式 `--auto` 使用默认值自动回答全部问题
 6. 对已 frozen/completed 的切片报错
-7. 已有测试全部通过（85+）
+7. 已有测试全部通过（204+）
 
 ## 设计
 

@@ -11,7 +11,7 @@
 2. 对已 abandoned 的切片报错（"already abandoned"）
 3. 对不存在的切片报错
 4. 发射 `slice.state.changed` 事件记录状态变更
-5. 已有测试全部通过（88+）
+5. 已有测试全部通过（204+）
 6. 新增 4+ 测试覆盖 abandon 的各种场景
 
 ## 设计

@@ -14,7 +14,7 @@
 3. 约束包以 JSON 文件形式传递给 agent（文件路径在环境变量 `ZELTO_BUNDLE`）
 4. agent 退出后自动 transition 到 frozen（`RUN_FINISH`）
 5. agent 非零退出时记录事件并报错
-6. 全部 78+ 测试通过
+6. 全部 204+ 测试通过
 
 ## 风险
 - agent 进程可能长时间运行 — 需后台执行

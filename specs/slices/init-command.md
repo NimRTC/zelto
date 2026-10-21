@@ -11,7 +11,7 @@
 1. `zelto init` 创建 `.zelto/slices/` `.zelto/events/` `.zelto/locks/` + 默认 config.yaml
 2. 已存在时跳过，不覆盖已有文件
 3. 输出清晰的状态信息
-4. 全部 62+ 测试通过
+4. 全部 204+ 测试通过
 
 ## 风险
 - 无。纯文件操作。
