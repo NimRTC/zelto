@@ -24,8 +24,8 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 204
-ℹ suites 44
+ℹ tests 216
+ℹ suites 46
 ℹ pass 204
 ℹ fail 0
 ```
@@ -205,7 +205,7 @@ zelto/
 │   └── adapters/          适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema（6 个）
 ├── policy/                策略文件
-├── tests/                 测试文件（24 个单元 + 15 验收 suites）
+├── tests/                 测试文件（24 个单元 + 17 验收 suites）
 └── .zelto/                运行时状态
 ```
 
