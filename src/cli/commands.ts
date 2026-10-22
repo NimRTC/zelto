@@ -1631,6 +1631,11 @@ Commands (AI Pipeline):
   plan confirm <id>         Confirm plan and create slice specs
   version status            Show version plan status
   version start <ver>       Start executing a version's slices
+
+Commands (Panoramic):
+  pipeline status           Show full pipeline: requirements → designs → plans → versions → slices
+  trace <req-id>            Trace a requirement through design → plan → versions → slices
+  impact <req-id>           Impact analysis: what's affected if a requirement changes
 `);
   return 0;
 });
@@ -2446,6 +2451,278 @@ register('version', async (args) => {
 
   console.error('Usage: zelto version status | zelto version start <version-label> [--plan <plan-id>]');
   return 1;
+});
+
+// ─── pipeline ────────────────────────────────────────────────────────────
+
+register('pipeline', async (args) => {
+  const subcmd = args[0];
+
+  if (subcmd !== 'status') {
+    console.error('Usage: zelto pipeline status');
+    return 1;
+  }
+
+  const reqStore = new RequirementStore(ZELTO_DIR);
+  const designStore = new DesignStore(ZELTO_DIR);
+  const versionStore = new VersionStore(ZELTO_DIR);
+  const sliceStore = new SliceStore(SLICES_DIR);
+
+  const reqs = await reqStore.list();
+  if (reqs.length === 0) {
+    console.log('No requirements. Start with: zelto require <text>');
+    return 0;
+  }
+
+  const designList = await designStore.list();
+  const planList = await versionStore.list();
+
+  for (const req of reqs) {
+    const statusIcon = req.status === 'confirmed' ? '✅' : '📝';
+    console.log(`${statusIcon} ${req.id}  (${req.status})  "${req.title}"`);
+
+    const designs = (await Promise.all(
+      designList.filter((d) => d.requirementId === req.id).map((d) => designStore.read(d.id)),
+    ));
+
+    if (designs.length === 0) {
+      console.log('   └── (no design yet)');
+      continue;
+    }
+
+    for (const design of designs) {
+      const designIcon = design.status === 'confirmed' ? '✅' : '📝';
+      console.log(`   │`);
+      console.log(`   └── ${designIcon} ${design.id}  (${design.status})  "${design.title}"  [${design.modules.length} modules]`);
+
+      const plans = (await Promise.all(
+        planList.map((p) => versionStore.read(p.id)),
+      )).filter((p) => p.designId === design.id);
+
+      if (plans.length === 0) {
+        console.log(`       └── (no plan yet)`);
+        continue;
+      }
+
+      for (const plan of plans) {
+        const planIcon = plan.status === 'confirmed' ? '✅' : '📝';
+        console.log(`       │`);
+        console.log(`       └── ${planIcon} ${plan.id}  (${plan.status})  "${plan.title}"`);
+
+        for (const v of plan.versions) {
+          const vIcons: Record<string, string> = {
+            planned: '⏳', in_progress: '🔄', integrated: '✅', delivered: '🚀',
+          };
+          const vIcon = vIcons[v.status] ?? '⏳';
+          console.log(`           │`);
+          console.log(`           ├── ${vIcon} ${v.version}  (${v.status})  ${v.description}`);
+
+          for (const s of v.slices) {
+            let sliceState = '—';
+            try {
+              const sd = await sliceStore.read(s.id);
+              sliceState = sd.state;
+            } catch { /* not created yet */ }
+            const sIcons: Record<string, string> = {
+              draft: '📝', clarifying: '❓', frozen: '❄️', running: '🔄',
+              completed: '✅', abandoned: '🗑️',
+            };
+            const sIcon = sIcons[sliceState] ?? '⬜';
+            console.log(`           │   └── ${sIcon} ${s.id}  (${sliceState})  ${s.title}`);
+          }
+        }
+      }
+    }
+  }
+
+  return 0;
+});
+
+// ─── trace ───────────────────────────────────────────────────────────────
+
+register('trace', async (args) => {
+  const reqId = args[0];
+  if (!reqId || reqId.startsWith('--')) {
+    console.error('Usage: zelto trace <requirement-id>');
+    return 1;
+  }
+
+  const reqStore = new RequirementStore(ZELTO_DIR);
+  const designStore = new DesignStore(ZELTO_DIR);
+  const versionStore = new VersionStore(ZELTO_DIR);
+  const sliceStore = new SliceStore(SLICES_DIR);
+
+  // Validate requirement exists
+  if (!(await reqStore.exists(reqId))) {
+    console.error(`Requirement "${reqId}" not found.`);
+    return 1;
+  }
+
+  const req = await reqStore.read(reqId);
+  console.log(`📋 Trace for: ${req.id}  "${req.title}"  (${req.status})`);
+  console.log(`   Acceptance Criteria: ${req.acceptanceCriteria.length}`);
+  console.log('');
+
+  // Find all designs for this requirement
+  const allDesigns = await designStore.list();
+  const matchingDesigns = allDesigns.filter((d) => d.requirementId === reqId);
+
+  if (matchingDesigns.length === 0) {
+    console.log('   No designs trace to this requirement.');
+    return 0;
+  }
+
+  for (const ds of matchingDesigns) {
+    const design = await designStore.read(ds.id);
+    const designIcon = design.status === 'confirmed' ? '✅' : '📝';
+    console.log(`   ${designIcon} Design: ${design.id}  "${design.title}"  (${design.status})`);
+    console.log(`      Modules: ${design.modules.map((m) => m.name).join(', ')}`);
+
+    // Find plans for this design
+    const allPlans = await versionStore.list();
+    const matchingPlans = (await Promise.all(
+      allPlans.map((p) => versionStore.read(p.id)),
+    )).filter((p) => p.designId === design.id);
+
+    if (matchingPlans.length === 0) {
+      console.log('      └── No plan traces to this design.');
+      continue;
+    }
+
+    for (const plan of matchingPlans) {
+      const planIcon = plan.status === 'confirmed' ? '✅' : '📝';
+      console.log(`      ${planIcon} Plan: ${plan.id}  "${plan.title}"  (${plan.status})`);
+
+      for (const v of plan.versions) {
+        console.log(`         ${v.version}  (${v.status}):`);
+
+        for (const s of v.slices) {
+          let sliceState = '—';
+          try {
+            const sd = await sliceStore.read(s.id);
+            sliceState = sd.state;
+          } catch { /* not created */ }
+          console.log(`           ${s.id}  (${sliceState})  ${s.title}  [module: ${s.module}]`);
+        }
+      }
+    }
+  }
+
+  return 0;
+});
+
+// ─── impact ──────────────────────────────────────────────────────────────
+
+register('impact', async (args) => {
+  const reqId = args[0];
+  if (!reqId || reqId.startsWith('--')) {
+    console.error('Usage: zelto impact <requirement-id>');
+    return 1;
+  }
+
+  const reqStore = new RequirementStore(ZELTO_DIR);
+  const designStore = new DesignStore(ZELTO_DIR);
+  const versionStore = new VersionStore(ZELTO_DIR);
+  const sliceStore = new SliceStore(SLICES_DIR);
+
+  if (!(await reqStore.exists(reqId))) {
+    console.error(`Requirement "${reqId}" not found.`);
+    return 1;
+  }
+
+  const req = await reqStore.read(reqId);
+  console.log(`\n🔍 Impact Analysis for: ${req.id}  "${req.title}"`);
+  console.log(`   Current status: ${req.status}`);
+  console.log('');
+
+  // Collect all affected items
+  const allDesigns = await designStore.list();
+  const matchingDesigns = allDesigns.filter((d) => d.requirementId === reqId);
+
+  if (matchingDesigns.length === 0) {
+    console.log('   ✅ No downstream impact — no designs reference this requirement.');
+    return 0;
+  }
+
+  let hasActiveWork = false;
+  let confirmedCount = 0;
+  let inProgressCount = 0;
+
+  for (const ds of matchingDesigns) {
+    const design = await designStore.read(ds.id);
+    const designImpact = design.status === 'confirmed' ? '⚠️' : 'ℹ️';
+    if (design.status === 'confirmed') confirmedCount++;
+
+    console.log(`   ${designImpact} Design: ${design.id}  "${design.title}"  (${design.status})`);
+    if (design.status === 'confirmed') {
+      console.log(`      Impact: Design is confirmed — re-review needed if requirement changes.`);
+    }
+
+    const allPlans = await versionStore.list();
+    const matchingPlans = (await Promise.all(
+      allPlans.map((p) => versionStore.read(p.id)),
+    )).filter((p) => p.designId === design.id);
+
+    for (const plan of matchingPlans) {
+      const planImpact = plan.status === 'confirmed' ? '⚠️' : 'ℹ️';
+      if (plan.status === 'confirmed') confirmedCount++;
+
+      console.log(`      ${planImpact} Plan: ${plan.id}  "${plan.title}"  (${plan.status})`);
+      if (plan.status === 'confirmed') {
+        console.log(`         Impact: Plan is confirmed — may need regeneration.`);
+      }
+
+      for (const v of plan.versions) {
+        if (v.status !== 'planned') hasActiveWork = true;
+
+        for (const s of v.slices) {
+          let sliceState = '—';
+          try {
+            const sd = await sliceStore.read(s.id);
+            sliceState = sd.state;
+            if (sd.state === 'running') inProgressCount++;
+            if (sd.state === 'completed' || sd.state === 'frozen') hasActiveWork = true;
+          } catch { /* not created */ }
+
+          const sliceImpact =
+            sliceState === 'completed' ? '⚠️' :
+            sliceState === 'running' ? '🔴' :
+            sliceState === 'frozen' ? '⚠️' :
+            sliceState === 'draft' ? 'ℹ️' : '⬜';
+          const impactNote =
+            sliceState === 'completed' ? 'already completed — may need rework' :
+            sliceState === 'running' ? 'IN PROGRESS — will be invalidated' :
+            sliceState === 'frozen' ? 'frozen but not yet run — may need re-freeze' :
+            sliceState === 'draft' ? 'not yet started — safe to adjust' :
+            '';
+
+          console.log(`         ${sliceImpact} ${s.id}  (${sliceState})  ${s.title}`);
+          if (impactNote) console.log(`            ${impactNote}`);
+        }
+      }
+    }
+  }
+
+  // Summary
+  console.log('');
+  console.log('─── Impact Summary ───');
+  console.log(`   Designs/Plans confirmed: ${confirmedCount}`);
+  if (inProgressCount > 0) console.log(`   🔴 Slices in progress: ${inProgressCount}  — WILL BE INVALIDATED`);
+  if (hasActiveWork) console.log(`   ⚠️  Completed/frozen work exists — may need rework`);
+  console.log('');
+
+  if (hasActiveWork || confirmedCount > 0) {
+    console.log('Recommendation:');
+    console.log(`   If this requirement change is significant:`);
+    console.log(`   1. Create a new version of the requirement (zelto require with supersede info)`);
+    console.log(`   2. Regenerate the design (zelto design <new-req-id>)`);
+    console.log(`   3. Re-plan affected versions (zelto plan <new-design-id>)`);
+    console.log(`   4. Re-execute affected slices`);
+  } else {
+    console.log('✅ No active work affected — safe to modify.');
+  }
+
+  return 0;
 });
 
 export async function runCLI(argv: string[]): Promise<number> {
