@@ -3,6 +3,7 @@
 import type { LlmAdapter } from '../../adapters/llm/types.js';
 import type { DesignDoc, DesignModule } from '../../core/design/types.js';
 import { DESIGN_PROMPT } from '../prompts/design.js';
+import { REFINE_DESIGN_PROMPT } from '../prompts/refine-design.js';
 
 export async function generateDesign(
   llm: LlmAdapter,
@@ -22,6 +23,32 @@ export async function generateDesign(
   });
 
   return parseDesignResponse(response.content, existingId);
+}
+
+/**
+ * Refine an existing design document with user feedback.
+ * Multi-turn iterative editing — keeps the same structure, applies changes.
+ */
+export async function refineDesign(
+  llm: LlmAdapter,
+  currentBody: string,
+  feedback: string,
+): Promise<Pick<DesignDoc, 'title' | 'body' | 'modules'>> {
+  const prompt = REFINE_DESIGN_PROMPT
+    .replace('{{CURRENT_DESIGN}}', currentBody)
+    .replace('{{FEEDBACK}}', feedback);
+
+  const response = await llm.chat({
+    model: 'deepseek-chat',
+    messages: [
+      { role: 'system', content: '你是一个高级软件架构师。根据反馈迭代更新设计文档。' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.7,
+    maxTokens: 4096,
+  });
+
+  return parseDesignResponse(response.content, '');
 }
 
 function parseDesignResponse(

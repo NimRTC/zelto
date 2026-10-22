@@ -20,12 +20,12 @@ import type { GateConfig } from '../core/gate/types.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../core/policy/types.js';
 import type { RequirementDoc } from '../core/requirements/types.js';
 import type { DesignDoc } from '../core/design/types.js';
-import type { VersionPlan } from '../core/version/types.js';
+import type { VersionPlan, VersionSlice } from '../core/version/types.js';
 import { SliceStore } from '../core/slice/store.js';
 import { AuditTrail } from '../core/audit/trail.js';
 import { MetricsCollector } from '../core/metrics/collector.js';
 import { generateRequirements, refineRequirements } from '../llm/generators/requirements.js';
-import { generateDesign } from '../llm/generators/design.js';
+import { generateDesign, refineDesign } from '../llm/generators/design.js';
 import { generateSlicePlan } from '../llm/generators/slice-plan.js';
 
 const ZELTO_DIR = '.zelto';
@@ -1627,10 +1627,12 @@ Commands (AI Pipeline):
   design <req-id>           Generate design document from requirement (via LLM)
   design list               List all designs
   design confirm <id>       Confirm a design
+  design refine <id> <txt>  Iteratively refine a draft design with feedback
   plan <design-id>          Generate version plan from design (via LLM)
   plan confirm <id>         Confirm plan and create slice specs
   version status            Show version plan status
-  version start <ver>       Start executing a version's slices
+  version start <ver>       Execute a version's slices (agents in parallel)
+  version deliver <ver>     Mark a version as delivered
 
 Commands (Panoramic):
   pipeline status           Show full pipeline: requirements → designs → plans → versions → slices
@@ -2077,6 +2079,54 @@ register('design', async (args) => {
     return 0;
   }
 
+  // zelto design refine <id> <feedback> — iterative multi-turn editing
+  if (subcmd === 'refine') {
+    const id = args[1];
+    const feedback = args.slice(2).join(' ');
+    if (!id || id.startsWith('--') || !feedback) {
+      console.error('Usage: zelto design refine <id> <feedback text>');
+      return 1;
+    }
+    const designStore = new DesignStore(ZELTO_DIR);
+    if (!(await designStore.exists(id))) {
+      console.error(`Design "${id}" not found.`);
+      return 1;
+    }
+    const doc = await designStore.read(id);
+    if (doc.status !== 'draft') {
+      console.error(`Design "${id}" is already ${doc.status}. Can only refine draft designs.`);
+      return 1;
+    }
+
+    const llm = createLlmFromConfig();
+    if (!llm) {
+      console.error('LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      return 1;
+    }
+
+    console.log(`Refining design "${id}" with feedback...`);
+    const result = await refineDesign(llm, doc.body, feedback);
+
+    // Update the design in place
+    doc.title = result.title;
+    doc.body = result.body;
+    doc.modules = result.modules;
+    await designStore.save(doc);
+
+    console.log(`\n✅ Design "${id}" updated.`);
+    console.log(`   Title: ${result.title}`);
+    console.log(`\nModules:`);
+    for (const m of result.modules) {
+      console.log(`  ${m.name}`);
+      console.log(`    Description: ${m.description}`);
+      if (m.filePatterns.length > 0) console.log(`    Files: ${m.filePatterns.join(', ')}`);
+      if (m.dependencies.length > 0) console.log(`    Dependencies: ${m.dependencies.join(', ')}`);
+    }
+    console.log(`\nRun again: zelto design refine ${id} <more feedback>`);
+    console.log(`Or confirm: zelto design confirm ${id}`);
+    return 0;
+  }
+
   // zelto design <req-id> — generate design from requirement
   const reqId = subcmd;
   if (!reqId || reqId.startsWith('--')) {
@@ -2257,6 +2307,66 @@ register('version', async (args) => {
     return 0;
   }
 
+  // zelto version deliver <version-label> [--plan <plan-id>]
+  if (subcmd === 'deliver') {
+    const versionLabel = args[1];
+    if (!versionLabel || versionLabel.startsWith('--')) {
+      console.error('Usage: zelto version deliver <version-label> [--plan <plan-id>]');
+      return 1;
+    }
+
+    const planIdx = args.indexOf('--plan');
+    const planId = planIdx >= 0 ? args[planIdx + 1] : null;
+
+    const versionStore = new VersionStore(ZELTO_DIR);
+    let targetPlan: VersionPlan | null = null;
+
+    if (planId) {
+      if (!(await versionStore.exists(planId))) {
+        console.error(`Plan "${planId}" not found.`);
+        return 1;
+      }
+      targetPlan = await versionStore.read(planId);
+    } else {
+      const plans = await versionStore.list();
+      const confirmed = plans.filter((p) => p.status === 'confirmed');
+      if (confirmed.length === 0) {
+        console.error('No confirmed plans found.');
+        return 1;
+      }
+      targetPlan = await versionStore.read(confirmed[0].id);
+    }
+
+    const version = targetPlan.versions.find((v) => v.version === versionLabel);
+    if (!version) {
+      console.error(`Version "${versionLabel}" not found in plan "${targetPlan.id}".`);
+      return 1;
+    }
+
+    if (version.status !== 'integrated') {
+      console.error(`Version "${versionLabel}" is ${version.status}. Must be "integrated" to deliver.`);
+      return 1;
+    }
+
+    await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'delivered');
+    console.log(`\n🚀 Version ${versionLabel} delivered!`);
+    console.log(`   ${version.description}`);
+    console.log(`   Slices: ${version.slices.map((s) => s.id).join(', ')}`);
+
+    // Check if next version can be started
+    const nextVersion = targetPlan.versions.find((v) => v.status === 'planned');
+    if (nextVersion) {
+      const depsReady = nextVersion.dependsOn.every((dep) => {
+        const dv = targetPlan!.versions.find((v) => v.version === dep);
+        return dv && (dv.status === 'integrated' || dv.status === 'delivered');
+      });
+      if (depsReady) {
+        console.log(`\n👉 Next: zelto version start ${nextVersion.version} [--plan ${targetPlan.id}]`);
+      }
+    }
+    return 0;
+  }
+
   // zelto version start <version-label> [--plan <plan-id>]
   if (subcmd === 'start') {
     const versionLabel = args[1];
@@ -2278,7 +2388,6 @@ register('version', async (args) => {
       }
       targetPlan = await versionStore.read(planId);
     } else {
-      // Find the latest confirmed plan
       const plans = await versionStore.list();
       const confirmed = plans.filter((p) => p.status === 'confirmed');
       if (confirmed.length === 0) {
@@ -2310,67 +2419,59 @@ register('version', async (args) => {
 
     console.log(`Starting version ${versionLabel} (${version.description})`);
     console.log(`Slices: ${version.slices.map((s) => s.id).join(', ')}`);
+    console.log('');
 
     // Update version status to in_progress
     await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'in_progress');
 
-    // Execute slices sequentially (each starts a zelto subprocess)
     const sliceStore = new SliceStore(SLICES_DIR);
-    const sliceResults: Array<{ id: string; ok: boolean }> = [];
+    const cfg = loadConfig();
+
+    // Phase 1: Prepare all slices (create, read spec, freeze)
+    console.log('── Phase 1: Prepare slices ──');
+    interface SliceCtx {
+      def: VersionSlice;
+      specContent: string;
+      bundlePath: string;
+    }
+    const sliceCtxs: SliceCtx[] = [];
 
     for (const sliceDef of version.slices) {
-      console.log(`\n--- Executing slice: ${sliceDef.id} ---`);
-      console.log(`  Title: ${sliceDef.title}`);
-      console.log(`  Module: ${sliceDef.module}`);
-      console.log(`  Writes: ${sliceDef.writes.join(', ')}`);
-
       // Create slice data if it doesn't exist
       if (!(await sliceStore.exists(sliceDef.id))) {
         const sliceData = sliceStore.create(sliceDef.id, sliceDef.title, {
           writes: sliceDef.writes,
         });
         await sliceStore.write(sliceData);
-        console.log(`  ✅ Slice "${sliceDef.id}" created`);
+        console.log(`  ✅ "${sliceDef.id}" created`);
       } else {
-        console.log(`  ℹ️  Slice "${sliceDef.id}" already exists`);
+        console.log(`  ℹ️  "${sliceDef.id}" already exists`);
       }
 
-      // Read the slice spec content
+      // Read or generate spec content
       const specPath = sliceDef.specPath;
       let specContent = '';
       try {
         specContent = readFileSync(specPath, 'utf-8');
       } catch {
-        // Generate spec content if file doesn't exist
         specContent = generateSliceSpecContent(sliceDef.id, sliceDef.title, sliceDef.module, sliceDef.writes, versionLabel);
         if (!existsSync('specs/slices')) mkdirSync('specs/slices', { recursive: true });
         writeFileSync(specPath, specContent, 'utf-8');
       }
 
-      // Freeze the slice
-      await sliceStore.transit(sliceDef.id, 'FREEZE');
-      console.log(`  ✅ Slice "${sliceDef.id}" frozen`);
-
-      // Run the slice using agent
-      const cfg = loadConfig();
-      const agentCmd = cfg.agent.command;
-      const agent = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: agentCmd });
-
-      // Write a temporary prompt file with spec content for the agent
+      // Write bundle file
+      const bundlePath = join(ZELTO_DIR, `${sliceDef.id}-bundle.json`);
       const promptContent = [
         `You are working on slice "${sliceDef.id}" of version ${versionLabel}.`,
         '',
-        `## Spec`,
+        '## Spec',
         specContent,
         '',
-        `## Write permissions`,
+        '## Write permissions',
         ...sliceDef.writes.map((w) => `- ${w}`),
         '',
         'Implement the spec above. Write code to satisfy the acceptance criteria.',
       ].join('\n');
-
-      // Write prompt to bundle file
-      const bundlePath = join(ZELTO_DIR, `${sliceDef.id}-bundle.json`);
       const bundle = {
         sliceId: sliceDef.id,
         specPath: sliceDef.specPath,
@@ -2381,45 +2482,68 @@ register('version', async (args) => {
       };
       writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
-      // Start agent
-      const { sessionId } = await agent.start({ sliceId: sliceDef.id, prompt: bundlePath });
+      // Freeze the slice
+      await sliceStore.transit(sliceDef.id, 'FREEZE');
+      console.log(`  ❄️  "${sliceDef.id}" frozen`);
+
+      sliceCtxs.push({ def: sliceDef, specContent, bundlePath });
+    }
+
+    // Phase 2: Run all agents in parallel
+    console.log('\n── Phase 2: Execute agents (parallel) ──');
+    const agentResults = await Promise.all(sliceCtxs.map(async (ctx) => {
+      const agent = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: cfg.agent.command });
+      const { sessionId } = await agent.start({ sliceId: ctx.def.id, prompt: ctx.bundlePath });
       const exitCode = await agent.waitForExit(sessionId);
-      const agentSuccess = exitCode === 0;
-      sliceResults.push({ id: sliceDef.id, ok: agentSuccess });
+      return { id: ctx.def.id, exitCode };
+    }));
 
-      if (agentSuccess) {
-        // Transition: RUN_FINISH
-        await sliceStore.transit(sliceDef.id, 'RUN_FINISH');
-        console.log(`  ✅ Slice "${sliceDef.id}" completed agent run`);
-
-        // Run gate (test & lint)
-        console.log(`  Running gate checks for "${sliceDef.id}"...`);
-        const gateConfig = {
-          commands: cfg.gate.commands.map((c) => ({ name: c.name, run: c.run })),
-          changedLineCoverage: 0.8,
-          timeoutSec: cfg.gate.timeoutSec,
-          retry: { max: cfg.gate.retry.max, budgetStepUsd: 0.05 },
-        } satisfies GateConfig;
-        const gate = new GateExecutor(sliceStore, events, gateConfig);
-        const gateResult = await gate.execute(sliceDef.id);
-        if (gateResult.passed) {
-          await sliceStore.transit(sliceDef.id, 'GATE_PASS');
-          console.log(`  ✅ Gate passed for "${sliceDef.id}"`);
-        } else {
-          const failedCmds = gateResult.results.filter((r) => !r.passed).map((r) => r.command);
-          console.error(`  ❌ Gate failed for "${sliceDef.id}": ${failedCmds.join(', ')}`);
-        }
+    for (const r of agentResults) {
+      if (r.exitCode === 0) {
+        console.log(`  ✅ "${r.id}" agent completed`);
+        await sliceStore.transit(r.id, 'RUN_FINISH');
       } else {
-        console.error(`  ❌ Agent failed for "${sliceDef.id}" (exit code: ${exitCode})`);
+        console.log(`  ❌ "${r.id}" agent failed (exit ${r.exitCode})`);
+      }
+    }
+
+    // Phase 3: Run gates sequentially (avoid parallel pnpm test conflicts)
+    console.log('\n── Phase 3: Gate checks ──');
+    const gateResults: Array<{ id: string; passed: boolean }> = [];
+    for (const ctx of sliceCtxs) {
+      const agentOk = agentResults.find((r) => r.id === ctx.def.id)?.exitCode === 0;
+      if (!agentOk) {
+        gateResults.push({ id: ctx.def.id, passed: false });
+        continue;
+      }
+
+      const gateConfig = {
+        commands: cfg.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+        changedLineCoverage: 0.8,
+        timeoutSec: cfg.gate.timeoutSec,
+        retry: { max: cfg.gate.retry.max, budgetStepUsd: 0.05 },
+      } satisfies GateConfig;
+      const gate = new GateExecutor(sliceStore, events, gateConfig);
+      const gateResult = await gate.execute(ctx.def.id);
+
+      if (gateResult.passed) {
+        await sliceStore.transit(ctx.def.id, 'GATE_PASS');
+        console.log(`  ✅ "${ctx.def.id}" gate passed`);
+        gateResults.push({ id: ctx.def.id, passed: true });
+      } else {
+        const failedCmds = gateResult.results.filter((r) => !r.passed).map((r) => r.command);
+        console.log(`  ❌ "${ctx.def.id}" gate failed: ${failedCmds.join(', ')}`);
+        gateResults.push({ id: ctx.def.id, passed: false });
       }
     }
 
     // Check results
-    const allOk = sliceResults.every((r) => r.ok);
+    const allAgentsOk = agentResults.every((r) => r.exitCode === 0);
+    const allGatesOk = gateResults.every((r) => r.passed);
 
-    if (allOk) {
-      // Run integration tests
-      console.log(`\n--- Running integration tests for ${versionLabel} ---`);
+    if (allAgentsOk && allGatesOk) {
+      // Phase 4: Integration tests
+      console.log('\n── Phase 4: Integration tests ──');
       const integrationTestDir = version.integrationTestDir;
       if (existsSync(integrationTestDir)) {
         const { execSync } = await import('node:child_process');
@@ -2432,24 +2556,32 @@ register('version', async (args) => {
           console.log(`  ✅ Integration tests passed for ${versionLabel}`);
           await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
           console.log(`\n✅ Version ${versionLabel} integrated successfully!`);
+          console.log(`👉 Next: zelto version deliver ${versionLabel}`);
         } catch {
           console.error(`  ❌ Integration tests failed for ${versionLabel}`);
           await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
           console.log(`\n⚠️  Version ${versionLabel} marked as integrated (tests need review).`);
         }
       } else {
-        console.log(`  ℹ️  No integration tests found at ${integrationTestDir}`);
+        console.log(`  ℹ️  No integration tests at ${integrationTestDir}`);
         await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
         console.log(`\n✅ Version ${versionLabel} integrated successfully!`);
+        console.log(`👉 Next: zelto version deliver ${versionLabel}`);
       }
     } else {
-      console.log(`\n❌ Version ${versionLabel} has failures. Check individual slice status.`);
+      console.log(`\n❌ Version ${versionLabel} has failures:`);
+      for (const r of agentResults) {
+        if (r.exitCode !== 0) console.log(`   ❌ Agent: ${r.id} (exit ${r.exitCode})`);
+      }
+      for (const r of gateResults) {
+        if (!r.passed) console.log(`   ❌ Gate: ${r.id}`);
+      }
     }
 
-    return allOk ? 0 : 1;
+    return allAgentsOk && allGatesOk ? 0 : 1;
   }
 
-  console.error('Usage: zelto version status | zelto version start <version-label> [--plan <plan-id>]');
+  console.error('Usage: zelto version status | zelto version start <ver> [--plan <id>] | zelto version deliver <ver> [--plan <id>]');
   return 1;
 });
 
