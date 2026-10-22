@@ -26,7 +26,7 @@ import { AuditTrail } from '../core/audit/trail.js';
 import { MetricsCollector } from '../core/metrics/collector.js';
 import { generateRequirements, refineRequirements } from '../llm/generators/requirements.js';
 import { generateDesign, refineDesign } from '../llm/generators/design.js';
-import { generateSlicePlan } from '../llm/generators/slice-plan.js';
+import { generateSlicePlan, generateVersion } from '../llm/generators/slice-plan.js';
 
 const ZELTO_DIR = '.zelto';
 const SLICES_DIR = join(ZELTO_DIR, 'slices');
@@ -1630,6 +1630,7 @@ Commands (AI Pipeline):
   design refine <id> <txt>  Iteratively refine a draft design with feedback
   plan <design-id>          Generate version plan from design (via LLM)
   plan confirm <id>         Confirm plan and create slice specs
+  plan add-version <id> <d> Append a new version to an existing plan (via LLM)
   version status            Show version plan status
   version start <ver>       Execute a version's slices (agents in parallel)
   version deliver <ver>     Mark a version as delivered
@@ -2227,6 +2228,62 @@ register('plan', async (args) => {
     return 0;
   }
 
+  // zelto plan add-version <plan-id> <description> — append a new version via LLM
+  if (subcmd === 'add-version') {
+    const id = args[1];
+    const description = args.slice(2).join(' ');
+    if (!id || id.startsWith('--') || !description) {
+      console.error('Usage: zelto plan add-version <plan-id> <version description>');
+      return 1;
+    }
+
+    const versionStore = new VersionStore(ZELTO_DIR);
+    if (!(await versionStore.exists(id))) {
+      console.error(`Plan "${id}" not found.`);
+      return 1;
+    }
+    const plan = await versionStore.read(id);
+
+    // Find the design for context
+    const designStore = new DesignStore(ZELTO_DIR);
+    let designBody = '';
+    try {
+      const design = await designStore.read(plan.designId);
+      designBody = design.body;
+    } catch {
+      console.error(`Design "${plan.designId}" not found. Cannot generate version without design context.`);
+      return 1;
+    }
+
+    const llm = createLlmFromConfig();
+    if (!llm) {
+      console.error('LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      return 1;
+    }
+
+    console.log(`Generating new version for plan "${id}"...`);
+    const newVersion = await generateVersion(llm, designBody, plan.versions, description);
+
+    // Check for duplicate version label
+    if (plan.versions.some((v) => v.version === newVersion.version)) {
+      console.error(`Version "${newVersion.version}" already exists in plan "${id}".`);
+      return 1;
+    }
+
+    plan.versions.push(newVersion);
+    await versionStore.save(plan);
+
+    console.log(`\n✅ Version ${newVersion.version} added to plan "${id}":`);
+    console.log(`   Description: ${newVersion.description}`);
+    console.log(`   Depends on: ${newVersion.dependsOn.join(', ') || '(none)'}`);
+    console.log(`   Slices:`);
+    for (const s of newVersion.slices) {
+      console.log(`     - ${s.id}: ${s.title} (module: ${s.module})`);
+    }
+    console.log(`\nRun "zelto plan confirm ${id}" to lock the updated plan.`);
+    return 0;
+  }
+
   // zelto plan <design-id> — generate version plan from design
   const designId = subcmd;
   if (!designId || designId.startsWith('--')) {
@@ -2296,11 +2353,32 @@ register('version', async (args) => {
     }
     for (const p of plans) {
       const plan = await versionStore.read(p.id);
+      const vIcons: Record<string, string> = {
+        planned: '⏳', in_progress: '🔄', integrated: '✅', delivered: '🚀',
+      };
       console.log(`Plan: ${p.id} (${p.status})`);
       console.log(`  Title: ${plan.title}`);
       for (const v of plan.versions) {
+        const icon = vIcons[v.status] ?? '⏳';
         const slices = v.slices.map((s) => s.id).join(', ');
-        console.log(`  ${v.version}: ${v.status} — [${slices}]`);
+        console.log(`  ${icon} ${v.version}: ${v.status} — [${slices}]`);
+      }
+      // Show next actionable version
+      const nextVersion = plan.versions.find((v) => v.status === 'planned');
+      if (nextVersion) {
+        const depsReady = nextVersion.dependsOn.every((dep) => {
+          const dv = plan.versions.find((v) => v.version === dep);
+          return dv && (dv.status === 'integrated' || dv.status === 'delivered');
+        });
+        if (depsReady) {
+          console.log(`  👉 Next: zelto version start ${nextVersion.version} --plan ${plan.id}`);
+        } else {
+          const blockedBy = nextVersion.dependsOn.filter((dep) => {
+            const dv = plan.versions.find((v) => v.version === dep);
+            return !dv || (dv.status !== 'integrated' && dv.status !== 'delivered');
+          });
+          console.log(`  ⏳ Next: ${nextVersion.version} (waiting for: ${blockedBy.join(', ')})`);
+        }
       }
       console.log('');
     }
