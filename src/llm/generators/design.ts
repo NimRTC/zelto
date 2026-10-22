@@ -73,12 +73,12 @@ function parseDesignResponse(
 
     const filesMatch = body.match(/\*\*文件路径\*\*[：:]\s*(.+)/);
     const filePatterns = filesMatch
-      ? filesMatch[1].split(/[,，、]/).map((f: string) => f.trim()).filter(Boolean)
+      ? filesMatch[1].split(/[,，、]/).map((f: string) => f.replace(/^\[|\]$/g, '').trim()).filter(Boolean)
       : [];
 
     const depsMatch = body.match(/\*\*依赖模块\*\*[：:]\s*(.+)/);
     const dependencies = depsMatch
-      ? depsMatch[1].split(/[,，、]/).map((d: string) => d.trim()).filter(Boolean)
+      ? depsMatch[1].split(/[,，、]/).map((d: string) => d.replace(/^\[|\]$/g, '').trim()).filter(Boolean)
       : [];
 
     modules.push({ name, description, filePatterns, dependencies });

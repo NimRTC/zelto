@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.1.0 · 最后更新: 2026-10-21（文档同步至代码当前状态）
+> 版本: v0.1.0 · 最后更新: 2026-10-22（文档同步至代码当前状态）
 
 ---
 
@@ -162,6 +162,23 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto help` | 帮助 | 通用 |
 | `zelto stall [id] [--auto-resolved]` | 列出 stalled slices / 查看详情 | 通用 |
 | `zelto resume <id> [--skip\|--abandon]` | 恢复 stalled slice | run |
+| `zelto require <text>` | 用自然语言创建需求文档 | AI pipeline |
+| `zelto require list` | 列出所有需求 | AI pipeline |
+| `zelto require confirm <id>` | 确认需求 | AI pipeline |
+| `zelto require refine <id> <txt>` | 多轮迭代修改需求草案 | AI pipeline |
+| `zelto design <req-id>` | 从需求生成设计文档 | AI pipeline |
+| `zelto design list` | 列出所有设计 | AI pipeline |
+| `zelto design confirm <id>` | 确认设计 | AI pipeline |
+| `zelto design refine <id> <txt>` | 多轮迭代修改设计草案 | AI pipeline |
+| `zelto plan <design-id>` | 从设计生成版本计划 | AI pipeline |
+| `zelto plan confirm <id>` | 确认计划并创建切片规格 | AI pipeline |
+| `zelto plan add-version <id> <d>` | 追加新版本到已有计划 | AI pipeline |
+| `zelto version status` | 显示版本计划状态 | AI pipeline |
+| `zelto version start <ver>` | 执行版本切片（agent 并行） | AI pipeline |
+| `zelto version deliver <ver>` | 标记版本为已交付 | AI pipeline |
+| `zelto pipeline status` | 全链一览：需求→设计→计划→版本→切片 | 全景 |
+| `zelto trace <req-id>` | 追溯需求到下游全链路 | 全景 |
+| `zelto impact <req-id>` | 变更影响分析 | 全景 |
 
 ### 3.3 独立 Hook
 
@@ -242,7 +259,7 @@ zelto/
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
 │   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现（19 个命令）
+│   ├── cli/               CLI 命令实现（37 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
@@ -254,7 +271,7 @@ zelto/
 │   │   ├── admit-command/   准入命令验收测试
 │   │   ├── event-emission/  事件发射验收测试
 │   │   ├── ... (15 acceptance test suites total)
-│   ├── *.test.ts          单元测试（29 个文件）
+│   ├── *.test.ts          单元测试（33 个文件）
 │   └── ...
 └── .zelto/                运行时状态
     ├── slices/            切片文件
@@ -296,7 +313,12 @@ zelto/
 | `tests/summary-command.test.ts` | 3 | summary 命令 |
 | `tests/events-summary.test.ts` | 5 | 事件与摘要集成 |
 | `tests/acceptance/*/` | 49 (15 suites) | 验收测试 |
-| **总计** | **204** | **44 suites** |
+| `tests/requirement-store.test.ts` | 7 | RequirementStore |
+| `tests/design-store.test.ts` | 7 | DesignStore |
+| `tests/version-store.test.ts` | 8 | VersionStore |
+| `tests/llm-generators.test.ts` | 10 | LLM generators |
+| `tests/ai-pipeline-cli.test.ts` | 20 | AI pipeline CLI |
+| **总计** | **281** | **62 suites** |
 
 ---
 
@@ -318,7 +340,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（204 tests, 44 suites）
+pnpm test           # 编译 + 运行测试（281 tests, 62 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
