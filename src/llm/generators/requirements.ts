@@ -3,6 +3,7 @@
 import type { LlmAdapter } from '../../adapters/llm/types.js';
 import type { RequirementDoc } from '../../core/requirements/types.js';
 import { REQUIREMENTS_PROMPT } from '../prompts/requirements.js';
+import { REFINE_REQUIREMENTS_PROMPT } from '../prompts/refine-requirements.js';
 
 export async function generateRequirements(
   llm: LlmAdapter,
@@ -22,6 +23,32 @@ export async function generateRequirements(
   });
 
   return parseRequirementsResponse(response.content, existingId);
+}
+
+/**
+ * Refine an existing requirement document with user feedback.
+ * Multi-turn iterative editing — keeps the same structure, applies changes.
+ */
+export async function refineRequirements(
+  llm: LlmAdapter,
+  currentSpec: string,
+  feedback: string,
+): Promise<Pick<RequirementDoc, 'title' | 'spec' | 'acceptanceCriteria'>> {
+  const prompt = REFINE_REQUIREMENTS_PROMPT
+    .replace('{{CURRENT_SPEC}}', currentSpec)
+    .replace('{{FEEDBACK}}', feedback);
+
+  const response = await llm.chat({
+    model: 'deepseek-chat',
+    messages: [
+      { role: 'system', content: '你是一个专业的需求分析专家。根据用户反馈迭代更新需求文档。' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.7,
+    maxTokens: 4096,
+  });
+
+  return parseRequirementsResponse(response.content, '');
 }
 
 function parseRequirementsResponse(

@@ -24,7 +24,7 @@ import type { VersionPlan } from '../core/version/types.js';
 import { SliceStore } from '../core/slice/store.js';
 import { AuditTrail } from '../core/audit/trail.js';
 import { MetricsCollector } from '../core/metrics/collector.js';
-import { generateRequirements } from '../llm/generators/requirements.js';
+import { generateRequirements, refineRequirements } from '../llm/generators/requirements.js';
 import { generateDesign } from '../llm/generators/design.js';
 import { generateSlicePlan } from '../llm/generators/slice-plan.js';
 
@@ -1623,6 +1623,7 @@ Commands (AI Pipeline):
   require <text>            Create requirement from natural language (via LLM)
   require list              List all requirements
   require confirm <id>      Confirm a requirement
+  require refine <id> <txt> Iteratively refine a draft requirement with feedback
   design <req-id>           Generate design document from requirement (via LLM)
   design list               List all designs
   design confirm <id>       Confirm a design
@@ -1939,6 +1940,52 @@ register('require', async (args) => {
     doc.confirmedAt = new Date().toISOString();
     await reqStore.save(doc);
     console.log(`Requirement "${id}" confirmed.`);
+    return 0;
+  }
+
+  // zelto require refine <id> <feedback> — iterative multi-turn editing
+  if (subcmd === 'refine') {
+    const id = args[1];
+    const feedback = args.slice(2).join(' ');
+    if (!id || id.startsWith('--') || !feedback) {
+      console.error('Usage: zelto require refine <id> <feedback text>');
+      return 1;
+    }
+    const reqStore = new RequirementStore(ZELTO_DIR);
+    if (!(await reqStore.exists(id))) {
+      console.error(`Requirement "${id}" not found.`);
+      return 1;
+    }
+    const doc = await reqStore.read(id);
+    if (doc.status !== 'draft') {
+      console.error(`Requirement "${id}" is already ${doc.status}. Can only refine draft requirements.`);
+      return 1;
+    }
+
+    const llm = createLlmFromConfig();
+    if (!llm) {
+      console.error('LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      return 1;
+    }
+
+    console.log(`Refining requirement "${id}" with feedback...`);
+    const result = await refineRequirements(llm, doc.spec, feedback);
+
+    // Update the requirement in place
+    doc.title = result.title;
+    doc.spec = result.spec;
+    doc.acceptanceCriteria = result.acceptanceCriteria;
+    await reqStore.save(doc);
+
+    console.log(`\n✅ Requirement "${id}" updated.`);
+    console.log(`   Title: ${result.title}`);
+    console.log(`\n${result.spec}`);
+    console.log(`\nAcceptance Criteria:`);
+    for (const ac of result.acceptanceCriteria) {
+      console.log(`  - ${ac}`);
+    }
+    console.log(`\nRun again: zelto require refine ${id} <more feedback>`);
+    console.log(`Or confirm: zelto require confirm ${id}`);
     return 0;
   }
 
