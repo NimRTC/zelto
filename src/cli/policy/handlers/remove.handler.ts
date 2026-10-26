@@ -1,15 +1,16 @@
 /**
- * remove.handler.ts — `zelto policy remove` business logic
+ * remove.handler.ts — `zelto policy remove` business logic (v3)
  *
- * Removes a policy rule by ID from policy.yaml.
- * Reads the raw YAML, finds and removes the rule block, and writes back.
+ * Removes a policy rule by ID from policy.yaml using core yaml-writer.
  *
  * C6: cli/policy/ may depend on adapters/ and core/, but not vice versa.
- * C1: State only in files — reads/writes policy/policy.yaml directly.
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { loadPolicyConfig } from '../../commands/shared.js';
+import { writePolicyYaml } from '../../../core/policy/yaml-writer.js';
+import type { PolicyRule } from '../../../core/policy/types.js';
+import type { RuleData } from '../../../core/policy/yaml-writer.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,6 +25,8 @@ export interface RemoveHandlerResult {
   success: boolean;
   ruleId: string;
   message: string;
+  /** Number of rules remaining after removal (0 if failed) */
+  totalRulesAfter: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -33,101 +36,107 @@ export interface RemoveHandlerResult {
 /**
  * Remove a policy rule by ID from policy.yaml.
  *
- * 1. Loads the policy config to verify the rule exists.
- * 2. Reads policy.yaml as raw text.
- * 3. Parses the YAML line-by-line to locate and remove the rule block.
- * 4. Writes the modified content back to policy.yaml.
+ * 1. Load current policy config to verify the rule exists.
+ * 2. Read raw YAML to preserve header comments.
+ * 3. Filter out the matching rule.
+ * 4. Write the updated rules back via core yaml-writer.
  *
  * Returns a result indicating success or failure.
  */
 export function removePolicyRule(options: RemoveOptions): RemoveHandlerResult {
   const { ruleId } = options;
-  const policyPath = 'policy/policy.yaml';
 
-  // 1. Verify the rule exists by loading the config
-  let config;
+  // 1. Load current policy config to verify the rule exists
+  let currentRules: PolicyRule[];
   try {
-    config = loadPolicyConfig();
+    const config = loadPolicyConfig();
+    currentRules = config.rules;
   } catch {
     return {
       success: false,
       ruleId,
       message: 'Failed to load policy configuration',
+      totalRulesAfter: 0,
     };
   }
 
-  const ruleIndex = config.rules.findIndex((r) => r.id === ruleId);
-  if (ruleIndex === -1) {
+  const ruleExists = currentRules.some((r) => r.id === ruleId);
+  if (!ruleExists) {
     return {
       success: false,
       ruleId,
       message: `Rule "${ruleId}" not found in policy`,
+      totalRulesAfter: currentRules.length,
     };
   }
 
-  // 2. Read the raw YAML
-  if (!existsSync(policyPath)) {
-    return {
-      success: false,
-      ruleId,
-      message: `Policy file not found: ${policyPath}`,
-    };
+  // 2. Read raw YAML to extract header comments
+  const policyPath = 'policy/policy.yaml';
+  let headerComment: string | undefined;
+
+  if (existsSync(policyPath)) {
+    const rawContent = readFileSync(policyPath, 'utf-8');
+    headerComment = extractHeaderComment(rawContent);
   }
 
-  const content = readFileSync(policyPath, 'utf-8');
+  // 3. Filter out the matching rule
+  const updatedRules = currentRules
+    .filter((r) => r.id !== ruleId)
+    .map(toRuleData);
 
-  // 3. Parse line-by-line to remove the rule block matching the given ID
-  const lines = content.split('\n');
-  const newLines: string[] = [];
-  let inTargetRule = false;
-  let found = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-
-    // Detect start of a rule: `- id: <ruleId>`
-    if (trimmed.startsWith('- id:')) {
-      const idValue = trimmed.slice(5).trim().replace(/^"|"$/g, '');
-      if (idValue === ruleId) {
-        inTargetRule = true;
-        found = true;
-        continue; // Skip this line — rule starts here
-      }
-      inTargetRule = false;
-    }
-
-    if (inTargetRule) {
-      // Check if we've reached the next rule or a top-level key
-      if (trimmed.startsWith('- id:') || trimmed.startsWith('#')) {
-        inTargetRule = false;
-        // Fall through to add this line
-      } else {
-        // Still inside the target rule block — skip
-        continue;
-      }
-    }
-
-    // Only re-add if we haven't just finished skipping the target rule
-    if (!inTargetRule) {
-      newLines.push(lines[i]);
-    }
-  }
-
-  if (!found) {
-    return {
-      success: false,
-      ruleId,
-      message: `Rule "${ruleId}" could not be located in policy.yaml text`,
-    };
-  }
-
-  // 4. Write the modified content back
-  const newContent = newLines.join('\n');
-  writeFileSync(policyPath, newContent, 'utf-8');
+  // 4. Write the updated rules back
+  writePolicyYaml(policyPath, updatedRules, headerComment);
 
   return {
     success: true,
     ruleId,
     message: `Rule "${ruleId}" has been removed`,
+    totalRulesAfter: updatedRules.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the header comment block (lines starting with #) from raw YAML content.
+ * Returns lines as they appear, including leading # and trailing newline.
+ */
+function extractHeaderComment(rawContent: string): string | undefined {
+  const lines = rawContent.split('\n');
+  const commentLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('#')) {
+      commentLines.push(line);
+    } else if (trimmed === '' && commentLines.length > 0) {
+      // Allow blank lines within the header block
+      commentLines.push(line);
+    } else {
+      break;
+    }
+  }
+
+  return commentLines.length > 0 ? commentLines.join('\n') : undefined;
+}
+
+/**
+ * Convert a PolicyRule (from core types) to the RuleData format used by yaml-writer.
+ */
+function toRuleData(rule: PolicyRule): RuleData {
+  return {
+    id: rule.id,
+    match: {
+      ...(rule.match.path ? { path: rule.match.path } : {}),
+      ...(rule.match.operation ? { operation: rule.match.operation } : {}),
+      ...(rule.match.harness ? { harness: rule.match.harness } : {}),
+    },
+    action: rule.action,
+    basis: rule.basis,
+    ...(rule.guidance ? { guidance: rule.guidance } : {}),
+    ...(rule.priority !== undefined ? { priority: rule.priority } : {}),
+    ...(rule.description ? { description: rule.description } : {}),
   };
 }
