@@ -558,11 +558,12 @@ register('version', async (args) => {
   if (subcmd === 'start') {
     const versionLabel = args[1];
     if (!versionLabel || versionLabel.startsWith('--')) {
-      console.error('Usage: zelto version start <version-label> [--plan <plan-id>] [--auto]');
+      console.error('Usage: zelto version start <version-label> [--plan <plan-id>] [--auto] [--retry-failed]');
       return 1;
     }
 
     const isAuto = args.includes('--auto');
+    const isRetry = args.includes('--retry-failed');
     const planIdx = args.indexOf('--plan');
     const planId = planIdx >= 0 ? args[planIdx + 1] : null;
 
@@ -592,8 +593,11 @@ register('version', async (args) => {
     }
 
     if (version.status !== 'planned') {
-      console.error(`Version "${versionLabel}" is already ${version.status}.`);
-      return 1;
+      if (!isRetry || version.status !== 'in_progress') {
+        console.error(`Version "${versionLabel}" is already ${version.status}.`);
+        return 1;
+      }
+      console.log(`  ℹ️  Version "${versionLabel}" is in_progress — retrying failed slices`);
     }
 
     for (const dep of version.dependsOn) {
@@ -619,6 +623,19 @@ register('version', async (args) => {
     const sliceCtxs: SliceCtx[] = [];
 
     for (const sliceDef of version.slices) {
+      // In retry mode, skip slices that are already completed
+      if (isRetry) {
+        const existingSlice = await sliceStore.read(sliceDef.id).catch(() => null);
+        if (existingSlice && existingSlice.state === 'completed') {
+          console.log(`  ✅ "${sliceDef.id}" already completed — skipping`);
+          continue;
+        }
+        if (existingSlice && existingSlice.state === 'frozen') {
+          console.log(`  ❄️  "${sliceDef.id}" already frozen — will re-run`);
+          // Will create bundle below
+        }
+      }
+
       if (!(await sliceStore.exists(sliceDef.id))) {
         const sliceData = sliceStore.create(sliceDef.id, sliceDef.title, { writes: sliceDef.writes });
         await sliceStore.write(sliceData);
