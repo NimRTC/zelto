@@ -1,0 +1,38 @@
+# zelto Docker Compose — development and CI usage
+#
+# Usage:
+#   docker compose run --rm zelto --help
+#   docker compose run --rm zelto init
+#   docker compose run --rm zelto project scan
+#
+# With LLM support (set your API key in .env):
+#   echo "LLM_API_KEY=sk-..." > .env
+#   docker compose --profile llm run --rm zelto project design
+
+services:
+  zelto:
+    build: .
+    image: zelto:latest
+    profiles: ["core"]
+    volumes:
+      # Mount project for governance
+      - .:/app
+      # Persist zelto state
+      - zelto-state:/app/.zelto
+      # Exclude node_modules from host (use container's)
+      - /app/node_modules
+    environment:
+      - ZELTO_SKIP_LLM=${ZELTO_SKIP_LLM:-1}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+    entrypoint: ["node", "dist/cli/index.js"]
+
+  # LLM proxy service — optional, for AI pipeline features
+  llm-proxy:
+    profiles: ["llm"]
+    image: alpine:3.19
+    entrypoint: ["sh", "-c", "echo 'LLM proxy placeholder — configure your LLM provider directly in .zelto/config.yaml'; exit 0"]
+
+volumes:
+  zelto-state:

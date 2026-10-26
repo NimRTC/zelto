@@ -183,14 +183,14 @@ describe('acceptance: e2e full lifecycle', { concurrency: false }, () => {
 
   it('step 9: gate runs (platform-dependent pass/fail)', async () => {
     const result = await zelto('gate', 'e2e-test-slice');
-    // Gate runs the commands; may or may not pass depending on slice state
-    // At minimum, gate.executed event should exist
+    // Gate runs the commands; may or may not pass depending on slice state.
+    // With auto-gate-after-run, the slice may already be "completed".
+    // At minimum, gate.executed event should exist (from auto-gate) or a state message.
     const events = await readEvents('e2e-test-slice');
     const gateExecuted = events.filter((e) => e.type === 'gate.executed');
-    // Gate may fail if slice is not in the right state
-    // Just verify it doesn't crash
+    // Gate may be skipped if already completed; just verify it doesn't crash
     assert.ok(
-      result.stdout.includes('running gate') || result.stdout.includes('Error'),
+      result.stdout.includes('running gate') || result.stdout.includes('Error') || result.stdout.includes('completed'),
       `gate should at least attempt: ${result.stdout}`,
     );
   });

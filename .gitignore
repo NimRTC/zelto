@@ -1,11 +1,7 @@
 node_modules
 dist
 dist-test
-.zelto/slices/
-.zelto/events/
-.zelto/locks/
-.zelto/config.yaml
-.zelto/*.json
+.zelto/
 .DS_Store
 *.log
 *.tsbuildinfo
@@ -13,3 +9,8 @@ dist-test
 .env.local
 .claude/plans/
 .claude/worktrees/
+# Go companion CLI
+zelto
+zelto.exe
+go.work
+go.work.sum

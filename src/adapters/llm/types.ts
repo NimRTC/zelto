@@ -6,7 +6,7 @@ export interface LlmMessage {
 }
 
 export interface LlmRequest {
-  model: string;
+  model?: string;
   messages: LlmMessage[];
   temperature?: number;
   maxTokens?: number;

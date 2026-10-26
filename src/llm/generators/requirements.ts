@@ -13,7 +13,6 @@ export async function generateRequirements(
   const prompt = REQUIREMENTS_PROMPT.replace('{{USER_INPUT}}', userInput);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个专业的需求分析专家。请严格按用户要求生成需求文档。' },
       { role: 'user', content: prompt },
@@ -39,7 +38,6 @@ export async function refineRequirements(
     .replace('{{FEEDBACK}}', feedback);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个专业的需求分析专家。根据用户反馈迭代更新需求文档。' },
       { role: 'user', content: prompt },

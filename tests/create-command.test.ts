@@ -39,7 +39,7 @@ describe('zelto create', () => {
 
     assert.equal(code, 0);
     assert.ok(stdout.includes('my-test-slice'));
-    assert.ok(stdout.includes('created'));
+    assert.ok(/created/i.test(stdout));
 
     const slicePath = join(TEST_DIR, '.zelto', 'slices', 'my-test-slice.json');
     assert.ok(existsSync(slicePath));

@@ -39,7 +39,7 @@ describe('zelto start', () => {
 
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
     assert.ok(stdout.includes('fresh-slice'));
-    assert.ok(stdout.includes('created') || stdout.includes('started'));
+    assert.ok(/created|started/i.test(stdout));
 
     // Verify slice was created
     const slicePath = join(TEST_DIR, '.zelto', 'slices', 'fresh-slice.json');

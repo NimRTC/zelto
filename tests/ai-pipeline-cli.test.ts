@@ -49,10 +49,9 @@ describe('AI Pipeline — CLI commands', () => {
       assert.ok(stdout.includes('No requirements'));
     });
 
-    it('require without args shows list (default behavior)', async () => {
-      const { stdout, code } = await runCli('require');
-      assert.equal(code, 0);
-      assert.ok(stdout.includes('No requirements'));
+    it('require without args shows usage', async () => {
+      const { code } = await runCli('require');
+      assert.equal(code, 1);
     });
 
     it('require confirm without id shows usage', async () => {
@@ -90,10 +89,9 @@ describe('AI Pipeline — CLI commands', () => {
       assert.equal(code, 1);
     });
 
-    it('design without args shows list (default behavior)', async () => {
-      const { stdout, code } = await runCli('design');
-      assert.equal(code, 0);
-      assert.ok(stdout.includes('No designs'));
+    it('design without args shows usage', async () => {
+      const { code } = await runCli('design');
+      assert.equal(code, 1);
     });
   });
 

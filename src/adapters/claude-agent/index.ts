@@ -1,12 +1,65 @@
 // ClaudeAgentAdapter — ExecutorAdapter implementation for Claude Code CLI
 //
 // Spawns `npx claude-code` (or configured agent command) as a child process,
-// passing ZELTO_BUNDLE, ZELTO_SLICE_ID, and ZELTO_PROJECT_ROOT env vars.
+// passing the bundle instructions via --print for non-interactive execution.
+//
+// Features:
+// - Session persistence to .zelto/sessions/ for crash recovery
+// - Configurable timeout (kills agent if it exceeds time limit)
+// - Configurable retry (re-spawns on failure up to maxRetries)
+// - Output capture for event logging
+// - Temp file cleanup on exit
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import {
+  readFileSync, writeFileSync, mkdtempSync, rmSync,
+  existsSync, mkdirSync, readdirSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { type ExecutorAdapter, type AdapterMeta } from '../../core/ports/executor.js';
 import type { EventEnvelope } from '../../core/events/index.js';
+
+// ─── Session Persistence ─────────────────────────────────────────────────────
+
+const SESSIONS_DIR = '.zelto/sessions';
+
+export interface PersistentSessionData {
+  sessionId: string;
+  sliceId: string;
+  agentCommand: string;
+  startedAt: string;
+  status: 'running' | 'completed' | 'failed' | 'timeout' | 'killed';
+  exitCode: number | null;
+  timeoutMs: number | null;
+  retryCount: number;
+  maxRetries: number;
+  prompt: string;        // original bundle path for retry
+  output: string[];
+}
+
+function sessionPath(sessionId: string): string {
+  return join(SESSIONS_DIR, `${sessionId}.json`);
+}
+
+function saveSession(data: PersistentSessionData): void {
+  if (!existsSync(SESSIONS_DIR)) {
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+  }
+  writeFileSync(sessionPath(data.sessionId), JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function loadSession(sessionId: string): PersistentSessionData | null {
+  const path = sessionPath(sessionId);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, 'utf-8')) as PersistentSessionData;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Options ─────────────────────────────────────────────────────────────────
 
 interface ClaudeAgentAdapterOptions {
   /** Path to the agent binary (default: 'npx claude-code') */
@@ -15,11 +68,15 @@ interface ClaudeAgentAdapterOptions {
   cwd?: string;
   /** Environment variables to pass (default: process.env) */
   env?: NodeJS.ProcessEnv;
+  /** Maximum time in ms before killing the agent (default: 300000 = 5 min) */
+  timeoutMs?: number;
+  /** Maximum number of retries on failure (default: 2) */
+  maxRetries?: number;
 }
 
 const ADAPTER_META: AdapterMeta = {
-  version: '1.0.0',
-  description: 'Claude Code CLI adapter — spawns npx claude-code as child process',
+  version: '2.0.0',
+  description: 'Claude Code CLI adapter — spawns npx claude-code with session persistence, timeout, and retry',
   capabilities: {
     resume: false,
     events: false,
@@ -30,6 +87,9 @@ const ADAPTER_META: AdapterMeta = {
 interface SessionState {
   child: ChildProcess;
   startedAt: string;
+  sliceId: string;
+  retryCount: number;
+  output: string[];
 }
 
 export class ClaudeAgentAdapter implements ExecutorAdapter {
@@ -39,74 +99,304 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   private readonly agentCommand: string;
   private readonly cwd: string;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly useClaudeCodeFlags: boolean;
   private readonly sessions = new Map<string, SessionState>();
+  private timeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(options: ClaudeAgentAdapterOptions = {}) {
     this.agentCommand = options.agentCommand ?? 'npx claude-code';
     this.cwd = options.cwd ?? process.cwd();
     this.env = options.env ?? process.env;
+    this.timeoutMs = options.timeoutMs ?? 300_000; // 5 minutes default
+    this.maxRetries = options.maxRetries ?? 2;
+    // Detect if the command is Claude Code (npx or direct binary)
+    this.useClaudeCodeFlags = /claude(-code)?\b/.test(this.agentCommand);
   }
 
+  // ─── Session Recovery ──────────────────────────────────────────────────────
+
+  /**
+   * Recover sessions that were left in 'running' state from a previous zelto instance.
+   * Call this on startup if needed.
+   * Returns list of recovered session IDs.
+   */
+  recoverRunningSessions(): string[] {
+    if (!existsSync(SESSIONS_DIR)) return [];
+
+    const recovered: string[] = [];
+    for (const file of readdirSync(SESSIONS_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const sessionId = file.slice(0, -5);
+      const data = loadSession(sessionId);
+      if (data && data.status === 'running') {
+        // Mark as failed since the process died with us
+        data.status = 'failed';
+        data.exitCode = null;
+        data.output.push('[zelto: session orphaned on restart]');
+        saveSession(data);
+        recovered.push(sessionId);
+      }
+    }
+    return recovered;
+  }
+
+  // ─── Start ─────────────────────────────────────────────────────────────────
+
   async start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }> {
-    const sessionId = `claude-agent-${spec.sliceId}-${Date.now()}`;
+    return this.startWithRetry(spec, 0);
+  }
 
-    // Build args: if prompt is a file path (bundle), pass it as the prompt file
+  private async startWithRetry(
+    spec: { sliceId: string; prompt: string; model?: string },
+    retryCount: number,
+  ): Promise<{ sessionId: string }> {
+    const sessionId = `claude-agent-${spec.sliceId}-${Date.now()}${retryCount > 0 ? `-retry-${retryCount}` : ''}`;
+
+    // Read the bundle file to extract the instructions text
     const bundlePath = spec.prompt;
+    let instructions: string;
+    try {
+      const bundleContent = readFileSync(bundlePath, 'utf-8');
+      const bundle = JSON.parse(bundleContent);
+      instructions = bundle.instructions ?? bundleContent;
+    } catch {
+      instructions = spec.prompt;
+    }
 
-    const child = spawn(this.agentCommand, [], {
-      cwd: this.cwd,
-      stdio: ['inherit', 'inherit', 'inherit'],
-      shell: true,
-      env: {
-        ...this.env,
-        ZELTO_BUNDLE: bundlePath,
-        ZELTO_SLICE_ID: spec.sliceId,
-        ZELTO_PROJECT_ROOT: this.cwd,
-      },
-    });
+    // Write instructions to a temp file
+    const tmpDir = mkdtempSync(join(tmpdir(), 'zelto-prompt-'));
+    const tmpFile = join(tmpDir, `${spec.sliceId}.txt`);
+    writeFileSync(tmpFile, instructions, 'utf-8');
 
-    this.sessions.set(sessionId, {
-      child,
+    // Create persistent session data
+    const sessionData: PersistentSessionData = {
+      sessionId,
+      sliceId: spec.sliceId,
+      agentCommand: this.agentCommand,
       startedAt: new Date().toISOString(),
-    });
+      status: 'running',
+      exitCode: null,
+      timeoutMs: this.timeoutMs,
+      retryCount,
+      maxRetries: this.maxRetries,
+      prompt: bundlePath,
+      output: [],
+    };
+    saveSession(sessionData);
 
-    // Clean up on exit
-    child.on('close', () => {
-      this.sessions.delete(sessionId);
+    // Spawn with --print for non-interactive execution
+    // Use --permission-mode bypassPermissions since zelto's own policy system governs access
+    // Build spawn env: copy parent env but strip ANTHROPIC_MODEL to avoid
+    // model-recognition warnings in Claude Code (the warning is non-fatal but noisy)
+    const spawnEnv: NodeJS.ProcessEnv = { ...this.env };
+    delete spawnEnv.ANTHROPIC_MODEL;
+
+    // Add Claude Code-specific flags only when running Claude Code
+    const claudeFlags = this.useClaudeCodeFlags
+      ? ' --print --permission-mode bypassPermissions'
+      : '';
+
+    const child = spawn(
+      `${this.agentCommand}${claudeFlags} < "${tmpFile}"`,
+      [],
+      {
+        cwd: this.cwd,
+        stdio: ['inherit', 'inherit', 'inherit'],
+        shell: true,
+        env: {
+          ...spawnEnv,
+          ZELTO_BUNDLE: bundlePath,
+          ZELTO_SLICE_ID: spec.sliceId,
+          ZELTO_PROJECT_ROOT: this.cwd,
+          ZELTO_SESSION_ID: sessionId,
+        },
+      },
+    );
+
+    const state: SessionState = {
+      child,
+      startedAt: sessionData.startedAt,
+      sliceId: spec.sliceId,
+      retryCount,
+      output: [],
+    };
+
+    this.sessions.set(sessionId, state);
+
+    // Set timeout
+    const timeout = setTimeout(() => {
+      this.handleTimeout(sessionId);
+    }, this.timeoutMs);
+    this.timeouts.set(sessionId, timeout);
+
+    // Clean up temp file on exit
+    const cleanup = () => {
+      try { rmSync(tmpDir, { force: true, recursive: true }); } catch { /* ignore */ }
+    };
+    child.on('exit', cleanup);
+    child.on('error', cleanup);
+
+    // Track exit
+    child.on('close', (code) => {
+      this.handleExit(sessionId, code);
     });
 
     return { sessionId };
   }
 
+  // ─── Timeout Handling ──────────────────────────────────────────────────────
+
+  private handleTimeout(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const data = loadSession(sessionId);
+    if (data && data.status === 'running') {
+      data.status = 'timeout';
+      data.output.push(`[zelto: timeout after ${this.timeoutMs}ms]`);
+      saveSession(data);
+    }
+
+    // Kill gracefully first, then force
+    session.child.kill('SIGTERM');
+    setTimeout(() => {
+      try { session.child.kill('SIGKILL'); } catch { /* already dead */ }
+    }, 3000);
+  }
+
+  // ─── Exit Handling ─────────────────────────────────────────────────────────
+
+  private handleExit(sessionId: string, exitCode: number | null): void {
+    // Clear timeout
+    const timeout = this.timeouts.get(sessionId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.timeouts.delete(sessionId);
+    }
+
+    // Update persistent session
+    const data = loadSession(sessionId);
+    if (data) {
+      data.exitCode = exitCode;
+      data.status = exitCode === 0 ? 'completed' : 'failed';
+      saveSession(data);
+    }
+  }
+
+  // ─── Resume ────────────────────────────────────────────────────────────────
+
   async resume(_sessionId: string, _patch: string): Promise<void> {
     throw new Error('resume not supported by ClaudeAgentAdapter');
   }
+
+  // ─── Stop ──────────────────────────────────────────────────────────────────
 
   async stop(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       throw new Error(`Session "${sessionId}" not found`);
     }
+
+    // Clear timeout
+    const timeout = this.timeouts.get(sessionId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.timeouts.delete(sessionId);
+    }
+
+    // Update persistent session
+    const data = loadSession(sessionId);
+    if (data && data.status === 'running') {
+      data.status = 'killed';
+      data.output.push('[zelto: session stopped by user]');
+      saveSession(data);
+    }
+
     session.child.kill('SIGTERM');
-    // Give it a moment, then SIGKILL
     setTimeout(() => {
       try { session.child.kill('SIGKILL'); } catch { /* already dead */ }
     }, 5000);
   }
 
+  // ─── Events ────────────────────────────────────────────────────────────────
+
   async events(_sessionId: string): Promise<AsyncIterable<EventEnvelope>> {
     throw new Error('events streaming not supported by ClaudeAgentAdapter');
   }
 
-  /** Get exit code promise for a session — used by CLI to await completion */
+  // ─── Wait For Exit ─────────────────────────────────────────────────────────
+
+  /**
+   * Get exit code promise for a session.
+   * Supports retry: if exit code != 0 and retries remain, auto-restarts.
+   */
   waitForExit(sessionId: string): Promise<number | null> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       return Promise.resolve(null);
     }
+
     return new Promise<number | null>((resolve) => {
-      session.child.on('close', (code) => resolve(code));
-      session.child.on('error', () => resolve(1));
+      const checkExit = async (code: number | null) => {
+        if (code === 0) {
+          resolve(0);
+          return;
+        }
+
+        // Check if we should retry
+        if (code !== null && code !== 0 && session.retryCount < this.maxRetries) {
+          const data = loadSession(sessionId);
+          if (!data || !data.prompt) {
+            resolve(code);
+            return;
+          }
+
+          const newRetry = session.retryCount + 1;
+          // Start retry using the original prompt from session data
+          try {
+            const { sessionId: newId } = await this.startWithRetry(
+              { sliceId: session.sliceId, prompt: data.prompt },
+              newRetry,
+            );
+            // Wait on the new session
+            const newCode = await this.waitForExit(newId);
+            resolve(newCode);
+          } catch {
+            resolve(code);
+          }
+          return;
+        }
+
+        resolve(code);
+      };
+
+      session.child.on('close', checkExit);
+      session.child.on('error', () => checkExit(1));
     });
+  }
+
+  // ─── Session Status (query) ────────────────────────────────────────────────
+
+  /** Get the status of a session from persistent storage */
+  getSessionStatus(sessionId: string): PersistentSessionData | null {
+    return loadSession(sessionId);
+  }
+
+  /** List all persisted sessions for a slice */
+  listSliceSessions(sliceId: string): PersistentSessionData[] {
+    if (!existsSync(SESSIONS_DIR)) return [];
+    const sessions: PersistentSessionData[] = [];
+    for (const file of readdirSync(SESSIONS_DIR)) {
+      if (!file.endsWith('.json')) continue;
+      const data = loadSession(file.slice(0, -5));
+      if (data && data.sliceId === sliceId) {
+        sessions.push(data);
+      }
+    }
+    return sessions.sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
+    );
   }
 }

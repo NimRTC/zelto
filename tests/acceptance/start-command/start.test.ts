@@ -51,8 +51,8 @@ describe('acceptance: zelto start', () => {
   it('runs full start flow on a new slice', async () => {
     const { stdout, code } = await zelto('start', 'new-slice', '--title', 'New Slice');
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
-    assert.ok(stdout.includes('created'), 'should show created');
-    assert.ok(stdout.includes('frozen'), 'should mention frozen');
+    assert.ok(/created/i.test(stdout), 'should show created');
+    assert.ok(/frozen/i.test(stdout), 'should mention frozen');
     assert.ok(stdout.includes('Agent:'), 'should show agent info');
     assert.ok(stdout.includes('completed successfully'), 'should show completion');
   });
@@ -61,7 +61,7 @@ describe('acceptance: zelto start', () => {
     await zelto('create', 'existing-draft');
     const { stdout, code } = await zelto('start', 'existing-draft');
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
-    assert.ok(stdout.includes('already exists'), 'should mention existing');
+    assert.ok(/already exists/i.test(stdout), 'should mention existing');
     assert.ok(stdout.includes('Agent:'), 'should run agent');
   });
 

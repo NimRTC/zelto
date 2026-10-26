@@ -75,9 +75,10 @@ describe('acceptance: agent-execution', () => {
     assert.ok(existsSync(sliceFile), 'slice file should exist');
     const slice = JSON.parse(await readFile(sliceFile, 'utf-8'));
 
-    // The agent ran and finished, so state should be frozen (RUN_FINISH transition)
-    assert.ok(slice.state === 'frozen' || slice.state === 'running',
-      `Expected frozen or running, got ${slice.state}`);
+    // The agent ran and finished; with auto-gate-after-run, state may be
+    // frozen (legacy), running, or completed (auto-gate passed)
+    assert.ok(slice.state === 'frozen' || slice.state === 'running' || slice.state === 'completed',
+      `Expected frozen/running/completed, got ${slice.state}`);
 
     // Should have at least one run recorded
     assert.ok(Array.isArray(slice.runs), 'slice should have runs array');

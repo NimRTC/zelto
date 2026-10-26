@@ -42,7 +42,6 @@ export async function generateSlicePlan(
     .replace('{{MODULES_JSON}}', modulesJson);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个项目管理专家。严格按格式输出 JSON。' },
       { role: 'user', content: prompt },
@@ -130,7 +129,6 @@ export async function generateVersion(
     .replace('{{VERSION_DESCRIPTION}}', versionDescription);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个项目管理专家。严格按格式输出 JSON。' },
       { role: 'user', content: prompt },

@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.1.0 · 最后更新: 2026-10-22（文档同步至代码当前状态）
+> 版本: v0.2.0 · 最后更新: 2026-10-26（文档同步至代码当前状态）
 
 ---
 
@@ -284,41 +284,13 @@ zelto/
 
 ## 附录 A：测试清单
 
-| 测试文件 | 测试数 | 覆盖模块 |
-|---|---|---|
-| `tests/policy-engine.test.ts` | 14 | PolicyEngine, matchPath, checkAnchor, hashPolicy |
-| `tests/slice-state.test.ts` | 5 | SliceState 状态机 |
-| `tests/stall-classifier.test.ts` | 5 | StallClassifier |
-| `tests/sign-manager.test.ts` | 10 | SignManager |
-| `tests/gate-executor.test.ts` | 3 | GateExecutor |
-| `tests/scheduler.test.ts` | 6 | Scheduler |
-| `tests/clarify-engine.test.ts` | 5 | ClarifyEngine |
-| `tests/metrics-collector.test.ts` | 5 | MetricsCollector |
-| `tests/audit-trail.test.ts` | 5 | AuditTrail |
-| `tests/budget-collector.test.ts` | 10 | BudgetCollector |
-| `tests/hook-executable.test.ts` | 7 | Hook 可执行体 |
-| `tests/admit-command.test.ts` | 5 | Admit 命令 |
-| `tests/abandon-command.test.ts` | 6 | abandon 命令 |
-| `tests/clarify-command.test.ts` | 6 | clarify 命令 |
-| `tests/config-loading.test.ts` | 5 | 配置加载 |
-| `tests/create-command.test.ts` | 5 | create 命令 |
-| `tests/init-command.test.ts` | 3 | init 命令 |
-| `tests/start-command.test.ts` | 3 | start 命令 |
-| `tests/stall-command.test.ts` | 7 | stall 命令 |
-| `tests/resume-command.test.ts` | 5 | resume 命令 |
-| `tests/events-command.test.ts` | 5 | events 命令 |
-| `tests/executor-adapter.test.ts` | 7 | ExecutorAdapter |
-| `tests/event-emission.test.ts` | 4 | 事件发射 |
-| `tests/agent-execution.test.ts` | 4 | agent 执行流程 |
-| `tests/summary-command.test.ts` | 3 | summary 命令 |
-| `tests/events-summary.test.ts` | 5 | 事件与摘要集成 |
-| `tests/acceptance/*/` | 49 (15 suites) | 验收测试 |
-| `tests/requirement-store.test.ts` | 7 | RequirementStore |
-| `tests/design-store.test.ts` | 7 | DesignStore |
-| `tests/version-store.test.ts` | 8 | VersionStore |
-| `tests/llm-generators.test.ts` | 10 | LLM generators |
-| `tests/ai-pipeline-cli.test.ts` | 20 | AI pipeline CLI |
-| **总计** | **281** | **62 suites** |
+| 类别 | 测试数 | Suites |
+|------|--------|--------|
+| 单元测试 | 335 | 61 |
+| 验收测试 | 82 | 18 |
+| **总计** | **417** | **79** |
+
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-26，335 单元 + 82 验收 = 417 全绿。
 
 ---
 
@@ -340,7 +312,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（281 tests, 62 suites）
+pnpm test           # 编译 + 运行测试（417 tests, 79 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查

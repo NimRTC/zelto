@@ -1,0 +1,14 @@
+# .dockerignore — exclude unnecessary files from Docker build context
+
+node_modules/
+dist/
+dist-test/
+.git/
+.gitignore
+*.md
+docs/
+specs/
+tests/
+.zelto/
+policy/
+zelto-hook*

@@ -13,7 +13,6 @@ export async function generateDesign(
   const prompt = DESIGN_PROMPT.replace('{{REQUIREMENT_SPEC}}', requirementSpec);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个高级软件架构师。请严格按用户要求生成设计文档。' },
       { role: 'user', content: prompt },
@@ -39,7 +38,6 @@ export async function refineDesign(
     .replace('{{FEEDBACK}}', feedback);
 
   const response = await llm.chat({
-    model: 'deepseek-chat',
     messages: [
       { role: 'system', content: '你是一个高级软件架构师。根据反馈迭代更新设计文档。' },
       { role: 'user', content: prompt },

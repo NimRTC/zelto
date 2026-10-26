@@ -21,7 +21,7 @@ describe('ClaudeAgentAdapter', () => {
   it('has required metadata', () => {
     const adapter = new ClaudeAgentAdapter();
     assert.equal(adapter.name, 'claude-agent');
-    assert.equal(adapter.metadata.version, '1.0.0');
+    assert.equal(adapter.metadata.version, '2.0.0');
     assert.equal(adapter.metadata.capabilities.resume, false);
     assert.equal(adapter.metadata.capabilities.events, false);
   });
