@@ -12,6 +12,8 @@ export interface TraceRequirement {
 export interface TraceModule {
   name: string;
   description: string;
+  /** Other modules this module depends on (from DesignModule.dependencies) */
+  dependencies: string[];
 }
 
 /** A design that traces from a requirement */

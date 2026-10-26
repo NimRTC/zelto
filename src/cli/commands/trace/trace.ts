@@ -1,9 +1,11 @@
-// Main coordinator for the trace command (v1 — JSON output path)
-// Parses args, fetches trace data, renders output in text or JSON format.
+// Main coordinator for the trace command (v3 — supports graph and timeline rendering)
+// Parses args, fetches trace data, renders output in text, JSON, graph, or timeline format.
 
 import { parseTraceArgs, printTraceHelp } from './args.js';
 import { fetchTraceData } from './data.js';
 import { renderJsonTrace } from './json_render.js';
+import { renderDesignDepGraph } from './graph_render.js';
+import { renderTimelineTrace } from './timeline_render.js';
 import type { TraceData } from './model.js';
 import { register } from '../shared.js';
 import { ZELTO_DIR, SLICES_DIR } from '../shared.js';
@@ -75,7 +77,7 @@ function renderTextTrace(data: TraceData): void {
 
 /**
  * Main trace command handler.
- * Usage: zelto trace <requirement-id> [--json]
+ * Usage: zelto trace <requirement-id> [--json|--graph|--timeline]
  */
 export async function traceCommand(args: string[]): Promise<number> {
   const parsed = parseTraceArgs(args);
@@ -96,10 +98,31 @@ export async function traceCommand(args: string[]): Promise<number> {
     return 1;
   }
 
-  if (parsed.format === 'json') {
-    console.log(renderJsonTrace(data));
-  } else {
-    renderTextTrace(data);
+  switch (parsed.format) {
+    case 'json':
+      console.log(renderJsonTrace(data));
+      break;
+    case 'graph':
+      // Map TraceData designs to the format expected by renderDesignDepGraph
+      console.log(renderDesignDepGraph(
+        data.designs.map((d) => ({
+          id: d.id,
+          title: d.title,
+          status: d.status,
+          modules: d.modules.map((m) => ({
+            name: m.name,
+            description: m.description,
+            dependencies: [] as string[],
+          })),
+        })),
+      ));
+      break;
+    case 'timeline':
+      console.log(renderTimelineTrace(data));
+      break;
+    default:
+      renderTextTrace(data);
+      break;
   }
 
   return 0;

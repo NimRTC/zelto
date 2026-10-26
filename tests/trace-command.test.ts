@@ -25,8 +25,8 @@ function makeSampleTraceData(): TraceData {
         title: 'Auth system design',
         status: 'confirmed',
         modules: [
-          { name: 'auth', description: 'Authentication module' },
-          { name: 'session', description: 'Session management' },
+          { name: 'auth', description: 'Authentication module', dependencies: [] },
+          { name: 'session', description: 'Session management', dependencies: [] },
         ],
         plans: [
           {

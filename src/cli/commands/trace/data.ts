@@ -94,6 +94,7 @@ export async function fetchTraceData(
       modules: design.modules.map((m) => ({
         name: m.name,
         description: m.description,
+        dependencies: m.dependencies ?? [],
       })),
       plans,
     });
