@@ -466,6 +466,8 @@ ${colors.bold('Project takeover:')}
 ${colors.bold('Panoramic:')}
   trace <req-id>         Trace requirement → design → plan → slices
   impact <req-id>        Change impact analysis
+  audit <slice-id>       Show audit trail for a slice
+  snapshot [cmd]         Capture/list/show project state snapshots
 
 ${colors.bold('Other:')}
   hook --install         Install git hooks
@@ -487,7 +489,7 @@ register('completion', async (args) => {
     'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
     'stall', 'resume', 'events', 'init', 'summary', 'report',
     'require', 'design', 'plan', 'version', 'pipeline',
-    'project', 'trace', 'impact', 'hook', 'help', 'completion',
+    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'help', 'completion',
   ];
   const subcommands = {
     require: ['list', 'confirm', 'refine'],
