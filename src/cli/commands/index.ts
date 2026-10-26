@@ -14,6 +14,7 @@ import './trace/trace.js';
 import '../policy/index.js';
 import './completion.js';
 import './audit.js';
+import './snapshot.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
