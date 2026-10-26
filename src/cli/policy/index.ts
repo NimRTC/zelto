@@ -10,6 +10,8 @@ import { register } from '../commands/shared.js';
 import { listPolicyRules } from './commands/list.command.js';
 import { checkPolicy } from './commands/check.command.js';
 import { validatePolicy } from './commands/validate.command.js';
+import { addPolicyRule } from './commands/add.command.js';
+import { removePolicyRule } from './commands/remove.command.js';
 
 // ─── Subcommand dispatch ─────────────────────────────────────────────────────
 
@@ -22,15 +24,25 @@ ${'Usage:'}
   zelto policy list [--json]
   zelto policy check <path> [--operation <op>] [--json]
   zelto policy validate [--json]
+  zelto policy add <rule-id> --path <path> [--operation <op>] --action <action> --basis <basis> [options]
+  zelto policy remove <rule-id> [--json]
 
 ${'Subcommands:'}
   list      List all policy rules
   check     Check a path+operation against policy rules
   validate  Validate the policy.yaml configuration
+  add       Add a new rule to policy.yaml
+  remove    Remove a rule from policy.yaml
 
 ${'Options:'}
   --json        Output in JSON format
   --operation   Operation to check (read|write|execute); default: write
+  --path        Glob pattern for the rule (add)
+  --action      Action for the rule: allow|deny|ask (add)
+  --basis       Justification basis for the rule (add)
+  --guidance    Guidance message for the rule (add)
+  --description Human-readable description (add)
+  --priority    Rule priority, lower = higher precedence (add)
     `);
     return 0;
   }
@@ -59,6 +71,66 @@ ${'Options:'}
     const rest = args.slice(1);
     const isJson = rest.includes('--json');
     return validatePolicy({ json: isJson });
+  }
+
+  if (subcmd === 'add') {
+    const rest = args.slice(1);
+    const ruleId = rest.find((a) => !a.startsWith('--'));
+    if (!ruleId) {
+      console.error('Error: <rule-id> is required for "policy add".');
+      console.error('Usage: zelto policy add <rule-id> --path <path> [--operation <op>] --action <action> --basis <basis>');
+      return 1;
+    }
+    const pathIndex = rest.indexOf('--path');
+    const path = pathIndex !== -1 && rest[pathIndex + 1] ? rest[pathIndex + 1] : undefined;
+    if (!path) {
+      console.error('Error: --path is required for "policy add".');
+      return 1;
+    }
+    const opIndex = rest.indexOf('--operation');
+    const operation = opIndex !== -1 && rest[opIndex + 1] ? rest[opIndex + 1] : undefined;
+    const actionIndex = rest.indexOf('--action');
+    const action = actionIndex !== -1 && rest[actionIndex + 1] ? rest[actionIndex + 1] as 'allow' | 'deny' | 'ask' : undefined;
+    if (!action) {
+      console.error('Error: --action is required for "policy add".');
+      return 1;
+    }
+    const basisIndex = rest.indexOf('--basis');
+    const basis = basisIndex !== -1 && rest[basisIndex + 1] ? rest[basisIndex + 1] : undefined;
+    if (!basis) {
+      console.error('Error: --basis is required for "policy add".');
+      return 1;
+    }
+    const guidanceIndex = rest.indexOf('--guidance');
+    const guidance = guidanceIndex !== -1 && rest[guidanceIndex + 1] ? rest[guidanceIndex + 1] : undefined;
+    const descIndex = rest.indexOf('--description');
+    const description = descIndex !== -1 && rest[descIndex + 1] ? rest[descIndex + 1] : undefined;
+    const priorityIndex = rest.indexOf('--priority');
+    const priority = priorityIndex !== -1 && rest[priorityIndex + 1] ? Number.parseInt(rest[priorityIndex + 1], 10) : undefined;
+    const isJson = rest.includes('--json');
+    return addPolicyRule({
+      ruleId,
+      path,
+      operation,
+      action,
+      basis,
+      guidance,
+      description,
+      priority: priority !== undefined && !Number.isNaN(priority) ? priority : undefined,
+      json: isJson,
+    });
+  }
+
+  if (subcmd === 'remove') {
+    const rest = args.slice(1);
+    const ruleId = rest.find((a) => !a.startsWith('--'));
+    if (!ruleId) {
+      console.error('Error: <rule-id> is required for "policy remove".');
+      console.error('Usage: zelto policy remove <rule-id> [--json]');
+      return 1;
+    }
+    const isJson = rest.includes('--json');
+    return removePolicyRule({ ruleId, json: isJson });
   }
 
   console.error(`Unknown policy subcommand: "${subcmd}"`);

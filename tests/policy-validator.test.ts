@@ -281,7 +281,6 @@ describe('validatePolicyYaml', () => {
     basis: "test"
 `;
     const result = validatePolicyYaml(yaml);
-    console.error('DEBUG result:', JSON.stringify(result));
     assert.equal(result.valid, false);
     assert.ok(
       result.errors.some((e) => e.path.includes('id') || e.code === 'E_PARSE' || e.code === 'E_EMPTY'),
