@@ -179,6 +179,15 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto pipeline status` | 全链一览：需求→设计→计划→版本→切片 | 全景 |
 | `zelto trace <req-id>` | 追溯需求到下游全链路 | 全景 |
 | `zelto impact <req-id>` | 变更影响分析 | 全景 |
+| `zelto audit <slice-id>` | 查看切片审计追踪 | 全景 |
+| `zelto snapshot` | 捕获项目状态快照 | 全景 |
+| `zelto snapshot list` | 列出已保存快照 | 全景 |
+| `zelto snapshot show <id>` | 查看快照详情 | 全景 |
+| `zelto policy list [--json]` | 列出策略规则 | 策略 |
+| `zelto policy check <path>` | 检查路径是否被策略允许 | 策略 |
+| `zelto policy validate [--json]` | 验证策略 YAML 格式 | 策略 |
+| `zelto policy add <id> --path <p> --action <a> --basis <b>` | 添加策略规则 | 策略 |
+| `zelto policy remove <id>` | 删除策略规则 | 策略 |
 
 ### 3.3 独立 Hook
 
