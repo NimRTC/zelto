@@ -94,75 +94,9 @@ register('pipeline', async (args) => {
   return 0;
 });
 
-// ─── trace ───────────────────────────────────────────────────────────────────
-
-register('trace', async (args) => {
-  const reqId = args[0];
-  if (!reqId || reqId.startsWith('--')) {
-    console.error('Usage: zelto trace <requirement-id>');
-    return 1;
-  }
-
-  const reqStore = new RequirementStore(ZELTO_DIR);
-  const designStore = new DesignStore(ZELTO_DIR);
-  const versionStore = new VersionStore(ZELTO_DIR);
-  const sliceStore = new SliceStore(SLICES_DIR);
-
-  if (!(await reqStore.exists(reqId))) {
-    console.error(`Requirement "${reqId}" not found.`);
-    return 1;
-  }
-
-  const req = await reqStore.read(reqId);
-  console.log(`📋 Trace for: ${req.id}  "${req.title}"  (${req.status})`);
-  console.log(`   Acceptance Criteria: ${req.acceptanceCriteria.length}`);
-  console.log('');
-
-  const allDesigns = await designStore.list();
-  const matchingDesigns = allDesigns.filter((d) => d.requirementId === reqId);
-
-  if (matchingDesigns.length === 0) {
-    console.log('   No designs trace to this requirement.');
-    return 0;
-  }
-
-  for (const ds of matchingDesigns) {
-    const design = await designStore.read(ds.id);
-    const designIcon = design.status === 'confirmed' ? '✅' : '📝';
-    console.log(`   ${designIcon} Design: ${design.id}  "${design.title}"  (${design.status})`);
-    console.log(`      Modules: ${design.modules.map((m) => m.name).join(', ')}`);
-
-    const allPlans = await versionStore.list();
-    const matchingPlans = (await Promise.all(
-      allPlans.map((p) => versionStore.read(p.id)),
-    )).filter((p) => p.designId === design.id);
-
-    if (matchingPlans.length === 0) {
-      console.log('      └── No plan traces to this design.');
-      continue;
-    }
-
-    for (const plan of matchingPlans) {
-      const planIcon = plan.status === 'confirmed' ? '✅' : '📝';
-      console.log(`      ${planIcon} Plan: ${plan.id}  "${plan.title}"  (${plan.status})`);
-
-      for (const v of plan.versions) {
-        console.log(`         ${v.version}  (${v.status}):`);
-
-        for (const s of v.slices) {
-          let sliceState = '—';
-          try {
-            const sd = await sliceStore.read(s.id);
-            sliceState = sd.state;
-          } catch { /* not created */ }
-          console.log(`           ${s.id}  (${sliceState})  ${s.title}  [module: ${s.module}]`);
-        }
-      }
-    }
-  }
-
-  return 0;
-});
+// ─── trace — delegated to src/cli/commands/trace/trace.ts ────────────────────
+// The trace command is now implemented in the modular trace/ directory.
+// Registration happens in trace/trace.ts via register('trace', ...).
 
 // ─── impact ──────────────────────────────────────────────────────────────────
 

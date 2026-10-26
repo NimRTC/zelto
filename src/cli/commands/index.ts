@@ -10,6 +10,7 @@ import './gate-sign.js';
 import './info-help.js';
 import './ai-pipeline.js';
 import './panoramic-project.js';
+import './trace/trace.js';
 import './completion.js';
 
 export async function runCLI(argv: string[]): Promise<number> {

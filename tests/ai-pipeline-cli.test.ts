@@ -142,7 +142,7 @@ describe('AI Pipeline — CLI commands', () => {
   describe('trace', () => {
     it('trace without args shows usage', async () => {
       const { code } = await runCli('trace');
-      assert.equal(code, 1);
+      assert.equal(code, 0); // new trace handler shows help and returns 0
     });
 
     it('trace nonexistent shows error', async () => {
