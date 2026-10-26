@@ -1,0 +1,19 @@
+# {{title}}
+
+{{#if metadata.author}}*Author: {{metadata.author}}*{{/if}}
+{{#if metadata.version}}*Version: {{metadata.version}}*{{/if}}
+{{#if metadata.description}}
+
+{{metadata.description}}
+{{/if}}
+
+*Generated: {{generatedAt}}*
+
+---
+
+{{#each sections}}
+{{#repeat level}}#{{/repeat}} {{heading}}
+
+{{content}}
+
+{{/each}}

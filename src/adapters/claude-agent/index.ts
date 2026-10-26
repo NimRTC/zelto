@@ -109,7 +109,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     this.agentCommand = options.agentCommand ?? 'npx claude-code';
     this.cwd = options.cwd ?? process.cwd();
     this.env = options.env ?? process.env;
-    this.timeoutMs = options.timeoutMs ?? 300_000; // 5 minutes default
+    this.timeoutMs = options.timeoutMs ?? 900_000; // 15 minutes default
     this.maxRetries = options.maxRetries ?? 2;
     // Detect if the command is Claude Code (npx or direct binary)
     this.useClaudeCodeFlags = /claude(-code)?\b/.test(this.agentCommand);

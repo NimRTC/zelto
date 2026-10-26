@@ -1,153 +1,213 @@
-// Report generator — produces Markdown or JSON project status reports
-// from analyzed report data.
+import { renderTemplate } from "./markdown-generator.js";
+import type { ReportData } from "./report-analyzer.js";
 
-import type { ReportData, SliceStatusDistribution, VersionProgress, GateStats, EventStats, AnomalousSlice } from './report-analyzer.js';
+/**
+ * A section of a report with a heading, content, and heading level.
+ */
+export interface Section {
+  /** The heading text */
+  heading: string;
+  /** The body content (markdown) */
+  content: string;
+  /** Heading level (1 = #, 2 = ##, etc.) */
+  level: number;
+}
 
-export type ReportFormat = 'markdown' | 'json';
+/**
+ * Metadata associated with a report.
+ */
+export interface ReportMetadata {
+  /** Report author */
+  author?: string;
+  /** Version string */
+  version?: string;
+  /** Short description */
+  description?: string;
+  /** Additional metadata fields */
+  [key: string]: unknown;
+}
 
-export function generateReport(data: ReportData, format: ReportFormat): string {
-  switch (format) {
-    case 'markdown':
-      return generateMarkdown(data);
-    case 'json':
-      return generateJson(data);
+/**
+ * A generated report with title, sections, metadata, and timestamp.
+ */
+export interface Report {
+  /** Report title */
+  title: string;
+  /** Report sections */
+  sections: Section[];
+  /** Report metadata */
+  metadata: ReportMetadata;
+  /** ISO timestamp when the report was generated */
+  generatedAt: string;
+}
+
+/**
+ * Generates structured reports from input data.
+ */
+export class ReportGenerator {
+  /**
+   * Generate a Report object from input data.
+   *
+   * @param data - Raw data to convert into a report
+   * @returns A structured Report object
+   */
+  generate(data: {
+    title: string;
+    sections: Array<{ heading: string; content: string; level?: number }>;
+    metadata?: Record<string, unknown>;
+  }): Report {
+    const sections: Section[] = data.sections.map((s) => ({
+      heading: s.heading,
+      content: s.content,
+      level: s.level ?? 1,
+    }));
+
+    return {
+      title: data.title,
+      sections,
+      metadata: {
+        author: undefined,
+        version: undefined,
+        description: undefined,
+        ...(data.metadata ?? {}),
+      },
+      generatedAt: new Date().toISOString(),
+    };
   }
 }
 
-function generateMarkdown(data: ReportData): string {
+/**
+ * Renders a Report into markdown using a template.
+ */
+export class MarkdownGenerator {
+  /**
+   * Render a Report to a markdown string.
+   *
+   * @param report - The Report to render
+   * @returns Markdown string
+   */
+  render(report: Report): string {
+    return renderTemplate("templates/report.hbs", {
+      title: report.title,
+      sections: report.sections,
+      metadata: report.metadata,
+      generatedAt: report.generatedAt,
+    });
+  }
+}
+
+// ─── Legacy API (used by CLI `zelto report` command) ─────────────────────────
+
+export type ReportFormat = 'markdown' | 'json';
+
+function renderReportDataMarkdown(data: ReportData): string {
   const lines: string[] = [];
 
-  lines.push(`# 项目状态报告`);
+  lines.push(`# ${data.project.name} — Status Report`);
+  lines.push(`*Generated: ${data.project.generatedAt}*`);
   lines.push('');
-  lines.push(`**生成时间**: ${new Date(data.project.generatedAt).toLocaleString()}`);
-  lines.push(`**项目**: ${data.project.name}`);
-  lines.push('');
-
-  // ── 1. 需求与设计概览 ──
-  lines.push('## 1. 需求与设计概览');
-  lines.push('');
-  lines.push('| 类型 | 总计 | 已确认 | 草稿 |');
-  lines.push('|------|------|--------|------|');
-  lines.push(`| 需求 | ${data.requirements.total} | ${data.requirements.confirmed} | ${data.requirements.draft} |`);
-  lines.push(`| 设计 | ${data.designs.total} | ${data.designs.confirmed} | ${data.designs.draft} |`);
-  lines.push(`| 计划 | ${data.plans.total} | ${data.plans.confirmed} | ${data.plans.draft} |`);
+  lines.push('---');
   lines.push('');
 
-  // ── 2. 切片状态分布 ──
-  lines.push('## 2. 切片状态分布');
+  // Requirements
+  lines.push('## Requirements');
   lines.push('');
-  const s = data.slices;
-  lines.push(`**总计**: ${s.total} 个切片`);
-  lines.push('');
-  lines.push('| 状态 | 数量 | 占比 |');
-  lines.push('|------|------|------|');
-  for (const [state, count] of Object.entries(getStateDistribution(s))) {
-    const pct = s.total > 0 ? ((count / s.total) * 100).toFixed(1) : '0.0';
-    lines.push(`| ${stateLabel(state)} | ${count} | ${pct}% |`);
-  }
+  lines.push(`- Total: ${data.requirements.total}`);
+  lines.push(`- Confirmed: ${data.requirements.confirmed}`);
+  lines.push(`- Draft: ${data.requirements.draft}`);
   lines.push('');
 
-  // ── 3. 版本进度 ──
-  lines.push('## 3. 版本进度');
+  // Designs
+  lines.push('## Designs');
   lines.push('');
-  for (const v of data.versions) {
-    const pct = v.totalSlices > 0 ? ((v.completedSlices / v.totalSlices) * 100).toFixed(0) : '0';
-    lines.push(`### ${v.version} — ${v.description}`);
+  lines.push(`- Total: ${data.designs.total}`);
+  lines.push(`- Confirmed: ${data.designs.confirmed}`);
+  lines.push(`- Draft: ${data.designs.draft}`);
   lines.push('');
-    lines.push(`- **状态**: ${v.status}`);
-    lines.push(`- **切片进度**: ${v.completedSlices}/${v.totalSlices} (${pct}%)`);
+
+  // Plans
+  lines.push('## Plans');
+  lines.push('');
+  lines.push(`- Total: ${data.plans.total}`);
+  lines.push(`- Confirmed: ${data.plans.confirmed}`);
+  lines.push(`- Draft: ${data.plans.draft}`);
+  lines.push('');
+
+  // Slices
+  lines.push('## Slices');
+  lines.push('');
+  lines.push(`- Total: ${data.slices.total}`);
+  lines.push(`- Draft: ${data.slices.draft}`);
+  lines.push(`- Clarifying: ${data.slices.clarifying}`);
+  lines.push(`- Frozen: ${data.slices.frozen}`);
+  lines.push(`- Running: ${data.slices.running}`);
+  lines.push(`- Completed: ${data.slices.completed}`);
+  lines.push(`- Abandoned: ${data.slices.abandoned}`);
+  lines.push('');
+
+  // Versions
+  if (data.versions.length > 0) {
+    lines.push('## Versions');
     lines.push('');
-    lines.push('| 切片 | 状态 |');
-    lines.push('|------|------|');
-    for (const [sliceId, state] of Object.entries(v.sliceStates)) {
-      lines.push(`| ${sliceId} | ${stateLabel(state)} |`);
+    for (const v of data.versions) {
+      lines.push(`### ${v.version} — ${v.description}`);
+      lines.push('');
+      lines.push(`- Status: ${v.status}`);
+      lines.push(`- Slices: ${v.completedSlices}/${v.totalSlices} completed`);
+      lines.push('');
+    }
+  }
+
+  // Gate stats
+  if (data.gates.total > 0) {
+    lines.push('## Gate Results');
+    lines.push('');
+    lines.push(`- Passed: ${data.gates.passed}`);
+    lines.push(`- Failed: ${data.gates.failed}`);
+    lines.push(`- Pass Rate: ${(data.gates.passRate * 100).toFixed(1)}%`);
+    lines.push('');
+  }
+
+  // Events
+  lines.push('## Events');
+  lines.push('');
+  lines.push(`- Total Events: ${data.events.total}`);
+  lines.push('');
+  if (data.events.recent.length > 0) {
+    lines.push('### Recent Events');
+    lines.push('');
+    lines.push('| Timestamp | Type | Slice |');
+    lines.push('|-----------|------|-------|');
+    for (const e of data.events.recent) {
+      lines.push(`| ${e.ts.slice(0, 19)} | ${e.type} | ${e.slice} |`);
     }
     lines.push('');
   }
 
-  // ── 4. 门禁通过率 ──
-  lines.push('## 4. 门禁通过率');
-  lines.push('');
-  const g = data.gates;
-  if (g.total > 0) {
-    lines.push(`| 项目 | 数值 |`);
-    lines.push(`|------|------|`);
-    lines.push(`| 通过 | ${g.passed} |`);
-    lines.push(`| 失败 | ${g.failed} |`);
-    lines.push(`| 总计 | ${g.total} |`);
-    lines.push(`| 通过率 | ${(g.passRate * 100).toFixed(1)}% |`);
-  } else {
-    lines.push('暂无门禁记录。');
-  }
-  lines.push('');
-
-  // ── 5. 事件统计 ──
-  lines.push('## 5. 事件统计');
-  lines.push('');
-  const e = data.events;
-  lines.push(`**事件总量**: ${e.total}`);
-  lines.push('');
-  lines.push('| 事件类型 | 数量 |');
-  lines.push('|----------|------|');
-  const sortedTypes = Object.entries(e.byType).sort((a, b) => b[1] - a[1]);
-  for (const [type, count] of sortedTypes) {
-    lines.push(`| \`${type}\` | ${count} |`);
-  }
-  lines.push('');
-
-  if (e.recent.length > 0) {
-    lines.push('### 最近事件');
+  // Anomalies
+  if (data.anomalies.length > 0) {
+    lines.push('## Anomalies');
     lines.push('');
-    for (const ev of e.recent) {
-      lines.push(`- \`${ev.type}\` — ${ev.slice} (${new Date(ev.ts).toLocaleString()})`);
-    }
-    lines.push('');
-  }
-
-  // ── 6. 异常切片 ──
-  lines.push('## 6. 异常切片');
-  lines.push('');
-  if (data.anomalies.length === 0) {
-    lines.push('✅ 无异常切片。');
-  } else {
-    lines.push('| 切片 | 状态 | 最后更新 | 最近事件 |');
-    lines.push('|------|------|----------|----------|');
     for (const a of data.anomalies) {
-      lines.push(`| ${a.id} | ${stateLabel(a.state)} | ${new Date(a.updatedAt).toLocaleString()} | ${a.lastEvent ?? '—'} |`);
+      lines.push(`- **${a.id}** (${a.state}): ${a.reason}`);
     }
+    lines.push('');
   }
-  lines.push('');
 
   return lines.join('\n');
 }
 
-function generateJson(data: ReportData): string {
-  return JSON.stringify(data, null, 2);
-}
-
-function getStateDistribution(s: SliceStatusDistribution): Record<string, number> {
-  return {
-    draft: s.draft,
-    clarifying: s.clarifying,
-    frozen: s.frozen,
-    running: s.running,
-    completed: s.completed,
-    abandoned: s.abandoned,
-  };
-}
-
-function stateLabel(state: string): string {
-  const labels: Record<string, string> = {
-    draft: '📝 草稿',
-    clarifying: '❓ 澄清中',
-    frozen: '❄️ 已冻结',
-    running: '🔄 运行中',
-    completed: '✅ 已完成',
-    abandoned: '🗑️ 已废弃',
-    planned: '⏳ 已规划',
-    in_progress: '🔄 进行中',
-    integrated: '✅ 已集成',
-    delivered: '🚀 已交付',
-  };
-  return labels[state] ?? state;
+/**
+ * Generate a report string from analyzed data.
+ * Legacy API used by the CLI `zelto report` command.
+ *
+ * @param data - Analyzed report data
+ * @param format - Output format ('markdown' | 'json')
+ * @returns Formatted report string
+ */
+export function generateReport(data: ReportData, format: ReportFormat): string {
+  if (format === 'json') {
+    return JSON.stringify(data, null, 2);
+  }
+  return renderReportDataMarkdown(data);
 }

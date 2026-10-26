@@ -43,6 +43,7 @@ export interface AnomalousSlice {
   id: string;
   title: string;
   state: string;
+  reason: string;
   updatedAt: string;
   lastEvent: string | null;
 }
@@ -127,8 +128,6 @@ export async function analyzeReport(
       }
     }
   }
-  // Also count GATE_PASS transitions in slice events
-  // (gate.result events may not always be recorded, so also check slice state)
   const gates: GateStats = {
     passed: gatePassed,
     failed: gateFailed,
@@ -173,6 +172,7 @@ export async function analyzeReport(
         id: s.id,
         title: s.title,
         state: s.state,
+        reason,
         updatedAt: s.updatedAt,
         lastEvent,
       });
