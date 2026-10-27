@@ -11,7 +11,7 @@ import { store, events, ZELTO_DIR, loadConfig } from './shared.js';
 
 register('gate', async (args) => {
   const [id] = args;
-  if (!id) {
+  if (!id || id === '--help' || id === '-h') {
     console.error('Usage: zelto gate <slice-id> [--retry <N>]');
     return 1;
   }

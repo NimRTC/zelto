@@ -137,6 +137,12 @@ async function pruneSlices(): Promise<number> {
 register('create', async (args) => {
   let [id] = args;
 
+  // Show usage for --help
+  if (id === '--help' || id === '-h') {
+    console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>]');
+    return 0;
+  }
+
   // Interactive mode: prompt for values if not provided
   if (!id || id.startsWith('--')) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
