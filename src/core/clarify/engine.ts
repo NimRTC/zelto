@@ -1,6 +1,10 @@
 // Clarify dialogue engine — asks structured questions during slice clarification
 // C2: core/ no SDK dependencies
 // C7: llm/ output is only drafts/suggestions, never decisions
+//
+// The engine accepts an optional llmQuestionGenerator callback for LLM-powered
+// question generation. This keeps core/ free of llm/ imports (C6) while allowing
+// the CLI layer to wire in LLM-powered question generation.
 
 import type { SliceData } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
@@ -30,18 +34,49 @@ export interface ClarifyAnswer {
   answeredBy: string;
 }
 
+/**
+ * Optional callback for LLM-powered question generation.
+ * core/ defines the type; the CLI layer wires in the implementation from llm/.
+ * Returns null/empty to fall back to rule-based generation.
+ */
+export type LlmQuestionGenerator = (
+  slice: SliceData,
+  round: number,
+) => Promise<ClarifyQuestion[] | null>;
+
 export class ClarifyEngine {
   private readonly events: EventStream;
+  private readonly llmGenerator: LlmQuestionGenerator | null;
 
-  constructor(events: EventStream) {
+  constructor(events: EventStream, llmGenerator?: LlmQuestionGenerator | null) {
     this.events = events;
+    this.llmGenerator = llmGenerator ?? null;
   }
 
   /**
    * Generate questions based on slice data gaps.
-   * This is a rule-based fallback; an LLM-powered version can provide richer questions.
+   * If an LLM generator is configured, it is called first for richer questions.
+   * Falls back to rule-based generation if LLM returns nothing or is unavailable.
    */
-  generateQuestions(slice: SliceData, round: number): ClarifyRound {
+  async generateQuestions(slice: SliceData, round: number): Promise<ClarifyRound> {
+    // Try LLM-powered generation first
+    if (this.llmGenerator) {
+      try {
+        const llmQuestions = await this.llmGenerator(slice, round);
+        if (llmQuestions && llmQuestions.length > 0) {
+          return {
+            round,
+            questions: llmQuestions,
+            converged: false,
+            unresolved: llmQuestions.map((q) => q.id),
+          };
+        }
+      } catch {
+        // LLM failed — fall through to rule-based
+      }
+    }
+
+    // Rule-based fallback
     const questions: ClarifyQuestion[] = [];
 
     // Check for missing requirements trace
@@ -180,7 +215,7 @@ export class ClarifyEngine {
     actor: string = 'zelto',
     selfAnswer: boolean = false,
   ): Promise<ClarifyRound> {
-    const result = this.generateQuestions(slice, round);
+    const result = await this.generateQuestions(slice, round);
 
     // Log questions to event stream
     for (const q of result.questions) {

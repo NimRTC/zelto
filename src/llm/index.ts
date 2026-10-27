@@ -4,3 +4,5 @@ export { generateRequirements, refineRequirements } from './generators/requireme
 export { generateDesign, refineDesign } from './generators/design.js';
 export { generateSlicePlan, generateVersion } from './generators/slice-plan.js';
 export { generateProjectDesign } from './generators/project-design.js';
+export { generateClarifyQuestions } from './generators/clarify.js';
+export type { LlmClarifyQuestion } from './generators/clarify.js';

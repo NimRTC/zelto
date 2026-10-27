@@ -20,7 +20,7 @@ function extractFlagValue(args: string[], flag: string): string | undefined {
   return parts.length > 0 ? parts.join(' ') : undefined;
 }
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
-import { ClarifyEngine } from '../../core/clarify/engine.js';
+import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
 import { BudgetCollector } from '../../core/budget/collector.js';
 import { GateExecutor } from '../../core/gate/executor.js';
@@ -28,7 +28,8 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import { register } from './shared.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig } from './shared.js';
+import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -331,7 +332,29 @@ register('clarify', async (args) => {
       return 1;
     }
 
-    const engine = new ClarifyEngine(events);
+    // Create LLM-powered question generator if LLM is configured
+    const llm = createLlmFromConfig();
+    const llmGenerator: LlmQuestionGenerator | null = llm
+      ? async (s, round) => {
+          const questions = await generateClarifyQuestions(llm, {
+            id: s.id,
+            title: s.title,
+            writes: s.writes,
+            requirements: s.trace.requirements,
+            contracts: s.trace.contracts,
+            tests: s.trace.tests,
+            acceptanceDir: s.acceptance.dir,
+            oracleSrc: s.acceptance.oracleSrc,
+          }, round);
+          if (questions.length === 0) return null;
+          return questions.map((q) => ({
+            ...q,
+            selfAnswered: false,
+          }));
+        }
+      : null;
+
+    const engine = new ClarifyEngine(events, llmGenerator);
 
     if (slice.state === 'draft') {
       if (!isDryRun) {
@@ -351,7 +374,7 @@ register('clarify', async (args) => {
     const round = (current.runs?.length ?? 0) + 1;
 
     if (isAuto || isDryRun) {
-      const result = engine.generateQuestions(current, round);
+      const result = await engine.generateQuestions(current, round);
 
       if (result.converged) {
         console.log('  ✅ No open questions — slice is already complete.');
@@ -401,7 +424,7 @@ register('clarify', async (args) => {
     }
 
     // Interactive mode
-    const result = engine.generateQuestions(current, round);
+    const result = await engine.generateQuestions(current, round);
 
     if (result.converged) {
       console.log('  ✅ No open questions — slice is already complete.');
