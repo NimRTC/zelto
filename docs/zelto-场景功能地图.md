@@ -188,6 +188,8 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto policy validate [--json]` | 验证策略 YAML 格式 | 策略 |
 | `zelto policy add <id> --path <p> --action <a> --basis <b>` | 添加策略规则 | 策略 |
 | `zelto policy remove <id>` | 删除策略规则 | 策略 |
+| `zelto policy edit <id> [--path <p>] [--action <a>] ...` | 编辑已有策略规则 | 策略 |
+| `zelto completion bash\|zsh\|fish` | 生成 shell 补全脚本 | 通用 |
 
 ### 3.3 独立 Hook
 
@@ -268,13 +270,13 @@ zelto/
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
 │   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现（37 个命令）
+│   ├── cli/               CLI 命令实现（42+ 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（15 suites）
+│   ├── acceptance/        验收测试（21 suites）
 │   │   ├── e2e-full-cycle/  端到端全生命周期测试
 │   │   ├── events-command/  事件命令验收测试
 │   │   ├── admit-command/   准入命令验收测试
@@ -295,11 +297,11 @@ zelto/
 
 | 类别 | 测试数 | Suites |
 |------|--------|--------|
-| 单元测试 | 335 | 61 |
-| 验收测试 | 82 | 18 |
-| **总计** | **417** | **79** |
+| 单元测试 | 423 | 91 |
+| 验收测试 | 128 | 27 |
+| **总计** | **551** | **118** |
 
-> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-26，335 单元 + 82 验收 = 417 全绿。
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-27，423 单元 + 128 验收 = 551 全绿。
 
 ---
 
@@ -321,7 +323,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（417 tests, 79 suites）
+pnpm test           # 编译 + 运行测试（551 tests, 118 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
