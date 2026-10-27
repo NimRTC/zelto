@@ -4,9 +4,9 @@
 import { register } from './shared.js';
 
 const COMMANDS = [
-  'create', 'slices', 'check', 'clarify', 'freeze', 'run', 'start',
+  'create', 'slices', 'slice', 'check', 'clarify', 'freeze', 'run', 'start',
   'admit', 'diff', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
-  'stall', 'resume', 'events', 'init', 'summary', 'report',
+  'stall', 'resume', 'events', 'init', 'summary', 'report', 'config',
   'require', 'design', 'plan', 'version', 'pipeline',
   'project', 'trace', 'impact', 'audit', 'snapshot', 'policy',
   'hook', 'help', 'completion',
@@ -19,16 +19,21 @@ const SUBCOMMANDS: Record<string, string[]> = {
   version: ['status', 'start', 'deliver'],
   project: ['scan', 'init', 'design', 'slice', 'status'],
   sign: ['--approve', '--reject'],
-  policy: ['list', 'check', 'validate', 'add', 'remove', 'edit'],
+  policy: ['list', 'show', 'check', 'validate', 'add', 'remove', 'edit'],
   hook: ['--install', '--uninstall', '--status'],
   stall: ['--auto-resolved'],
   snapshot: ['list', 'show'],
   run: ['--dry-run', '--agent'],
-  start: ['--title', '--writes', '--agent'],
+  start: ['--title', '--writes', '--agent', '--yes'],
   create: ['--title', '--writes'],
+  slice: ['--json'],
+  config: ['get', 'set'],
   clarify: ['--auto', '--dry-run'],
   report: ['--format'],
   completion: ['bash', 'zsh', 'fish'],
+  gate: ['--retry', '--dry-run', '--json'],
+  trace: ['--json', '--graph', '--timeline', '--slice'],
+  init: ['--force', '--with-examples'],
 };
 
 register('completion', async (args) => {

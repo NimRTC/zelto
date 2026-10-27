@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.2.0 · 最后更新: 2026-10-26（文档同步至代码当前状态）
+> 版本: v0.2.0 · 最后更新: 2026-10-27（文档同步至代码当前状态）
 
 ---
 
@@ -141,25 +141,26 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 | 命令 | 用途 | 对应流程阶段 |
 |---|---|---|
-| `zelto init` | 初始化 `.zelto/` 运行时目录 | 通用 |
-| `zelto slices` | 列出所有切片 | 通用 |
-| `zelto create <id>` | 创建新切片 | create |
+| `zelto init [--with-examples]` | 初始化 `.zelto/` 运行时目录 | 通用 |
+| `zelto config [get\|set] [key] [value]` | 查看/修改配置 | 通用 |
+| `zelto slices [--active] [--json]` | 列出所有切片 | 通用 |
+| `zelto slice <id> [--json]` | 查看切片详情 | 通用 |
+| `zelto create <id> [--json]` | 创建新切片 | create |
 | `zelto next` | 推荐下一步动作 | 通用 |
-| `zelto check <id>` | 门禁① 确定性检查 | freeze 前 |
-| `zelto clarify <id>` | 澄清切片规格 | clarify |
-| `zelto freeze <id>` | 冻结切片基线 | freeze |
-| `zelto start <id>` | 一键执行：create→check→freeze→run | run |
-| `zelto run <id>` | 执行切片（含并行准入） | run |
-| `zelto run <id> --dry-run` | 模拟准入检查 | run 前 |
-| `zelto admit <id>` | 准入检查 | run 前 |
-| `zelto gate <id>` | 门禁② 验收测试 | gate |
+| `zelto check <id> [--json]` | 门禁① 确定性检查 | freeze 前 |
+| `zelto clarify <id> [--auto] [--dry-run]` | 澄清切片规格 | clarify |
+| `zelto freeze <id> [--json]` | 冻结切片基线 | freeze |
+| `zelto start <id> [--yes] [--agent <name>]` | 一键执行：create→check→freeze→run | run |
+| `zelto run <id> [--dry-run] [--agent <name>] [--json]` | 执行切片（含并行准入） | run |
+| `zelto admit <id> [--json]` | 准入检查 | run 前 |
+| `zelto gate <id> [--dry-run] [--retry <N>] [--json]` | 门禁② 验收测试 | gate |
 | `zelto inbox` | 待签名队列 | sign 前 |
-| `zelto sign <id> --approve` | 审批切片 | sign |
-| `zelto sign <id> --reject` | 拒绝切片 | sign |
+| `zelto sign <id> --approve [--json]` | 审批切片 | sign |
+| `zelto sign <id> --reject [--json]` | 拒绝切片 | sign |
 | `zelto abandon <id>` | 废弃切片 | 通用 |
-| `zelto events <id>` | 查看切片事件流 | 通用 |
+| `zelto events <id> [--json] [--tail <N>]` | 查看切片事件流 | 通用 |
 | `zelto summary` | 项目概况 | 通用 |
-| `zelto help` | 帮助 | 通用 |
+| `zelto help [<cmd>]` | 帮助 / 查看特定命令帮助 | 通用 |
 | `zelto stall [id] [--auto-resolved]` | 列出 stalled slices / 查看详情 | 通用 |
 | `zelto resume <id> [--skip\|--abandon]` | 恢复 stalled slice | run |
 | `zelto require <text>` | 用自然语言创建需求文档 | AI pipeline |
@@ -177,17 +178,19 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto version start <ver>` | 执行版本切片（agent 并行） | AI pipeline |
 | `zelto version deliver <ver>` | 标记版本为已交付 | AI pipeline |
 | `zelto pipeline status` | 全链一览：需求→设计→计划→版本→切片 | 全景 |
-| `zelto trace <req-id>` | 追溯需求到下游全链路 | 全景 |
+| `zelto trace <req-id> [--json\|--graph\|--timeline]` | 追溯需求到下游全链路 | 全景 |
 | `zelto impact <req-id>` | 变更影响分析 | 全景 |
-| `zelto audit <slice-id>` | 查看切片审计追踪 | 全景 |
+| `zelto audit <slice-id> [--json]` | 查看切片审计追踪 | 全景 |
+| `zelto diff <slice-id> [--stat] [--json]` | 查看切片变更差异 | 全景 |
 | `zelto snapshot` | 捕获项目状态快照 | 全景 |
-| `zelto snapshot list` | 列出已保存快照 | 全景 |
+| `zelto snapshot list [--json]` | 列出已保存快照 | 全景 |
 | `zelto snapshot show <id>` | 查看快照详情 | 全景 |
 | `zelto policy list [--json]` | 列出策略规则 | 策略 |
-| `zelto policy check <path>` | 检查路径是否被策略允许 | 策略 |
+| `zelto policy show <id> [--json]` | 查看单个策略规则 | 策略 |
+| `zelto policy check <path> [--json]` | 检查路径是否被策略允许 | 策略 |
 | `zelto policy validate [--json]` | 验证策略 YAML 格式 | 策略 |
 | `zelto policy add <id> --path <p> --action <a> --basis <b>` | 添加策略规则 | 策略 |
-| `zelto policy remove <id>` | 删除策略规则 | 策略 |
+| `zelto policy remove <id> [--json]` | 删除策略规则 | 策略 |
 | `zelto policy edit <id> [--path <p>] [--action <a>] ...` | 编辑已有策略规则 | 策略 |
 | `zelto completion bash\|zsh\|fish` | 生成 shell 补全脚本 | 通用 |
 
@@ -270,19 +273,19 @@ zelto/
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
 │   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现（42+ 个命令）
+│   ├── cli/               CLI 命令实现（45+ 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（21 suites）
+│   ├── acceptance/        验收测试（27 suites）
 │   │   ├── e2e-full-cycle/  端到端全生命周期测试
 │   │   ├── events-command/  事件命令验收测试
 │   │   ├── admit-command/   准入命令验收测试
 │   │   ├── event-emission/  事件发射验收测试
-│   │   ├── ... (15 acceptance test suites total)
-│   ├── *.test.ts          单元测试（33 个文件）
+│   │   ├── ... (19 acceptance test suites total)
+│   ├── *.test.ts          单元测试（44 个文件）
 │   └── ...
 └── .zelto/                运行时状态
     ├── slices/            切片文件
@@ -297,11 +300,11 @@ zelto/
 
 | 类别 | 测试数 | Suites |
 |------|--------|--------|
-| 单元测试 | 423 | 91 |
-| 验收测试 | 128 | 27 |
-| **总计** | **551** | **118** |
+| 单元测试 | 456 | 91 |
+| 验收测试 | 148 | 27 |
+| **总计** | **604** | **118** |
 
-> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-27，423 单元 + 128 验收 = 551 全绿。
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-27，456 单元 + 148 验收 = 604 全绿。
 
 ---
 
@@ -323,7 +326,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（551 tests, 118 suites）
+pnpm test           # 编译 + 运行测试（604 tests, 118 suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查

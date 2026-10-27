@@ -12,10 +12,12 @@ import { store, events, ZELTO_DIR, loadConfig } from './shared.js';
 register('gate', async (args) => {
   const [id] = args;
   if (!id || id === '--help' || id === '-h') {
-    console.error('Usage: zelto gate <slice-id> [--retry <N>]');
+    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run]');
     return 1;
   }
 
+  const isJson = args.includes('--json');
+  const isDryRun = args.includes('--dry-run');
   const retryFlag = args.indexOf('--retry');
   const forceRetry = retryFlag >= 0 && args[retryFlag + 1] ? Math.max(0, parseInt(args[retryFlag + 1], 10) || 0) : -1;
 
@@ -26,8 +28,12 @@ register('gate', async (args) => {
         // Force re-run gate on any state
         console.log(`zelto gate ${id} — re-running gate② (forced, state=${slice.state})...`);
       } else {
-        console.error(`Slice "${id}" is in state "${slice.state}". Must be "frozen" to run gate.`);
-        console.error(`  Use --retry <N> to force re-run regardless of state.`);
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, passed: false, error: `Slice is in state "${slice.state}", must be "frozen"` }));
+        } else {
+          console.error(`Slice "${id}" is in state "${slice.state}". Must be "frozen" to run gate.`);
+          console.error(`  Use --retry <N> to force re-run regardless of state.`);
+        }
         return 1;
       }
     } else {
@@ -35,6 +41,28 @@ register('gate', async (args) => {
     }
 
     const config = loadConfig();
+
+    // Dry run: show what would be executed
+    if (isDryRun) {
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, dryRun: true,
+          commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+          timeoutSec: config.gate.timeoutSec,
+          retry: config.gate.retry,
+        }));
+      } else {
+        console.log(`  Dry-run for gate ${id}:`);
+        console.log(`  Commands: ${config.gate.commands.length}`);
+        for (const c of config.gate.commands) {
+          console.log(`    - ${c.name}: ${c.run}`);
+        }
+        console.log(`  Timeout: ${config.gate.timeoutSec}s`);
+        console.log(`  Retries: ${config.gate.retry.max}`);
+        console.log(`\n  Run without --dry-run to execute.`);
+      }
+      return 0;
+    }
 
     const gateConfig = {
       commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
@@ -45,6 +73,18 @@ register('gate', async (args) => {
 
     const executor = new GateExecutor(store, events, gateConfig);
     const report = await executor.execute(id);
+
+    if (isJson) {
+      console.log(JSON.stringify({
+        sliceId: id, passed: report.passed,
+        commands: report.results.map((r) => ({
+          command: r.command, passed: r.passed, exitCode: r.exitCode, durationMs: r.durationMs,
+        })),
+        retryCount: report.retryCount,
+        totalDurationMs: report.totalDurationMs,
+      }));
+      return report.passed ? 0 : 1;
+    }
 
     console.log(`  Commands: ${report.results.length}`);
     for (const r of report.results) {
@@ -74,7 +114,11 @@ register('gate', async (args) => {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error running gate for "${id}": ${msg}`);
+    if (isJson) {
+      console.log(JSON.stringify({ sliceId: id, error: msg }));
+    } else {
+      console.error(`Error running gate for "${id}": ${msg}`);
+    }
     return 1;
   }
   return 0;
@@ -239,6 +283,7 @@ register('sign', async (args) => {
     return 1;
   }
 
+  const isJson = args.includes('--json');
   const signManager = new SignManager(ZELTO_DIR, events, store);
   const commentIndex = args.indexOf('--comment');
   const comment = commentIndex >= 0 ? args[commentIndex + 1] : null;
@@ -250,31 +295,55 @@ register('sign', async (args) => {
       if (!req) {
         const newReq = await signManager.request(id, 'human');
         await signManager.approve(newReq.id, 'human', comment);
-        console.log(`zelto sign ${id} -- ✅ Approved (auto-requested)`);
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'approved', autoRequested: true }));
+        } else {
+          console.log(`zelto sign ${id} -- ✅ Approved (auto-requested)`);
+        }
       } else {
         await signManager.approve(req.id, 'human', comment);
-        console.log(`zelto sign ${id} -- ✅ Approved`);
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'approved' }));
+        } else {
+          console.log(`zelto sign ${id} -- ✅ Approved`);
+        }
       }
 
       // Auto-merge: stage, commit, and merge to main
-      await autoMergeSlice(id);
+      if (!isJson) await autoMergeSlice(id);
     } else if (action === '--reject') {
       const pending = await signManager.list('pending');
       const req = pending.find((r) => r.sliceId === id);
       if (!req) {
-        console.error(`No pending sign request for slice "${id}".`);
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'rejected', error: 'No pending sign request' }));
+        } else {
+          console.error(`No pending sign request for slice "${id}".`);
+        }
         return 1;
       }
       await signManager.reject(req.id, 'human', comment);
-      console.log(`zelto sign ${id} -- ❌ Rejected`);
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, action: 'rejected' }));
+      } else {
+        console.log(`zelto sign ${id} -- ❌ Rejected`);
+      }
     } else {
-      console.error(`Unknown action: ${action}`);
-      console.error('Usage: zelto sign <slice-id> [--approve|--reject]');
+      if (isJson) {
+        console.log(JSON.stringify({ error: `Unknown action: ${action}` }));
+      } else {
+        console.error(`Unknown action: ${action}`);
+        console.error('Usage: zelto sign <slice-id> [--approve|--reject]');
+      }
       return 1;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error processing sign for "${id}": ${msg}`);
+    if (isJson) {
+      console.log(JSON.stringify({ sliceId: id, error: msg }));
+    } else {
+      console.error(`Error processing sign for "${id}": ${msg}`);
+    }
     return 1;
   }
   return 0;

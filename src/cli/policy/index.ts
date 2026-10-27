@@ -13,6 +13,7 @@ import { validatePolicy } from './commands/validate.command.js';
 import { addPolicyRule } from './commands/add.command.js';
 import { removePolicyRule } from './commands/remove.command.js';
 import { editPolicyRule } from './commands/edit.command.js';
+import { showPolicyRuleCommand } from './commands/show.command.js';
 
 // ─── Subcommand dispatch ─────────────────────────────────────────────────────
 
@@ -74,6 +75,18 @@ ${'Options:'}
     const rest = args.slice(1);
     const isJson = rest.includes('--json');
     return validatePolicy({ json: isJson });
+  }
+
+  if (subcmd === 'show') {
+    const rest = args.slice(1);
+    const ruleId = rest.find((a) => !a.startsWith('--'));
+    if (!ruleId) {
+      console.error('Error: <rule-id> is required for "policy show".');
+      console.error('Usage: zelto policy show <rule-id> [--json]');
+      return 1;
+    }
+    const isJson = rest.includes('--json');
+    return showPolicyRuleCommand({ ruleId, json: isJson });
   }
 
   if (subcmd === 'add') {

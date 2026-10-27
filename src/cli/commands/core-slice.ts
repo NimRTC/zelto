@@ -185,19 +185,38 @@ register('create', async (args) => {
   const writesRaw = extractFlagValue(args, '--writes');
   const writes = writesRaw ? writesRaw.split(',').map((w: string) => w.trim()).filter(Boolean) : [];
 
+  const isJson = args.includes('--json');
+
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-    console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+    if (isJson) {
+      console.log(JSON.stringify({ success: false, error: `Invalid slice ID: "${id}"` }));
+    } else {
+      console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+    }
     return 1;
   }
 
   if (await store.exists(id)) {
-    console.error(`Slice "${id}" already exists.`);
+    if (isJson) {
+      console.log(JSON.stringify({ success: false, error: `Slice "${id}" already exists.` }));
+    } else {
+      console.error(`Slice "${id}" already exists.`);
+    }
     return 1;
   }
 
   const slice = store.create(id, title, { writes });
   await store.write(slice);
   await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title, specPath: slice.spec.path });
+
+  if (isJson) {
+    console.log(JSON.stringify({
+      success: true, id, title, state: slice.state,
+      writes, spec: slice.spec.path,
+    }));
+    return 0;
+  }
+
   console.log(`zelto create ${id} — ✅ Created`);
   console.log(`  ID:     ${id}`);
   console.log(`  Title:  ${title}`);
@@ -217,8 +236,25 @@ register('check', async (args) => {
     return 1;
   }
 
+  const isJson = args.includes('--json');
+
   try {
     const slice = await store.read(id);
+
+    // For completed/abandoned slices, just show state without warnings
+    if (slice.state === 'completed' || slice.state === 'abandoned') {
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, state: slice.state, passed: true,
+          issues: [], message: `Slice is ${slice.state} — no checks needed`,
+        }));
+      } else {
+        console.log(`zelto check ${id} — ✅ Slice is ${slice.state}, no checks needed.`);
+        console.log(`  Use --retry with gate to re-run, or "zelto slice ${id}" for details.`);
+      }
+      return 0;
+    }
+
     console.log(`zelto check ${id} — running gate① checks...`);
     console.log(`  Slice:   ${slice.title}`);
     console.log(`  State:   ${slice.state}`);
@@ -250,6 +286,14 @@ register('check', async (args) => {
       sliceId: id, issues: issues.length, passed: issues.length === 0, details: issues,
     });
 
+    if (isJson) {
+      console.log(JSON.stringify({
+        sliceId: id, state: slice.state, passed: issues.length === 0,
+        issues, traces: slice.trace,
+      }));
+      return issues.length === 0 ? 0 : 1;
+    }
+
     if (issues.length === 0) {
       console.log('  Result:  ✅ All checks passed');
     } else {
@@ -258,7 +302,11 @@ register('check', async (args) => {
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error reading slice "${id}": ${msg}`);
+    if (isJson) {
+      console.log(JSON.stringify({ sliceId: id, error: msg }));
+    } else {
+      console.error(`Error reading slice "${id}": ${msg}`);
+    }
     return 1;
   }
   return 0;
@@ -461,10 +509,16 @@ register('freeze', async (args) => {
     return 1;
   }
 
+  const isJson = args.includes('--json');
+
   try {
     const slice = await store.read(id);
     if (slice.state !== 'draft' && slice.state !== 'clarifying') {
-      console.error(`Slice "${id}" is in state "${slice.state}", cannot freeze.`);
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, success: false, error: `Cannot freeze slice in state "${slice.state}"` }));
+      } else {
+        console.error(`Slice "${id}" is in state "${slice.state}", cannot freeze.`);
+      }
       return 1;
     }
 
@@ -477,10 +531,22 @@ register('freeze', async (args) => {
     await events.append(id, 'spec.frozen', 'cli', {
       sliceId: id, frozenHash: slice.spec.frozenHash, frozenAt: slice.spec.frozenAt,
     });
-    console.log(`zelto freeze ${id} — ✅ Slice frozen at ${slice.spec.frozenAt}`);
+
+    if (isJson) {
+      console.log(JSON.stringify({
+        sliceId: id, success: true, state: 'frozen',
+        frozenHash: slice.spec.frozenHash, frozenAt: slice.spec.frozenAt,
+      }));
+    } else {
+      console.log(`zelto freeze ${id} — ✅ Slice frozen at ${slice.spec.frozenAt}`);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error freezing slice "${id}": ${msg}`);
+    if (isJson) {
+      console.log(JSON.stringify({ sliceId: id, success: false, error: msg }));
+    } else {
+      console.error(`Error freezing slice "${id}": ${msg}`);
+    }
     return 1;
   }
   return 0;
@@ -495,14 +561,20 @@ register('run', async (args) => {
     return 1;
   }
 
+  const isJson = args.includes('--json');
+
   try {
     const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
     const result = await scheduler.admit(id);
     if (result.decision !== 'admitted') {
-      console.error(`zelto run ${id} — ❌ Cannot run: ${result.reason}`);
-      if (result.blockedBy.length > 0) {
-        console.error(`  Blocked by: ${result.blockedBy.join(', ')}`);
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, decision: 'blocked', reason: result.reason, blockedBy: result.blockedBy }));
+      } else {
+        console.error(`zelto run ${id} — ❌ Cannot run: ${result.reason}`);
+        if (result.blockedBy.length > 0) {
+          console.error(`  Blocked by: ${result.blockedBy.join(', ')}`);
+        }
       }
       return 1;
     }
@@ -531,13 +603,21 @@ register('run', async (args) => {
     const isDryRun = args.includes('--dry-run');
 
     if (isDryRun) {
-      console.log(`zelto run ${id} — ✅ Would admit (dry-run)`);
       const bundle = scheduler.buildConstraints(slice);
-      console.log(`  Spec:          ${bundle.specPath}`);
-      console.log(`  Frozen hash:   ${bundle.frozenHash}`);
-      console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
-      console.log(`  Policy rules:  ${bundle.policyRules.length}`);
-      console.log(`  Instructions:  ${bundle.instructions.split('\n').length} lines`);
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, decision: 'admitted', dryRun: true,
+          spec: bundle.specPath, frozenHash: bundle.frozenHash,
+          writes: bundle.writes, policyRules: bundle.policyRules.length,
+        }));
+      } else {
+        console.log(`zelto run ${id} — ✅ Would admit (dry-run)`);
+        console.log(`  Spec:          ${bundle.specPath}`);
+        console.log(`  Frozen hash:   ${bundle.frozenHash}`);
+        console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
+        console.log(`  Policy rules:  ${bundle.policyRules.length}`);
+        console.log(`  Instructions:  ${bundle.instructions.split('\n').length} lines`);
+      }
       return 0;
     }
 
@@ -748,8 +828,28 @@ async function autoClassifyStall(id: string, exitCode: number | null): Promise<v
 register('start', async (args) => {
   const [id] = args;
   if (!id || id.startsWith('--')) {
-    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--agent <name>]');
+    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--agent <name>] [--yes]');
     return 1;
+  }
+
+  // Confirmation prompt (skip with --yes)
+  if (!args.includes('--yes') && !args.includes('-y')) {
+    const title = extractFlagValue(args, '--title') ?? id;
+    console.log(`About to execute slice "${id}" ("${title}")`);
+    console.log(`  This will: create → freeze → run an AI agent`);
+    console.log(`  The agent may modify files and incur API costs.`);
+    console.log('');
+
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const answer = await new Promise<string>((resolve) => {
+      rl.question('  Proceed? [y/N] ', resolve);
+    });
+    rl.close();
+
+    if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+      console.log('Cancelled.');
+      return 0;
+    }
   }
 
   const title = extractFlagValue(args, '--title') ?? id;

@@ -1,6 +1,6 @@
 # zelto 开工包
 
-> 版本: v0.1.0 · 最后更新: 2026-10-21
+> 版本: v0.1.0 · 最后更新: 2026-10-27
 
 ---
 
@@ -24,9 +24,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 544
-ℹ suites 117
-ℹ pass 544
+ℹ tests 604
+ℹ suites 118
+ℹ pass 604
 ℹ fail 0
 ```
 
@@ -200,12 +200,12 @@ zelto/
 │   │   ├── contracts/     契约管理
 │   │   ├── route/         路由
 │   │   └── spec/          规格引擎
-│   ├── cli/               CLI 实现（42 命令 + help）
+│   ├── cli/               CLI 实现（45+ 个命令）
 │   ├── hook/              独立 hook
 │   └── adapters/          适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema（6 个）
 ├── policy/                策略文件
-├── tests/                 测试文件（33 个单元 + 15 验收 suites）
+├── tests/                 测试文件（44 个单元 + 19 验收 suites）
 └── .zelto/                运行时状态
 ```
 
@@ -464,7 +464,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 | 操作 | 耗时 |
 |---|---|
 | `pnpm build` | ~2s |
-| `pnpm test` (544 tests) | ~45s |
+| `pnpm test` (604 tests) | ~55s |
 | Hook 单次判定 | < 10ms |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |

@@ -6,6 +6,9 @@ import { commands } from './shared.js';
 
 // Import all command group files — these call register() as module-level side effects
 import './core-slice.js';
+import './slices.js'; // Overrides slices from core-slice with --active/--json support
+import './slice-detail.js';
+import './config.js';
 import './gate-sign.js';
 import './info-help.js';
 import './ai-pipeline.js';
@@ -27,8 +30,13 @@ export async function runCLI(argv: string[]): Promise<number> {
     return 0;
   }
 
-  if (!cmd || cmd === 'help' || cmd === '--help') {
+  if (!cmd || cmd === '--help') {
     return commands.help?.([]) ?? 0;
+  }
+
+  // zelto help <cmd> — pass the rest args to help handler
+  if (cmd === 'help') {
+    return commands.help?.(rest) ?? 0;
   }
 
   const handler = commands[cmd];

@@ -152,6 +152,7 @@ register('suggest', async () => {
 
 register('init', async (args) => {
   const doForce = args.includes('--force');
+  const withExamples = args.includes('--with-examples');
 
   if (existsSync(ZELTO_DIR) && !doForce) {
     console.log(`zelto init — ⚠️  .zelto/ already exists.`);
@@ -185,6 +186,43 @@ register('init', async (args) => {
     console.log(`zelto init — ✅ Project "${projectMap.projectName}" initialized.`);
     for (const item of result.created) {
       console.log(`  ✅ ${item}`);
+    }
+  }
+
+  // Create example slice if --with-examples
+  if (withExamples) {
+    const exampleId = 'example-hello-world';
+    if (!(await store.exists(exampleId))) {
+      const slice = store.create(exampleId, 'Example: Hello World', {
+        writes: ['src/**/*.ts'],
+        trace: { requirements: ['example-req'], contracts: [], tests: [] },
+      });
+      await store.write(slice);
+      console.log(`  ✅ Example slice created: ${exampleId}`);
+
+      // Write example spec
+      const specPath = slice.spec.path;
+      const specDir = specPath.substring(0, specPath.lastIndexOf('/'));
+      if (!existsSync(specDir)) mkdirSync(specDir, { recursive: true });
+      writeFileSync(specPath, `# Example: Hello World
+
+## Purpose
+An example slice to demonstrate zelto's workflow.
+
+## Scope
+- \`src/**/*.ts\`
+
+## Acceptance Criteria
+1. Create a simple hello-world module
+2. Write a basic test
+3. All tests pass
+
+## Notes
+This is an example. Replace with your actual slice.
+`, 'utf-8');
+      console.log(`  ✅ Example spec written: ${specPath}`);
+    } else {
+      console.log(`  ℹ️  Example slice already exists`);
     }
   }
 
@@ -428,7 +466,21 @@ register('events', async (args) => {
 
 // ─── help ────────────────────────────────────────────────────────────────────
 
-register('help', async () => {
+register('help', async (args) => {
+  const [specificCmd] = args;
+
+  // Support: zelto help <cmd> — show command-specific help
+  if (specificCmd && !specificCmd.startsWith('--')) {
+    const { commands } = await import('./shared.js');
+    const handler = commands[specificCmd];
+    if (handler) {
+      return handler(['--help']);
+    }
+    console.error(`Unknown command: ${specificCmd}`);
+    console.error('Run "zelto help" for usage.');
+    return 1;
+  }
+
   console.log(`
 ${colors.bold('zelto — AI Programming Cockpit')}
 
@@ -436,30 +488,41 @@ ${colors.cyan('Usage:')}
   zelto <command> [options]
 
 ${colors.bold('Core slice commands:')}
-  create <id>            Create a new slice (interactive if no args)
-  slices                 List all slices
-  check <id>             Gate① — pre-freeze checks
+  create <id>            Create a new slice (interactive if no args) [--json]
+  slices                 List all slices [--active] [--json]
+  slice <id>             Show slice details [--json]
+  check <id>             Gate① — pre-freeze checks [--json]
   clarify <id>           Clarify slice spec (interactive, --auto, --dry-run)
-  freeze <id>            Freeze slice baseline
-  run <id>               Execute slice (--dry-run, --agent <name>)
-  start <id>             One-command: create → check → freeze → run
+  freeze <id>            Freeze slice baseline [--json]
+  run <id>               Execute slice (--dry-run, --agent <name>) [--json]
+  start <id>             One-command: create → check → freeze → run [--yes]
   admit <id>             Check admission (--json)
   diff <id>              Show changes made by a slice (--stat, --json)
-  gate <id>              Gate② — run acceptance tests
+  gate <id>              Gate② — run acceptance tests [--dry-run] [--json]
   inbox                  View pending sign requests
-  sign <id> --approve    Approve completed slice (auto-commits & merges to main)
-  sign <id> --reject     Reject completed slice
+  sign <id> --approve    Approve completed slice [--json]
+  sign <id> --reject     Reject completed slice [--json]
   abandon <id>           Abandon a slice
   next                   Suggest next action on a slice
   suggest                Full project overview and suggested actions
   stall [id]             List stalled slices or inspect one (--auto-resolved)
   resume <id>            Resume stalled slice (--skip, --abandon)
-  events <id>            View slice event stream
+  events <id>            View slice event stream [--json]
 
 ${colors.bold('Project management:')}
-  init                   Initialize .zelto/ directory
+  init                   Initialize .zelto/ directory [--with-examples]
   summary                Project overview
   report [--format]      Generate status report (markdown|json)
+  config                 View or modify configuration (get/set)
+
+${colors.bold('Governance:')}
+  policy list            List policy rules [--json]
+  policy show <id>       Show a single policy rule [--json]
+  policy check <path>    Check path against policy [--json]
+  policy validate        Validate policy configuration [--json]
+  policy add <id>        Add a policy rule
+  policy remove <id>     Remove a policy rule [--json]
+  policy edit <id>       Edit a policy rule
 
 ${colors.bold('AI Pipeline:')}
   require <text>         Create requirement document

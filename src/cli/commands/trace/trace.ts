@@ -8,7 +8,7 @@ import { renderDesignDepGraph } from './graph_render.js';
 import { renderTimelineTrace } from './timeline_render.js';
 import type { TraceData } from './model.js';
 import { register } from '../shared.js';
-import { ZELTO_DIR, SLICES_DIR } from '../shared.js';
+import { ZELTO_DIR, SLICES_DIR, store } from '../shared.js';
 import { colors } from '../../color.js';
 
 // ─── State color map for text output ────────────────────────────────────────
@@ -78,6 +78,7 @@ function renderTextTrace(data: TraceData): void {
 /**
  * Main trace command handler.
  * Usage: zelto trace <requirement-id> [--json|--graph|--timeline]
+ *        zelto trace <slice-id> --slice   Trace a slice's events and state
  */
 export async function traceCommand(args: string[]): Promise<number> {
   const parsed = parseTraceArgs(args);
@@ -87,6 +88,17 @@ export async function traceCommand(args: string[]): Promise<number> {
     return 0;
   }
 
+  // Support: zelto trace <slice-id> --slice — show slice traceability
+  if (args.includes('--slice')) {
+    return traceSlice(parsed.reqId);
+  }
+
+  // Auto-detect: if ID exists as a slice, show slice trace
+  const sliceExists = await store.exists(parsed.reqId).catch(() => false);
+  if (sliceExists) {
+    return traceSlice(parsed.reqId);
+  }
+
   const data = await fetchTraceData(parsed.reqId, ZELTO_DIR, SLICES_DIR);
 
   if (!data) {
@@ -94,6 +106,7 @@ export async function traceCommand(args: string[]): Promise<number> {
       console.log(JSON.stringify({ error: `Requirement "${parsed.reqId}" not found.` }));
     } else {
       console.error(`Requirement "${parsed.reqId}" not found.`);
+      console.error(`Tip: Use "zelto trace <slice-id> --slice" to trace a slice.`);
     }
     return 1;
   }
@@ -131,3 +144,61 @@ export async function traceCommand(args: string[]): Promise<number> {
 // ─── Register command ───────────────────────────────────────────────────────
 
 register('trace', traceCommand);
+
+// ─── Slice tracing ──────────────────────────────────────────────────────────
+
+/**
+ * Trace a slice: show its state, events, and related requirements/contracts.
+ */
+async function traceSlice(sliceId: string): Promise<number> {
+  try {
+    const slice = await store.read(sliceId);
+    const evts = await (await import('../shared.js')).events.read(sliceId);
+
+    console.log(`📋 Slice trace: ${sliceId}`);
+    console.log(`   Title:       ${slice.title}`);
+    console.log(`   State:       ${stateColor(slice.state)}`);
+    console.log(`   Created:     ${slice.createdAt.slice(0, 10)}`);
+    console.log(`   Updated:     ${slice.updatedAt.slice(0, 10)}`);
+    console.log(`   Events:      ${evts.length}`);
+    console.log(`   Writes:      ${slice.writes.length > 0 ? slice.writes.join(', ') : '(none)'}`);
+
+    if (slice.trace.requirements.length > 0) {
+      console.log(`   Reqs:        ${slice.trace.requirements.join(', ')}`);
+    }
+    if (slice.trace.contracts.length > 0) {
+      console.log(`   Contracts:   ${slice.trace.contracts.join(', ')}`);
+    }
+    if (slice.trace.tests.length > 0) {
+      console.log(`   Tests:       ${slice.trace.tests.join(', ')}`);
+    }
+
+    if (slice.stall.class) {
+      console.log(`   Stall:       ${slice.stall.class} (resolved: ${slice.stall.autoResolved})`);
+    }
+
+    // Show state timeline
+    console.log(`\n   State timeline:`);
+    const stateEvents = evts.filter((e: { type: string }) => e.type === 'slice.state.changed');
+    for (const e of stateEvents.slice(-10)) {
+      const payload = e.payload as { from?: string; to?: string } | undefined;
+      if (payload?.from && payload?.to) {
+        console.log(`     ${stateColor(payload.from)} → ${stateColor(payload.to)}`);
+      }
+    }
+
+    // Show recent events
+    if (evts.length > 0) {
+      console.log(`\n   Recent events:`);
+      for (const e of evts.slice(-5)) {
+        console.log(`     [${e.ts?.slice(0, 19) ?? '?'}] ${e.type} (${e.actor})`);
+      }
+    }
+
+    return 0;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Slice "${sliceId}" not found: ${msg}`);
+    return 1;
+  }
+}
