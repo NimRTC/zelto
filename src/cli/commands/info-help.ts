@@ -188,6 +188,26 @@ register('init', async (args) => {
     }
   }
 
+  // Auto-install git hooks
+  try {
+    const GIT_HOOKS_DIR = join(process.cwd(), '.git', 'hooks');
+    if (existsSync(GIT_HOOKS_DIR)) {
+      console.log(`\n  Installing git hooks...`);
+      const { execSync } = await import('node:child_process');
+      try {
+        execSync(
+          `node "${join(process.cwd(), 'dist', 'cli', 'index.js')}" hook --install`,
+          { cwd: process.cwd(), timeout: 15000, stdio: 'pipe' },
+        );
+      } catch {
+        // Hook install may fail if dist/ not built yet — non-fatal
+        console.log(`  ℹ️  Auto-install hooks skipped. Run "zelto hook --install" manually.`);
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+
   console.log(`\n👉 Next: zelto project design`);
   return 0;
 });
@@ -390,6 +410,7 @@ register('events', async (args) => {
       }
     }
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (isJson) {
       console.log(JSON.stringify({ sliceId: id, error: String(err), events: [] }));
     } else {
@@ -398,7 +419,7 @@ register('events', async (args) => {
         console.log(`No events for slice "${id}".`);
         return 1;
       }
-      console.error(`Error reading events for slice "${id}": ${err}`);
+      console.error(`Error reading events for slice "${id}": ${msg}`);
     }
     return 1;
   }
@@ -415,7 +436,7 @@ ${colors.cyan('Usage:')}
   zelto <command> [options]
 
 ${colors.bold('Core slice commands:')}
-  create <id>            Create a new slice
+  create <id>            Create a new slice (interactive if no args)
   slices                 List all slices
   check <id>             Gate① — pre-freeze checks
   clarify <id>           Clarify slice spec (interactive, --auto, --dry-run)
@@ -423,6 +444,7 @@ ${colors.bold('Core slice commands:')}
   run <id>               Execute slice (--dry-run, --agent <name>)
   start <id>             One-command: create → check → freeze → run
   admit <id>             Check admission (--json)
+  diff <id>              Show changes made by a slice (--stat, --json)
   gate <id>              Gate② — run acceptance tests
   inbox                  View pending sign requests
   sign <id> --approve    Approve completed slice (auto-commits & merges to main)
@@ -768,6 +790,7 @@ register('resume', async (args) => {
   try {
     await scheduler.resume(id, { skip, abandon });
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`Error: ${(err as Error).message}`);
     return 1;
   }

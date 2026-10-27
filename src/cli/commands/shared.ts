@@ -140,6 +140,8 @@ export function loadConfig(): ZeltoConfig {
     const content = readFileSync(configPath, 'utf-8');
     const parsed = parseConfigYaml(content);
     if (parsed) {
+      // Validate config and warn about common issues
+      validateConfig(parsed);
       return {
         gate: parsed.gate,
         agent: parsed.agent ?? defaultConfig.agent,
@@ -149,6 +151,29 @@ export function loadConfig(): ZeltoConfig {
     return defaultConfig;
   } catch {
     return defaultConfig;
+  }
+}
+
+/**
+ * Validate config for common issues and log warnings.
+ * Does not throw — warnings are non-fatal.
+ */
+function validateConfig(config: ZeltoConfig): void {
+  if (!config.gate?.commands?.length) {
+    console.warn('  ⚠️  Config: no gate commands defined. Gate② will be a no-op.');
+  }
+  if (config.gate?.timeoutSec !== undefined && (config.gate.timeoutSec < 10 || config.gate.timeoutSec > 3600)) {
+    console.warn(`  ⚠️  Config: gate.timeoutSec (${config.gate.timeoutSec}) seems unusual. Expected 10-3600.`);
+  }
+  if (config.gate?.retry?.max !== undefined && config.gate.retry.max < 0) {
+    console.warn(`  ⚠️  Config: gate.retry.max (${config.gate.retry.max}) is negative. Using 0.`);
+    config.gate.retry.max = 0;
+  }
+  if (!config.agent?.command) {
+    console.warn('  ⚠️  Config: no agent command defined. "zelto run" will fail.');
+  }
+  if (config.llm?.apiKey && config.llm.apiKey === 'sk-your-key-here') {
+    console.warn('  ⚠️  Config: LLM API key appears to be a placeholder. Update .zelto/config.yaml with a real key.');
   }
 }
 

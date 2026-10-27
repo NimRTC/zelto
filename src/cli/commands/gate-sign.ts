@@ -12,25 +12,35 @@ import { store, events, ZELTO_DIR, loadConfig } from './shared.js';
 register('gate', async (args) => {
   const [id] = args;
   if (!id) {
-    console.error('Usage: zelto gate <slice-id>');
+    console.error('Usage: zelto gate <slice-id> [--retry <N>]');
     return 1;
   }
+
+  const retryFlag = args.indexOf('--retry');
+  const forceRetry = retryFlag >= 0 && args[retryFlag + 1] ? Math.max(0, parseInt(args[retryFlag + 1], 10) || 0) : -1;
 
   try {
     const slice = await store.read(id);
     if (slice.state !== 'frozen') {
-      console.error(`Slice "${id}" is in state "${slice.state}". Must be "frozen" to run gate.`);
-      return 1;
+      if (forceRetry >= 0) {
+        // Force re-run gate on any state
+        console.log(`zelto gate ${id} — re-running gate② (forced, state=${slice.state})...`);
+      } else {
+        console.error(`Slice "${id}" is in state "${slice.state}". Must be "frozen" to run gate.`);
+        console.error(`  Use --retry <N> to force re-run regardless of state.`);
+        return 1;
+      }
+    } else {
+      console.log(`zelto gate ${id} — running gate②...`);
     }
 
-    console.log(`zelto gate ${id} — running gate②...`);
     const config = loadConfig();
 
     const gateConfig = {
       commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
       changedLineCoverage: 0.8,
       timeoutSec: config.gate.timeoutSec,
-      retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
+      retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
 
     const executor = new GateExecutor(store, events, gateConfig);
@@ -63,7 +73,8 @@ register('gate', async (args) => {
       console.log(`  Result:   ❌ Gate failed (${report.totalDurationMs.toFixed(0)}ms)`);
     }
   } catch (err) {
-    console.error(`Error running gate for "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error running gate for "${id}": ${msg}`);
     return 1;
   }
   return 0;
@@ -162,7 +173,26 @@ async function autoMergeSlice(sliceId: string): Promise<void> {
       encoding: 'utf-8', timeout: 5000,
     }).trim();
 
-    if (currentBranch !== 'main') {
+    const expectedBranch = `slice/${sliceId}`;
+
+    if (currentBranch === 'main' || currentBranch === 'master') {
+      // On main branch — commit changes directly with slice attribution
+      console.log(`  Staging: committing changes to ${currentBranch}...`);
+      execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
+      try {
+        execSync(`git commit -m "feat(${sliceId}): slice approved
+
+Auto-commit after sign approval for slice ${sliceId}
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
+          cwd: process.cwd(), timeout: 15000,
+        });
+        console.log(`  ✅ Committed to ${currentBranch}`);
+      } catch {
+        console.log(`  ℹ️  Nothing to commit`);
+      }
+    } else {
+      // On a feature branch — merge to main
       console.log(`  Merging: staging changes...`);
       execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
       try {
@@ -183,11 +213,17 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
           cwd: process.cwd(), timeout: 15000,
         });
         console.log(`  ✅ Merged "${currentBranch}" → main`);
+
+        // Delete the feature branch
+        try {
+          execSync(`git branch -d ${currentBranch}`, { cwd: process.cwd(), timeout: 5000 });
+          console.log(`  ✅ Deleted branch "${currentBranch}"`);
+        } catch {
+          console.log(`  ℹ️  Could not delete branch "${currentBranch}" (may have unmerged changes)`);
+        }
       } catch {
         console.log(`  ℹ️  No main branch to merge into. Current: ${currentBranch}`);
       }
-    } else {
-      console.log(`  ℹ️  Already on main branch, skipping merge`);
     }
   } catch (mergeErr) {
     console.log(`  ⚠️  Auto-merge skipped: ${mergeErr}`);
@@ -237,7 +273,8 @@ register('sign', async (args) => {
       return 1;
     }
   } catch (err) {
-    console.error(`Error processing sign for "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error processing sign for "${id}": ${msg}`);
     return 1;
   }
   return 0;

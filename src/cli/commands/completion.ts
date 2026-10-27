@@ -5,7 +5,7 @@ import { register } from './shared.js';
 
 const COMMANDS = [
   'create', 'slices', 'check', 'clarify', 'freeze', 'run', 'start',
-  'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
+  'admit', 'diff', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
   'stall', 'resume', 'events', 'init', 'summary', 'report',
   'require', 'design', 'plan', 'version', 'pipeline',
   'project', 'trace', 'impact', 'audit', 'snapshot', 'policy',

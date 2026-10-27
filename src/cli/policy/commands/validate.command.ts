@@ -48,9 +48,10 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
   try {
     yamlContent = readFileSync(policyPath, 'utf-8');
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (options.json) {
       writeOutput(
-        { valid: false, errors: [{ path: policyPath, message: `Failed to read: ${err}`, code: 'E_READ' }] },
+        { valid: false, errors: [{ path: policyPath, message: `Failed to read: ${msg}`, code: 'E_READ' }] },
         undefined,
         { json: true },
       );
@@ -93,15 +94,16 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
   try {
     config = loadPolicyConfig();
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (options.json) {
       writeOutput(
-        { valid: false, errors: [{ path: 'policy', message: `Failed to load: ${err}`, code: 'E_LOAD' }] },
+        { valid: false, errors: [{ path: 'policy', message: `Failed to load: ${msg}`, code: 'E_LOAD' }] },
         undefined,
         { json: true },
       );
     } else {
       console.log(`${colors.red('✗')} ${colors.bold('Validation: FAILED')}`);
-      console.log(`  ${colors.dim(`Failed to load policy: ${err}`)}`);
+      console.log(`  ${colors.dim(`Failed to load policy: ${msg}`)}`);
     }
     return 1;
   }

@@ -3,6 +3,22 @@
 import { createInterface } from 'node:readline';
 import { writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+
+/**
+ * Extract the value of a named flag from args, stopping at the next flag.
+ * Returns undefined if the flag is not found or has no value.
+ * E.g. extractFlagValue(['--title', 'hello', '--writes', 'x'], '--title') → 'hello'
+ */
+function extractFlagValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  if (idx === -1) return undefined;
+  const parts: string[] = [];
+  for (let i = idx + 1; i < args.length; i++) {
+    if (args[i].startsWith('--')) break;
+    parts.push(args[i]);
+  }
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClarifyEngine } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
@@ -119,17 +135,49 @@ async function pruneSlices(): Promise<number> {
 // ─── create ──────────────────────────────────────────────────────────────────
 
 register('create', async (args) => {
-  const [id] = args;
+  let [id] = args;
+
+  // Interactive mode: prompt for values if not provided
+  if (!id || id.startsWith('--')) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+    const ask = (q: string): Promise<string> => new Promise((r) => rl.question(q, r));
+
+    console.log('Creating a new slice (interactive mode)');
+    console.log('');
+
+    id = (await ask('  Slice ID (e.g. "my-feature"): ')).trim();
+    if (!id) {
+      console.error('Error: Slice ID is required.');
+      rl.close();
+      return 1;
+    }
+
+    const titleInput = await ask('  Title (optional, defaults to ID): ');
+    const writesInput = await ask('  Write-set (comma-separated paths, optional): ');
+
+    rl.close();
+
+    args = [id];
+    if (titleInput) {
+      args.push('--title', titleInput);
+    }
+    if (writesInput) {
+      args.push('--writes', ...writesInput.split(',').map((w) => w.trim()).filter(Boolean));
+    }
+  }
+
+  // Re-parse after potential interactive input
+  id = args[0];
   if (!id || id.startsWith('--')) {
     console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>]');
     return 1;
   }
 
-  const titleIdx = args.indexOf('--title');
-  const title = titleIdx >= 0 ? args.slice(titleIdx + 1).join(' ') : id;
+  const title = extractFlagValue(args, '--title') ?? id;
 
-  const writesIdx = args.indexOf('--writes');
-  const writes = writesIdx >= 0 ? args[writesIdx + 1].split(',').map((w: string) => w.trim()).filter(Boolean) : [];
+  const writesRaw = extractFlagValue(args, '--writes');
+  const writes = writesRaw ? writesRaw.split(',').map((w: string) => w.trim()).filter(Boolean) : [];
 
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
     console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
@@ -203,7 +251,8 @@ register('check', async (args) => {
       console.log('  Result:  ⚠️  Fix issues before freezing');
     }
   } catch (err) {
-    console.error(`Error reading slice "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error reading slice "${id}": ${msg}`);
     return 1;
   }
   return 0;
@@ -357,7 +406,8 @@ register('clarify', async (args) => {
     console.log(`  Next: zelto run ${id} --dry-run`);
     return 0;
   } catch (err) {
-    console.error(`Error clarifying slice "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error clarifying slice "${id}": ${msg}`);
     return 1;
   }
 });
@@ -390,7 +440,8 @@ register('abandon', async (args) => {
     console.log(`  Now:            abandoned`);
     return 0;
   } catch (err) {
-    console.error(`Error abandoning slice "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error abandoning slice "${id}": ${msg}`);
     return 1;
   }
 });
@@ -422,7 +473,8 @@ register('freeze', async (args) => {
     });
     console.log(`zelto freeze ${id} — ✅ Slice frozen at ${slice.spec.frozenAt}`);
   } catch (err) {
-    console.error(`Error freezing slice "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error freezing slice "${id}": ${msg}`);
     return 1;
   }
   return 0;
@@ -494,6 +546,21 @@ register('run', async (args) => {
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
+    // Create feature branch for this slice
+    const branchName = `slice/${id}`;
+    try {
+      const { execSync } = await import('node:child_process');
+      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf-8', timeout: 5000 }).trim();
+      if (currentBranch === 'main' || currentBranch === 'master') {
+        execSync(`git checkout -b ${branchName}`, { cwd: process.cwd(), timeout: 10000 });
+        console.log(`  Branch:        ${branchName} (created from ${currentBranch})`);
+      } else {
+        console.log(`  Branch:        ${currentBranch} (already on feature branch)`);
+      }
+    } catch {
+      console.log(`  Branch:        (not a git repository or git unavailable)`);
+    }
+
     const cfg = loadConfig();
     const agentCmd = cfg.agent.command;
     const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : agentCmd;
@@ -526,7 +593,8 @@ register('run', async (args) => {
       await autoClassifyStall(id, exitCode);
     }
   } catch (err) {
-    console.error(`Error running slice "${id}": ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error running slice "${id}": ${msg}`);
     return 1;
   }
   return 0;
@@ -596,6 +664,7 @@ async function checkBudget(id: string): Promise<boolean> {
     }
     return true;
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     // Budget check failure is non-fatal — proceed without enforcement
     return true;
   }
@@ -663,7 +732,8 @@ async function autoClassifyStall(id: string, exitCode: number | null): Promise<v
     console.log(`  Stall: ⚠️ Classified as "${stallClass}"`);
     console.log(`  Run: zelto resume ${id} to handle`);
   } catch (err) {
-    console.error(`  ⚠️ Could not write stall info: ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ⚠️ Could not write stall info: ${msg}`);
   }
 }
 
@@ -676,11 +746,10 @@ register('start', async (args) => {
     return 1;
   }
 
-  const titleIdx = args.indexOf('--title');
-  const title = titleIdx >= 0 ? args.slice(titleIdx + 1).join(' ') : id;
+  const title = extractFlagValue(args, '--title') ?? id;
 
-  const writesIdx = args.indexOf('--writes');
-  const customWrites = writesIdx >= 0 ? args[writesIdx + 1].split(',').map((w: string) => w.trim()).filter(Boolean) : null;
+  const writesRaw = extractFlagValue(args, '--writes');
+  const customWrites = writesRaw ? writesRaw.split(',').map((w: string) => w.trim()).filter(Boolean) : null;
 
   // Step 1: Create if not exists
   let isNew = false;
@@ -727,7 +796,8 @@ register('start', async (args) => {
       console.log(`  ℹ️  Already frozen: ${id} (state=${current.state})`);
     }
   } catch (err) {
-    console.error(`  ❌ Freeze failed: ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ❌ Freeze failed: ${msg}`);
     return 1;
   }
 
@@ -786,7 +856,8 @@ register('start', async (args) => {
       await autoClassifyStall(id, exitCode);
     }
   } catch (err) {
-    console.error(`  ❌ Agent execution failed: ${err}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ❌ Agent execution failed: ${msg}`);
     return 1;
   }
 

@@ -116,14 +116,15 @@ export async function addPolicyRule(options: AddOptions): Promise<number> {
   try {
     writeFileSync(policyPath, updatedYaml, 'utf-8');
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     if (options.json) {
       writeOutput(
-        { success: false, error: `Failed to write policy.yaml: ${err}` },
+        { success: false, error: `Failed to write policy.yaml: ${msg}` },
         undefined,
         { json: true },
       );
     } else {
-      console.error(`${colors.red('✗')} Failed to write policy.yaml: ${err}`);
+      console.error(`${colors.red('✗')} Failed to write policy.yaml: ${msg}`);
     }
     return 1;
   }
