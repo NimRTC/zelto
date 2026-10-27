@@ -1,28 +1,4 @@
-// LLM types — shared between adapters/llm and llm/generators
+// LLM types — re-exported from core/ports for dependency inversion
+// C6: adapters/ may import from core/, but core/ never imports from adapters/
 
-export interface LlmMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-}
-
-export interface LlmRequest {
-  model?: string;
-  messages: LlmMessage[];
-  temperature?: number;
-  maxTokens?: number;
-}
-
-export interface LlmResponse {
-  content: string;
-  model: string;
-  usage: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-  };
-}
-
-export interface LlmAdapter {
-  /** Send a chat completion request and return the response text */
-  chat(request: LlmRequest): Promise<LlmResponse>;
-}
+export type { LlmAdapter, LlmMessage, LlmRequest, LlmResponse } from '../../core/ports/llm.js';

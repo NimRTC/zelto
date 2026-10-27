@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import type { LlmAdapter } from '../../core/ports/llm.js';
 import { DeepSeekAdapter } from '../../adapters/llm/index.js';
 import { EventStream } from '../../core/events/stream.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../../core/policy/types.js';
@@ -353,7 +354,7 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
 
 // ─── LLM Helper ──────────────────────────────────────────────────────────────
 
-export function createLlmFromConfig(): DeepSeekAdapter | null {
+export function createLlmFromConfig(): LlmAdapter | null {
   const cfg = loadConfig();
   if (!cfg.llm?.apiKey) return null;
   return new DeepSeekAdapter({

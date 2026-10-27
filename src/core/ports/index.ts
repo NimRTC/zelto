@@ -4,6 +4,7 @@
 import type { EventEnvelope, EventType } from '../events/index.js';
 
 export { type ExecutorAdapter, type AdapterMeta } from './executor.js';
+export type { LlmAdapter, LlmMessage, LlmRequest, LlmResponse } from './llm.js';
 
 export interface SessionPort {
   start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }>;
