@@ -55,4 +55,10 @@ export interface ExecutorAdapter {
    * @param sessionId — The session to read events from
    */
   events(sessionId: string): Promise<AsyncIterable<EventEnvelope>>;
+
+  /**
+   * Wait for the session to exit and return the exit code.
+   * Returns null if the session is not found.
+   */
+  waitForExit(sessionId: string): Promise<number | null>;
 }

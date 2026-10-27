@@ -19,7 +19,6 @@ function extractFlagValue(args: string[], flag: string): string | undefined {
   }
   return parts.length > 0 ? parts.join(' ') : undefined;
 }
-import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
 import { BudgetCollector } from '../../core/budget/collector.js';
@@ -28,7 +27,7 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import { register } from './shared.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter } from './shared.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
@@ -580,7 +579,7 @@ register('freeze', async (args) => {
 register('run', async (args) => {
   const [id] = args;
   if (!id) {
-    console.error('Usage: zelto run <slice-id> [--agent <name>] [--dry-run]');
+    console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
     return 1;
   }
 
@@ -678,7 +677,8 @@ register('run', async (args) => {
     console.log(`  Bundle:        ${bundlePath}`);
     console.log('');
 
-    const adapter = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: agentName });
+    const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+    const adapter = createExecutorAdapter(adapterType, agentName);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
@@ -851,7 +851,7 @@ async function autoClassifyStall(id: string, exitCode: number | null): Promise<v
 register('start', async (args) => {
   const [id] = args;
   if (!id || id.startsWith('--')) {
-    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--agent <name>] [--yes]');
+    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--agent <name>] [--adapter <type>] [--yes]');
     return 1;
   }
 
@@ -961,7 +961,8 @@ register('start', async (args) => {
 
     console.log(`  Agent:         ${agentName}`);
 
-    const adapter = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: agentName });
+    const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+    const adapter = createExecutorAdapter(adapterType, agentName);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {

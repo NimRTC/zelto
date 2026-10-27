@@ -494,8 +494,8 @@ ${colors.bold('Core slice commands:')}
   check <id>             Gate① — pre-freeze checks [--json]
   clarify <id>           Clarify slice spec (interactive, --auto, --dry-run)
   freeze <id>            Freeze slice baseline [--json]
-  run <id>               Execute slice (--dry-run, --agent <name>) [--json]
-  start <id>             One-command: create → check → freeze → run [--yes]
+  run <id>               Execute slice (--dry-run, --agent <name>, --adapter <type>) [--json]
+  start <id>             One-command: create → check → freeze → run [--yes] [--adapter <type>]
   admit <id>             Check admission (--json)
   diff <id>              Show changes made by a slice (--stat, --json)
   gate <id>              Gate② — run acceptance tests [--dry-run] [--json]
@@ -585,8 +585,8 @@ register('completion', async (args) => {
     sign: ['--approve', '--reject'],
     hook: ['--install', '--uninstall'],
     stall: ['--auto-resolved'],
-    run: ['--dry-run', '--agent'],
-    start: ['--title', '--writes', '--agent'],
+    run: ['--dry-run', '--agent', '--adapter'],
+    start: ['--title', '--writes', '--agent', '--yes', '--adapter'],
     create: ['--title', '--writes'],
     clarify: ['--auto', '--dry-run'],
     report: ['--format'],

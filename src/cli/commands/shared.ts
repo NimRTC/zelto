@@ -4,7 +4,10 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { LlmAdapter } from '../../core/ports/llm.js';
+import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { DeepSeekAdapter } from '../../adapters/llm/index.js';
+import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
+import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js';
 import { EventStream } from '../../core/events/stream.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { SliceStore } from '../../core/slice/store.js';
@@ -115,7 +118,7 @@ export interface ZeltoConfig {
     timeoutSec: number;
     retry: { max: number };
   };
-  agent: { command: string };
+  agent: { command: string; adapter?: string };
   llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string };
 }
 
@@ -183,6 +186,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let timeoutSec = 120;
   let retryMax = 2;
   let agentCommand = 'npx claude-code';
+  let agentAdapter = '';
   let currentCommand: { name: string; run: string } | null = null;
   let inGateSection = false;
   let inAgentSection = false;
@@ -252,6 +256,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       agentCommand = trimmed.slice(8).trim().replace(/^"|"$/g, '');
     }
 
+    if (inAgentSection && trimmed.startsWith('adapter:')) {
+      agentAdapter = trimmed.slice(8).trim().replace(/^"|"$/g, '');
+    }
+
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = trimmed.slice(9).trim().replace(/^"|"$/g, '');
@@ -276,7 +284,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         gate: commands.length > 0
           ? { commands, timeoutSec, retry: { max: retryMax } }
           : { commands: [], timeoutSec: 120, retry: { max: 2 } },
-        agent: { command: agentCommand },
+        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}) },
         llm,
       }
     : null;
@@ -361,6 +369,37 @@ export function createLlmFromConfig(): LlmAdapter | null {
     apiKey: cfg.llm.apiKey,
     baseUrl: cfg.llm.baseUrl,
     model: cfg.llm.model ?? 'deepseek-chat',
+  });
+}
+
+// ─── Executor Adapter Factory ──────────────────────────────────────────────
+
+export type AdapterType = 'claude-agent' | 'claude-agent-sdk';
+
+/**
+ * Create an executor adapter based on config and optional override.
+ * @param overrideType — Optional override from CLI --adapter flag
+ * @param agentCommand — Agent command string (for claude-agent adapter)
+ */
+export function createExecutorAdapter(
+  overrideType?: string,
+  agentCommand?: string,
+): ExecutorAdapter {
+  const cfg = loadConfig();
+  const type = (overrideType ?? cfg.agent.adapter ?? 'claude-agent') as AdapterType;
+
+  if (type === 'claude-agent-sdk') {
+    return new ClaudeAgentSdkAdapter({
+      cwd: process.cwd(),
+      model: cfg.llm?.model,
+      env: process.env as Record<string, string>,
+    });
+  }
+
+  // Default: claude-agent (shell spawn)
+  return new ClaudeAgentAdapter({
+    cwd: process.cwd(),
+    agentCommand: agentCommand ?? cfg.agent.command,
   });
 }
 
