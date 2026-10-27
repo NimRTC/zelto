@@ -168,45 +168,65 @@ export async function addPolicyRule(options: AddOptions): Promise<number> {
 function appendRuleToYaml(yaml: string, rule: PolicyRule): string {
   const lines = yaml.split('\n');
 
-  // Find the last line that is part of the rules list
-  let lastRuleLine = -1;
+  // Scan to find the rules section boundaries
+  let rulesHeaderLine = -1;
   let rulesSectionEnd = -1;
-  let inRules = false;
 
   for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
+    const raw = lines[i];
 
-    if (trimmed === 'rules:') {
-      inRules = true;
+    if (raw.trim() === 'rules:') {
+      rulesHeaderLine = i;
       continue;
     }
 
-    if (inRules) {
-      // A top-level key (no indent) marks the end of rules section
-      if (trimmed !== '' && !trimmed.startsWith('#') && !trimmed.startsWith('-') && !trimmed.startsWith(' ') && !trimmed.startsWith('\t')) {
+    // rules section ended: we see a non-empty line with no leading whitespace
+    // (top-level YAML key) that isn't a comment
+    if (rulesHeaderLine !== -1 && rulesSectionEnd === -1) {
+      if (raw.length > 0 && raw[0] !== ' ' && raw[0] !== '\t' && raw[0] !== '#') {
         rulesSectionEnd = i;
-        inRules = false;
         break;
-      }
-
-      if (trimmed.startsWith('- id:')) {
-        lastRuleLine = i;
       }
     }
   }
 
-  // Build the YAML block for the new rule
+  if (rulesHeaderLine === -1) {
+    // No rules section at all, append to end
+    lines.push('', 'rules:');
+    lines.push(buildRuleYamlBlock(rule));
+    return lines.join('\n');
+  }
+
+  // Find the last rule entry and where it ends
+  let lastRuleStart = -1;   // line index of last `- id:`
+  let afterLastRule = rulesSectionEnd !== -1 ? rulesSectionEnd : lines.length;
+
+  for (let i = rulesHeaderLine + 1; i < afterLastRule; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith('- id:')) {
+      lastRuleStart = i;
+    }
+  }
+
+  if (lastRuleStart !== -1) {
+    // Find where the last rule entry ends: next `- id:` or section end
+    for (let i = lastRuleStart + 1; i < afterLastRule; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith('- id:')) {
+        afterLastRule = i;
+        break;
+      }
+    }
+  }
+
   const ruleBlock = buildRuleYamlBlock(rule);
 
-  if (lastRuleLine !== -1) {
-    // Insert after the last rule entry
-    lines.splice(lastRuleLine + 1, 0, ruleBlock);
-  } else if (rulesSectionEnd !== -1) {
-    // Rules section exists but empty, insert before the next key
-    lines.splice(rulesSectionEnd, 0, ruleBlock);
+  if (lastRuleStart !== -1) {
+    // Insert after the last complete rule entry
+    lines.splice(afterLastRule, 0, ruleBlock);
   } else {
-    // Rules section with no entries, append to end
-    lines.push(ruleBlock);
+    // Rules section exists but empty, insert after the header
+    lines.splice(rulesHeaderLine + 1, 0, ruleBlock);
   }
 
   return lines.join('\n');

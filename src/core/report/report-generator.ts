@@ -194,6 +194,35 @@ function renderReportDataMarkdown(data: ReportData): string {
     lines.push('');
   }
 
+  // Policy
+  if (data.policy.totalRules > 0) {
+    lines.push('## Policy');
+    lines.push('');
+    lines.push(`- Total Rules: ${data.policy.totalRules}`);
+    lines.push(`- Allow: ${data.policy.allowRules}`);
+    lines.push(`- Deny: ${data.policy.denyRules}`);
+    lines.push(`- Ask: ${data.policy.askRules}`);
+    if (data.policy.protectedPaths.length > 0) {
+      lines.push('');
+      lines.push('Protected Paths:');
+      for (const p of data.policy.protectedPaths) {
+        lines.push(`  - \`${p}\``);
+      }
+    }
+    lines.push('');
+  }
+
+  // Snapshots
+  if (data.snapshots.total > 0) {
+    lines.push('## Snapshots');
+    lines.push('');
+    lines.push(`- Total Snapshots: ${data.snapshots.total}`);
+    if (data.snapshots.latest && data.snapshots.latestAt) {
+      lines.push(`- Latest: \`${data.snapshots.latest}\` (${data.snapshots.latestAt.slice(0, 19)})`);
+    }
+    lines.push('');
+  }
+
   return lines.join('\n');
 }
 

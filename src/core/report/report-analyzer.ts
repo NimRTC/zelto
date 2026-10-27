@@ -6,6 +6,8 @@ import type { VersionPlan, Version } from '../version/types.js';
 import type { RequirementSummary } from '../requirements/types.js';
 import type { DesignSummary } from '../design/types.js';
 import type { EventEnvelope } from '../events/stream.js';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 export interface SliceStatusDistribution {
   draft: number;
@@ -73,6 +75,18 @@ export interface ReportData {
   gates: GateStats;
   events: EventStats;
   anomalies: AnomalousSlice[];
+  policy: {
+    totalRules: number;
+    allowRules: number;
+    denyRules: number;
+    askRules: number;
+    protectedPaths: string[];
+  };
+  snapshots: {
+    total: number;
+    latest: string | null;
+    latestAt: string | null;
+  };
 }
 
 export async function analyzeReport(
@@ -179,6 +193,61 @@ export async function analyzeReport(
     }
   }
 
+  // Policy stats — read policy.yaml and count rules by action
+  let totalRules = 0;
+  let allowRules = 0;
+  let denyRules = 0;
+  let askRules = 0;
+  const protectedPaths: string[] = [];
+  try {
+    const policyPath = join(process.cwd(), 'policy', 'policy.yaml');
+    if (existsSync(policyPath)) {
+      const content = readFileSync(policyPath, 'utf-8');
+      const lines = content.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('action:')) {
+          const action = trimmed.slice(7).trim();
+          if (action === 'allow') allowRules++;
+          else if (action === 'deny') denyRules++;
+          else if (action === 'ask') askRules++;
+          totalRules++;
+        }
+      }
+      // Also read PROTECTED_PATTERNS from engine.ts comment or just hardcode
+      protectedPaths.push(
+        'policy/**', '.zelto/**', 'AGENTS.md',
+        '.cursor/rules/**', 'zelto-hook', 'zelto-hook.exe',
+      );
+    }
+  } catch {
+    // Policy file doesn't exist or unreadable
+  }
+
+  // Snapshot stats
+  let snapshotTotal = 0;
+  let snapshotLatest: string | null = null;
+  let snapshotLatestAt: string | null = null;
+  try {
+    const snapDir = join(process.cwd(), '.zelto', 'events', 'snapshots');
+    if (existsSync(snapDir)) {
+      const files = readdirSync(snapDir).filter((f) => f.endsWith('.json')).sort().reverse();
+      snapshotTotal = files.length;
+      if (files.length > 0) {
+        snapshotLatest = files[0].replace(/\.json$/, '');
+        try {
+          const latestContent = readFileSync(join(snapDir, files[0]), 'utf-8');
+          const latestData = JSON.parse(latestContent);
+          snapshotLatestAt = latestData.capturedAt ?? null;
+        } catch {
+          // ignore parse errors
+        }
+      }
+    }
+  } catch {
+    // Snapshots directory doesn't exist
+  }
+
   return {
     project: {
       name: 'zelto',
@@ -204,5 +273,17 @@ export async function analyzeReport(
     gates,
     events: eventStats,
     anomalies,
+    policy: {
+      totalRules,
+      allowRules,
+      denyRules,
+      askRules,
+      protectedPaths,
+    },
+    snapshots: {
+      total: snapshotTotal,
+      latest: snapshotLatest,
+      latestAt: snapshotLatestAt,
+    },
   };
 }
