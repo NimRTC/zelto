@@ -215,8 +215,8 @@ export class Scheduler {
   private pathMatches(filePath: string, pattern: string): boolean {
     // Simple glob matching (same logic as policy engine's matchPath)
     const regexStr = pattern
-      .replace(/\./g, '\\.')
       .replace(/\*\*/g, '<<<DOUBLESTAR>>>')
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
       .replace(/\*/g, '[^/]*')
       .replace(/<<<DOUBLESTAR>>>/g, '.*');
     return new RegExp(`^${regexStr}$`).test(filePath);

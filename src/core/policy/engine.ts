@@ -3,6 +3,7 @@
 
 import { type PolicyConfig, type PolicyDecision, type PolicyRule, type Decision } from './types.js';
 import { createHash } from 'node:crypto';
+import { normalize } from 'node:path';
 
 const PROTECTED_PATTERNS: readonly string[] = [
   'policy/**',
@@ -17,9 +18,9 @@ export function matchPath(pattern: string, path: string): boolean {
   // Convert glob-like pattern to regex
   // ** matches zero or more directory levels, * matches within a single segment
   const regexStr = pattern
-    .replace(/\./g, '\\.')
     .replace(/\*\*\//g, '<<<DS>>>/')   // **/ → sentinel (keeps trailing / for later)
     .replace(/\*\*/g, '<<<DSB>>>')     // bare ** → different sentinel
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')  // escape all regex metacharacters
     .replace(/\*/g, '[^/]*')
     .replace(/<<<DS>>>\//g, '(.+/|)')  // **/ → zero-or-more dirs (with optional /)
     .replace(/<<<DSB>>>/g, '.*');       // bare ** → any path
@@ -52,7 +53,8 @@ export function evaluatePolicy(
   }
 
   // 2. Check for path escape (outside project root)
-  if (path.startsWith('..') || path.startsWith('/') || path.includes(':\\')) {
+  const normalized = normalize(path);
+  if (normalized.startsWith('..') || path.startsWith('/') || path.includes(':\\')) {
     return {
       decision: 'deny',
       ruleId: 'protected:0a',

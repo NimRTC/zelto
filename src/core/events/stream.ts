@@ -48,6 +48,40 @@ export class EventStream {
 
   constructor(baseDir: string) {
     this.baseDir = baseDir;
+    // Restore last sequence number from existing files to survive restarts
+    this.restoreSeq().catch(() => { /* non-fatal */ });
+  }
+
+  private async restoreSeq(): Promise<void> {
+    const { readdir, readFile } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    try {
+      const entries = await readdir(this.baseDir, { withFileTypes: true });
+      let maxSeq = 0;
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const eventFile = join(this.baseDir, entry.name, 'events.jsonl');
+        try {
+          const content = await readFile(eventFile, 'utf-8');
+          const trimmed = content.trimEnd();
+          const lastNewline = trimmed.lastIndexOf('\n');
+          const lastLine = lastNewline >= 0 ? trimmed.slice(lastNewline + 1) : trimmed;
+          if (lastLine) {
+            const last = JSON.parse(lastLine);
+            if (typeof last.runSeq === 'number' && last.runSeq > maxSeq) {
+              maxSeq = last.runSeq;
+            }
+          }
+        } catch {
+          // Skip unreadable files
+        }
+      }
+      if (maxSeq > 0) {
+        this.seq = maxSeq + 1;
+      }
+    } catch {
+      // Directory may not exist yet
+    }
   }
 
   async append(sliceId: string, type: EventType, actor: string, payload: Record<string, unknown>, runId: string | null = null): Promise<EventEnvelope> {

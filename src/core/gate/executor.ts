@@ -3,7 +3,6 @@
 // C3: deterministic only — no model calls, no network
 
 import { spawn } from 'node:child_process';
-import { resolve } from 'node:path';
 import type { GateConfig, GateCommand, GateResult, GateReport } from './types.js';
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
@@ -13,12 +12,18 @@ function runCommand(cmd: GateCommand, timeoutSec: number, cwd: string): Promise<
     const start = performance.now();
     // Use shell: true with the full command as a single string
     // to avoid the deprecation warning about args with shell
+    const ac = new AbortController();
     const child = spawn(cmd.run || cmd.name, [], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: true,
-      timeout: timeoutSec * 1000,
+      signal: ac.signal,
     });
+
+    const timer = setTimeout(() => {
+      ac.abort();
+      child.kill();
+    }, timeoutSec * 1000);
 
     let stdout = '';
     let stderr = '';
@@ -27,6 +32,7 @@ function runCommand(cmd: GateCommand, timeoutSec: number, cwd: string): Promise<
     child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 
     child.on('close', (exitCode) => {
+      clearTimeout(timer);
       const durationMs = performance.now() - start;
       resolvePromise({
         command: cmd.name,
@@ -39,6 +45,7 @@ function runCommand(cmd: GateCommand, timeoutSec: number, cwd: string): Promise<
     });
 
     child.on('error', (err) => {
+      clearTimeout(timer);
       const durationMs = performance.now() - start;
       resolvePromise({
         command: cmd.name,
@@ -75,7 +82,7 @@ export class GateExecutor {
     const totalStart = performance.now();
     const results: GateResult[] = [];
     let passed = true;
-    let retryCount = 0;
+    let totalRetries = 0;
 
     await this.appendEvent(sliceId, 'gate.executed', actor, {
       sliceId,
@@ -83,13 +90,11 @@ export class GateExecutor {
     });
 
     for (const cmd of this.config.commands) {
-      const result = await this.runWithRetry(cmd, slice, actor);
+      const { result, retries } = await this.runWithRetry(cmd, slice, actor);
       results.push(result);
+      totalRetries += retries;
       if (!result.passed) {
         passed = false;
-        if (retryCount < this.config.retry.max) {
-          retryCount++;
-        }
       }
     }
 
@@ -99,7 +104,7 @@ export class GateExecutor {
       sliceId,
       passed,
       results: results.map((r) => ({ command: r.command, passed: r.passed, exitCode: r.exitCode })),
-      retryCount,
+      retryCount: totalRetries,
       totalDurationMs,
     });
 
@@ -107,7 +112,7 @@ export class GateExecutor {
       sliceId,
       passed,
       results,
-      retryCount,
+      retryCount: totalRetries,
       totalDurationMs,
     };
   }
@@ -116,7 +121,7 @@ export class GateExecutor {
     cmd: GateCommand,
     slice: SliceData,
     actor: string,
-  ): Promise<GateResult> {
+  ): Promise<{ result: GateResult; retries: number }> {
     let result = await runCommand(cmd, this.config.timeoutSec, this.projectRoot);
     let attempts = 0;
 
@@ -129,15 +134,23 @@ export class GateExecutor {
         previousExitCode: result.exitCode,
       });
 
-      // Update slice stall data
-      slice.stall.gateRetries++;
-      slice.stall.class = 'gate_retry';
-      await this.store.write(slice);
+      // Re-read slice before writing to avoid overwriting concurrent modifications
+      try {
+        const fresh = await this.store.read(slice.id);
+        fresh.stall.gateRetries++;
+        fresh.stall.class = 'gate_retry';
+        await this.store.write(fresh);
+      } catch {
+        // Fallback to stale slice if read fails
+        slice.stall.gateRetries++;
+        slice.stall.class = 'gate_retry';
+        await this.store.write(slice);
+      }
 
       result = await runCommand(cmd, this.config.timeoutSec, this.projectRoot);
     }
 
-    return result;
+    return { result, retries: attempts };
   }
 
   private async appendEvent(
