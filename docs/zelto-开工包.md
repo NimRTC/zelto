@@ -1,6 +1,6 @@
 # zelto 开工包
 
-> 版本: v0.2.1 · 最后更新: 2026-10-27
+> 版本: v0.2.2 · 最后更新: 2026-10-28
 
 ---
 
@@ -24,9 +24,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 662
-ℹ suites 124
-ℹ pass 662
+ℹ tests 676+
+ℹ suites 128+
+ℹ pass 676+
 ℹ fail 0
 ```
 
@@ -196,11 +196,12 @@ zelto/
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
 │   │   ├── ports/         端口接口
+│   │   └── spec/          规格引擎
 │   │   ├── artifacts/     制品管理
 │   │   ├── contracts/     契约管理
 │   │   ├── route/         路由
 │   │   └── spec/          规格引擎
-│   ├── cli/               CLI 实现（45+ 个命令）
+│   ├── cli/               CLI 实现（40+ 个命令）
 │   ├── hook/              独立 hook
 │   └── adapters/          适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema（6 个）

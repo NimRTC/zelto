@@ -1,6 +1,6 @@
 # zelto 技术架构
 
-> 版本: v0.1.0 · 最后更新: 2026-10-27
+> 版本: v0.2.0 · 最后更新: 2026-10-28
 
 ---
 
@@ -34,11 +34,11 @@
      │  5 类问题       │  │  3 类指标      │  │  29 种摘要     │
      └────────────────┘  └────────────────┘  └────────────────┘
 
-     ┌────────────────┐  ┌────────────────┐
-     │  core/ports    │  │   hook/       │
-     │  端口接口定义   │  │  独立判定进程  │
-     │  4 个 Port     │  │  零依赖可执行  │
-     └────────────────┘  └────────────────┘
+     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
+     │  core/ports    │  │  core/spec     │  │   hook/       │
+     │  端口接口定义   │  │  规格引擎      │  │  独立判定进程  │
+     │  4 个 Port     │  │  SpecMdExecutor│  │  零依赖可执行  │
+     └────────────────┘  └────────────────┘  └────────────────┘
 ```
 
 ### 1.1 依赖方向
@@ -268,7 +268,33 @@ class Scheduler {
 - `toText(sliceId)` — 生成可读文本报告
 - `latestEvent(sliceId, eventType)` — 获取最新事件
 
-### 3.10 Ports — `src/core/ports/`
+### 3.10 SpecMdExecutor — `src/core/spec/`
+
+**文件**: `SpecMdExecutor.ts`
+
+**职责**: 从结构化 Markdown 规格文件（`specs/slices/<id>.md`）中解析 `## Spec` 和 `## Checklists` 章节，直接驱动验证流程，消除规格→测试的翻译损耗。
+
+```typescript
+class SpecMdExecutor {
+  constructor(sliceRoot: string)        // sliceRoot = specs/slices/
+
+  parse(sliceId: string): ParsedSpec
+  // 返回 { spec: string, checklists: string[] }
+
+  validate(sliceId: string): ValidationResult
+  // 检查文件存在、## Spec 章节、## Checklists 章节、非空条目
+
+  runChecklists(sliceId: string): Promise<ChecklistResult[]>
+  // 对每个 checklist 条目执行验证
+}
+```
+
+**集成**:
+- CLI: `zelto spec-md validate|run <slice-id>`
+- Gate: `zelto gate --spec-md` 批量校验所有新格式规格
+- 旧格式文件（无 `## Spec` 章节）自动跳过，不报错
+
+### 3.11 Ports — `src/core/ports/`
 
 ```typescript
 interface SessionPort {    // agent 会话管理
@@ -285,7 +311,7 @@ interface HarnessMetaPort { // 执行器元信息
 }
 ```
 
-### 3.11 Hook — `src/hook/`
+### 3.12 Hook — `src/hook/`
 
 **文件**: `index.ts`
 
@@ -304,11 +330,11 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 4. 策略规则匹配（与 core/ 相同逻辑）
 5. 返回决策
 
-### 3.12 CLI — `src/cli/`
+### 3.13 CLI — `src/cli/`
 
 **文件**: `commands.ts`
 
-45+ 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
+40+ 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
 
 ---
 
@@ -442,7 +468,7 @@ C:\path     → deny
 
 ### 7.3 当前覆盖
 
-- **662 tests, 124 suites, 全部通过**
+- **676+ tests, 128+ suites, 全部通过**
 - 核心模块覆盖率 > 90%
 - Hook 可执行体 7 个集成测试
 

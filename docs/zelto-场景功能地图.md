@@ -1,6 +1,6 @@
 # zelto 场景功能地图
 
-> 版本: v0.2.1 · 最后更新: 2026-10-27（文档同步至代码当前状态）
+> 版本: v0.2.2 · 最后更新: 2026-10-28（文档同步至代码当前状态）
 
 ---
 
@@ -134,6 +134,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
 | **Audit Trail** | `src/core/audit/trail.ts` | 29 种事件摘要、可读审计报告 |
+| **Spec Executor** | `src/core/spec/SpecMdExecutor.ts` | Markdown 规格文件自校验（parse/validate/runChecklists） |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
@@ -153,7 +154,8 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto start <id> [--yes] [--agent <name>]` | 一键执行：create→check→freeze→run | run |
 | `zelto run <id> [--dry-run] [--agent <name>] [--json]` | 执行切片（含并行准入） | run |
 | `zelto admit <id> [--json]` | 准入检查 | run 前 |
-| `zelto gate <id> [--dry-run] [--retry <N>] [--json]` | 门禁② 验收测试 | gate |
+| `zelto gate <id> [--dry-run] [--retry <N>] [--spec-md] [--json]` | 门禁② 验收测试 | gate |
+| `zelto gate --spec-md` | 批量校验所有新格式规格文件 | gate |
 | `zelto inbox` | 待签名队列 | sign 前 |
 | `zelto sign <id> --approve [--json]` | 审批切片 | sign |
 | `zelto sign <id> --reject [--json]` | 拒绝切片 | sign |
@@ -193,6 +195,12 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto policy remove <id> [--json]` | 删除策略规则 | 策略 |
 | `zelto policy edit <id> [--path <p>] [--action <a>] ...` | 编辑已有策略规则 | 策略 |
 | `zelto completion bash\|zsh\|fish` | 生成 shell 补全脚本 | 通用 |
+| `zelto status [--watch] [--json]` | 查看 agent 会话状态 | 通用 |
+| `zelto spec-md validate <slice-id>` | 验证切片规格文件结构 | 规格 |
+| `zelto spec-md run <slice-id>` | 执行规格文件 checklist | 规格 |
+| `zelto slice-status [id] [--json]` | 查看切片运行状态详情 | 通用 |
+| `zelto ss [id] [--json]` | slice-status 别名 | 通用 |
+| `zelto patch-content` | 补丁内容管理 | 通用 |
 
 ### 3.3 独立 Hook
 
@@ -272,8 +280,9 @@ zelto/
 │   │   ├── budget/        预算跟踪
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
-│   │   └── ports/         端口接口定义
-│   ├── cli/               CLI 命令实现（45+ 个命令）
+│   │   ├── ports/         端口接口定义
+│   │   └── spec/          规格引擎（SpecMdExecutor）
+│   ├── cli/               CLI 命令实现（40+ 个命令）
 │   ├── hook/              独立可执行判定进程
 │   └── adapters/          执行器适配器（claude-agent）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
@@ -300,11 +309,11 @@ zelto/
 
 | 类别 | 测试数 | Suites |
 |------|--------|--------|
-| 单元测试 | 510 | 97 |
+| 单元测试 | 520+ | 100+ |
 | 验收测试 | 152 | 27 |
-| **总计** | **662** | **124** |
+| **总计** | **676+** | **128+** |
 
-> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-27，510 单元 + 152 验收 = 662 全绿。
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-28，520+ 单元 + 152 验收 = 676+ 全绿。
 
 ---
 
@@ -326,7 +335,7 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（662 tests, 124 suites）
+pnpm test           # 编译 + 运行测试（676+ tests, 128+ suites）
 pnpm test:quick     # 跳过编译直接跑测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
