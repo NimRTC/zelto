@@ -81,11 +81,11 @@ export function isPiped(): boolean {
 
 export class OutputFormatter {
   private format: OutputFormat;
-  private readonly _autoJsonFromPipe: boolean;
+  private autoJsonFromPipe: boolean;
 
   constructor(format: OutputFormat = OutputFormat.Terminal) {
     this.format = format;
-    this._autoJsonFromPipe = true;
+    this.autoJsonFromPipe = true;
   }
 
   // ─── Format Accessors ────────────────────────────────────────────────────
@@ -99,10 +99,25 @@ export class OutputFormatter {
   }
 
   /**
+   * Disable automatic JSON output when stdout is piped.
+   * Useful for testing or when explicit format control is needed.
+   */
+  disableAutoJsonFromPipe(): void {
+    this.autoJsonFromPipe = false;
+  }
+
+  /**
+   * Enable automatic JSON output when stdout is piped (default behavior).
+   */
+  enableAutoJsonFromPipe(): void {
+    this.autoJsonFromPipe = true;
+  }
+
+  /**
    * Resolve the effective output format, considering pipe detection.
    */
   private resolveFormat(): OutputFormat {
-    if (this._autoJsonFromPipe && isPiped() && this.format === OutputFormat.Terminal) {
+    if (this.autoJsonFromPipe && isPiped() && this.format === OutputFormat.Terminal) {
       return OutputFormat.JSON;
     }
     return this.format;
@@ -181,12 +196,12 @@ export class OutputFormatter {
 
     const errors = validateWithSchema('output-error', data);
     if (errors.length > 0) {
-      // Fallback to plain error object
-      this.writeStructured({ error: { code, message, ...extra } });
+      // Fallback to plain error object — write to stderr
+      this.writeStructured({ error: { code, message, ...extra } }, process.stderr);
       return;
     }
 
-    this.writeStructured(data);
+    this.writeStructured(data, process.stderr);
   }
 
   // ─── success() ───────────────────────────────────────────────────────────
@@ -234,23 +249,23 @@ export class OutputFormatter {
 
     const errors = validateWithSchema('output-warning', data);
     if (errors.length > 0) {
-      this.writeStructured({ warning: message, ...extra });
+      this.writeStructured({ warning: message, ...extra }, process.stderr);
       return;
     }
 
-    this.writeStructured(data);
+    this.writeStructured(data, process.stderr);
   }
 
   // ─── Structured Write (JSON / YAML) ─────────────────────────────────────
 
-  private writeStructured(data: unknown): void {
+  private writeStructured(data: unknown, stream: NodeJS.WriteStream = process.stdout): void {
     const fmt = this.resolveFormat();
 
     if (fmt === OutputFormat.JSON) {
-      process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+      stream.write(`${JSON.stringify(data, null, 2)}\n`);
     } else if (fmt === OutputFormat.YAML) {
       const stringify = getYamlStringifySync();
-      process.stdout.write(`${stringify(data)}\n`);
+      stream.write(`${stringify(data)}\n`);
     }
   }
 

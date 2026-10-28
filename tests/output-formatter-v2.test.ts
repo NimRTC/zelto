@@ -4,6 +4,18 @@ import assert from 'node:assert/strict';
 import { OutputFormat, OutputFormatter, initFormatter, getDefaultFormatter, setDefaultFormatter } from '../src/cli/output-formatter.js';
 import { validateWithSchema, isValid } from '../src/cli/validate-schema.js';
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Create an OutputFormatter with auto-JSON-from-pipe disabled.
+ * This ensures terminal mode tests work in non-TTY environments (e.g., test runners).
+ */
+function createFormatter(format: OutputFormat = OutputFormat.Terminal): OutputFormatter {
+  const f = new OutputFormatter(format);
+  f.disableAutoJsonFromPipe();
+  return f;
+}
+
 // Helper to capture stdout/stderr
 interface StreamCapture {
   restore: () => void;
@@ -36,17 +48,17 @@ describe('OutputFormatter', () => {
 
   describe('format accessors', () => {
     it('should default to Terminal', () => {
-      const f = new OutputFormatter();
+      const f = createFormatter();
       assert.equal(f.getFormat(), OutputFormat.Terminal);
     });
 
     it('should set format via constructor', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       assert.equal(f.getFormat(), OutputFormat.JSON);
     });
 
     it('should allow runtime format change', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       f.setFormat(OutputFormat.YAML);
       assert.equal(f.getFormat(), OutputFormat.YAML);
     });
@@ -54,7 +66,7 @@ describe('OutputFormatter', () => {
 
   describe('out()', () => {
     it('should write message to stdout in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.out('hello world');
       cap.restore();
@@ -63,7 +75,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should write to stderr with stderr option', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stderr');
       f.out('error msg', { stderr: true });
       cap.restore();
@@ -71,7 +83,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should output JSON in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.out('hello');
       cap.restore();
@@ -80,7 +92,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should include timestamp when requested', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.out('hello', { timestamp: true });
       cap.restore();
@@ -92,7 +104,7 @@ describe('OutputFormatter', () => {
 
   describe('data()', () => {
     it('should output (empty) for null in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.data(null);
       cap.restore();
@@ -100,7 +112,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should output (empty) for empty array in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.data([]);
       cap.restore();
@@ -108,7 +120,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should output array items in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.data([{ id: '1', name: 'test' }]);
       cap.restore();
@@ -117,7 +129,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should output JSON in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.data([{ id: '1' }]);
       cap.restore();
@@ -127,7 +139,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should include total/shown when provided', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.data([], { total: 10, showing: 0 });
       cap.restore();
@@ -139,7 +151,7 @@ describe('OutputFormatter', () => {
 
   describe('error()', () => {
     it('should write error to stderr in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stderr');
       f.error('TEST_ERR', 'something went wrong');
       cap.restore();
@@ -148,8 +160,8 @@ describe('OutputFormatter', () => {
     });
 
     it('should output structured error in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
-      const cap = captureStream('stdout');
+      const f = createFormatter(OutputFormat.JSON);
+      const cap = captureStream('stderr');
       f.error('ERR_CODE', 'fail');
       cap.restore();
       const parsed = JSON.parse(cap.getOutput());
@@ -158,8 +170,8 @@ describe('OutputFormatter', () => {
     });
 
     it('should include extra fields in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
-      const cap = captureStream('stdout');
+      const f = createFormatter(OutputFormat.JSON);
+      const cap = captureStream('stderr');
       f.error('ERR', 'msg', { path: '/test', detail: 'extra' });
       cap.restore();
       const parsed = JSON.parse(cap.getOutput());
@@ -170,7 +182,7 @@ describe('OutputFormatter', () => {
 
   describe('success()', () => {
     it('should write green success in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.success('all good');
       cap.restore();
@@ -178,7 +190,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should output structured success in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.success('done');
       cap.restore();
@@ -188,7 +200,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should include data when provided in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
+      const f = createFormatter(OutputFormat.JSON);
       const cap = captureStream('stdout');
       f.success('done', { data: { id: 1 } });
       cap.restore();
@@ -199,7 +211,7 @@ describe('OutputFormatter', () => {
 
   describe('warn()', () => {
     it('should write warning in terminal mode', () => {
-      const f = new OutputFormatter(OutputFormat.Terminal);
+      const f = createFormatter(OutputFormat.Terminal);
       const cap = captureStream('stdout');
       f.warn('be careful');
       cap.restore();
@@ -207,8 +219,8 @@ describe('OutputFormatter', () => {
     });
 
     it('should output structured warning in JSON mode', () => {
-      const f = new OutputFormatter(OutputFormat.JSON);
-      const cap = captureStream('stdout');
+      const f = createFormatter(OutputFormat.JSON);
+      const cap = captureStream('stderr');
       f.warn('caution');
       cap.restore();
       const parsed = JSON.parse(cap.getOutput());
@@ -223,7 +235,7 @@ describe('OutputFormatter', () => {
     });
 
     it('should allow setting default formatter', () => {
-      const custom = new OutputFormatter(OutputFormat.JSON);
+      const custom = createFormatter(OutputFormat.JSON);
       setDefaultFormatter(custom);
       assert.equal(getDefaultFormatter(), custom);
 
@@ -295,7 +307,7 @@ describe('validateWithSchema', () => {
 
 describe('OutputFormatter with YAML', () => {
   it('should output YAML when format is YAML', () => {
-    const f = new OutputFormatter(OutputFormat.YAML);
+    const f = createFormatter(OutputFormat.YAML);
     const cap = captureStream('stdout');
     f.success('done');
     cap.restore();
@@ -307,7 +319,7 @@ describe('OutputFormatter with YAML', () => {
   });
 
   it('should output data in YAML format', () => {
-    const f = new OutputFormatter(OutputFormat.YAML);
+    const f = createFormatter(OutputFormat.YAML);
     const cap = captureStream('stdout');
     f.data([{ id: '1' }]);
     cap.restore();

@@ -50,15 +50,15 @@ const SCHEMAS_DIR = (() => {
   try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
     // From dist/cli/ -> ../../contracts/schemas
-    const distPath = join(__dirname, '..', '..', '..', 'contracts', 'schemas');
+    const distPath = join(__dirname, '..', '..', 'contracts', 'schemas');
     if (existsSync(distPath)) return distPath;
   } catch { /* fall through */ }
 
   // Fallback: resolve from source dir
   try {
     const __dirname = dirname(fileURLToPath(import.meta.url));
-    // From src/cli/ -> ../../../contracts/schemas (for source)
-    const srcPath = join(__dirname, '..', '..', '..', 'contracts', 'schemas');
+    // From src/cli/ -> ../../contracts/schemas (for source)
+    const srcPath = join(__dirname, '..', '..', 'contracts', 'schemas');
     if (existsSync(srcPath)) return srcPath;
   } catch { /* fall through */ }
 
@@ -121,12 +121,25 @@ function validateValue(
   // Type check
   if (schema.type) {
     const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-    const actualType = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+    let actualType = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
 
     // Map JS types to schema types
     const mappedType = actualType === 'object' && value === null ? 'null' : actualType;
 
-    if (!types.includes(mappedType)) {
+    // Handle 'integer' type: JavaScript typeof returns 'number', so we check if it's an integer
+    const effectiveTypes = types.map((t) => {
+      if (t === 'integer') return 'number';
+      return t;
+    });
+
+    // For 'integer' type, also verify the value is actually an integer
+    const isIntegerType = types.includes('integer');
+    if (isIntegerType && typeof value === 'number' && !Number.isInteger(value)) {
+      errors.push(`${path}: expected integer, got non-integer number ${value}`);
+      return;
+    }
+
+    if (!effectiveTypes.includes(mappedType)) {
       errors.push(`${path}: expected type ${types.join('|')}, got ${mappedType}`);
       return; // No point checking further if type is wrong
     }
