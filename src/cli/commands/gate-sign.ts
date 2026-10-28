@@ -6,13 +6,28 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadConfig } from './shared.js';
+import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
+import { resolve } from 'node:path';
+import { readdir } from 'node:fs/promises';
 
 // ─── gate ────────────────────────────────────────────────────────────────────
 
 register('gate', async (args) => {
+  const hasSpecMd = args.includes('--spec-md');
+
+  // Handle `gate --spec-md` without a slice ID: run spec-md on all slices
+  if (hasSpecMd && (!args[0] || args[0].startsWith('--'))) {
+    return runSpecMdOnAllSlices();
+  }
+
   const [id] = args;
   if (!id || id === '--help' || id === '-h') {
-    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run]');
+    if (!id && hasSpecMd) {
+      // --spec-md without slice-id is handled above
+      return 0;
+    }
+    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run] [--spec-md]');
+    console.error('       zelto gate --spec-md                    (validate all specs)');
     return 1;
   }
 
@@ -70,6 +85,26 @@ register('gate', async (args) => {
       timeoutSec: config.gate.timeoutSec,
       retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
+
+    // Run spec-md validation if --spec-md flag is set
+    if (hasSpecMd) {
+      const specMd = new SpecMdExecutor(resolve(process.cwd(), 'specs', 'slices'));
+      const result = await specMd.validate(id);
+      if (!result.valid) {
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, specMdValid: false, specMdErrors: result.errors }));
+        } else {
+          console.log(`  Spec-MD: ❌ ${id} spec file validation failed`);
+          for (const err of result.errors) {
+            console.log(`    - ${err}`);
+          }
+        }
+        return 1;
+      }
+      if (!isJson) {
+        console.log(`  Spec-MD: ✅ ${id} spec file validated`);
+      }
+    }
 
     const executor = new GateExecutor(store, events, gateConfig);
     const report = await executor.execute(id);
@@ -283,6 +318,56 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
     }
   } catch (mergeErr) {
     console.log(`  ⚠️  Auto-merge skipped: ${mergeErr}`);
+  }
+}
+
+// ─── spec-md on all slices (for gate --spec-md without slice-id) ──────────────
+
+async function runSpecMdOnAllSlices(): Promise<number> {
+  const { readFile } = await import('node:fs/promises');
+  const slicesDir = resolve(process.cwd(), 'specs', 'slices');
+  const executor = new SpecMdExecutor(slicesDir);
+  try {
+    const entries = await readdir(slicesDir);
+    const mdFiles = entries.filter((f) => f.endsWith('.md'));
+    if (mdFiles.length === 0) {
+      console.log('No spec files found in specs/slices/.');
+      return 0;
+    }
+    let validated = 0;
+    let skipped = 0;
+    let allValid = true;
+    for (const file of mdFiles) {
+      const sliceId = file.replace(/\.md$/, '');
+      // Skip old-format spec files that don't have ## Spec section
+      const content = await readFile(resolve(slicesDir, file), 'utf-8');
+      if (!content.includes('## Spec')) {
+        skipped++;
+        continue;
+      }
+      const result = await executor.validate(sliceId);
+      if (result.valid) {
+        console.log(`  ✅ ${sliceId}`);
+        validated++;
+      } else {
+        console.error(`  ❌ ${sliceId}`);
+        for (const err of result.errors) {
+          console.error(`     - ${err}`);
+        }
+        allValid = false;
+      }
+    }
+    if (allValid) {
+      console.log(`\n✅ ${validated} spec files validated (spec-md). ${skipped > 0 ? `${skipped} old-format skipped.` : ''}`);
+    } else {
+      console.error(`\n❌ Some spec files failed validation (spec-md). ${skipped > 0 ? `${skipped} old-format skipped.` : ''}`);
+      return 1;
+    }
+    return 0;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error running spec-md on all slices: ${msg}`);
+    return 1;
   }
 }
 

@@ -299,6 +299,25 @@ register('plan', async (args) => {
   const subcmd = args[0];
   const f = getDefaultFormatter();
 
+  if (!subcmd) {
+    f.error('USAGE', 'Usage: zelto plan <design-id>');
+    f.out('       zelto plan list');
+    f.out('       zelto plan confirm <id>');
+    f.out('       zelto plan add-version <id> <description>');
+    return 1;
+  }
+
+  if (subcmd === 'list') {
+    const versionStore = new VersionStore(ZELTO_DIR);
+    const list = await versionStore.list();
+    if (list.length === 0) {
+      f.out('No plans found.');
+      return 0;
+    }
+    f.data(list.map((p) => ({ id: p.id, status: p.status, title: p.title, versions: p.versionCount })));
+    return 0;
+  }
+
   if (subcmd === 'confirm') {
     const id = args[1];
     if (!id || id.startsWith('--')) {
@@ -390,7 +409,7 @@ register('plan', async (args) => {
   // zelto plan <design-id>
   const designId = subcmd;
   if (!designId || designId.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan <design-id> | zelto plan confirm <id>');
+    f.error('USAGE', 'Usage: zelto plan <design-id> | zelto plan list | zelto plan confirm <id> | zelto plan add-version <id> <desc>');
     return 1;
   }
 
