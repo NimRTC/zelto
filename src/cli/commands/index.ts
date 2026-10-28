@@ -21,6 +21,8 @@ import './audit.js';
 import './snapshot.js';
 import './diff.js';
 import './patch-content.js';
+import './spec-md.js';
+import './slice-status.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────
