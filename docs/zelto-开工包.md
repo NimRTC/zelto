@@ -215,8 +215,10 @@ zelto/
 ```bash
 pnpm build          # 编译
 pnpm dev            # 监听模式编译
-pnpm test           # 编译 + 测试
-pnpm test:quick     # 快速测试（跳过编译）
+pnpm test           # 编译 + 全量测试
+pnpm test:quick     # 跳过编译跑全量测试
+pnpm test:unit      # 编译 + 纯单元测试（最快反馈，~1.8s）
+pnpm test:acceptance # 仅验收测试
 pnpm test:watch     # 监听模式测试
 pnpm lint           # Biome 检查
 pnpm format         # 自动格式化
@@ -464,8 +466,10 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
 
 | 操作 | 耗时 |
 |---|---|
-| `pnpm build` | ~2s |
-| `pnpm test` (662 tests) | ~55s |
-| Hook 单次判定 | < 10ms |
+| `pnpm build` | ~2.4s |
+| `pnpm test:unit` (482 tests) | ~1.8s（含编译） |
+| `pnpm test` (676+ tests, 208 files) | ~60s（含编译 + 验收） |
+| CLI 冷启动（`zelto help`） | ~300ms |
+| Hook 单次判定 | ~100ms（含 Node 启动），< 10ms（纯判定） |
 | SliceStore.read | < 5ms |
 | EventStream.append | < 5ms |

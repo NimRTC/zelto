@@ -333,10 +333,12 @@ zelto/
 ## 附录 C：开发命令
 
 ```bash
-pnpm build          # 编译（tsc）
+pnpm build          # 编译（tsc, ~2.4s）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 运行测试（676+ tests, 128+ suites）
-pnpm test:quick     # 跳过编译直接跑测试
+pnpm test           # 编译 + 全量测试（208 文件, 676+ tests）
+pnpm test:quick     # 跳过编译直接跑全量测试
+pnpm test:unit      # 编译 + 仅运行纯单元测试（482 tests, ~1.8s）
+pnpm test:acceptance # 仅运行验收测试（22 suites）
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
 pnpm format         # Biome 格式化
