@@ -591,6 +591,7 @@ register('completion', async (args) => {
     sign: ['--approve', '--reject'],
     hook: ['--install', '--uninstall'],
     stall: ['--auto-resolved'],
+    status: ['--watch', '--json'],
     run: ['--dry-run', '--agent', '--adapter'],
     start: ['--title', '--writes', '--agent', '--yes', '--adapter'],
     create: ['--title', '--writes'],
