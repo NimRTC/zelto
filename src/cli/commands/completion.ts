@@ -22,6 +22,7 @@ const SUBCOMMANDS: Record<string, string[]> = {
   policy: ['list', 'show', 'check', 'validate', 'add', 'remove', 'edit'],
   hook: ['--install', '--uninstall', '--status'],
   stall: ['--auto-resolved'],
+  status: ['--watch', '--json'],
   snapshot: ['list', 'show'],
   run: ['--dry-run', '--agent', '--adapter'],
   start: ['--title', '--writes', '--agent', '--yes', '--adapter'],
