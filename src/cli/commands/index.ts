@@ -3,6 +3,7 @@
 
 import { createLlmFromConfig } from './shared.js';
 import { commands } from './shared.js';
+import { OutputFormat, setDefaultFormatter, getDefaultFormatter, initFormatter } from '../output-formatter.js';
 
 // Import all command group files — these call register() as module-level side effects
 import './core-slice.js';
@@ -19,14 +20,37 @@ import './completion.js';
 import './audit.js';
 import './snapshot.js';
 import './diff.js';
+import './patch-content.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
+  // ─── Parse global flags ──────────────────────────────────────────────────
+  const formatIdx = argv.indexOf('--format');
+  let globalFormat: OutputFormat | undefined;
+  if (formatIdx >= 0 && formatIdx + 1 < argv.length) {
+    const formatStr = argv[formatIdx + 1].toLowerCase();
+    if (formatStr === 'json') globalFormat = OutputFormat.JSON;
+    else if (formatStr === 'yaml') globalFormat = OutputFormat.YAML;
+    else if (formatStr === 'terminal') globalFormat = OutputFormat.Terminal;
+    // Remove --format and its value from argv
+    argv.splice(formatIdx, 2);
+  }
+
+  // ─── Initialize OutputFormatter ──────────────────────────────────────────
+  // Pre-load YAML serializer if needed
+  await initFormatter();
+
+  const formatter = getDefaultFormatter();
+  if (globalFormat !== undefined) {
+    formatter.setFormat(globalFormat);
+  }
+  setDefaultFormatter(formatter);
+
   const [cmd, ...rest] = argv;
 
   // Handle --version and -v flags
   if (cmd === '--version' || cmd === '-v') {
     const { getVersionString } = await import('../version.js');
-    console.log(getVersionString());
+    formatter.out(getVersionString());
     return 0;
   }
 
@@ -48,8 +72,8 @@ export async function runCLI(argv: string[]): Promise<number> {
       const fullInput = [cmd, ...rest].join(' ');
       return routeAndExecute(fullInput, llm, commands);
     }
-    console.error(`Unknown command: ${cmd}`);
-    console.error('Run "zelto help" for usage.');
+    formatter.error('UNKNOWN_COMMAND', `Unknown command: ${cmd}`);
+    formatter.out('Run "zelto help" for usage.', { stderr: false });
     return 1;
   }
 

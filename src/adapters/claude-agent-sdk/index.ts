@@ -6,6 +6,12 @@
 //   - Supports session resume via session IDs
 //   - Streams real-time events from the agent session
 //
+// Reliability features:
+//   - Timeout (kills agent if it exceeds time limit)
+//   - Retry (re-starts on failure up to maxRetries)
+//   - Output capture for progress reporting
+//   - Health check (isSessionAlive)
+//
 // Requirements:
 //   - ANTHROPIC_API_KEY environment variable (or configured API key)
 //   - @anthropic-ai/claude-agent-sdk installed
@@ -29,12 +35,26 @@ export interface ClaudeAgentSdkAdapterOptions {
   permissionMode?: 'bypassPermissions' | 'auto' | 'default';
   /** Environment variables to pass */
   env?: Record<string, string>;
+  /** Maximum time in ms before aborting the agent (default: 900000 = 15 min) */
+  timeoutMs?: number;
+  /** Maximum number of retries on failure (default: 2) */
+  maxRetries?: number;
+  /**
+   * Optional callback for real-time output from the agent.
+   * Called with each text message as it arrives.
+   */
+  onOutput?: (sessionId: string, text: string) => void;
+  /**
+   * Optional callback for progress updates.
+   * Called periodically during execution with elapsed time info.
+   */
+  onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
 }
 
 const ADAPTER_META: AdapterMeta = {
-  version: '1.0.0',
+  version: '2.0.0',
   description:
-    'Claude Agent SDK adapter — programmatic agent control with budget, events, and resume',
+    'Claude Agent SDK adapter — programmatic agent control with timeout, retry, budget, events, and resume',
   capabilities: {
     resume: true,
     events: true,
@@ -49,6 +69,8 @@ interface SdkSessionState {
   startedAt: string;
   /** Abort controller for cancellation */
   abortController: AbortController;
+  /** Current retry attempt (0 = first try) */
+  retryCount: number;
 }
 
 /**
@@ -85,9 +107,21 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   private readonly claudeCodePath: string | undefined;
   private readonly permissionMode: 'bypassPermissions' | 'auto' | 'default';
   private readonly env: Record<string, string> | undefined;
+  private readonly timeoutMs: number;
+  private readonly maxRetries: number;
+  private readonly onOutput?: (sessionId: string, text: string) => void;
+  private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
 
   /** Active sessions keyed by sessionId */
   private readonly sessions = new Map<string, SdkSessionState>();
+  /** Timeouts per session */
+  private readonly timeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Progress intervals per session */
+  private readonly progressIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  /** Buffer of events per session, for the events() method */
+  private readonly sessionEvents = new Map<string, EventEnvelope[]>();
+  /** Resolve functions for waitForExit promises, keyed by sessionId */
+  private readonly exitResolvers = new Map<string, (code: number | null) => void>();
 
   constructor(options: ClaudeAgentSdkAdapterOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -97,6 +131,10 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     this.claudeCodePath = options.claudeCodePath;
     this.permissionMode = options.permissionMode ?? 'bypassPermissions';
     this.env = options.env;
+    this.timeoutMs = options.timeoutMs ?? 900_000; // 15 minutes default
+    this.maxRetries = options.maxRetries ?? 2;
+    this.onOutput = options.onOutput;
+    this.onProgress = options.onProgress;
   }
 
   async start(spec: {
@@ -104,7 +142,14 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     prompt: string;
     model?: string;
   }): Promise<{ sessionId: string }> {
-    const sessionId = `sdk-${spec.sliceId}-${Date.now()}`;
+    return this.startWithRetry(spec, 0);
+  }
+
+  private async startWithRetry(
+    spec: { sliceId: string; prompt: string; model?: string },
+    retryCount: number,
+  ): Promise<{ sessionId: string }> {
+    const sessionId = `sdk-${spec.sliceId}-${Date.now()}${retryCount > 0 ? `-retry-${retryCount}` : ''}`;
 
     // Build SDK options
     const sdkOptions: Record<string, unknown> = {
@@ -133,6 +178,15 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     }
 
     const abortController = new AbortController();
+    const startedAt = new Date().toISOString();
+
+    // Store session state before starting (so waitForExit can find it)
+    this.sessions.set(sessionId, {
+      sessionId,
+      startedAt,
+      abortController,
+      retryCount,
+    });
 
     // Start the agent session via SDK
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -141,16 +195,28 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     // Send the prompt
     const gen = warm.query(spec.prompt);
 
-    // Store session state (the generator runs asynchronously)
-    this.sessions.set(sessionId, {
-      sessionId,
-      startedAt: new Date().toISOString(),
-      abortController,
-    });
+    // Set timeout
+    const timeout = setTimeout(() => {
+      this.handleTimeout(sessionId);
+    }, this.timeoutMs);
+    this.timeouts.set(sessionId, timeout);
+
+    // Start progress reporting interval (every 5 seconds)
+    if (this.onProgress) {
+      const startedAtMs = Date.parse(startedAt);
+      const progressInterval = setInterval(() => {
+        if (!this.sessions.has(sessionId)) {
+          clearInterval(progressInterval);
+          return;
+        }
+        const elapsed = Date.now() - startedAtMs;
+        this.onProgress!(sessionId, elapsed, 'running');
+      }, 5000);
+      this.progressIntervals.set(sessionId, progressInterval);
+    }
 
     // Start consuming the generator in the background
-    // The consumer stores the last few messages for event streaming
-    this.consumeGenerator(sessionId, gen).catch((err) => {
+    this.consumeGenerator(sessionId, spec, gen, retryCount).catch((err) => {
       // If the session was intentionally stopped, ignore the error
       if ((err as Error).message?.includes('abort') || (err as Error).message?.includes('AbortError')) {
         return;
@@ -164,10 +230,13 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   /**
    * Consume the AsyncGenerator from query() and store events.
    * This runs in the background while the agent works.
+   * Handles timeout and retry internally.
    */
   private async consumeGenerator(
     sessionId: string,
+    spec: { sliceId: string; prompt: string; model?: string },
     gen: AsyncGenerator<unknown, void>,
+    retryCount: number,
   ): Promise<void> {
     const eventBuffer: EventEnvelope[] = [];
     try {
@@ -194,25 +263,91 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
 
         // Store events on the session for later retrieval
         this.sessionEvents.set(sessionId, [...eventBuffer]);
+
+        // Capture text output for progress callbacks
+        if (this.onOutput && msgType === 'text') {
+          const text = (msg.text as string) ?? (msg.content as string) ?? '';
+          if (text) {
+            this.onOutput(sessionId, text);
+          }
+        }
       }
+
+      // Generator completed normally
+      this.handleExit(sessionId, 0);
     } catch (err) {
-      // Generator stopped (normal end or abort)
+      // Generator stopped (error or abort)
       this.sessionEvents.set(sessionId, [...eventBuffer]);
-      throw err;
+
+      const errMsg = (err as Error).message ?? '';
+      if (errMsg.includes('abort') || errMsg.includes('AbortError')) {
+        // Intentionally stopped — don't retry
+        this.handleExit(sessionId, null);
+      } else if (retryCount < this.maxRetries) {
+        // Retry on unexpected errors
+        const newRetry = retryCount + 1;
+        if (this.onOutput) {
+          this.onOutput(sessionId, `\n[zelto: retrying (attempt ${newRetry}/${this.maxRetries})]\n`);
+        }
+        try {
+          const { sessionId: newId } = await this.startWithRetry(spec, newRetry);
+          // Resolve the old session's exit promise via the new session
+          const newCode = await this.waitForExit(newId);
+          this.handleExit(sessionId, newCode);
+        } catch {
+          this.handleExit(sessionId, 1);
+        }
+      } else {
+        // Max retries exceeded
+        if (this.onOutput) {
+          this.onOutput(sessionId, `\n[zelto: max retries (${this.maxRetries}) exceeded]\n`);
+        }
+        this.handleExit(sessionId, 1);
+      }
     }
   }
 
-  /** Buffer of events per session, for the events() method */
-  private readonly sessionEvents = new Map<string, EventEnvelope[]>();
+  // ─── Timeout Handling ──────────────────────────────────────────────────────
+
+  private handleTimeout(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    if (this.onOutput) {
+      this.onOutput(sessionId, `\n[zelto: timeout after ${this.timeoutMs}ms]\n`);
+    }
+
+    // Abort the generator
+    session.abortController.abort();
+    this.handleExit(sessionId, null);
+  }
+
+  // ─── Exit Handling ─────────────────────────────────────────────────────────
+
+  private handleExit(sessionId: string, exitCode: number | null): void {
+    // Clear timeout
+    const timeout = this.timeouts.get(sessionId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.timeouts.delete(sessionId);
+    }
+
+    // Clear progress interval
+    const progressInterval = this.progressIntervals.get(sessionId);
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      this.progressIntervals.delete(sessionId);
+    }
+
+    // Resolve the exit promise
+    const resolve = this.exitResolvers.get(sessionId);
+    if (resolve) {
+      resolve(exitCode);
+      this.exitResolvers.delete(sessionId);
+    }
+  }
 
   async resume(_sessionId: string, _patch: string): Promise<void> {
-    // Resume is supported via SDK's session resume mechanism.
-    // The SDK can resume a previous session by session UUID.
-    // For now, we re-start with additional context in the prompt.
-    //
-    // In a full implementation, this would use the SDK's session persistence
-    // to restore the agent's state and inject the patch as additional context.
-
     // Read the session's event history to rebuild context
     const existingEvents = this.sessionEvents.get(_sessionId);
     const contextSummary =
@@ -237,9 +372,10 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       sessionId: newSessionId,
       startedAt: new Date().toISOString(),
       abortController: new AbortController(),
+      retryCount: 0,
     });
 
-    this.consumeGenerator(newSessionId, gen).catch(() => {});
+    this.consumeGenerator(newSessionId, { sliceId: _sessionId, prompt: combinedPrompt }, gen, 0).catch(() => {});
   }
 
   async stop(sessionId: string): Promise<void> {
@@ -248,8 +384,23 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       throw new Error(`Session "${sessionId}" not found`);
     }
 
+    // Clear timeout
+    const timeout = this.timeouts.get(sessionId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.timeouts.delete(sessionId);
+    }
+
+    // Clear progress interval
+    const progressInterval = this.progressIntervals.get(sessionId);
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      this.progressIntervals.delete(sessionId);
+    }
+
     // Abort the generator to stop the agent
     session.abortController.abort();
+    this.handleExit(sessionId, null);
     this.sessions.delete(sessionId);
   }
 
@@ -277,25 +428,26 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       return null;
     }
 
-    // Wait for the generator to complete (or be aborted)
-    // We do this by polling the session events for a terminal event
     return new Promise<number | null>((resolve) => {
-      const check = () => {
-        const events = this.sessionEvents.get(sessionId) ?? [];
-        const lastEvent = events[events.length - 1];
-
-        if (lastEvent?.type === 'run.finished') {
-          resolve(0);
-        } else if (lastEvent?.type === 'run.aborted') {
-          resolve(1);
-        } else if (!this.sessions.has(sessionId)) {
-          resolve(null);
-        } else {
-          // Still running — check again in 500ms
-          setTimeout(check, 500);
-        }
-      };
-      check();
+      this.exitResolvers.set(sessionId, resolve);
     });
+  }
+
+  // ─── Health / Status ───────────────────────────────────────────────────────
+
+  /**
+   * Check if an agent session is still alive.
+   * Returns true if the session exists and hasn't resolved yet.
+   */
+  isSessionAlive(sessionId: string): boolean {
+    return this.sessions.has(sessionId) && !this.exitResolvers.has(sessionId);
+  }
+
+  /**
+   * Get the last N event summaries for a session.
+   */
+  getRecentEvents(sessionId: string, count: number = 10): EventEnvelope[] {
+    const events = this.sessionEvents.get(sessionId) ?? [];
+    return events.slice(-count);
   }
 }

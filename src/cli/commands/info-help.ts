@@ -9,6 +9,7 @@ import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
+import { getDefaultFormatter } from '../output-formatter.js';
 
 // ─── next ────────────────────────────────────────────────────────────────────
 
@@ -253,6 +254,7 @@ This is an example. Replace with your actual slice.
 // ─── summary ─────────────────────────────────────────────────────────────────
 
 register('summary', async () => {
+  const f = getDefaultFormatter();
   let pkg: Record<string, unknown> = {};
   try {
     pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
@@ -296,29 +298,29 @@ register('summary', async () => {
     }
   }
 
-  console.log(`\n  ╭──────────────────────────────────────╮`);
-  console.log(`  │  zelto project summary              │`);
-  console.log(`  ╰──────────────────────────────────────╯`);
-  console.log(``);
-  console.log(`  Project:    ${name} v${version}`);
-  console.log(`  Git:        ${gitBranch} @ ${gitCommit}${gitDirty ? ' (dirty)' : ''}`);
-  console.log(`  Dist:       ${distOk ? '✅ compiled' : '❌ not compiled'}`);
-  console.log(`  Test dist:  ${distTestOk ? '✅ compiled' : '❌ not compiled'}`);
-  console.log(``);
-  console.log(`  Core modules:`);
+  f.out(`\n  ╭──────────────────────────────────────╮`);
+  f.out(`  │  zelto project summary              │`);
+  f.out(`  ╰──────────────────────────────────────╯`);
+  f.out(``);
+  f.out(`  Project:    ${name} v${version}`);
+  f.out(`  Git:        ${gitBranch} @ ${gitCommit}${gitDirty ? ' (dirty)' : ''}`);
+  f.out(`  Dist:       ${distOk ? '✅ compiled' : '❌ not compiled'}`);
+  f.out(`  Test dist:  ${distTestOk ? '✅ compiled' : '❌ not compiled'}`);
+  f.out(``);
+  f.out(`  Core modules:`);
   if (coreModules.length > 0) {
     for (const m of coreModules) {
-      console.log(`    - ${m}`);
+      f.out(`    - ${m}`);
     }
   }
   if (placeholderDirs.length > 0) {
-    console.log(`  ⚠️  Placeholder dirs (empty):`);
+    f.out(`  ⚠️  Placeholder dirs (empty):`);
     for (const d of placeholderDirs) {
-      console.log(`    - ${d}`);
+      f.out(`    - ${d}`);
     }
   }
 
-  console.log(``);
+  f.out(``);
   const sliceList = await store.list();
   const sliceStates: Record<string, number> = {};
   for (const id of sliceList) {
@@ -328,9 +330,9 @@ register('summary', async () => {
     } catch { /* skip */ }
   }
 
-  console.log(`  Slices:     ${sliceList.length}`);
+  f.out(`  Slices:     ${sliceList.length}`);
   for (const [state, count] of Object.entries(sliceStates)) {
-    console.log(`    ${state}: ${count}`);
+    f.out(`    ${state}: ${count}`);
   }
 
   let reworkLine = '';
@@ -365,21 +367,21 @@ register('summary', async () => {
           }
         } catch { /* skip */ }
       }
-      console.log(``);
-      console.log(`  Audit & Metrics:`);
-      console.log(reworkLine);
-      console.log(cycleLine);
-      console.log(stallLine);
-      console.log(``);
-      console.log(`  Latest events:`);
+      f.out(``);
+      f.out(`  Audit & Metrics:`);
+      f.out(reworkLine);
+      f.out(cycleLine);
+      f.out(stallLine);
+      f.out(``);
+      f.out(`  Latest events:`);
       for (const s of sliceSummaries) {
-        console.log(`    ${s}`);
+        f.out(`    ${s}`);
       }
       if (sliceList.length > 10) {
-        console.log(`    ... and ${sliceList.length - 10} more slices`);
+        f.out(`    ... and ${sliceList.length - 10} more slices`);
       }
     } catch {
-      console.log(`  (error reading metrics)`);
+      f.out(`  (error reading metrics)`);
     }
   }
   return 0;
@@ -389,8 +391,10 @@ register('summary', async () => {
 
 register('events', async (args) => {
   const [id] = args;
+  const f = getDefaultFormatter();
+
   if (!id || id.startsWith('--')) {
-    console.error('Usage: zelto events <slice-id> [--json] [--tail <N>]');
+    f.error('USAGE', 'Usage: zelto events <slice-id> [--json] [--tail <N>]');
     return 1;
   }
 
@@ -403,9 +407,9 @@ register('events', async (args) => {
     const sliceExists = await store.exists(id);
     if (!sliceExists) {
       if (isJson) {
-        console.log(JSON.stringify({ sliceId: id, error: `Slice "${id}" not found`, events: [] }));
+        f.data({ sliceId: id, error: `Slice "${id}" not found`, events: [] });
       } else {
-        console.log(`Slice "${id}" not found.`);
+        f.out(`Slice "${id}" not found.`);
       }
       return 1;
     }
@@ -414,50 +418,50 @@ register('events', async (args) => {
 
     if (isJson) {
       const displayed = tailCount > 0 ? evts.slice(-tailCount) : evts;
-      console.log(JSON.stringify({
+      f.data({
         sliceId: id,
         total: evts.length,
         displayed: tailCount > 0 ? Math.min(tailCount, evts.length) : evts.length,
         events: displayed,
-      }, null, 2));
+      });
       return 0;
     }
 
     if (evts.length === 0) {
-      console.log(`No events for slice "${id}".`);
+      f.out(`No events for slice "${id}".`);
       return 0;
     }
 
     const displayEvents = tailCount > 0 ? evts.slice(-tailCount) : evts;
     if (tailCount > 0) {
-      console.log(`Events for "${id}" (showing last ${displayEvents.length} of ${evts.length}):`);
+      f.out(`Events for "${id}" (showing last ${displayEvents.length} of ${evts.length}):`);
     } else {
-      console.log(`Events for "${id}":`);
+      f.out(`Events for "${id}":`);
     }
 
     for (const e of displayEvents) {
       const ts = e.ts ? e.ts.slice(0, 19) : '?';
-      console.log(`  [${ts}] ${e.type} (${e.actor})`);
+      f.out(`  [${ts}] ${e.type} (${e.actor})`);
       if (e.payload && Object.keys(e.payload).length > 0) {
         const payloadStr = JSON.stringify(e.payload, null, 4)
           .split('\n')
           .map((l) => `    ${l}`)
           .join('\n')
           .trim();
-        console.log(`    ${payloadStr}`);
+        f.out(`    ${payloadStr}`);
       }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (isJson) {
-      console.log(JSON.stringify({ sliceId: id, error: String(err), events: [] }));
+      f.data({ sliceId: id, error: String(err), events: [] });
     } else {
       const msg = String(err);
       if (msg.includes('ENOENT') || msg.includes('not found')) {
-        console.log(`No events for slice "${id}".`);
+        f.out(`No events for slice "${id}".`);
         return 1;
       }
-      console.error(`Error reading events for slice "${id}": ${msg}`);
+      f.error('READ_ERROR', `Error reading events for slice "${id}": ${msg}`);
     }
     return 1;
   }
@@ -507,6 +511,7 @@ ${colors.bold('Core slice commands:')}
   suggest                Full project overview and suggested actions
   stall [id]             List stalled slices or inspect one (--auto-resolved)
   resume <id>            Resume stalled slice (--skip, --abandon)
+  status [--watch]       Show active agent sessions (--json)
   events <id>            View slice event stream [--json]
 
 ${colors.bold('Project management:')}
@@ -557,6 +562,7 @@ ${colors.bold('Panoramic:')}
 ${colors.bold('Other:')}
   hook --install         Install git hooks
   hook --uninstall       Uninstall git hooks
+  patch-content          Interactive per-slice patch splitter
   help                   Show this help
   completion [shell]     Generate shell completion script (bash|zsh|fish)
 
@@ -572,9 +578,9 @@ register('completion', async (args) => {
   const commands = [
     'create', 'slices', 'check', 'clarify', 'freeze', 'run', 'start',
     'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
-    'stall', 'resume', 'events', 'init', 'summary', 'report',
+    'stall', 'resume', 'status', 'events', 'init', 'summary', 'report',
     'require', 'design', 'plan', 'version', 'pipeline',
-    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'help', 'completion',
+    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'patch-content', 'help', 'completion',
   ];
   const subcommands = {
     require: ['list', 'confirm', 'refine'],
@@ -866,4 +872,145 @@ register('resume', async (args) => {
     console.log(`zelto resume ${id} -- Slice resumed for re-execution`);
   }
   return 0;
+});
+
+// ─── status ──────────────────────────────────────────────────────────────────
+
+register('status', async (args) => {
+  const isJson = args.includes('--json');
+  const watchMode = args.includes('--watch');
+
+  const SESSIONS_DIR = join(ZELTO_DIR, 'sessions');
+  const f = getDefaultFormatter();
+
+  async function showStatus(): Promise<number> {
+    const allIds = await store.list();
+    const activeSlices: Array<{
+      id: string; title: string; state: string; runningSince?: string;
+      elapsed?: string; sessionId?: string; exitCode?: number | null;
+    }> = [];
+
+    for (const id of allIds) {
+      try {
+        const s = await store.read(id);
+        if (s.state === 'running') {
+          activeSlices.push({
+            id, title: s.title, state: s.state,
+            runningSince: s.runs.length > 0 ? s.runs[s.runs.length - 1] : undefined,
+          });
+        }
+      } catch { /* skip */ }
+    }
+
+    // Check session persistence for running sessions
+    if (existsSync(SESSIONS_DIR)) {
+      for (const file of readdirSync(SESSIONS_DIR)) {
+        if (!file.endsWith('.json')) continue;
+        try {
+          const data = JSON.parse(readFileSync(join(SESSIONS_DIR, file), 'utf-8'));
+          if (data.status === 'running') {
+            const existing = activeSlices.find((a) => a.id === data.sliceId);
+            const elapsed = data.startedAt
+              ? formatElapsed(new Date(data.startedAt).getTime())
+              : '?';
+            if (existing) {
+              existing.sessionId = data.sessionId;
+              existing.elapsed = elapsed;
+              existing.runningSince = data.startedAt;
+            } else {
+              activeSlices.push({
+                id: data.sliceId,
+                title: data.sliceId,
+                state: 'running',
+                sessionId: data.sessionId,
+                elapsed,
+                runningSince: data.startedAt,
+              });
+            }
+          }
+        } catch { /* skip unreadable */ }
+      }
+    }
+
+    if (isJson) {
+      f.data({
+        timestamp: new Date().toISOString(),
+        activeCount: activeSlices.length,
+        sessions: activeSlices,
+      });
+      return 0;
+    }
+
+    if (activeSlices.length === 0) {
+      f.out(`  ${colors.green('✓ No active agent sessions')}`);
+      return 0;
+    }
+
+    f.out(`  ${colors.bold(`Active agent sessions (${activeSlices.length}):`)}`);
+    f.out('');
+    for (const slice of activeSlices) {
+      f.out(`  ${colors.cyan(slice.id)}`);
+      f.out(`    Title:    ${slice.title}`);
+      f.out(`    Status:   ${colors.green('running')}`);
+      if (slice.elapsed) {
+        f.out(`    Elapsed:  ${slice.elapsed}`);
+      }
+      if (slice.sessionId) {
+        f.out(`    Session:  ${slice.sessionId}`);
+      }
+
+      // Show recent output from session file
+      if (slice.sessionId) {
+        const sessionPath = join(SESSIONS_DIR, `${slice.sessionId}.json`);
+        if (existsSync(sessionPath)) {
+          try {
+            const data = JSON.parse(readFileSync(sessionPath, 'utf-8'));
+            const recentLines = data.output?.slice(-5) ?? [];
+            if (recentLines.length > 0) {
+              f.out(`    Recent output:`);
+              for (const line of recentLines) {
+                const trimmed = line.trim().slice(0, 120);
+                if (trimmed) {
+                  f.out(`      ${colors.dim(trimmed)}`);
+                }
+              }
+            }
+          } catch { /* skip */ }
+        }
+      }
+      f.out('');
+    }
+
+    if (watchMode) {
+      f.out(`  ${colors.dim('(--watch mode: refresh every 5s. Ctrl+C to stop)')}`);
+    }
+    return 0;
+  }
+
+  function formatElapsed(startMs: number): string {
+    const elapsed = Math.floor((Date.now() - startMs) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    if (mins > 0) return `${mins}m ${secs}s`;
+    return `${secs}s`;
+  }
+
+  if (watchMode) {
+    const initial = await showStatus();
+    if (initial !== 0) return initial;
+
+    return new Promise<number>(() => {
+      const interval = setInterval(async () => {
+        process.stdout.write('\x1b[2J\x1b[0f');
+        await showStatus();
+      }, 5000);
+
+      process.on('SIGINT', () => {
+        clearInterval(interval);
+        process.exit(0);
+      });
+    });
+  }
+
+  return showStatus();
 });

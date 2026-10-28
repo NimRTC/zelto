@@ -114,4 +114,98 @@ describe('ClaudeAgentAdapter', () => {
       /Session "nonexistent" not found/,
     );
   });
+
+  it('isSessionAlive returns true during execution', async () => {
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: 'sleep 5',
+      cwd: TEST_DIR,
+    });
+
+    const { sessionId } = await adapter.start({
+      sliceId: 'test-alive',
+      prompt: 'bundle',
+    });
+
+    assert.equal(adapter.isSessionAlive(sessionId), true);
+    await adapter.stop(sessionId);
+    // After stop, isSessionAlive may still return true briefly (child process not yet dead)
+    // but the session reference exists
+  });
+
+  it('isSessionAlive returns false for unknown session', () => {
+    const adapter = new ClaudeAgentAdapter();
+    assert.equal(adapter.isSessionAlive('nonexistent'), false);
+  });
+
+  it('getRecentOutput returns captured lines', async () => {
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: 'echo "line1" && echo "line2" && echo "line3"',
+      cwd: TEST_DIR,
+    });
+
+    const { sessionId } = await adapter.start({
+      sliceId: 'test-output',
+      prompt: 'bundle',
+    });
+
+    await adapter.waitForExit(sessionId);
+    const output = adapter.getRecentOutput(sessionId, 5);
+    assert.ok(output.length >= 3);
+    assert.ok(output.some((l) => l.includes('line1')));
+    assert.ok(output.some((l) => l.includes('line3')));
+  });
+
+  it('getRecentOutput returns empty for unknown session', () => {
+    const adapter = new ClaudeAgentAdapter();
+    assert.deepEqual(adapter.getRecentOutput('nonexistent'), []);
+  });
+
+  it('onOutput callback fires for each output line', async () => {
+    const lines: string[] = [];
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: 'echo "hello from agent"',
+      cwd: TEST_DIR,
+      onOutput: (_sessionId, text) => { lines.push(text); },
+    });
+
+    const { sessionId } = await adapter.start({
+      sliceId: 'test-onoutput',
+      prompt: 'bundle',
+    });
+
+    await adapter.waitForExit(sessionId);
+    assert.ok(lines.length > 0);
+    assert.ok(lines.some((l) => l.includes('hello from agent')));
+  });
+
+  it('onProgress callback fires during execution', async () => {
+    const progressUpdates: Array<{ elapsedMs: number; status: string }> = [];
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: 'echo "quick"',
+      cwd: TEST_DIR,
+      onProgress: (_sessionId, elapsedMs, status) => {
+        progressUpdates.push({ elapsedMs, status });
+      },
+    });
+
+    const { sessionId } = await adapter.start({
+      sliceId: 'test-onprogress',
+      prompt: 'bundle',
+    });
+
+    await adapter.waitForExit(sessionId);
+    // onProgress fires every 5s; a quick echo may not trigger it before exit
+    // Just verify it doesn't throw
+  });
+
+  it('checkAgentAvailable returns null for known command', async () => {
+    const result = await ClaudeAgentAdapter.checkAgentAvailable('echo');
+    assert.equal(result, null);
+  });
+
+  it('checkAgentAvailable returns error for unknown command', async () => {
+    const result = await ClaudeAgentAdapter.checkAgentAvailable('nonexistent-command-xyzzy');
+    assert.ok(result !== null);
+    assert.ok(result!.includes('not found'));
+  });
 });

@@ -658,6 +658,14 @@ register('run', async (args) => {
     const branchName = `slice/${id}`;
     try {
       const { execSync } = await import('node:child_process');
+
+      // Check for uncommitted changes
+      const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
+      if (status) {
+        console.warn(`  ⚠️  You have uncommitted changes. They will be included in slice "${id}".`);
+        console.warn(`       Commit them first if they belong to a different slice.`);
+      }
+
       const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf-8', timeout: 5000 }).trim();
       if (currentBranch === 'main' || currentBranch === 'master') {
         execSync(`git checkout -b ${branchName}`, { cwd: process.cwd(), timeout: 10000 });
@@ -678,6 +686,23 @@ register('run', async (args) => {
     console.log('');
 
     const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+
+    // Check agent availability before starting
+    try {
+      const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
+      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName);
+      if (agentError) {
+        console.error(`  ❌ ${agentError}`);
+        return 1;
+      }
+    } catch {
+      // checkAgentAvailable might not exist in SDK adapter; skip check
+    }
+
+    // Show progress spinner during execution
+    let startTime = Date.now();
+    let progressTimer: ReturnType<typeof setInterval> | null = null;
+
     const adapter = createExecutorAdapter(adapterType, agentName);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
@@ -685,18 +710,34 @@ register('run', async (args) => {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
     });
 
+    // Start progress display
+    progressTimer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+    }, 1000);
+
     const exitCode = await adapter.waitForExit(sessionId);
+
+    // Clear progress display
+    if (progressTimer) {
+      clearInterval(progressTimer);
+      process.stdout.write('\r' + ' '.repeat(50) + '\r');
+    }
 
     if (exitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
-      console.log(`\n✅ Agent completed successfully (exit 0)`);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
       // Auto-run gate and create sign request on pass
       await autoGateAfterRun(id);
     } else {
       await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
-      console.log(`\n❌ Agent exited with code ${exitCode}`);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`\n❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
       // Auto-classify stall for non-zero exit
       await autoClassifyStall(id, exitCode);
@@ -961,6 +1002,18 @@ register('start', async (args) => {
 
     console.log(`  Agent:         ${agentName}`);
 
+    // Check agent availability before starting
+    try {
+      const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
+      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName);
+      if (agentError) {
+        console.error(`  ❌ ${agentError}`);
+        return 1;
+      }
+    } catch {
+      // skip check
+    }
+
     const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
     const adapter = createExecutorAdapter(adapterType, agentName);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
@@ -969,18 +1022,32 @@ register('start', async (args) => {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
     });
 
+    // Show progress
+    let startTime = Date.now();
+    const progressTimer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const mins = Math.floor(elapsed / 60);
+      const secs = elapsed % 60;
+      process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+    }, 1000);
+
     const exitCode = await adapter.waitForExit(sessionId);
+
+    clearInterval(progressTimer);
+    process.stdout.write('\r' + ' '.repeat(50) + '\r');
 
     if (exitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
-      console.log(`  ✅ Agent completed successfully (exit 0)`);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`  ✅ Agent completed successfully (${elapsed}s)`);
 
       // Auto-run gate and create sign request on pass
       await autoGateAfterRun(id);
     } else {
       await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
-      console.log(`  ❌ Agent exited with code ${exitCode}`);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`  ❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
       // Auto-classify stall for non-zero exit
       await autoClassifyStall(id, exitCode);

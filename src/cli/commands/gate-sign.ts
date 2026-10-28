@@ -265,6 +265,18 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
         } catch {
           console.log(`  ℹ️  Could not delete branch "${currentBranch}" (may have unmerged changes)`);
         }
+
+        // Try to create a GitHub PR if gh CLI is available
+        try {
+          execSync('gh --version', { stdio: 'ignore', timeout: 3000 });
+          const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf-8', timeout: 3000 }).trim();
+          if (remoteUrl && remoteUrl.includes('github.com')) {
+            console.log(`  ℹ️  PR not created automatically. Create one:`);
+            console.log(`     gh pr create --fill --base main`);
+          }
+        } catch {
+          // gh CLI not available — skip
+        }
       } catch {
         console.log(`  ℹ️  No main branch to merge into. Current: ${currentBranch}`);
       }

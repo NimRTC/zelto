@@ -2,8 +2,10 @@ import { readdirSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { register, SLICES_DIR } from './shared.js';
 import type { SliceData } from '../../core/slice/store.js';
+import { getDefaultFormatter } from '../output-formatter.js';
 
 register('slices', async (args) => {
+  const f = getDefaultFormatter();
   const activeOnly = args.includes('--active') || args.includes('-a');
   const jsonOutput = args.includes('--json');
   const doPrune = args.includes('--prune');
@@ -14,9 +16,9 @@ register('slices', async (args) => {
 
   if (!existsSync(SLICES_DIR)) {
     if (jsonOutput) {
-      console.log(JSON.stringify({ slices: [] }));
+      f.data({ slices: [] });
     } else {
-      console.log('No slices found.');
+      f.out('No slices found.');
     }
     return 0;
   }
@@ -24,9 +26,9 @@ register('slices', async (args) => {
   const files = readdirSync(SLICES_DIR).filter((f) => f.endsWith('.json'));
   if (files.length === 0) {
     if (jsonOutput) {
-      console.log(JSON.stringify({ slices: [] }));
+      f.data({ slices: [] });
     } else {
-      console.log('No slices found.');
+      f.out('No slices found.');
     }
     return 0;
   }
@@ -47,7 +49,7 @@ register('slices', async (args) => {
     : slices;
 
   if (jsonOutput) {
-    console.log(JSON.stringify({ slices: filtered, total: slices.length, showing: filtered.length }, null, 2));
+    f.data({ slices: filtered, total: slices.length, showing: filtered.length });
     return 0;
   }
 
@@ -66,14 +68,14 @@ register('slices', async (args) => {
   const DAY_MS = 86400000;
 
   if (filtered.length === 0 && activeOnly) {
-    console.log('No active slices. Use --active to see active only, or omit to see all.');
-    console.log('');
-    console.log(`Archived: ${slices.length - filtered.length} completed/abandoned slices (use "zelto slices" to show all).`);
+    f.out('No active slices. Use --active to see active only, or omit to see all.');
+    f.out('');
+    f.out(`Archived: ${slices.length - filtered.length} completed/abandoned slices (use "zelto slices" to show all).`);
     return 0;
   }
 
-  console.log(`Slices (${filtered.length}/${slices.length}):`);
-  console.log('');
+  f.out(`Slices (${filtered.length}/${slices.length}):`);
+  f.out('');
   for (const s of filtered) {
     const age = now - new Date(s.updatedAt ?? s.createdAt).getTime();
     const ageStr = age < DAY_MS
@@ -90,15 +92,15 @@ register('slices', async (args) => {
     };
 
     const title = s.title ? ` — ${s.title}` : '';
-    console.log(`  ${icon[s.state] ?? '📄'} [${s.id}] ${s.state} (${ageStr})${title}`);
+    f.out(`  ${icon[s.state] ?? '📄'} [${s.id}] ${s.state} (${ageStr})${title}`);
   }
-  console.log('');
+  f.out('');
 
   if (!activeOnly) {
     const activeCount = slices.filter((s) => s.state !== 'completed' && s.state !== 'abandoned').length;
     const archivedCount = slices.length - activeCount;
     if (archivedCount > 0) {
-      console.log(`Tip: Use "zelto slices --active" to show only active (${activeCount} active, ${archivedCount} archived).`);
+      f.out(`Tip: Use "zelto slices --active" to show only active (${activeCount} active, ${archivedCount} archived).`);
     }
   }
 
@@ -111,6 +113,7 @@ register('slices', async (args) => {
 async function pruneSlices(): Promise<number> {
   const { rmSync } = await import('node:fs');
   const { join } = await import('node:path');
+  const f = getDefaultFormatter();
   const files = readdirSync(SLICES_DIR).filter((f) => f.endsWith('.json'));
   let removed = 0;
 
@@ -138,7 +141,7 @@ async function pruneSlices(): Promise<number> {
         rmSync(bundlePath, { force: true });
       }
 
-      console.log(`  🗑️  Removed abandoned slice: ${sliceId}`);
+      f.out(`  🗑️  Removed abandoned slice: ${sliceId}`);
       removed++;
     } catch {
       // Skip problematic slices
@@ -146,9 +149,9 @@ async function pruneSlices(): Promise<number> {
   }
 
   if (removed === 0) {
-    console.log('No abandoned slices to remove.');
+    f.out('No abandoned slices to remove.');
   } else {
-    console.log(`\n✅ Removed ${removed} abandoned slice(s).`);
+    f.out(`\n✅ Removed ${removed} abandoned slice(s).`);
   }
   return 0;
 }

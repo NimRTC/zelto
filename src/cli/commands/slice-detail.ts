@@ -2,11 +2,14 @@
 // Usage: zelto slice <id> [--json]
 
 import { register, store, events, hashSpecFile } from './shared.js';
+import { getDefaultFormatter } from '../output-formatter.js';
 
 register('slice', async (args) => {
   const [id] = args;
+  const f = getDefaultFormatter();
+
   if (!id || id === '--help' || id === '-h') {
-    console.error('Usage: zelto slice <slice-id> [--json]');
+    f.error('USAGE', 'Usage: zelto slice <slice-id> [--json]');
     return 1;
   }
 
@@ -17,7 +20,7 @@ register('slice', async (args) => {
     const evts = await events.read(id);
 
     if (isJson) {
-      console.log(JSON.stringify({
+      f.data({
         id: slice.id,
         title: slice.title,
         state: slice.state,
@@ -32,7 +35,7 @@ register('slice', async (args) => {
         createdAt: slice.createdAt,
         updatedAt: slice.updatedAt,
         eventCount: evts.length,
-      }, null, 2));
+      });
       return 0;
     }
 
@@ -45,52 +48,52 @@ register('slice', async (args) => {
       running: '▶️', completed: '✅', abandoned: '🗑️',
     };
 
-    console.log(`${stateIcons[slice.state] ?? '📄'} ${slice.id}`);
-    console.log(`  Title:     ${slice.title}`);
-    console.log(`  State:     ${slice.state}`);
-    console.log(`  Spec:      ${slice.spec.path} ${specHashOk}`);
-    console.log(`  Created:   ${slice.createdAt.slice(0, 10)}`);
-    console.log(`  Updated:   ${slice.updatedAt.slice(0, 10)}`);
-    console.log(`  Base:      ${slice.baseCommit ?? '(not set)'}`);
-    console.log(`  Writes:    ${slice.writes.length > 0 ? slice.writes.join(', ') : '(none)'}`);
-    console.log(`  Events:    ${evts.length}`);
+    f.out(`${stateIcons[slice.state] ?? '📄'} ${slice.id}`);
+    f.out(`  Title:     ${slice.title}`);
+    f.out(`  State:     ${slice.state}`);
+    f.out(`  Spec:      ${slice.spec.path} ${specHashOk}`);
+    f.out(`  Created:   ${slice.createdAt.slice(0, 10)}`);
+    f.out(`  Updated:   ${slice.updatedAt.slice(0, 10)}`);
+    f.out(`  Base:      ${slice.baseCommit ?? '(not set)'}`);
+    f.out(`  Writes:    ${slice.writes.length > 0 ? slice.writes.join(', ') : '(none)'}`);
+    f.out(`  Events:    ${evts.length}`);
 
     if (slice.trace.requirements.length > 0) {
-      console.log(`  Reqs:      ${slice.trace.requirements.join(', ')}`);
+      f.out(`  Reqs:      ${slice.trace.requirements.join(', ')}`);
     }
     if (slice.trace.contracts.length > 0) {
-      console.log(`  Contracts: ${slice.trace.contracts.join(', ')}`);
+      f.out(`  Contracts: ${slice.trace.contracts.join(', ')}`);
     }
     if (slice.trace.tests.length > 0) {
-      console.log(`  Tests:     ${slice.trace.tests.join(', ')}`);
+      f.out(`  Tests:     ${slice.trace.tests.join(', ')}`);
     }
 
     if (slice.drift.detected) {
-      console.log(`  Drift:     ⚠️ ${slice.drift.reason}`);
+      f.out(`  Drift:     ⚠️ ${slice.drift.reason}`);
     }
 
     if (slice.stall.class) {
-      console.log(`  Stall:     ⚠️ ${slice.stall.class} (auto-resolved: ${slice.stall.autoResolved})`);
+      f.out(`  Stall:     ⚠️ ${slice.stall.class} (auto-resolved: ${slice.stall.autoResolved})`);
     }
 
     if (slice.runs.length > 0) {
-      console.log(`  Runs:      ${slice.runs.length}`);
+      f.out(`  Runs:      ${slice.runs.length}`);
       for (const run of slice.runs.slice(-3)) {
-        console.log(`    - ${run}`);
+        f.out(`    - ${run}`);
       }
-      if (slice.runs.length > 3) console.log(`    ... (${slice.runs.length - 3} more)`);
+      if (slice.runs.length > 3) f.out(`    ... (${slice.runs.length - 3} more)`);
     }
 
     // Show last 5 events
     if (evts.length > 0) {
-      console.log(`\n  Recent events:`);
+      f.out(`\n  Recent events:`);
       for (const e of evts.slice(-5)) {
-        console.log(`    [${e.ts?.slice(0, 19) ?? '?'}] ${e.type} (${e.actor})`);
+        f.out(`    [${e.ts?.slice(0, 19) ?? '?'}] ${e.type} (${e.actor})`);
       }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error reading slice "${id}": ${msg}`);
+    f.error('READ_ERROR', `Error reading slice "${id}": ${msg}`);
     return 1;
   }
   return 0;

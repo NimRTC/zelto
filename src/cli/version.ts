@@ -3,6 +3,7 @@
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { getDefaultFormatter } from './output-formatter.js';
 
 const PKG_PATH = join(process.cwd(), 'package.json');
 
@@ -24,4 +25,13 @@ export const VERSION: string = pkg.version;
 /** Returns a formatted version string: "zelto v{version}" */
 export function getVersionString(): string {
   return `zelto v${VERSION}`;
+}
+
+/**
+ * Print version using OutputFormatter and return exit code.
+ */
+export function printVersion(): number {
+  const f = getDefaultFormatter();
+  f.out(getVersionString());
+  return 0;
 }

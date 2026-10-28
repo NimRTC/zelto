@@ -68,10 +68,20 @@ interface ClaudeAgentAdapterOptions {
   cwd?: string;
   /** Environment variables to pass (default: process.env) */
   env?: NodeJS.ProcessEnv;
-  /** Maximum time in ms before killing the agent (default: 300000 = 5 min) */
+  /** Maximum time in ms before killing the agent (default: 900000 = 15 min) */
   timeoutMs?: number;
   /** Maximum number of retries on failure (default: 2) */
   maxRetries?: number;
+  /**
+   * Optional callback for real-time output from the agent.
+   * Called with each line of stdout/stderr as it arrives.
+   */
+  onOutput?: (sessionId: string, text: string) => void;
+  /**
+   * Optional callback for progress updates.
+   * Called periodically during execution with elapsed time info.
+   */
+  onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
 }
 
 const ADAPTER_META: AdapterMeta = {
@@ -102,8 +112,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly useClaudeCodeFlags: boolean;
+  private readonly onOutput?: (sessionId: string, text: string) => void;
+  private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
   private readonly sessions = new Map<string, SessionState>();
   private timeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  private progressIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(options: ClaudeAgentAdapterOptions = {}) {
     this.agentCommand = options.agentCommand ?? 'npx claude-code';
@@ -111,6 +124,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     this.env = options.env ?? process.env;
     this.timeoutMs = options.timeoutMs ?? 900_000; // 15 minutes default
     this.maxRetries = options.maxRetries ?? 2;
+    this.onOutput = options.onOutput;
+    this.onProgress = options.onProgress;
     // Detect if the command is Claude Code (npx or direct binary)
     this.useClaudeCodeFlags = /claude(-code)?\b/.test(this.agentCommand);
   }
@@ -203,7 +218,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       [],
       {
         cwd: this.cwd,
-        stdio: ['inherit', 'inherit', 'inherit'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         shell: true,
         env: {
           ...spawnEnv,
@@ -214,6 +229,26 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
         },
       },
     );
+
+    // Capture stdout
+    child.stdout?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf-8');
+      state.output.push(text);
+      sessionData.output.push(text);
+      if (this.onOutput) {
+        this.onOutput(sessionId, text);
+      }
+    });
+
+    // Capture stderr
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf-8');
+      state.output.push(text);
+      sessionData.output.push(text);
+      if (this.onOutput) {
+        this.onOutput(sessionId, text);
+      }
+    });
 
     const state: SessionState = {
       child,
@@ -230,6 +265,20 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       this.handleTimeout(sessionId);
     }, this.timeoutMs);
     this.timeouts.set(sessionId, timeout);
+
+    // Start progress reporting interval (every 5 seconds)
+    if (this.onProgress) {
+      const startedAt = Date.parse(sessionData.startedAt);
+      const progressInterval = setInterval(() => {
+        if (!this.sessions.has(sessionId)) {
+          clearInterval(progressInterval);
+          return;
+        }
+        const elapsed = Date.now() - startedAt;
+        this.onProgress!(sessionId, elapsed, 'running');
+      }, 5000);
+      this.progressIntervals.set(sessionId, progressInterval);
+    }
 
     // Clean up temp file on exit
     const cleanup = () => {
@@ -259,6 +308,10 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       saveSession(data);
     }
 
+    if (this.onOutput) {
+      this.onOutput(sessionId, `\n[zelto: timeout after ${this.timeoutMs}ms]\n`);
+    }
+
     // Kill gracefully first, then force
     session.child.kill('SIGTERM');
     setTimeout(() => {
@@ -274,6 +327,13 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     if (timeout) {
       clearTimeout(timeout);
       this.timeouts.delete(sessionId);
+    }
+
+    // Clear progress interval
+    const progressInterval = this.progressIntervals.get(sessionId);
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      this.progressIntervals.delete(sessionId);
     }
 
     // Update persistent session
@@ -304,6 +364,13 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     if (timeout) {
       clearTimeout(timeout);
       this.timeouts.delete(sessionId);
+    }
+
+    // Clear progress interval
+    const progressInterval = this.progressIntervals.get(sessionId);
+    if (progressInterval) {
+      clearInterval(progressInterval);
+      this.progressIntervals.delete(sessionId);
     }
 
     // Update persistent session
@@ -398,5 +465,48 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     return sessions.sort(
       (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
     );
+  }
+
+  /**
+   * Check if an agent session is still alive.
+   * Returns true if the session exists and the child process is still running.
+   */
+  isSessionAlive(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      return session.child.exitCode === null && session.child.killed === false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get recent output lines from a running session.
+   * Returns the last N lines of captured output.
+   */
+  getRecentOutput(sessionId: string, maxLines: number = 20): string[] {
+    const session = this.sessions.get(sessionId);
+    if (!session) return [];
+    const allOutput = session.output.join('').split('\n');
+    return allOutput.slice(-maxLines);
+  }
+
+  /**
+   * Check if the agent command is available on this system.
+   * Returns null if available, or an error message if not.
+   */
+  static async checkAgentAvailable(agentCommand: string): Promise<string | null> {
+    try {
+      const { execSync } = await import('node:child_process');
+      const cmd = agentCommand.split(' ')[0]; // Get the base command
+      execSync(`${process.platform === 'win32' ? 'where' : 'which'} ${cmd}`, {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      return null;
+    } catch {
+      return `Agent command "${agentCommand}" not found. Install it or update .zelto/config.yaml agent.command.`;
+    }
   }
 }
