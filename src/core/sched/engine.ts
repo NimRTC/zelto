@@ -186,6 +186,23 @@ export class Scheduler {
     await this.store.write(slice);
   }
 
+  /**
+   * Check write-set conflicts between multiple slices.
+   * Returns pairs of indices (into writesList) that conflict.
+   * Useful for parallel admission: verify no two slices write the same files.
+   */
+  checkConflicts(writesList: string[][]): Array<[number, number]> {
+    const conflicts: Array<[number, number]> = [];
+    for (let i = 0; i < writesList.length; i++) {
+      for (let j = i + 1; j < writesList.length; j++) {
+        if (this.hasOverlap(writesList[i], writesList[j])) {
+          conflicts.push([i, j]);
+        }
+      }
+    }
+    return conflicts;
+  }
+
   private hasOverlap(a: string[], b: string[]): boolean {
     // Check if any path in 'a' overlaps with any path in 'b'
     for (const pa of a) {

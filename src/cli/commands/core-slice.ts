@@ -731,9 +731,15 @@ register('freeze', async (args) => {
 // ─── run ─────────────────────────────────────────────────────────────────────
 
 register('run', async (args) => {
+  // Dispatch to parallel runner if --parallel flag is present
+  if (args.includes('--parallel')) {
+    return runParallel(args);
+  }
+
   const [id] = args;
   if (!id) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
+    console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
     return 1;
   }
 
@@ -904,7 +910,278 @@ register('run', async (args) => {
   return 0;
 });
 
-// ─── admit ───────────────────────────────────────────────────────────────────
+// ─── run:parallel — concurrent slice execution ─────────────────────
+
+interface ParallelRunState {
+  id: string;
+  status: 'admitted' | 'running' | 'completed' | 'failed';
+  elapsedSec: number;
+  exitCode: number | null;
+  sessionId: string | null;
+  branchName: string;
+}
+
+/**
+ * Run multiple non-conflicting slices in parallel.
+ *
+ * Usage: zelto run --parallel <id1> [id2 ...] [--agent <name>] [--adapter <type>]
+ *
+ * Flow:
+ * 1. Admit all slices + check cross-conflicts
+ * 2. Create feature branches from same base commit
+ * 3. Start all agent sessions concurrently
+ * 4. Monitor progress with multi-line display
+ * 5. Process results (gate + sign requests)
+ */
+async function runParallel(args: string[]): Promise<number> {
+  // Collect slice IDs: all non-flag args, regardless of --parallel position
+  const ids = args.filter((a) => !a.startsWith('--') && a !== '--parallel');
+
+  if (ids.length < 2) {
+    console.error('Usage: zelto run --parallel <slice-id-1> <slice-id-2> [...slice-id-N] [--agent <name>]');
+    return 1;
+  }
+
+  const scheduler = new Scheduler(store, events, loadPolicyConfig());
+
+  // ── Phase 1: Admit all slices ────────────────────────────────────
+  const states: ParallelRunState[] = ids.map((id) => ({
+    id,
+    status: 'admitted',
+    elapsedSec: 0,
+    exitCode: null,
+    sessionId: null,
+    branchName: `slice/${id}`,
+  }));
+
+  console.log(`zelto run --parallel — admitting ${ids.length} slices...`);
+
+  for (const st of states) {
+    const result = await scheduler.admit(st.id);
+    if (result.decision !== 'admitted') {
+      console.error(`  ❌ ${st.id}: ${result.reason}`);
+      return 1;
+    }
+  }
+
+  // Read all slice data
+  const slices = await Promise.all(ids.map((id) => store.read(id)));
+
+  // Check cross-conflicts: no two parallel slices may write the same files
+  const conflicts = scheduler.checkConflicts(slices.map((s) => s.writes));
+  if (conflicts.length > 0) {
+    for (const [i, j] of conflicts) {
+      console.error(`  ❌ Write-set conflict: ${ids[i]} ↔ ${ids[j]}`);
+      console.error(`     "${ids[i]}" writes: ${slices[i].writes.join(', ')}`);
+      console.error(`     "${ids[j]}" writes: ${slices[j].writes.join(', ')}`);
+    }
+    return 1;
+  }
+
+  // Auto-detect writes for empty write-sets
+  for (let i = 0; i < slices.length; i++) {
+    if (slices[i].writes.length === 0) {
+      const detected = detectDefaultWrites();
+      if (detected.length > 0) {
+        slices[i].writes = detected;
+        await store.write(slices[i]);
+        console.log(`  ℹ️  ${ids[i]}: auto-detected write-set: ${detected.join(', ')}`);
+      }
+    }
+  }
+
+  // Check budgets
+  for (const id of ids) {
+    const ok = await checkBudget(id);
+    if (!ok) {
+      console.error(`  ❌ ${id}: budget exhausted`);
+      return 1;
+    }
+  }
+
+  // ── Phase 2: Create feature branches & start agents ──────────────
+  const { execSync } = await import('node:child_process');
+  const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : loadConfig().agent.command;
+  const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+
+  // Record base commit for branch creation
+  let baseCommit: string | null = null;
+  try {
+    baseCommit = execSync('git rev-parse HEAD', { encoding: 'utf-8', timeout: 5000 }).trim();
+  } catch {
+    // Non-git repo
+  }
+
+  // Check for uncommitted changes
+  try {
+    const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
+    if (status) {
+      console.warn(`  ⚠️  You have uncommitted changes. They will be included in all parallel slices.`);
+      console.warn(`       Commit them first if they belong to a different slice.`);
+    }
+  } catch { /* ignore */ }
+
+  for (let i = 0; i < ids.length; i++) {
+    const st = states[i];
+    const slice = slices[i];
+
+    // Start run
+    await scheduler.startRun(st.id);
+
+    // Build constraint bundle
+    const bundle = scheduler.buildConstraints(slice);
+    const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
+    writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
+
+    // Create feature branch from base commit
+    if (baseCommit) {
+      try {
+        execSync(`git checkout -b ${st.branchName} ${baseCommit}`, { cwd: process.cwd(), timeout: 10000 });
+      } catch {
+        // Branch may already exist; try switching
+        try {
+          execSync(`git checkout ${st.branchName}`, { cwd: process.cwd(), timeout: 10000 });
+        } catch { /* give up */ }
+      }
+    }
+
+    // Write event
+    await events.append(st.id, 'run.started', 'zelto', {
+      sliceId: st.id, agent: agentName, bundlePath, writes: slice.writes,
+    });
+  }
+
+  // Switch back to main after creating all branches
+  if (baseCommit) {
+    try {
+      execSync('git checkout main', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch {
+      try {
+        execSync('git checkout master', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Start all agent sessions
+  const adapters = states.map(() => createExecutorAdapter(adapterType, agentName));
+
+  const startTime = Date.now();
+  console.log(`\nzelto run --parallel — starting ${ids.length} agents...`);
+
+  for (let i = 0; i < states.length; i++) {
+    const st = states[i];
+    const adapter = adapters[i];
+    const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
+    try {
+      const { sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath });
+      st.sessionId = sessionId;
+      st.status = 'running';
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ❌ ${st.id}: failed to start agent: ${msg}`);
+      st.status = 'failed';
+    }
+  }
+
+  // ── Phase 3: Monitor progress ────────────────────────────────────
+  const statusLineCount = states.length + 2; // header + N slices + blank
+  let progressTimer: ReturnType<typeof setInterval> | null = null;
+
+  function renderProgress(): void {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const lines: string[] = [];
+    const running = states.filter((s) => s.status === 'running').length;
+    const done = states.filter((s) => s.status === 'completed' || s.status === 'failed').length;
+    lines.push(`  ⏱️  ${elapsed}s elapsed — ${running} running, ${done} done`);
+    for (const st of states) {
+      const icon = st.status === 'completed' ? '✅' : st.status === 'failed' ? '❌' : st.status === 'running' ? '🔄' : '⏳';
+      // Use frozen elapsedSec for completed/failed slices, live calculation for running
+      const elapsedStr = st.elapsedSec > 0 ? `${st.elapsedSec}s` : st.status !== 'admitted' ? `${Math.floor((Date.now() - startTime) / 1000)}s` : '—';
+      const exitStr = st.exitCode !== null ? ` exit=${st.exitCode}` : '';
+      lines.push(`    ${icon} ${st.id.padEnd(22)} ${elapsedStr.padEnd(6)}${exitStr}`);
+    }
+    // Move cursor up and rewrite
+    process.stdout.write(`\x1b[${statusLineCount}A` + lines.join('\n') + '\n');
+
+    // Stop timer when all slices are done
+    if (done === states.length && progressTimer) {
+      clearInterval(progressTimer);
+      progressTimer = null;
+    }
+  }
+
+  // Initial status
+  {
+    const lines: string[] = [];
+    lines.push(`  ⏱️  0s elapsed — ${states.length} starting...`);
+    for (const st of states) {
+      lines.push(`    ⏳ ${st.id.padEnd(22)} —`);
+    }
+    console.log(lines.join('\n'));
+  }
+
+  // Start progress updates
+  progressTimer = setInterval(renderProgress, 2000);
+
+  // ── Phase 4: Wait for all to complete ────────────────────────────
+  const results = await Promise.allSettled(
+    states.map(async (st, i) => {
+      if (st.sessionId === null) return { ...st, exitCode: -1, status: 'failed' as const };
+      const exitCode = await adapters[i].waitForExit(st.sessionId);
+      st.exitCode = exitCode;
+      st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
+      st.status = exitCode === 0 ? 'completed' : 'failed';
+      return st;
+    }),
+  );
+
+  // Clear progress display
+  if (progressTimer) {
+    clearInterval(progressTimer);
+  }
+  process.stdout.write(`\x1b[${statusLineCount}A` + ' '.repeat(80) + '\n');
+
+  // ── Phase 5: Process results ─────────────────────────────────────
+  console.log('');
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      const st = result.value;
+      if (st.exitCode === 0) {
+        await store.transit(st.id, 'RUN_FINISH');
+        await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
+        console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
+        await autoGateAfterRun(st.id);
+        successCount++;
+      } else {
+        const exitCode = st.exitCode ?? -1;
+        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
+        console.log(`❌ ${st.id}: failed (exit ${st.exitCode ?? 'signal'}, ${st.elapsedSec}s)`);
+        await autoClassifyStall(st.id, st.exitCode);
+        failCount++;
+      }
+    } else {
+      // Promise rejected
+      failCount++;
+    }
+  }
+
+  // Switch back to main after parallel run
+  if (baseCommit) {
+    try {
+      execSync('git checkout main', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch {
+      try {
+        execSync('git checkout master', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch { /* ignore */ }
+    }
+  }
+
+  console.log(`\n📊 Parallel run complete: ${successCount} passed, ${failCount} failed`);
+  return failCount > 0 ? 1 : 0;
+}
 
 register('admit', async (args) => {
   const [id] = args;

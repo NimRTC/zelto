@@ -296,8 +296,13 @@ async function autoMergeSlice(sliceId: string): Promise<void> {
     }
     addPaths.push(`.zelto/slices/${sliceId}.json`);
     if (specPath) addPaths.push(specPath);
-    // Also add acceptance test directory if it exists
-    addPaths.push(`tests/acceptance/${sliceId}*`);
+    // Only add acceptance test path if the directory exists
+    const { existsSync } = await import('node:fs');
+    const acceptGlob = `tests/acceptance/${sliceId}*`;
+    const acceptDir = `tests/acceptance`;
+    if (existsSync(acceptDir) || existsSync(`tests`)) {
+      addPaths.push(acceptGlob);
+    }
 
     if (currentBranch === 'main' || currentBranch === 'master') {
       // On main branch — commit changes directly with slice attribution
@@ -305,7 +310,7 @@ async function autoMergeSlice(sliceId: string): Promise<void> {
       if (addPaths.length > 0) {
         for (const p of addPaths) {
           try {
-            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000 });
+            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
           } catch {
             // Path may not exist — skip
           }
@@ -327,18 +332,31 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
         console.log(`  ℹ️  Nothing to commit`);
       }
     } else {
-      // On a feature branch — merge to main
+      // On a feature branch — commit then merge to main
       console.log(`  Merging: staging changes...`);
       if (addPaths.length > 0) {
         for (const p of addPaths) {
           try {
-            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000 });
+            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
           } catch {
             // Path may not exist — skip
           }
         }
       } else {
         execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
+      }
+
+      // Commit on feature branch first, then merge to main
+      try {
+        execSync(`git commit -m "feat(${sliceId}): slice approved
+
+Auto-commit from zelto run
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
+          cwd: process.cwd(), timeout: 15000,
+        });
+      } catch {
+        console.log(`  ℹ️  Nothing to commit on feature branch`);
       }
 
       try {
