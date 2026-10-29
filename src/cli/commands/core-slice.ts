@@ -2,6 +2,7 @@
 
 import { createInterface } from 'node:readline';
 import { writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /**
@@ -186,6 +187,7 @@ register('create', async (args) => {
   const writes = writesRaw ? writesRaw.split(',').map((w: string) => w.trim()).filter(Boolean) : [];
 
   const isJson = args.includes('--json');
+  const fromSpec = args.includes('--from-spec');
 
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
     if (isJson) {
@@ -203,6 +205,11 @@ register('create', async (args) => {
       console.error(`Slice "${id}" already exists.`);
     }
     return 1;
+  }
+
+  // If --from-spec, parse the spec markdown to populate slice fields
+  if (fromSpec) {
+    return await createSliceFromSpec(id, title, writes, isJson);
   }
 
   const slice = store.create(id, title, { writes });
@@ -226,6 +233,113 @@ register('create', async (args) => {
   console.log(`  Next:   zelto check ${id} && zelto freeze ${id}`);
   return 0;
 });
+
+// ─── create from spec (helper for --from-spec) ────────────────────────────
+
+/**
+ * Create a slice from a spec markdown file.
+ * Parses ## 范围 for writes, ## 验收标准 for requirements.
+ * Detects v0- prefix as baseline slices.
+ */
+async function createSliceFromSpec(
+  id: string,
+  title: string,
+  cliWrites: string[],
+  isJson: boolean,
+): Promise<number> {
+  const specPath = `specs/slices/${id}.md`;
+
+  let content: string;
+  try {
+    content = await readFile(specPath, 'utf-8');
+  } catch {
+    if (isJson) {
+      console.log(JSON.stringify({ success: false, error: `Spec file not found: ${specPath}` }));
+    } else {
+      console.error(`Spec file not found: ${specPath}`);
+    }
+    return 1;
+  }
+
+  const lines = content.split('\n');
+
+  // Parse title from # Slice: <id> heading
+  let parsedTitle = title;
+  for (const line of lines) {
+    const sliceMatch = line.match(/^#\s*Slice:\s*(.+)$/i);
+    if (sliceMatch) {
+      parsedTitle = sliceMatch[1].trim();
+      break;
+    }
+  }
+
+  // Parse writes and requirements in a single pass
+  const writes: string[] = [];
+  const requirements: string[] = [];
+  const cliWritesProvided = cliWrites.length > 0;
+
+  let inScope = false;
+  let inAcceptance = false;
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      inScope = /范围|scope|range/i.test(line);
+      inAcceptance = /验收标准|acceptance|criter/i.test(line);
+      continue;
+    }
+    if (inScope && !cliWritesProvided) {
+      const writeMatch = line.match(/^\s*[-*]\s*`([^`]+)`/);
+      if (writeMatch) {
+        writes.push(writeMatch[1]);
+      }
+    }
+    if (inAcceptance) {
+      const reqMatch = line.match(/^\s*\d+\.\s+(.+)/);
+      if (reqMatch) {
+        requirements.push(reqMatch[1].trim());
+      }
+    }
+  }
+
+  // Detect baseline slices (v0- prefix)
+  const isBaseline = id.startsWith('v0-');
+
+  // Auto-detect traceWaiver for non-TypeScript projects
+  const hasTypeScriptFiles = writes.some((w) => w.endsWith('.ts') || w.endsWith('.tsx') || w.includes('.ts'));
+  const traceWaiver = isBaseline && !hasTypeScriptFiles ? '基线切片 — 不修改代码，无需契约追踪' : null;
+
+  const finalWrites = cliWritesProvided ? cliWrites : writes;
+
+  const slice = store.create(id, parsedTitle, {
+    writes: finalWrites,
+    trace: { requirements, contracts: [], tests: [] },
+    traceWaiver,
+    baseline: isBaseline,
+  });
+  await store.write(slice);
+  await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title: parsedTitle, specPath, fromSpec: true });
+
+  if (isJson) {
+    console.log(JSON.stringify({
+      success: true, id, title: parsedTitle, state: slice.state,
+      writes: finalWrites, spec: slice.spec.path,
+      baseline: isBaseline, traceWaiver,
+      requirements: requirements.length,
+    }));
+    return 0;
+  }
+
+  console.log(`zelto create ${id} — ✅ Created from spec (${specPath})`);
+  console.log(`  ID:       ${id}`);
+  console.log(`  Title:    ${parsedTitle}`);
+  console.log(`  State:    ${slice.state}`);
+  console.log(`  Baseline: ${isBaseline ? '✅ (v0- prefix detected)' : 'no'}`);
+  console.log(`  Writes:   ${finalWrites.length > 0 ? finalWrites.join(', ') : '(none — add with --writes)'}`);
+  console.log(`  Reqs:     ${requirements.length} parsed from spec`);
+  if (traceWaiver) console.log(`  Waiver:   ${traceWaiver}`);
+  console.log(`  Spec:     ${slice.spec.path}`);
+  console.log(`  Next:     zelto check ${id} && zelto freeze ${id}`);
+  return 0;
+}
 
 // ─── check ───────────────────────────────────────────────────────────────────
 
@@ -259,11 +373,12 @@ register('check', async (args) => {
     console.log(`  Slice:   ${slice.title}`);
     console.log(`  State:   ${slice.state}`);
     console.log(`  Spec:    ${slice.spec.path}`);
-    console.log(`  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts, ${slice.trace.tests.length} tests`);
+    const waiverNote = slice.traceWaiver ? ` (waived: ${slice.traceWaiver})` : '';
+    console.log(`  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts${waiverNote}, ${slice.trace.tests.length} tests`);
 
     const issues: string[] = [];
     if (slice.trace.requirements.length === 0) issues.push('No requirements traced');
-    if (slice.trace.contracts.length === 0) issues.push('No contracts traced');
+    if (slice.trace.contracts.length === 0 && !slice.traceWaiver) issues.push('No contracts traced');
     if (slice.trace.tests.length === 0) issues.push('No tests traced');
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 

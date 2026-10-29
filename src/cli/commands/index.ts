@@ -20,6 +20,7 @@ import './completion.js';
 import './audit.js';
 import './snapshot.js';
 import './diff.js';
+import './diff-highlight.js';
 import './patch-content.js';
 import './spec-md.js';
 import './slice-status.js';

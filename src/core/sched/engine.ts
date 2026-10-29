@@ -45,10 +45,24 @@ export class Scheduler {
       };
     }
 
-    // Check write-set conflicts with running slices
+    // Check write-set conflicts with running slices (skip for baseline slices)
     const allSlices = await this.store.list();
     const runningWrites = new Map<string, string[]>(); // sliceId → writes
     const blockedBy: string[] = [];
+
+    if (slice.baseline) {
+      // Baseline slices don't write new code — they only capture existing state
+      // Skip writes reservation check to avoid blocking on unrelated running slices
+      await this.appendEvent(sliceId, 'sched.admitted', actor, {
+        sliceId, baseline: true, note: 'Baseline slice — writes reservation check skipped',
+      });
+      return {
+        sliceId,
+        decision: 'admitted',
+        reason: null,
+        blockedBy: [],
+      };
+    }
 
     for (const id of allSlices) {
       if (id === sliceId) continue;

@@ -371,16 +371,47 @@ async function runSpecMdOnAllSlices(): Promise<number> {
   }
 }
 
+// ─── auto-push after sign (shared helper) ────────────────────────────────
+
+async function autoPushAfterSign(sliceId: string): Promise<void> {
+  try {
+    const { execSync } = await import('node:child_process');
+    console.log(`  Push:    pushing to remote...`);
+
+    // First check if there's a remote configured
+    try {
+      execSync('git remote get-url origin', { stdio: 'pipe', timeout: 5000 });
+    } catch {
+      console.log(`  ℹ️  No remote "origin" configured — skipping push`);
+      return;
+    }
+
+    const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+      encoding: 'utf-8', timeout: 5000,
+    }).trim();
+
+    execSync(`git push origin ${currentBranch}`, {
+      cwd: process.cwd(), timeout: 30000, stdio: 'pipe',
+    });
+    console.log(`  ✅ Pushed "${currentBranch}" → origin/${currentBranch}`);
+  } catch (pushErr) {
+    const msg = pushErr instanceof Error ? pushErr.message : String(pushErr);
+    console.log(`  ⚠️  Push failed: ${msg}`);
+    console.log(`       To push manually: git push`);
+  }
+}
+
 // ─── sign ────────────────────────────────────────────────────────────────────
 
 register('sign', async (args) => {
   const [id, action] = args;
   if (!id || !action) {
-    console.error('Usage: zelto sign <slice-id> [--approve|--reject] [--comment <text>]');
+    console.error('Usage: zelto sign <slice-id> [--approve|--reject] [--comment <text>] [--push]');
     return 1;
   }
 
   const isJson = args.includes('--json');
+  const doPush = args.includes('--push');
   const signManager = new SignManager(ZELTO_DIR, events, store);
   const commentIndex = args.indexOf('--comment');
   const comment = commentIndex >= 0 ? args[commentIndex + 1] : null;
@@ -408,6 +439,11 @@ register('sign', async (args) => {
 
       // Auto-merge: stage, commit, and merge to main
       if (!isJson) await autoMergeSlice(id);
+
+      // Auto-push if --push flag is set
+      if (doPush) {
+        await autoPushAfterSign(id);
+      }
     } else if (action === '--reject') {
       const pending = await signManager.list('pending');
       const req = pending.find((r) => r.sliceId === id);

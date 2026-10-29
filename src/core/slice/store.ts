@@ -40,6 +40,7 @@ export interface SliceData {
   drift: SliceDrift;
   trace: SliceTrace;
   traceWaiver: string | null;
+  baseline: boolean;
   writes: string[];
   runs: string[];
   stall: StallInfo;
@@ -114,6 +115,7 @@ export class SliceStore {
       drift: { detected: false, reason: null, at: null },
       trace: opts?.trace ?? { requirements: [], contracts: [], tests: [] },
       traceWaiver: opts?.traceWaiver ?? null,
+      baseline: opts?.baseline ?? false,
       writes: opts?.writes ?? [],
       runs: opts?.runs ?? [],
       stall: opts?.stall ?? { class: null, autoResolved: 0, gateRetries: 0 },

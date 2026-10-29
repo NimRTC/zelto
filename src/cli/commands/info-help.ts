@@ -502,6 +502,7 @@ ${colors.bold('Core slice commands:')}
   start <id>             One-command: create → check → freeze → run [--yes] [--adapter <type>]
   admit <id>             Check admission (--json)
   diff <id>              Show changes made by a slice (--stat, --json)
+  diff-highlight         Read unified diff from stdin, output ANSI-highlighted version
   gate <id>              Gate② — run acceptance tests [--dry-run] [--json]
   inbox                  View pending sign requests
   sign <id> --approve    Approve completed slice [--json]
@@ -580,7 +581,7 @@ register('completion', async (args) => {
     'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
     'stall', 'resume', 'status', 'events', 'init', 'summary', 'report',
     'require', 'design', 'plan', 'version', 'pipeline',
-    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'patch-content', 'help', 'completion',
+    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'patch-content', 'diff-highlight', 'help', 'completion',
   ];
   const subcommands = {
     require: ['list', 'confirm', 'refine'],

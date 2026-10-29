@@ -17,6 +17,7 @@ function makeSlice(overrides: Partial<SliceData> = {}): SliceData {
     drift: { detected: false, reason: null, at: null },
     trace: { requirements: ['R1'], contracts: [], tests: [] },
     traceWaiver: null,
+    baseline: false,
     writes: [],
     runs: [],
     stall: { class: null, autoResolved: 0, gateRetries: 0 },

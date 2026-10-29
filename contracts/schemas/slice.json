@@ -46,6 +46,7 @@
       }
     },
     "traceWaiver": { "type": ["string", "null"] },
+    "baseline": { "type": "boolean" },
     "writes": { "type": "array", "items": { "type": "string" } },
     "runs": { "type": "array", "items": { "type": "string" } },
     "stall": {
