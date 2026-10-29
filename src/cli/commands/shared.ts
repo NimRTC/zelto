@@ -182,6 +182,19 @@ function validateConfig(config: ZeltoConfig): void {
   }
 }
 
+/**
+ * Strip surrounding double quotes from a string, but only if they wrap the entire value.
+ * Preserves embedded quotes inside the string.
+ * E.g. '"npx claude-code"' → 'npx claude-code'
+ *      'echo "hello"' → 'echo "hello"' (no change)
+ */
+function stripSurroundingQuotes(s: string): string {
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
 export function parseConfigYaml(content: string): ZeltoConfig | null {
   const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
   const profiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
@@ -232,10 +245,25 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     }
 
     if (inGateSection) {
-      // Detect profile section (indented key with list value)
-      const profileMatch = trimmed.match(/^(\w+):$/);
-      if (profileMatch && profileMatch[1] !== 'commands' && profileMatch[1] !== 'timeoutSec' && profileMatch[1] !== 'retry') {
+      // Handle profiles: section header — flush pending command to commands first
+      if (trimmed === 'profiles:') {
+        if (currentCommand) {
+          commands.push(currentCommand);
+          currentCommand = null;
+        }
         inProfileSection = true;
+        currentProfile = null;
+        continue;
+      }
+
+      // Detect profile name (indented under profiles:, e.g. "  docs:")
+      const profileMatch = trimmed.match(/^(\w+):$/);
+      if (profileMatch && inProfileSection) {
+        // Push pending command to the previous profile before switching
+        if (currentCommand && currentProfile) {
+          (profiles[currentProfile] ??= []).push(currentCommand);
+          currentCommand = null;
+        }
         currentProfile = profileMatch[1];
         continue;
       }
@@ -273,7 +301,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
 
       if (trimmed.startsWith('run:')) {
         if (currentCommand) {
-          currentCommand.run = trimmed.slice(4).trim().replace(/^"|"$/g, '');
+          currentCommand.run = stripSurroundingQuotes(trimmed.slice(4).trim());
         }
         continue;
       }
@@ -297,11 +325,11 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     }
 
     if (inAgentSection && trimmed.startsWith('command:')) {
-      agentCommand = trimmed.slice(8).trim().replace(/^"|"$/g, '');
+      agentCommand = stripSurroundingQuotes(trimmed.slice(8).trim());
     }
 
     if (inAgentSection && trimmed.startsWith('adapter:')) {
-      agentAdapter = trimmed.slice(8).trim().replace(/^"|"$/g, '');
+      agentAdapter = stripSurroundingQuotes(trimmed.slice(8).trim());
     }
 
     if (inAgentSection && trimmed.startsWith('timeout:')) {
@@ -310,13 +338,13 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
 
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
-        llmProvider = trimmed.slice(9).trim().replace(/^"|"$/g, '');
+        llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
       } else if (trimmed.startsWith('apiKey:')) {
-        llmApiKey = trimmed.slice(7).trim().replace(/^"|"$/g, '');
+        llmApiKey = stripSurroundingQuotes(trimmed.slice(7).trim());
       } else if (trimmed.startsWith('model:')) {
-        llmModel = trimmed.slice(6).trim().replace(/^"|"$/g, '');
+        llmModel = stripSurroundingQuotes(trimmed.slice(6).trim());
       } else if (trimmed.startsWith('baseUrl:')) {
-        llmBaseUrl = trimmed.slice(8).trim().replace(/^"|"$/g, '');
+        llmBaseUrl = stripSurroundingQuotes(trimmed.slice(8).trim());
       }
     }
   }
@@ -328,9 +356,6 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       commands.push(currentCommand);
     }
   }
-
-  // Push the last profile's last command if we ended in a profile
-  // (already handled above since we push on next command or end)
 
   const llm = llmProvider && llmApiKey
     ? { provider: llmProvider, apiKey: llmApiKey, ...(llmModel ? { model: llmModel } : {}), ...(llmBaseUrl ? { baseUrl: llmBaseUrl } : {}) }
@@ -387,7 +412,7 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
     if (trimmed.startsWith('path:')) {
       currentRule.match = {
         ...(currentRule.match as Record<string, unknown>),
-        path: trimmed.slice(5).trim().replace(/^"|"$/g, ''),
+        path: stripSurroundingQuotes(trimmed.slice(5).trim()),
       };
       continue;
     }
@@ -395,7 +420,7 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
     if (trimmed.startsWith('operation:')) {
       currentRule.match = {
         ...(currentRule.match as Record<string, unknown>),
-        operation: trimmed.slice(10).trim().replace(/^"|"$/g, ''),
+        operation: stripSurroundingQuotes(trimmed.slice(10).trim()),
       };
       continue;
     }
@@ -406,12 +431,12 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
     }
 
     if (trimmed.startsWith('basis:')) {
-      currentRule.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
+      currentRule.basis = stripSurroundingQuotes(trimmed.slice(6).trim());
       continue;
     }
 
     if (trimmed.startsWith('guidance:')) {
-      currentRule.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
+      currentRule.guidance = stripSurroundingQuotes(trimmed.slice(9).trim());
       continue;
     }
 
