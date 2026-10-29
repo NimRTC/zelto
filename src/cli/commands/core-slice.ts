@@ -140,7 +140,11 @@ register('create', async (args) => {
 
   // Show usage for --help
   if (id === '--help' || id === '-h') {
-    console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>]');
+    console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>] [--from-spec]');
+    console.error('');
+    console.error('  --from-spec    Parse spec markdown (specs/slices/<id>.md) to auto-populate');
+    console.error('                 writes, requirements, baseline, and acceptance test fields.');
+    console.error('                 Also detects v0- prefix as baseline slice.');
     return 0;
   }
 
@@ -307,14 +311,24 @@ async function createSliceFromSpec(
   const hasTypeScriptFiles = writes.some((w) => w.endsWith('.ts') || w.endsWith('.tsx') || w.includes('.ts'));
   const traceWaiver = isBaseline && !hasTypeScriptFiles ? '基线切片 — 不修改代码，无需契约追踪' : null;
 
+  // Auto-detect acceptance test file
+  const acceptanceTestPath = `tests/acceptance/${id}.test.ts`;
+  const hasAcceptanceTest = existsSync(acceptanceTestPath);
+  const acceptanceTests = hasAcceptanceTest ? [acceptanceTestPath] : [];
+
   const finalWrites = cliWritesProvided ? cliWrites : writes;
 
   const slice = store.create(id, parsedTitle, {
     writes: finalWrites,
-    trace: { requirements, contracts: [], tests: [] },
+    trace: { requirements, contracts: [], tests: acceptanceTests },
     traceWaiver,
     baseline: isBaseline,
   });
+
+  // Update acceptance.dir if test file detected
+  if (hasAcceptanceTest) {
+    slice.acceptance.dir = acceptanceTestPath;
+  }
   await store.write(slice);
   await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title: parsedTitle, specPath, fromSpec: true });
 
@@ -324,6 +338,7 @@ async function createSliceFromSpec(
       writes: finalWrites, spec: slice.spec.path,
       baseline: isBaseline, traceWaiver,
       requirements: requirements.length,
+      acceptanceTest: hasAcceptanceTest ? acceptanceTestPath : null,
     }));
     return 0;
   }
@@ -335,6 +350,7 @@ async function createSliceFromSpec(
   console.log(`  Baseline: ${isBaseline ? '✅ (v0- prefix detected)' : 'no'}`);
   console.log(`  Writes:   ${finalWrites.length > 0 ? finalWrites.join(', ') : '(none — add with --writes)'}`);
   console.log(`  Reqs:     ${requirements.length} parsed from spec`);
+  if (hasAcceptanceTest) console.log(`  Accept:   ✅ ${acceptanceTestPath}`);
   if (traceWaiver) console.log(`  Waiver:   ${traceWaiver}`);
   console.log(`  Spec:     ${slice.spec.path}`);
   console.log(`  Next:     zelto check ${id} && zelto freeze ${id}`);
@@ -411,6 +427,9 @@ register('check', async (args) => {
 
     if (issues.length === 0) {
       console.log('  Result:  ✅ All checks passed');
+    } else if (slice.state === 'frozen') {
+      console.log(`  Issues:  ${issues.join(', ')}`);
+      console.log('  Result:  ⚠️  Fix issues before gate');
     } else {
       console.log(`  Issues:  ${issues.join(', ')}`);
       console.log('  Result:  ⚠️  Fix issues before freezing');
@@ -954,6 +973,12 @@ async function autoGateAfterRun(id: string): Promise<void> {
   for (const r of report.results) {
     const icon = r.passed ? '✅' : '❌';
     console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
+    if (!r.passed && r.stderr) {
+      const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
+      for (const line of stderrLines) {
+        console.log(`       ${line.slice(0, 200)}`);
+      }
+    }
   }
 
   if (report.passed) {

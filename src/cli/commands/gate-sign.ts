@@ -125,6 +125,13 @@ register('gate', async (args) => {
     for (const r of report.results) {
       const icon = r.passed ? '✅' : '❌';
       console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
+      if (!r.passed && r.stderr) {
+        // Show truncated stderr for failure debugging
+        const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
+        for (const line of stderrLines) {
+          console.log(`       ${line.slice(0, 200)}`);
+        }
+      }
     }
 
     if (report.retryCount > 0) {
@@ -254,10 +261,42 @@ async function autoMergeSlice(sliceId: string): Promise<void> {
 
     const expectedBranch = `slice/${sliceId}`;
 
+    // Read slice to get write-set for scoped staging
+    let sliceWrites: string[] = [];
+    let specPath = '';
+    try {
+      const slice = await store.read(sliceId);
+      sliceWrites = slice.writes;
+      specPath = slice.spec.path;
+    } catch {
+      // Fall back to git add -A if slice can't be read
+    }
+
+    // Build scoped git add paths: write-set + slice file + spec + acceptance tests
+    const addPaths: string[] = [];
+    if (sliceWrites.length > 0) {
+      addPaths.push(...sliceWrites);
+    }
+    addPaths.push(`.zelto/slices/${sliceId}.json`);
+    if (specPath) addPaths.push(specPath);
+    // Also add acceptance test directory if it exists
+    addPaths.push(`tests/acceptance/${sliceId}*`);
+
     if (currentBranch === 'main' || currentBranch === 'master') {
       // On main branch — commit changes directly with slice attribution
       console.log(`  Staging: committing changes to ${currentBranch}...`);
-      execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
+      if (addPaths.length > 0) {
+        for (const p of addPaths) {
+          try {
+            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000 });
+          } catch {
+            // Path may not exist — skip
+          }
+        }
+      } else {
+        // Fallback if no specific paths
+        execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
+      }
       try {
         execSync(`git commit -m "feat(${sliceId}): slice approved
 
@@ -273,17 +312,16 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
     } else {
       // On a feature branch — merge to main
       console.log(`  Merging: staging changes...`);
-      execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
-      try {
-        execSync(`git commit -m "feat(${sliceId}): slice approved
-
-Auto-merge after sign approval for slice ${sliceId}
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"`, {
-          cwd: process.cwd(), timeout: 15000,
-        });
-      } catch {
-        // Nothing to commit — fine
+      if (addPaths.length > 0) {
+        for (const p of addPaths) {
+          try {
+            execSync(`git add ${p}`, { cwd: process.cwd(), timeout: 15000 });
+          } catch {
+            // Path may not exist — skip
+          }
+        }
+      } else {
+        execSync('git add -A', { cwd: process.cwd(), timeout: 15000 });
       }
 
       try {
