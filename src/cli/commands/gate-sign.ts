@@ -26,7 +26,7 @@ register('gate', async (args) => {
       // --spec-md without slice-id is handled above
       return 0;
     }
-    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run] [--spec-md]');
+    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run] [--spec-md] [--only <name>]');
     console.error('       zelto gate --spec-md                    (validate all specs)');
     return 1;
   }
@@ -35,6 +35,8 @@ register('gate', async (args) => {
   const isDryRun = args.includes('--dry-run');
   const retryFlag = args.indexOf('--retry');
   const forceRetry = retryFlag >= 0 && args[retryFlag + 1] ? Math.max(0, parseInt(args[retryFlag + 1], 10) || 0) : -1;
+  const onlyFlag = args.indexOf('--only');
+  const onlyCommand = onlyFlag >= 0 && args[onlyFlag + 1] ? args[onlyFlag + 1] : null;
 
   try {
     const slice = await store.read(id);
@@ -62,14 +64,18 @@ register('gate', async (args) => {
       if (isJson) {
         console.log(JSON.stringify({
           sliceId: id, dryRun: true,
-          commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+          commands: config.gate.commands
+            .filter((c) => !onlyCommand || c.name === onlyCommand)
+            .map((c) => ({ name: c.name, run: c.run })),
           timeoutSec: config.gate.timeoutSec,
           retry: config.gate.retry,
+          only: onlyCommand,
         }));
       } else {
+        const filteredCmds = config.gate.commands.filter((c) => !onlyCommand || c.name === onlyCommand);
         console.log(`  Dry-run for gate ${id}:`);
-        console.log(`  Commands: ${config.gate.commands.length}`);
-        for (const c of config.gate.commands) {
+        console.log(`  Commands: ${filteredCmds.length}${onlyCommand ? ` (filtered: ${onlyCommand})` : ''}`);
+        for (const c of filteredCmds) {
           console.log(`    - ${c.name}: ${c.run}`);
         }
         console.log(`  Timeout: ${config.gate.timeoutSec}s`);
@@ -80,11 +86,22 @@ register('gate', async (args) => {
     }
 
     const gateConfig = {
-      commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+      commands: config.gate.commands
+        .filter((c) => !onlyCommand || c.name === onlyCommand)
+        .map((c) => ({ name: c.name, run: c.run })),
       changedLineCoverage: 0.8,
       timeoutSec: config.gate.timeoutSec,
       retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
+
+    if (onlyCommand && gateConfig.commands.length === 0) {
+      console.error(`No gate command found with name "${onlyCommand}". Available: ${config.gate.commands.map((c) => c.name).join(', ')}`);
+      return 1;
+    }
+
+    if (onlyCommand && !isJson) {
+      console.log(`  Only:     ${onlyCommand}`);
+    }
 
     // Run spec-md validation if --spec-md flag is set
     if (hasSpecMd) {

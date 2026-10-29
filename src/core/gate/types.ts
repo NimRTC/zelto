@@ -4,6 +4,8 @@
 export interface GateCommand {
   name: string;
   run: string;
+  /** Per-command timeout in seconds. Falls back to GateConfig.timeoutSec if not set. */
+  timeoutSec?: number;
 }
 
 export interface GateConfig {

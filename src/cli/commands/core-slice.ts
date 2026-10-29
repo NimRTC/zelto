@@ -398,6 +398,26 @@ register('check', async (args) => {
     if (slice.trace.tests.length === 0) issues.push('No tests traced');
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 
+    // Validate write-set paths exist in the repo
+    const missingWrites = slice.writes.filter((w) => {
+      // Glob patterns with * are hard to verify; skip those
+      if (w.includes('*') || w.includes('?')) return false;
+      return !existsSync(w);
+    });
+    if (missingWrites.length > 0) {
+      issues.push(`Write-set paths not found: ${missingWrites.join(', ')}`);
+    }
+
+    // Validate acceptance test path exists
+    if (slice.acceptance.dir && !slice.acceptance.dir.includes('*') && slice.state !== 'draft') {
+      const acceptPath = slice.acceptance.dir.endsWith('/')
+        ? slice.acceptance.dir.slice(0, -1)
+        : slice.acceptance.dir;
+      if (!existsSync(acceptPath) && !existsSync(`${acceptPath}.test.ts`)) {
+        issues.push(`Acceptance test path not found: ${slice.acceptance.dir}`);
+      }
+    }
+
     if (slice.spec.frozenHash) {
       const currentHash = hashSpecFile(slice.spec.path);
       if (currentHash && currentHash !== slice.spec.frozenHash) {

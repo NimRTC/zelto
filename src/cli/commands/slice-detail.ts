@@ -4,6 +4,8 @@
 import { register, store, events, hashSpecFile } from './shared.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 
+// ─── slice (detail) ────────────────────────────────────────────────────────
+
 register('slice', async (args) => {
   const [id] = args;
   const f = getDefaultFormatter();
@@ -94,6 +96,93 @@ register('slice', async (args) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     f.error('READ_ERROR', `Error reading slice "${id}": ${msg}`);
+    return 1;
+  }
+  return 0;
+});
+
+// ─── slice set (edit slice fields) ─────────────────────────────────────────
+
+const SLICE_SETTABLE_FIELDS = new Set([
+  'title', 'traceWaiver', 'writes', 'acceptance.dir',
+  'trace.requirements', 'trace.contracts', 'trace.tests',
+  'baseCommit', 'baseline',
+]);
+
+register('set', async (args) => {
+  const [id] = args;
+  const f = getDefaultFormatter();
+
+  if (!id || id === '--help' || id === '-h') {
+    f.error('USAGE', 'Usage: zelto set <slice-id> --field <name> --value <val> [--json]');
+    f.out('');
+    f.out('Settable fields:');
+    for (const field of [...SLICE_SETTABLE_FIELDS].sort()) {
+      f.out(`  ${field}`);
+    }
+    return 1;
+  }
+
+  const isJson = args.includes('--json');
+  const fieldIdx = args.indexOf('--field');
+  const valueIdx = args.indexOf('--value');
+
+  if (fieldIdx < 0 || valueIdx < 0) {
+    f.error('MISSING_ARGS', 'Both --field and --value are required');
+    return 1;
+  }
+
+  const field = args[fieldIdx + 1];
+  const rawValue = args[valueIdx + 1];
+
+  if (!field || !rawValue) {
+    f.error('MISSING_ARGS', 'Both --field and --value require a value');
+    return 1;
+  }
+
+  if (!SLICE_SETTABLE_FIELDS.has(field)) {
+    f.error('INVALID_FIELD', `Unknown field: "${field}". Use --help to list settable fields.`);
+    return 1;
+  }
+
+  try {
+    const slice = await store.read(id);
+    const prevState = slice.state;
+
+    // Parse value: comma-separated for array fields, boolean for boolean fields
+    if (field === 'writes' || field === 'trace.requirements' || field === 'trace.contracts' || field === 'trace.tests') {
+      const values = rawValue.split(',').map((v: string) => v.trim()).filter(Boolean);
+      if (field === 'writes') slice.writes = values;
+      else if (field === 'trace.requirements') slice.trace.requirements = values;
+      else if (field === 'trace.contracts') slice.trace.contracts = values;
+      else if (field === 'trace.tests') slice.trace.tests = values;
+    } else if (field === 'baseline') {
+      slice.baseline = rawValue === 'true' || rawValue === '1';
+    } else if (field === 'title') {
+      slice.title = rawValue;
+    } else if (field === 'traceWaiver') {
+      slice.traceWaiver = rawValue || null;
+    } else if (field === 'acceptance.dir') {
+      slice.acceptance.dir = rawValue;
+    } else if (field === 'baseCommit') {
+      slice.baseCommit = rawValue || null;
+    }
+
+    await store.write(slice);
+    await events.append(id, 'spec.drafted', 'cli', {
+      sliceId: id, field, fromValue: prevState, action: 'slice.set',
+    });
+
+    if (isJson) {
+      f.data({ success: true, id, field, value: rawValue });
+      return 0;
+    }
+
+    f.out(`zelto set ${id} — ✅ Updated ${field}`);
+    f.out(`  ${field}: ${rawValue}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    f.error('SET_ERROR', `Error updating slice "${id}": ${msg}`);
     return 1;
   }
   return 0;

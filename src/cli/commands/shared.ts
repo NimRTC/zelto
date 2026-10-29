@@ -114,7 +114,7 @@ export function hashSpecFile(specPath: string): string | null {
 
 export interface ZeltoConfig {
   gate: {
-    commands: Array<{ name: string; run: string }>;
+    commands: Array<{ name: string; run: string; timeoutSec?: number }>;
     timeoutSec: number;
     retry: { max: number };
   };
@@ -182,12 +182,12 @@ function validateConfig(config: ZeltoConfig): void {
 }
 
 export function parseConfigYaml(content: string): ZeltoConfig | null {
-  const commands: Array<{ name: string; run: string }> = [];
+  const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
   let timeoutSec = 120;
   let retryMax = 2;
   let agentCommand = 'npx claude-code';
   let agentAdapter = '';
-  let currentCommand: { name: string; run: string } | null = null;
+  let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
   let inGateSection = false;
   let inAgentSection = false;
   let inLlmSection = false;
@@ -230,7 +230,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
 
       if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
         if (currentCommand) commands.push(currentCommand);
-        currentCommand = { name: trimmed.slice(7).trim(), run: '' };
+        currentCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
         continue;
       }
 
@@ -241,8 +241,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
+      // Per-command timeout (indented under a command item)
       if (trimmed.startsWith('timeoutSec:')) {
-        timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
+        if (currentCommand && currentCommand.run) {
+          // Per-command timeout
+          currentCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+        } else {
+          // Global timeout
+          timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
+        }
         continue;
       }
 

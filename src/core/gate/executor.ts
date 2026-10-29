@@ -163,7 +163,8 @@ export class GateExecutor {
     slice: SliceData,
     actor: string,
   ): Promise<{ result: GateResult; retries: number }> {
-    let result = await runCommand(cmd, this.config.timeoutSec, this.projectRoot);
+    const timeoutSec = cmd.timeoutSec ?? this.config.timeoutSec;
+    let result = await runCommand(cmd, timeoutSec, this.projectRoot);
     let attempts = 0;
 
     while (!result.passed && attempts < this.config.retry.max) {
@@ -173,6 +174,7 @@ export class GateExecutor {
         attempt: attempts,
         maxRetries: this.config.retry.max,
         previousExitCode: result.exitCode,
+        timeoutSec,
       });
 
       // Re-read slice before writing to avoid overwriting concurrent modifications
@@ -188,7 +190,7 @@ export class GateExecutor {
         await this.store.write(slice);
       }
 
-      result = await runCommand(cmd, this.config.timeoutSec, this.projectRoot);
+      result = await runCommand(cmd, timeoutSec, this.projectRoot);
     }
 
     return { result, retries: attempts };
