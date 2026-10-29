@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { type SliceState, transitionSlice, type SliceEvent } from './state.js';
 import type { StallInfo } from '../stall/types.js';
+import type { SliceType } from '../gate/types.js';
 
 export interface SliceSpec {
   path: string;
@@ -41,9 +42,11 @@ export interface SliceData {
   trace: SliceTrace;
   traceWaiver: string | null;
   baseline: boolean;
+  type?: SliceType;
   writes: string[];
   runs: string[];
   stall: StallInfo;
+  agentTimeout?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -116,9 +119,11 @@ export class SliceStore {
       trace: opts?.trace ?? { requirements: [], contracts: [], tests: [] },
       traceWaiver: opts?.traceWaiver ?? null,
       baseline: opts?.baseline ?? false,
+      type: opts?.type,
       writes: opts?.writes ?? [],
       runs: opts?.runs ?? [],
       stall: opts?.stall ?? { class: null, autoResolved: 0, gateRetries: 0 },
+      agentTimeout: opts?.agentTimeout,
       createdAt: now,
       updatedAt: now,
     };

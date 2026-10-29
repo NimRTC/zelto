@@ -26,6 +26,7 @@ import { BudgetCollector } from '../../core/budget/collector.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
+import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter } from './shared.js';
@@ -318,8 +319,12 @@ async function createSliceFromSpec(
 
   const finalWrites = cliWritesProvided ? cliWrites : writes;
 
+  // Auto-detect slice type from write-set
+  const sliceType = detectSliceType(finalWrites);
+
   const slice = store.create(id, parsedTitle, {
     writes: finalWrites,
+    type: sliceType,
     trace: { requirements, contracts: [], tests: acceptanceTests },
     traceWaiver,
     baseline: isBaseline,
@@ -740,8 +745,12 @@ register('run', async (args) => {
   if (!id) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
     console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
+    console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
     return 1;
   }
+
+  const isHotfix = args.includes('--hotfix');
+  const isDetach = args.includes('--detach');
 
   const isJson = args.includes('--json');
 
@@ -863,12 +872,40 @@ register('run', async (args) => {
     let startTime = Date.now();
     let progressTimer: ReturnType<typeof setInterval> | null = null;
 
-    const adapter = createExecutorAdapter(adapterType, agentName);
+    const sliceData = await store.read(id);
+    const agentTimeout = sliceData.agentTimeout;
+    const adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
     });
+
+    // ── Detach mode ─────────────────────────────────────────────────
+    if (isDetach) {
+      // Save task tracking info and return immediately
+      const taskId = `task-${id}-${Date.now()}`;
+      const taskInfo = {
+        taskId,
+        sliceId: id,
+        sessionId,
+        agentName,
+        startedAt: new Date().toISOString(),
+        status: 'running' as const,
+      };
+      const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const tasksDir = join(ZELTO_DIR, 'tasks');
+      if (!existsSync(tasksDir)) mkdirSync(tasksDir, { recursive: true });
+      writeFileSync(join(tasksDir, `${taskId}.json`), JSON.stringify(taskInfo, null, 2), 'utf-8');
+
+      // Spawn background monitor to update task status
+      monitorTaskInBackground(taskId, sessionId, adapter, id, startTime, isHotfix);
+      console.log(`zelto run ${id} — ✅ Detached (task: ${taskId})`);
+      console.log(`  Session: ${sessionId}`);
+      console.log(`  Run: zelto status ${taskId}`);
+      return 0;
+    }
 
     // Start progress display
     progressTimer = setInterval(() => {
@@ -892,8 +929,20 @@ register('run', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
-      // Auto-run gate and create sign request on pass
-      await autoGateAfterRun(id);
+      if (isHotfix) {
+        // Hotfix: skip gate, auto-sign, write hotfix event
+        await store.transit(id, 'GATE_PASS');
+        await events.append(id, 'slice.hotfix', 'zelto', {
+          sliceId: id, elapsed, note: 'hotfix — gate skipped, auto-approved',
+        });
+        const signManager = new SignManager(ZELTO_DIR, events, store);
+        const signReq = await signManager.request(id, 'zelto');
+        await signManager.approve(signReq.id, 'zelto');
+        console.log(`  🔥 Hotfix: gate skipped, auto-approved (${signReq.id})`);
+      } else {
+        // Auto-run gate and create sign request on pass
+        await autoGateAfterRun(id);
+      }
     } else {
       await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1062,8 +1111,11 @@ async function runParallel(args: string[]): Promise<number> {
     }
   }
 
-  // Start all agent sessions
-  const adapters = states.map(() => createExecutorAdapter(adapterType, agentName));
+  // Start all agent sessions — each with its own timeout from slice config
+  const adapters = states.map((st, i) => {
+    const timeout = slices[i]?.agentTimeout;
+    return createExecutorAdapter(adapterType, agentName, timeout);
+  });
 
   const startTime = Date.now();
   console.log(`\nzelto run --parallel — starting ${ids.length} agents...`);
@@ -1257,6 +1309,7 @@ async function autoGateAfterRun(id: string): Promise<void> {
   const config = loadConfig();
   const gateConfig: GateConfig = {
     commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+    profiles: config.gate.profiles,
     changedLineCoverage: 0.8,
     timeoutSec: config.gate.timeoutSec,
     retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
@@ -1452,7 +1505,8 @@ register('start', async (args) => {
     }
 
     const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
-    const adapter = createExecutorAdapter(adapterType, agentName);
+    const sliceForTimeout = await store.read(id);
+    const adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
     const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
@@ -1496,4 +1550,225 @@ register('start', async (args) => {
   }
 
   return 0;
+});
+
+// ─── Background task tracking ────────────────────────────────────────────
+
+interface TaskInfo {
+  taskId: string;
+  sliceId: string;
+  sessionId: string;
+  agentName: string;
+  startedAt: string;
+  status: 'running' | 'completed' | 'failed' | 'timeout';
+  completedAt?: string;
+  exitCode?: number;
+  elapsedSec?: number;
+}
+
+function tasksDir(): string {
+  return join(ZELTO_DIR, 'tasks');
+}
+
+function taskPath(taskId: string): string {
+  return join(tasksDir(), `${taskId}.json`);
+}
+
+async function saveTask(info: TaskInfo): Promise<void> {
+  const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
+  if (!existsSync(tasksDir())) mkdirSync(tasksDir(), { recursive: true });
+  writeFileSync(taskPath(info.taskId), JSON.stringify(info, null, 2), 'utf-8');
+}
+
+async function loadTask(taskId: string): Promise<TaskInfo | null> {
+  const { readFileSync, existsSync } = await import('node:fs');
+  const p = taskPath(taskId);
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, 'utf-8')) as TaskInfo;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Monitor a background task and update its status.
+ * Runs asynchronously (not awaited) to allow immediate CLI return.
+ */
+async function monitorTaskInBackground(
+  taskId: string,
+  sessionId: string,
+  adapter: ReturnType<typeof createExecutorAdapter>,
+  sliceId: string,
+  startTime: number,
+  isHotfix: boolean,
+): Promise<void> {
+  try {
+    const exitCode = await adapter.waitForExit(sessionId);
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const status = exitCode === 0 ? 'completed' : 'failed';
+
+    // Update task file
+    const task = await loadTask(taskId);
+    if (task) {
+      task.status = status;
+      task.exitCode = exitCode ?? undefined;
+      task.elapsedSec = elapsed;
+      task.completedAt = new Date().toISOString();
+      await saveTask(task);
+    }
+
+    // Process result as if foreground (state transition, gate, etc.)
+    if (exitCode === 0) {
+      await store.transit(sliceId, 'RUN_FINISH');
+      await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0 });
+      if (isHotfix) {
+        await store.transit(sliceId, 'GATE_PASS');
+        await events.append(sliceId, 'slice.hotfix', 'zelto', {
+          sliceId, elapsed, note: 'hotfix — gate skipped, auto-approved',
+        });
+        const signManager = new SignManager(ZELTO_DIR, events, store);
+        const signReq = await signManager.request(sliceId, 'zelto');
+        await signManager.approve(signReq.id, 'zelto');
+      } else {
+        await autoGateAfterRun(sliceId);
+      }
+    } else {
+      await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+      await autoClassifyStall(sliceId, exitCode);
+    }
+  } catch {
+    // Background monitor failure is non-fatal
+    const task = await loadTask(taskId);
+    if (task && task.status === 'running') {
+      task.status = 'failed';
+      await saveTask(task);
+    }
+  }
+}
+
+// ─── task: list background tasks ──────────────────────────────────────────
+
+register('tasks', async (args) => {
+  const { readdirSync, existsSync } = await import('node:fs');
+  const dir = tasksDir();
+  if (!existsSync(dir)) {
+    console.log('No background tasks.');
+    return 0;
+  }
+
+  const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+  if (files.length === 0) {
+    console.log('No background tasks.');
+    return 0;
+  }
+
+  console.log('Background tasks:');
+  for (const file of files) {
+    const task = await loadTask(file.slice(0, -5));
+    if (!task) continue;
+    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? '🔄' : '❌';
+    const elapsed = task.elapsedSec ? `${task.elapsedSec}s` : '—';
+    console.log(`  ${icon} ${task.taskId.padEnd(30)} ${task.status.padEnd(10)} ${elapsed}`);
+  }
+  return 0;
+});
+
+// ─── task-status: show task status ────────────────────────────────────
+
+register('task-status', async (args) => {
+  const [target] = args;
+  if (!target) {
+    // Show all tasks summary
+    const { readdirSync, existsSync } = await import('node:fs');
+    const dir = tasksDir();
+    if (existsSync(dir)) {
+      const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
+      const running = [];
+      for (const file of files) {
+        const t = await loadTask(file.slice(0, -5));
+        if (t?.status === 'running') running.push(t);
+      }
+      if (running.length > 0) {
+        console.log(`Running tasks (${running.length}):`);
+        for (const task of running) {
+          const elapsed = Math.floor((Date.now() - new Date(task.startedAt).getTime()) / 1000);
+          console.log(`  🔄 ${task.taskId} — ${task.sliceId} (${elapsed}s)`);
+        }
+        return 0;
+      }
+    }
+    console.log('No running background tasks.');
+    return 0;
+  }
+
+  // Check if target is a task ID (starts with "task-")
+  if (target.startsWith('task-')) {
+    const task = await loadTask(target);
+    if (!task) {
+      console.error(`Task not found: ${target}`);
+      return 1;
+    }
+    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? '🔄' : '❌';
+    console.log(`  ${icon} ${task.taskId}`);
+    console.log(`    Slice:    ${task.sliceId}`);
+    console.log(`    Status:   ${task.status}`);
+    console.log(`    Agent:    ${task.agentName}`);
+    console.log(`    Session:  ${task.sessionId}`);
+    if (task.elapsedSec) console.log(`    Elapsed:  ${task.elapsedSec}s`);
+    if (task.exitCode !== undefined) console.log(`    Exit:     ${task.exitCode}`);
+    return 0;
+  }
+
+  // Otherwise, show slice status via slice-status command
+  const handler = (await import('./shared.js')).commands['slice-status'];
+  if (handler) {
+    return handler([target]);
+  }
+  console.error(`Unknown status target: ${target}`);
+  return 1;
+});
+
+// ─── wait: block until task completes ─────────────────────────────────────
+
+register('wait', async (args) => {
+  const [taskId] = args;
+  if (!taskId || !taskId.startsWith('task-')) {
+    console.error('Usage: zelto wait <task-id>');
+    console.error('  Get task ID from "zelto run --detach" or "zelto tasks"');
+    return 1;
+  }
+
+  let task = await loadTask(taskId);
+  if (!task) {
+    console.error(`Task not found: ${taskId}`);
+    return 1;
+  }
+
+  if (task.status !== 'running') {
+    const icon = task.status === 'completed' ? '✅' : '❌';
+    console.log(`${icon} Task ${taskId}: ${task.status}`);
+    return task.status === 'completed' ? 0 : 1;
+  }
+
+  // Poll for completion
+  const startTime = Date.now();
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    await new Promise((r) => setTimeout(r, 2000));
+    task = await loadTask(taskId);
+    if (!task || task.status !== 'running') break;
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    process.stdout.write(`\r  ⏱️  Waiting... ${elapsed}s`);
+  }
+
+  process.stdout.write('\r' + ' '.repeat(30) + '\r');
+  if (!task) {
+    console.error(`Task lost: ${taskId}`);
+    return 1;
+  }
+
+  const icon = task.status === 'completed' ? '✅' : '❌';
+  console.log(`${icon} Task ${taskId}: ${task.status} (${task.elapsedSec ?? '?'}s)`);
+  return task.status === 'completed' ? 0 : 1;
 });

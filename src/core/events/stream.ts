@@ -14,6 +14,7 @@ export type EventType =
   | 'run.stalled'
   | 'run.finished'
   | 'run.aborted'
+  | 'slice.hotfix'
   | 'policy.decision'
   | 'policy.anchor_mismatch'
   | 'gate.executed'

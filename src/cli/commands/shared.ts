@@ -115,10 +115,11 @@ export function hashSpecFile(specPath: string): string | null {
 export interface ZeltoConfig {
   gate: {
     commands: Array<{ name: string; run: string; timeoutSec?: number }>;
+    profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
     timeoutSec: number;
     retry: { max: number };
   };
-  agent: { command: string; adapter?: string };
+  agent: { command: string; adapter?: string; timeout?: number };
   llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string };
 }
 
@@ -183,14 +184,18 @@ function validateConfig(config: ZeltoConfig): void {
 
 export function parseConfigYaml(content: string): ZeltoConfig | null {
   const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
+  const profiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
   let timeoutSec = 120;
   let retryMax = 2;
   let agentCommand = 'npx claude-code';
   let agentAdapter = '';
+  let agentTimeout: number | undefined;
   let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
   let inGateSection = false;
   let inAgentSection = false;
   let inLlmSection = false;
+  let inProfileSection = false;
+  let currentProfile: string | null = null;
   let llmProvider = '';
   let llmApiKey = '';
   let llmModel = '';
@@ -205,31 +210,63 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       inGateSection = true;
       inAgentSection = false;
       inLlmSection = false;
+      inProfileSection = false;
+      currentProfile = null;
       continue;
     }
     if (trimmed === 'agent:') {
       inAgentSection = true;
       inGateSection = false;
       inLlmSection = false;
+      inProfileSection = false;
+      currentProfile = null;
       continue;
     }
     if (trimmed === 'llm:') {
       inLlmSection = true;
       inGateSection = false;
       inAgentSection = false;
+      inProfileSection = false;
+      currentProfile = null;
       continue;
     }
 
     if (inGateSection) {
+      // Detect profile section (indented key with list value)
+      const profileMatch = trimmed.match(/^(\w+):$/);
+      if (profileMatch && profileMatch[1] !== 'commands' && profileMatch[1] !== 'timeoutSec' && profileMatch[1] !== 'retry') {
+        inProfileSection = true;
+        currentProfile = profileMatch[1];
+        continue;
+      }
+
+      if (trimmed.startsWith('commands:') || trimmed === 'commands:') {
+        inProfileSection = false;
+        currentProfile = null;
+        continue;
+      }
+
       const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
       if (inlineMatch) {
-        if (currentCommand) commands.push(currentCommand);
+        if (currentCommand) {
+          if (currentProfile) {
+            (profiles[currentProfile] ??= []).push(currentCommand);
+          } else {
+            commands.push(currentCommand);
+          }
+        }
         currentCommand = { name: inlineMatch[1], run: inlineMatch[2] };
         continue;
       }
 
       if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
-        if (currentCommand) commands.push(currentCommand);
+        if (currentCommand) {
+          if (currentProfile) {
+            (profiles[currentProfile] ??= []).push(currentCommand);
+          } else {
+            commands.push(currentCommand);
+          }
+        }
         currentCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
         continue;
       }
@@ -267,6 +304,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       agentAdapter = trimmed.slice(8).trim().replace(/^"|"$/g, '');
     }
 
+    if (inAgentSection && trimmed.startsWith('timeout:')) {
+      agentTimeout = Number.parseInt(trimmed.slice(8).trim(), 10) || undefined;
+    }
+
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = trimmed.slice(9).trim().replace(/^"|"$/g, '');
@@ -280,18 +321,34 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     }
   }
 
-  if (currentCommand) commands.push(currentCommand);
+  if (currentCommand) {
+    if (currentProfile) {
+      (profiles[currentProfile] ??= []).push(currentCommand);
+    } else {
+      commands.push(currentCommand);
+    }
+  }
+
+  // Push the last profile's last command if we ended in a profile
+  // (already handled above since we push on next command or end)
 
   const llm = llmProvider && llmApiKey
     ? { provider: llmProvider, apiKey: llmApiKey, ...(llmModel ? { model: llmModel } : {}), ...(llmBaseUrl ? { baseUrl: llmBaseUrl } : {}) }
     : undefined;
 
-  return commands.length > 0 || llm
+  const gate = commands.length > 0
     ? {
-        gate: commands.length > 0
-          ? { commands, timeoutSec, retry: { max: retryMax } }
-          : { commands: [], timeoutSec: 120, retry: { max: 2 } },
-        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}) },
+        commands,
+        ...(Object.keys(profiles).length > 0 ? { profiles } : {}),
+        timeoutSec,
+        retry: { max: retryMax },
+      }
+    : { commands: [], timeoutSec: 120, retry: { max: 2 } };
+
+  return commands.length > 0 || Object.keys(profiles).length > 0 || llm
+    ? {
+        gate,
+        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}) },
         llm,
       }
     : null;
@@ -387,13 +444,16 @@ export type AdapterType = 'claude-agent' | 'claude-agent-sdk';
  * Create an executor adapter based on config and optional override.
  * @param overrideType — Optional override from CLI --adapter flag
  * @param agentCommand — Agent command string (for claude-agent adapter)
+ * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
  */
 export function createExecutorAdapter(
   overrideType?: string,
   agentCommand?: string,
+  timeoutSec?: number,
 ): ExecutorAdapter {
   const cfg = loadConfig();
   const type = (overrideType ?? cfg.agent.adapter ?? 'claude-agent') as AdapterType;
+  const timeoutMs = (timeoutSec ?? cfg.agent.timeout ?? 900) * 1000;
 
   if (type === 'claude-agent-sdk') {
     return new ClaudeAgentSdkAdapter({
@@ -407,6 +467,7 @@ export function createExecutorAdapter(
   return new ClaudeAgentAdapter({
     cwd: process.cwd(),
     agentCommand: agentCommand ?? cfg.agent.command,
+    timeoutMs,
   });
 }
 

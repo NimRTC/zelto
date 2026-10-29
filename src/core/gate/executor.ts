@@ -6,7 +6,8 @@ import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { GateConfig, GateCommand, GateResult, GateReport } from './types.js';
+import type { GateConfig, GateCommand, GateResult, GateReport, SliceType } from './types.js';
+import { detectSliceType } from './types.js';
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 
@@ -87,6 +88,18 @@ export class GateExecutor {
     let passed = true;
     let totalRetries = 0;
 
+    // Select gate commands based on slice type
+    const sliceType: SliceType = slice.type ?? detectSliceType(slice.writes);
+    const commands = this.selectCommands(sliceType);
+
+    // Log profile selection
+    await this.appendEvent(sliceId, 'gate.executed', actor, {
+      sliceId,
+      sliceType,
+      commandCount: commands.length,
+      profile: commands === this.config.commands ? 'default' : sliceType,
+    });
+
     // Check for uninitialized git submodules before running commands
     const submoduleIssue = await this.checkSubmodules();
     if (submoduleIssue) {
@@ -118,12 +131,7 @@ export class GateExecutor {
       };
     }
 
-    await this.appendEvent(sliceId, 'gate.executed', actor, {
-      sliceId,
-      commandCount: this.config.commands.length,
-    });
-
-    for (const cmd of this.config.commands) {
+    for (const cmd of commands) {
       const { result, retries } = await this.runWithRetry(cmd, slice, actor);
       results.push(result);
       totalRetries += retries;
@@ -156,6 +164,17 @@ export class GateExecutor {
       retryCount: totalRetries,
       totalDurationMs,
     };
+  }
+
+  /**
+   * Select gate commands based on slice type.
+   * Looks up the type in config.profiles, falls back to default commands.
+   */
+  private selectCommands(sliceType: SliceType): GateCommand[] {
+    if (this.config.profiles && this.config.profiles[sliceType]) {
+      return this.config.profiles[sliceType];
+    }
+    return this.config.commands;
   }
 
   private async runWithRetry(
