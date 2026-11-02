@@ -40,7 +40,12 @@ function zelto(...args: string[]): Promise<{ stdout: string; stderr: string; cod
 
 describe('acceptance: agent-execution', () => {
   before(async () => {
-    await rm(BASE_DIR, { recursive: true, force: true });
+    // Attempt cleanup, but don't fail on EBUSY (Windows lock)
+    try {
+      await rm(BASE_DIR, { recursive: true, force: true });
+    } catch {
+      // EBUSY on Windows — proceed anyway
+    }
     await mkdir(join(BASE_DIR, '.zelto', 'slices'), { recursive: true });
     await mkdir(join(BASE_DIR, '.zelto', 'events'), { recursive: true });
     await mkdir(join(BASE_DIR, 'specs', 'slices'), { recursive: true });
@@ -61,12 +66,16 @@ describe('acceptance: agent-execution', () => {
   });
 
   after(async () => {
-    await rm(BASE_DIR, { recursive: true, force: true });
+    try {
+      await rm(BASE_DIR, { recursive: true, force: true });
+    } catch {
+      // EBUSY on Windows — ignore
+    }
   });
 
   it('zelto run spawns agent and transitions to running state', async () => {
     // Use start to create + freeze + run in one go
-    const { stdout, code } = await zelto('start', 'run-test-1', '--title', 'Agent Run Test');
+    const { stdout, code } = await zelto('start', 'run-test-1', '--title', 'Agent Run Test', '--yes');
     assert.equal(code, 0, `start should exit 0: ${stdout}`);
 
     // After start with echo agent, the slice should eventually be in frozen state

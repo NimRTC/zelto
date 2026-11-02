@@ -1,12 +1,17 @@
 // Dashboard — project bird's-eye view
 // Layers: ① Abnormalities ② Releases ③ Version Plans ④ Code Areas (collapsed)
-// Usage: zelto dashboard [--watch] [--open] [--output <path>]
+// Usage: zelto dashboard [--watch] [--open] [--output <path>] [--tty] [--json]
 
-import { existsSync, readFileSync, readdirSync, writeFileSync, watch } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, watch } from 'node:fs';
 import { join } from 'node:path';
 import { register, ZELTO_DIR } from './shared.js';
 import { loadReleases, type ReleaseDef } from './releases.js';
 import { detectSliceType, type SliceType } from '../../core/gate/types.js';
+import { colors } from '../color.js';
+
+// ─── Cost Cache (avoids re-reading unchanged event files) ───────────────────
+
+const costCache = new Map<string, { mtimeMs: number; cost: SliceCost }>();
 
 // ─── Area Mapping ────────────────────────────────────────────────────────────
 
@@ -184,6 +189,18 @@ function collectCosts(): Map<string, SliceCost> {
     let completionTokens = 0;
     let llmCalls = 0;
 
+    // Cache check: skip if file mtime unchanged
+    try {
+      const st = statSync(f);
+      const cached = costCache.get(sliceId);
+      if (cached && cached.mtimeMs === st.mtimeMs) {
+        if (cached.cost.totalCost > 0 || cached.cost.llmCalls > 0) {
+          costMap.set(sliceId, cached.cost);
+        }
+        continue;
+      }
+    } catch { /* stat failed — re-read */ }
+
     try {
       for (const line of readFileSync(f, 'utf-8').split('\n').filter(Boolean)) {
         try {
@@ -193,7 +210,6 @@ function collectCosts(): Map<string, SliceCost> {
             totalTokens += e.payload?.totalTokens ?? 0;
             promptTokens += e.payload?.promptTokens ?? 0;
             completionTokens += e.payload?.completionTokens ?? 0;
-            totalCost += e.payload?.cost ?? 0;
           } else if (e.type === 'budget.spent') {
             totalCost += e.payload?.amount ?? 0;
           }
@@ -202,7 +218,11 @@ function collectCosts(): Map<string, SliceCost> {
     } catch { /* skip unreadable files */ }
 
     if (llmCalls > 0 || totalCost > 0) {
-      costMap.set(sliceId, { totalCost, totalTokens, promptTokens, completionTokens, llmCalls });
+      const cost = { totalCost, totalTokens, promptTokens, completionTokens, llmCalls };
+      costMap.set(sliceId, cost);
+      // Update cache
+      try { const st = statSync(f); costCache.set(sliceId, { mtimeMs: st.mtimeMs, cost }); }
+      catch { /* skip */ }
     }
   }
   return costMap;
@@ -213,6 +233,244 @@ function fmtCost(cost: number): string {
   if (cost < 0.01) return '$' + cost.toFixed(4);
   if (cost < 1) return '$' + cost.toFixed(3);
   return '$' + cost.toFixed(2);
+}
+
+// ─── Action Recommendations ──────────────────────────────────────────────────
+
+interface ActionItem {
+  priority: number;
+  command: string;
+  reason: string;
+}
+
+function computeActions(
+  slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
+): ActionItem[] {
+  const actions: ActionItem[] = [];
+
+  // Stalled slices → resume
+  for (const s of slices) {
+    if (s.stallClass) {
+      const stallAge = s.updatedAt ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000) : 0;
+      const ageStr = stallAge > 0 ? ` (${stallAge}m)` : '';
+      actions.push({ priority: 1, command: `zelto resume ${s.id}`, reason: `⚠️ Stalled: ${s.stallClass}${ageStr}` });
+    }
+  }
+
+  // Plans with completed slices that could be delivered
+  for (const plan of plans) {
+    for (const v of plan.versions) {
+      const total = v.slices.length;
+      const done = v.slices.filter((s) => s.state === 'completed').length;
+      if (total > 0 && done === total) {
+        actions.push({ priority: 2, command: `zelto version deliver ${v.name}`, reason: `📦 Version ${v.name} all ${total} slices completed` });
+      }
+      // Plans with some progress but stalled
+      const stalled = v.slices.filter((s) => s.stallClass).length;
+      if (stalled > 0 && done < total) {
+        actions.push({ priority: 2, command: `zelto version status ${v.name}`, reason: `📋 Version ${v.name}: ${done}/${total} done, ${stalled} stalled` });
+      }
+    }
+  }
+
+  // Check sign inbox for pending approvals
+  const inboxDir = join(ZELTO_DIR, 'inbox');
+  if (existsSync(inboxDir)) {
+    let pendingCount = 0;
+    try {
+      for (const f of readdirSync(inboxDir)) {
+        if (f.endsWith('.json')) pendingCount++;
+      }
+    } catch { /* skip */ }
+    if (pendingCount > 0) {
+      actions.push({ priority: 3, command: 'zelto sign --list', reason: `📝 ${pendingCount} pending approval(s)` });
+    }
+  }
+
+  // Auto-resolved stalls that haven't been resumed
+  const autoResolved = slices.filter((s) => s.autoResolved > 0 && !s.stallClass);
+  if (autoResolved.length > 0) {
+    actions.push({ priority: 3, command: `zelto stall --auto-resolved`, reason: `🔄 ${autoResolved.length} slice(s) with auto-retry history` });
+  }
+
+  // Running slices (check for long-running)
+  const running = slices.filter((s) => s.state === 'running');
+  for (const s of running) {
+    if (s.updatedAt) {
+      const elapsed = Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000);
+      if (elapsed > 10) {
+        actions.push({ priority: 4, command: `zelto stall ${s.id}`, reason: `⏱️ ${s.id} running ${elapsed}m — check status` });
+      }
+    }
+  }
+
+  return actions.sort((a, b) => a.priority - b.priority);
+}
+
+// ─── TTY Render ─────────────────────────────────────────────────────────────
+
+function renderTty(
+  slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
+  events: EventInfo[], costMap: Map<string, SliceCost>,
+): string {
+  const stalled = slices.filter((s) => s.stallClass);
+  const running = slices.filter((s) => s.state === 'running');
+  const stateCnt: Record<string, number> = {};
+  for (const s of slices) { stateCnt[s.state] = (stateCnt[s.state] ?? 0) + 1; }
+
+  let totalCost = 0;
+  let totalLlmCalls = 0;
+  for (const c of costMap.values()) { totalCost += c.totalCost; totalLlmCalls += c.llmCalls; }
+
+  const lines: string[] = [];
+  const h = (s: string) => colors.bold(colors.cyan(s));
+
+  lines.push('');
+  lines.push(`  ${h('📊 zelto 工程状态')}  ${colors.dim(new Date().toLocaleString())}`);
+  lines.push('');
+
+  // Summary bar
+  const summaryParts = [
+    `Slices: ${colors.bold(String(slices.length))}`,
+    `Running: ${colors.blue(String(stateCnt['running'] ?? 0))}`,
+    `Stalled: ${colors.red(String(stalled.length))}`,
+    `Completed: ${colors.green(String(stateCnt['completed'] ?? 0))}`,
+    `Cost: ${colors.magenta(fmtCost(totalCost))}${totalLlmCalls > 0 ? colors.dim(` (${totalLlmCalls} calls)`) : ''}`,
+  ];
+  lines.push(`  ${summaryParts.join('  ·  ')}`);
+  lines.push('');
+
+  // State bar (compact)
+  const stateOrder = ['running', 'frozen', 'completed', 'draft', 'clarifying', 'abandoned'];
+  const barParts = stateOrder
+    .map((st) => { const c = stateCnt[st] ?? 0; return c > 0 ? `${ST_ICON[st] ?? '❔'} ${c}` : ''; })
+    .filter(Boolean);
+  if (barParts.length > 0) lines.push(`  ${colors.dim('States:')}  ${barParts.join('  ')}`);
+  lines.push('');
+
+  // Stalled list
+  if (stalled.length > 0) {
+    lines.push(`  ${colors.red(colors.bold(`⚠️  Stalled (${stalled.length})`))}`);
+    for (const s of stalled) {
+      const loc = [s.planTitle, s.version, s.module].filter(Boolean).join('/') || '';
+      const locStr = loc ? colors.dim(` (${loc})`) : '';
+      lines.push(`    ${colors.red('❌')} ${colors.bold(s.id)} ${colors.yellow(s.stallClass!)}${locStr}`);
+      lines.push(`       ${colors.dim('→')} zelto resume ${s.id}`);
+    }
+    lines.push('');
+  }
+
+  // Running list
+  if (running.length > 0) {
+    lines.push(`  ${colors.blue(colors.bold(`🔄 Running (${running.length})`))}`);
+    for (const s of running) {
+      const elapsed = s.updatedAt ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 1000) : 0;
+      const elapsedStr = elapsed > 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`;
+      lines.push(`    ${colors.blue('🔄')} ${colors.bold(s.id)} ${colors.dim(elapsedStr)}`);
+    }
+    lines.push('');
+  }
+
+  // Release progress
+  if (releases.length > 0) {
+    lines.push(`  ${h('📌 版本路线图')}`);
+    for (const r of releases) {
+      const relSlices: SliceData[] = [];
+      for (const pid of r.plans) {
+        const p = plans.find((pl) => pl.planId === pid);
+        if (p) for (const v of p.versions) relSlices.push(...v.slices);
+      }
+      const total = relSlices.length;
+      const done = relSlices.filter((s) => s.state === 'completed').length;
+      const sCnt = relSlices.filter((s) => s.stallClass).length;
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      const colorFn = pct === 100 ? colors.green : sCnt > 0 ? colors.red : colors.blue;
+      lines.push(`    ${colors.bold(r.version)} ${colors.dim(r.title)}  ${colorFn(`${done}/${total} ${pct}%`)}${sCnt > 0 ? colors.red(` ⚠${sCnt}`) : ''}`);
+    }
+    lines.push('');
+  }
+
+  // Actions
+  const actions = computeActions(slices, plans, releases);
+  if (actions.length > 0) {
+    lines.push(`  ${h('📋 Next Actions')}`);
+    for (const a of actions) {
+      const pfx = a.priority === 1 ? colors.red('⚠') : a.priority === 2 ? colors.blue('▶') : colors.dim('·');
+      lines.push(`    ${pfx} ${colors.bold(a.command)}  ${colors.dim(`# ${a.reason}`)}`);
+    }
+    lines.push('');
+  }
+
+  // Summary line
+  lines.push(`  ${colors.dim('Generated by zelto dashboard')}  ${colors.dim('Run zelto dashboard --tty for this view')}`);
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+// ─── JSON Render ────────────────────────────────────────────────────────────
+
+function renderJson(
+  slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
+  events: EventInfo[], costMap: Map<string, SliceCost>,
+): string {
+  const stalled = slices.filter((s) => s.stallClass);
+  const running = slices.filter((s) => s.state === 'running');
+  const stateCnt: Record<string, number> = {};
+  const typeCnt: Record<string, number> = {};
+  for (const s of slices) { stateCnt[s.state] = (stateCnt[s.state] ?? 0) + 1; typeCnt[s.type] = (typeCnt[s.type] ?? 0) + 1; }
+
+  let totalCost = 0;
+  let totalLlmCalls = 0;
+  for (const c of costMap.values()) { totalCost += c.totalCost; totalLlmCalls += c.llmCalls; }
+
+  const data = {
+    generatedAt: new Date().toISOString(),
+    summary: {
+      totalSlices: slices.length,
+      stateCounts: stateCnt,
+      typeCounts: typeCnt,
+      stalledCount: stalled.length,
+      runningCount: running.length,
+      totalCost,
+      totalLlmCalls,
+      releaseCount: releases.length,
+      planCount: plans.length,
+    },
+    stalled: stalled.map((s) => ({
+      id: s.id, title: s.title, stallClass: s.stallClass,
+      autoResolved: s.autoResolved, area: s.area,
+      plan: s.planTitle, version: s.version, module: s.module,
+      updatedAt: s.updatedAt,
+    })),
+    running: running.map((s) => ({
+      id: s.id, title: s.title, area: s.area, updatedAt: s.updatedAt,
+    })),
+    releases: releases.map((r) => {
+      const relSlices: SliceData[] = [];
+      for (const pid of r.plans) {
+        const p = plans.find((pl) => pl.planId === pid);
+        if (p) for (const v of p.versions) relSlices.push(...v.slices);
+      }
+      return {
+        version: r.version, title: r.title, status: r.status,
+        totalSlices: relSlices.length,
+        completedSlices: relSlices.filter((s) => s.state === 'completed').length,
+        stalledSlices: relSlices.filter((s) => s.stallClass).length,
+      };
+    }),
+    plans: plans.map((p) => ({
+      planId: p.planId, title: p.title,
+      versions: p.versions.map((v) => ({
+        name: v.name, status: v.status,
+        totalSlices: v.slices.length,
+        completedSlices: v.slices.filter((s) => s.state === 'completed').length,
+      })),
+    })),
+    actions: computeActions(slices, plans, releases),
+  };
+
+  return JSON.stringify(data, null, 2);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -260,11 +518,9 @@ function renderHtml(
 
   // Cost calculations
   let totalCostAll = 0;
-  let totalTokensAll = 0;
   let totalLlmCalls = 0;
   for (const c of costMap.values()) {
     totalCostAll += c.totalCost;
-    totalTokensAll += c.totalTokens;
     totalLlmCalls += c.llmCalls;
   }
 
@@ -273,7 +529,7 @@ function renderHtml(
 <div class="g">
   <div class="c"><div class="n">${slices.length}</div><div class="l">Slices</div></div>
   <div class="c"><div class="n">${releases.length}</div><div class="l">Releases</div></div>
-  <div class="c"><div class="n">${slices.filter((s) => s.state === 'running').length}</div><div class="l">🔄 Running</div></div>
+  <div class="c"><div class="n">${stateCnt['running'] ?? 0}</div><div class="l">🔄 Running</div></div>
   <div class="c st"><div class="n">${stalled.length}</div><div class="l">⚠️ Stalled</div></div>
   <div class="c" style="border-color:#58a6ff66"><div class="n">${fmtCost(totalCostAll)}</div><div class="l">💰 Total ${totalLlmCalls > 0 ? `(${totalLlmCalls} calls)` : ''}</div></div>
 </div>`;
@@ -572,6 +828,12 @@ ${watchMode ? '<meta http-equiv="refresh" content="3">' : ''}
   .etm{font-size:10px;color:#8b949e;white-space:nowrap}
   .eet{font-family:monospace;font-size:10px;color:#d2a8ff}
   .ft{margin-top:20px;padding:12px 0;border-top:1px solid #21262d;color:#484f58;font-size:10px;display:flex;justify-content:space-between}
+  /* Actions */
+  .ax{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin-bottom:18px}
+  .ax-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:11px}
+  .ax-icon{width:14px;text-align:center;flex-shrink:0}
+  .ax-cmd{font-family:monospace;font-size:10px;color:#58a6ff;background:#0d1117;padding:1px 6px;border-radius:3px;min-width:200px;flex-shrink:0}
+  .ax-why{color:#8b949e;font-size:10px;flex:1}
   .empty{color:#484f58;text-align:center;padding:20px;font-size:12px}
 </style>
 </head>
@@ -595,6 +857,17 @@ ${releaseLayer}
 ${planLayer}
 ${areaLayer}
 
+<!-- Action Items -->
+${(() => {
+  const actions = computeActions(slices, plans, releases);
+  if (actions.length === 0) return '';
+  return `
+<h2 class="sh">📋 Next Actions <span class="hc">${actions.length} items</span></h2>
+<div class="ax">${actions.map((a) => {
+  const icon = a.priority === 1 ? '🔴' : a.priority === 2 ? '🔵' : '⚪';
+  return `<div class="ax-row"><span class="ax-icon">${icon}</span><code class="ax-cmd">${a.command}</code><span class="ax-why">${a.reason}</span></div>`;
+}).join('')}</div>`;})()}
+
 <h2 class="sh">📜 Recent Events</h2>
 <table>
 <thead><tr><th>Time</th><th>Type</th><th>Slice</th><th>Actor</th></tr></thead>
@@ -616,16 +889,54 @@ ${watchMode ? '<script>setInterval(function(){location.reload()},3000)</script>'
 register('dashboard', async (args) => {
   const watchMode = args.includes('--watch');
   const openBrowser = args.includes('--open');
+  const ttyMode = args.includes('--tty');
+  const jsonMode = args.includes('--json');
   const outputIdx = args.indexOf('--output');
   const outputPath = outputIdx >= 0 ? args[outputIdx + 1] : join(process.cwd(), 'zelto-dashboard.html');
 
-  const generate = () => {
+  const gather = () => {
     const sliceMap = collectSlices();
     const plans = buildPlans(sliceMap);
     const releases = loadReleases();
     const slices = [...sliceMap.values()].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
     const events = collectRecentEvents();
     const costMap = collectCosts();
+    return { slices, plans, releases, events, costMap };
+  };
+
+  // ── TTY mode ────────────────────────────────────────────────────────────
+  if (ttyMode) {
+    const { slices, plans, releases, events, costMap } = gather();
+    process.stdout.write(renderTty(slices, plans, releases, events, costMap));
+
+    if (watchMode) {
+      console.log(colors.dim('  👀 Watching... (Ctrl+C to stop)'));
+      const regen = () => {
+        try {
+          const d = gather();
+          process.stdout.write('\x1b[2J\x1b[H'); // clear screen
+          process.stdout.write(renderTty(d.slices, d.plans, d.releases, d.events, d.costMap));
+        } catch { /* ignore */ }
+      };
+      for (const sub of ['slices', 'versions', 'events']) {
+        const d = join(ZELTO_DIR, sub);
+        if (existsSync(d)) watch(d, { recursive: sub === 'events' }, regen);
+      }
+      await new Promise(() => {});
+    }
+    return 0;
+  }
+
+  // ── JSON mode ───────────────────────────────────────────────────────────
+  if (jsonMode) {
+    const { slices, plans, releases, events, costMap } = gather();
+    console.log(renderJson(slices, plans, releases, events, costMap));
+    return 0;
+  }
+
+  // ── HTML mode (default) ─────────────────────────────────────────────────
+  const generate = () => {
+    const { slices, plans, releases, events, costMap } = gather();
     return renderHtml(slices, plans, releases, events, watchMode, costMap);
   };
 

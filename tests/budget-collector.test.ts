@@ -33,16 +33,12 @@ describe('BudgetCollector', { concurrency: false }, () => {
     assert.equal(spent, 0);
   });
 
-  it('sums llm.called cost events', async () => {
-    await events.append('llm-slice', 'llm.called', 'agent', {
-      model: 'claude-sonnet-4',
-      tokens: 500,
-      cost: 0.15,
+  it('sums budget.spent events with amount field', async () => {
+    await events.append('llm-slice', 'budget.spent', 'system', {
+      amount: 0.15,
     });
-    await events.append('llm-slice', 'llm.called', 'agent', {
-      model: 'claude-haiku-4',
-      tokens: 200,
-      cost: 0.03,
+    await events.append('llm-slice', 'budget.spent', 'system', {
+      amount: 0.03,
     });
 
     const spent = await budget.getSpent('llm-slice');
@@ -61,8 +57,8 @@ describe('BudgetCollector', { concurrency: false }, () => {
     assert.equal(spent, 0.75);
   });
 
-  it('combines llm.called and budget.spent', async () => {
-    await events.append('combined-slice', 'llm.called', 'agent', { cost: 0.10 });
+  it('combines multiple budget.spent events', async () => {
+    await events.append('combined-slice', 'budget.spent', 'system', { amount: 0.10 });
     await events.append('combined-slice', 'budget.spent', 'system', { amount: 0.20 });
 
     const spent = await budget.getSpent('combined-slice');
@@ -102,9 +98,9 @@ describe('BudgetCollector', { concurrency: false }, () => {
     assert.equal(exhausted, true);
   });
 
-  it('handles cost in string format', async () => {
-    await events.append('string-cost-slice', 'llm.called', 'agent', {
-      cost: '0.42',
+  it('handles amount in string format', async () => {
+    await events.append('string-cost-slice', 'budget.spent', 'system', {
+      amount: '0.42',
     });
 
     const spent = await budget.getSpent('string-cost-slice');
@@ -120,7 +116,7 @@ describe('BudgetCollector', { concurrency: false }, () => {
     assert.equal(spent, 0);
   });
 
-  it('ignores llm.called without cost field', async () => {
+  it('ignores non-budget events without amount', async () => {
     await events.append('no-cost-slice', 'llm.called', 'agent', {
       model: 'claude-sonnet-4',
       tokens: 100,
