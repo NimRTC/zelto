@@ -102,3 +102,9 @@ dash).
 ```
 Refs-Slice: v1-project-status-ui
 ```
+
+## 验收标准
+1. 完成 v1-project-status-ui
+
+## 风险
+- 无

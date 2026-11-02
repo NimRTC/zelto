@@ -2,7 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { DeepSeekAdapter } from '../../adapters/llm/index.js';
@@ -119,8 +119,23 @@ export interface ZeltoConfig {
     timeoutSec: number;
     retry: { max: number };
   };
-  agent: { command: string; adapter?: string; timeout?: number };
+  agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
   llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string };
+  /** External project configuration for cross-repo workflows.
+   *  When set, `zelto gate` and `zelto slice create` operate in the
+   *  target project directory instead of the current working directory. */
+  targetProject?: {
+    /** Absolute or relative path to the target project root. */
+    path: string;
+    /** Optional gate overrides for the target project. Falls back to
+     *  the root gate.commands when not specified. */
+    gate?: {
+      commands: Array<{ name: string; run: string; timeoutSec?: number }>;
+      profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
+    };
+    /** Spec directory relative to target project root. Default = "specs/slices". */
+    specDir?: string;
+  };
 }
 
 export function loadConfig(): ZeltoConfig {
@@ -136,6 +151,7 @@ export function loadConfig(): ZeltoConfig {
     },
     agent: {
       command: 'npx claude-code',
+      maxRetries: 2,
     },
   };
 
@@ -151,6 +167,7 @@ export function loadConfig(): ZeltoConfig {
         gate: parsed.gate,
         agent: parsed.agent ?? defaultConfig.agent,
         llm: parsed.llm,
+        targetProject: parsed.targetProject,
       };
     }
     return defaultConfig;
@@ -203,23 +220,34 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentCommand = 'npx claude-code';
   let agentAdapter = '';
   let agentTimeout: number | undefined;
+  let agentMaxRetries: number | undefined;
   let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
   let inGateSection = false;
   let inAgentSection = false;
   let inLlmSection = false;
+  let inTargetProjectSection = false;
+  let inTargetProjectGateSection = false;
   let inProfileSection = false;
   let currentProfile: string | null = null;
   let llmProvider = '';
   let llmApiKey = '';
   let llmModel = '';
   let llmBaseUrl = '';
+  let targetProjectPath = '';
+  let targetProjectSpecDir = '';
+  let targetProjectDepth = 0;
+  const targetProjectCommands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
+  const targetProjectProfiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
+  let currentTpCommand: { name: string; run: string; timeoutSec?: number } | null = null;
+  let inTpProfileSection = false;
+  let currentTpProfile: string | null = null;
 
   const lines = content.split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
-    if (trimmed === 'gate:') {
+    if (trimmed === 'gate:' && !inTargetProjectSection) {
       inGateSection = true;
       inAgentSection = false;
       inLlmSection = false;
@@ -227,7 +255,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       currentProfile = null;
       continue;
     }
-    if (trimmed === 'agent:') {
+    if (trimmed === 'agent:' && !inTargetProjectSection) {
       inAgentSection = true;
       inGateSection = false;
       inLlmSection = false;
@@ -235,12 +263,23 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       currentProfile = null;
       continue;
     }
-    if (trimmed === 'llm:') {
+    if (trimmed === 'llm:' && !inTargetProjectSection) {
       inLlmSection = true;
       inGateSection = false;
       inAgentSection = false;
+      inTargetProjectSection = false;
       inProfileSection = false;
       currentProfile = null;
+      continue;
+    }
+    if (trimmed === 'targetProject:') {
+      inTargetProjectSection = true;
+      inGateSection = false;
+      inAgentSection = false;
+      inLlmSection = false;
+      inProfileSection = false;
+      currentProfile = null;
+      targetProjectDepth = 0;
       continue;
     }
 
@@ -336,6 +375,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       agentTimeout = Number.parseInt(trimmed.slice(8).trim(), 10) || undefined;
     }
 
+    if (inAgentSection && trimmed.startsWith('maxRetries:')) {
+      agentMaxRetries = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+    }
+
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
@@ -347,6 +390,99 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         llmBaseUrl = stripSurroundingQuotes(trimmed.slice(8).trim());
       }
     }
+
+    if (inTargetProjectSection) {
+      // Track indentation depth to detect when targetProject ends
+      const indent = line.length - trimmed.length;
+      if (indent <= targetProjectDepth && indent > 0 && trimmed.includes(':')) {
+        // Sub-section header within targetProject
+      }
+
+      if (trimmed.startsWith('path:')) {
+        targetProjectPath = stripSurroundingQuotes(trimmed.slice(5).trim());
+        continue;
+      }
+      if (trimmed.startsWith('specDir:')) {
+        targetProjectSpecDir = stripSurroundingQuotes(trimmed.slice(8).trim());
+        continue;
+      }
+
+      // Nested gate: section under targetProject
+      if (trimmed === 'gate:') {
+        inTargetProjectGateSection = true;
+        inTpProfileSection = false;
+        currentTpProfile = null;
+        continue;
+      }
+
+      if (inTargetProjectGateSection) {
+        if (trimmed === 'profiles:') {
+          if (currentTpCommand) {
+            targetProjectCommands.push(currentTpCommand);
+            currentTpCommand = null;
+          }
+          inTpProfileSection = true;
+          currentTpProfile = null;
+          continue;
+        }
+
+        // Detect profile name (indented under profiles:)
+        const profileMatch = trimmed.match(/^(\w+):$/);
+        if (profileMatch && inTpProfileSection) {
+          if (currentTpCommand && currentTpProfile) {
+            (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
+            currentTpCommand = null;
+          }
+          currentTpProfile = profileMatch[1];
+          continue;
+        }
+
+        if (trimmed.startsWith('commands:') || trimmed === 'commands:') {
+          inTpProfileSection = false;
+          currentTpProfile = null;
+          continue;
+        }
+
+        const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
+        if (inlineMatch) {
+          if (currentTpCommand) {
+            if (currentTpProfile) {
+              (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
+            } else {
+              targetProjectCommands.push(currentTpCommand);
+            }
+          }
+          currentTpCommand = { name: inlineMatch[1], run: inlineMatch[2] };
+          continue;
+        }
+
+        if (trimmed.startsWith('- name:')) {
+          if (currentTpCommand) {
+            if (currentTpProfile) {
+              (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
+            } else {
+              targetProjectCommands.push(currentTpCommand);
+            }
+          }
+          currentTpCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
+          continue;
+        }
+
+        if (trimmed.startsWith('run:')) {
+          if (currentTpCommand) {
+            currentTpCommand.run = stripSurroundingQuotes(trimmed.slice(4).trim());
+          }
+          continue;
+        }
+
+        if (trimmed.startsWith('timeoutSec:')) {
+          if (currentTpCommand && currentTpCommand.run) {
+            currentTpCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+          }
+          continue;
+        }
+      }
+    }
   }
 
   if (currentCommand) {
@@ -354,6 +490,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       (profiles[currentProfile] ??= []).push(currentCommand);
     } else {
       commands.push(currentCommand);
+    }
+  }
+
+  // Flush pending targetProject command
+  if (currentTpCommand) {
+    if (currentTpProfile) {
+      (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
+    } else {
+      targetProjectCommands.push(currentTpCommand);
     }
   }
 
@@ -370,13 +515,56 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
     : { commands: [], timeoutSec: 120, retry: { max: 2 } };
 
-  return commands.length > 0 || Object.keys(profiles).length > 0 || llm
+  const targetProject = targetProjectPath
+    ? {
+        path: targetProjectPath,
+        ...(targetProjectSpecDir ? { specDir: targetProjectSpecDir } : {}),
+        ...(targetProjectCommands.length > 0 || Object.keys(targetProjectProfiles).length > 0
+          ? {
+              gate: {
+                commands: targetProjectCommands,
+                ...(Object.keys(targetProjectProfiles).length > 0 ? { profiles: targetProjectProfiles } : {}),
+              },
+            }
+          : {}),
+      }
+    : undefined;
+
+  return commands.length > 0 || Object.keys(profiles).length > 0 || llm || targetProject
     ? {
         gate,
-        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}) },
+        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}), ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}) },
         llm,
+        ...(targetProject ? { targetProject } : {}),
       }
     : null;
+}
+
+/**
+ * Resolve the target project directory if configured.
+ * Returns the absolute path to the target project root, or null if not configured.
+ * When a target project is configured, this is the directory where gate commands
+ * and spec operations should execute.
+ */
+export function resolveTargetDir(): string | null {
+  const cfg = loadConfig();
+  if (!cfg.targetProject?.path) return null;
+  const resolved = resolve(process.cwd(), cfg.targetProject.path);
+  return existsSync(resolved) ? resolved : null;
+}
+
+/**
+ * Get the spec directory for the target project, or the default.
+ * Returns the absolute path.
+ */
+export function resolveSpecDir(): string {
+  const cfg = loadConfig();
+  if (cfg.targetProject?.path) {
+    const projectDir = resolve(process.cwd(), cfg.targetProject.path);
+    const specDir = cfg.targetProject.specDir ?? 'specs/slices';
+    return resolve(projectDir, specDir);
+  }
+  return resolve(process.cwd(), 'specs', 'slices');
 }
 
 // ─── Policy YAML Parser ─────────────────────────────────────────────────────

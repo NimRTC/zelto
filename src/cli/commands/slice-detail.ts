@@ -1,17 +1,31 @@
 // Slice detail command — show single slice details
 // Usage: zelto slice <id> [--json]
 
-import { register, store, events, hashSpecFile } from './shared.js';
+import { register, store, events, hashSpecFile, resolveSpecDir } from './shared.js';
 import { getDefaultFormatter } from '../output-formatter.js';
+import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 // ─── slice (detail) ────────────────────────────────────────────────────────
 
 register('slice', async (args) => {
-  const [id] = args;
+  const [subcommandOrId, ...rest] = args;
   const f = getDefaultFormatter();
 
+  // Route subcommands
+  if (subcommandOrId === 'create') {
+    return handleSliceCreate(rest, f);
+  }
+  if (subcommandOrId === 'validate') {
+    return handleSliceValidate(rest, f);
+  }
+
+  // Default: show slice detail
+  const id = subcommandOrId;
   if (!id || id === '--help' || id === '-h') {
     f.error('USAGE', 'Usage: zelto slice <slice-id> [--json]');
+    f.out('       zelto slice create <id> [--title <title>]');
+    f.out('       zelto slice validate <id>');
     return 1;
   }
 
@@ -187,3 +201,212 @@ register('set', async (args) => {
   }
   return 0;
 });
+
+// ─── Spec template generator ──────────────────────────────────────────────
+
+/**
+ * Generate the standard slice spec markdown template.
+ */
+function generateSpecTemplate(id: string, title: string): string {
+  return [
+    `# Slice: ${id}`,
+    '',
+    '## 目的',
+    title,
+    '',
+    '## 范围',
+    '',
+    '## 验收标准',
+    '',
+    '## 风险',
+    '- 无',
+    '',
+    '## 参考',
+    '',
+  ].join('\n');
+}
+
+// ─── slice create ──────────────────────────────────────────────────────────
+
+async function handleSliceCreate(args: string[], f: ReturnType<typeof getDefaultFormatter>): Promise<number> {
+  const id = args[0];
+  if (!id || id === '--help' || id === '-h') {
+    f.error('USAGE', 'Usage: zelto slice create <id> [--title <title>]');
+    return 1;
+  }
+
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    f.error('INVALID_ID', `Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+    return 1;
+  }
+
+  const titleIdx = args.indexOf('--title');
+  const title = titleIdx >= 0 ? args[titleIdx + 1] : '';
+
+  const specDir = resolveSpecDir();
+  const specPath = join(specDir, `${id}.md`);
+
+  if (existsSync(specPath)) {
+    f.error('EXISTS', `Spec file already exists: ${specPath}`);
+    return 1;
+  }
+
+  // Create spec directory if needed
+  if (!existsSync(specDir)) {
+    mkdirSync(specDir, { recursive: true });
+  }
+
+  const content = generateSpecTemplate(id, title);
+  writeFileSync(specPath, content, 'utf-8');
+
+  f.out(`zelto slice create ${id} — ✅ Created`);
+  f.out(`  File:  ${specPath}`);
+  f.out(`  Title: ${title || '(edit ## 目的 to fill in)'}`);
+  f.out(`  Next:  Edit ${specPath} with the spec details, then:`);
+  f.out(`         zelto create ${id} --from-spec`);
+  return 0;
+}
+
+// ─── slice validate ────────────────────────────────────────────────────────
+
+const REQUIRED_SPEC_SECTIONS = ['## 目的', '## 范围', '## 验收标准', '## 风险'];
+
+async function handleSliceValidate(args: string[], f: ReturnType<typeof getDefaultFormatter>): Promise<number> {
+  const id = args[0];
+  if (!id || id === '--help' || id === '-h') {
+    f.error('USAGE', 'Usage: zelto slice validate <id>');
+    f.out('       zelto slice validate --all');
+    return 1;
+  }
+
+  // Validate all specs
+  if (id === '--all') {
+    return validateAllSpecs(f);
+  }
+
+  const specDir = resolveSpecDir();
+  const specPath = join(specDir, `${id}.md`);
+
+  if (!existsSync(specPath)) {
+    f.error('NOT_FOUND', `Spec file not found: ${specPath}`);
+    return 1;
+  }
+
+  const content = readFileSync(specPath, 'utf-8');
+  const errors = validateSpecContent(id, content);
+
+  if (errors.length === 0) {
+    f.out(`zelto slice validate ${id} — ✅ Valid`);
+    return 0;
+  }
+
+  f.error('VALIDATION_ERRORS', `zelto slice validate ${id} — ❌ ${errors.length} issue(s):`);
+  for (const err of errors) {
+    f.out(`  - ${err}`);
+  }
+  return 1;
+}
+
+/**
+ * Validate a spec file's content against the standard format.
+ * Returns a list of error messages (empty = valid).
+ */
+function validateSpecContent(id: string, content: string): string[] {
+  const errors: string[] = [];
+
+  // Check # Slice: <id> header
+  if (!content.includes(`# Slice: ${id}`) && !content.includes(`# Slice: ${id.replace(/-/g, ' ')}`)) {
+    errors.push(`Missing or mismatched "# Slice: ${id}" header`);
+  }
+
+  // Check required sections
+  for (const section of REQUIRED_SPEC_SECTIONS) {
+    if (!content.includes(section)) {
+      errors.push(`Missing required section: ${section}`);
+    }
+  }
+
+  // Check that 范围 has at least one bullet
+  const lines = content.split('\n');
+  let inScope = false;
+  let hasScopeItems = false;
+  for (const line of lines) {
+    if (line.startsWith('## 范围')) {
+      inScope = true;
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      inScope = false;
+      continue;
+    }
+    if (inScope && line.trimStart().startsWith('-')) {
+      hasScopeItems = true;
+    }
+  }
+  if (!hasScopeItems) {
+    errors.push('## 范围 section has no bullet items');
+  }
+
+  // Check that 验收标准 has at least one numbered item
+  let inAcceptance = false;
+  let hasAcceptanceItems = false;
+  for (const line of lines) {
+    if (line.startsWith('## 验收标准')) {
+      inAcceptance = true;
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      inAcceptance = false;
+      continue;
+    }
+    if (inAcceptance && /^\s*\d+\.\s+/.test(line)) {
+      hasAcceptanceItems = true;
+    }
+  }
+  if (!hasAcceptanceItems) {
+    errors.push('## 验收标准 section has no numbered criteria');
+  }
+
+  return errors;
+}
+
+/**
+ * Validate all spec files in the spec directory.
+ */
+async function validateAllSpecs(f: ReturnType<typeof getDefaultFormatter>): Promise<number> {
+  const { readdirSync } = await import('node:fs');
+  const specDir = resolveSpecDir();
+
+  if (!existsSync(specDir)) {
+    f.error('NOT_FOUND', `Spec directory not found: ${specDir}`);
+    return 1;
+  }
+
+  const files = readdirSync(specDir).filter((fn) => fn.endsWith('.md'));
+  if (files.length === 0) {
+    f.out('No spec files found.');
+    return 0;
+  }
+
+  let validCount = 0;
+  let invalidCount = 0;
+
+  for (const file of files) {
+    const sliceId = file.replace(/\.md$/, '');
+    const content = readFileSync(join(specDir, file), 'utf-8');
+    const errors = validateSpecContent(sliceId, content);
+    if (errors.length === 0) {
+      f.out(`  ✅ ${sliceId}`);
+      validCount++;
+    } else {
+      f.error('INVALID', `  ❌ ${sliceId}`);
+      for (const err of errors) {
+        f.out(`      - ${err}`);
+      }
+      invalidCount++;
+    }
+  }
+
+  f.out(`\n${validCount} valid, ${invalidCount} invalid`);
+  return invalidCount > 0 ? 1 : 0;
+}

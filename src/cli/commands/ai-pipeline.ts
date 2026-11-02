@@ -20,6 +20,8 @@ import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
 import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent } from './shared.js';
+import { handleAgentFailure } from './core-slice.js';
+import { isAutoResolvable } from '../../core/stall/classifier.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 
 // ─── require ─────────────────────────────────────────────────────────────────
@@ -693,22 +695,49 @@ register('version', async (args) => {
       sliceCtxs.push({ def: sliceDef, specContent, bundlePath });
     }
 
-    // Phase 2: Run agents in parallel
+    // Phase 2: Run agents in parallel with per-slice auto-retry
     f.out('\n── Phase 2: Execute agents (parallel) ──');
+    const maxRetries = cfg.agent.maxRetries ?? 2;
+
     const agentResults = await Promise.all(sliceCtxs.map(async (ctx) => {
       await sliceStore.transit(ctx.def.id, 'RUN_START');
-      const agent = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: cfg.agent.command });
-      const { sessionId } = await agent.start({ sliceId: ctx.def.id, prompt: ctx.bundlePath });
-      const exitCode = await agent.waitForExit(sessionId);
-      return { id: ctx.def.id, exitCode };
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const agent = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: cfg.agent.command });
+        const { sessionId } = await agent.start({ sliceId: ctx.def.id, prompt: ctx.bundlePath });
+        const exitCode = await agent.waitForExit(sessionId);
+
+        if (exitCode === 0) {
+          return { id: ctx.def.id, exitCode: 0, attempts: attempt + 1 };
+        }
+
+        // Failed — try auto-retry at CLI level
+        f.out(`  ❌ "${ctx.def.id}" agent failed (exit ${exitCode})`);
+
+        if (attempt < maxRetries) {
+          const result = await handleAgentFailure(ctx.def.id, exitCode, { maxRetries });
+          if (result.action === 'retry') {
+            f.out(`  🔄 "${ctx.def.id}" auto-retry (${result.retryCount}/${maxRetries})`);
+            continue;
+          }
+        } else {
+          // Ensure stall info is written on final failure
+          await handleAgentFailure(ctx.def.id, exitCode, { maxRetries });
+        }
+
+        return { id: ctx.def.id, exitCode, attempts: attempt + 1 };
+      }
+
+      return { id: ctx.def.id, exitCode: -1, attempts: maxRetries + 1 };
     }));
 
+    f.out('');
     for (const r of agentResults) {
       if (r.exitCode === 0) {
-        f.out(`  ✅ "${r.id}" agent completed`);
+        f.out(`  ✅ "${r.id}" agent completed (${r.attempts} attempt(s))`);
         await sliceStore.transit(r.id, 'RUN_FINISH');
       } else {
-        f.out(`  ❌ "${r.id}" agent failed (exit ${r.exitCode})`);
+        f.out(`  ❌ "${r.id}" agent failed after ${r.attempts} attempt(s)`);
       }
     }
 

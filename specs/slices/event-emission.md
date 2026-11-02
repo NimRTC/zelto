@@ -19,3 +19,6 @@
 - `stall.classified` — 属于 stall 检测特征
 - `run.resumed/stalled` — resume/stall 功能未实现
 - `budget.spent/llm.called/queue.*/merge.*` — 对应功能未实现
+
+## 风险
+- 无

@@ -98,3 +98,9 @@ class SpecMdExecutor {
 - 不修改任何现有切片规格文件的内容
 - 不修改 SpecService 现有接口（只新增 SpecMdExecutor）
 - 不依赖 llm/、不触网、不调用模型
+
+## 验收标准
+1. 完成 v1-spec-md-executor
+
+## 风险
+- 无

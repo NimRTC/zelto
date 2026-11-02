@@ -27,7 +27,7 @@ import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
-import { classifyStall } from '../../core/stall/classifier.js';
+import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter } from './shared.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -874,8 +874,8 @@ register('run', async (args) => {
 
     const sliceData = await store.read(id);
     const agentTimeout = sliceData.agentTimeout;
-    const adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
-    const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
+    let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
@@ -915,15 +915,63 @@ register('run', async (args) => {
       process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
     }, 1000);
 
-    const exitCode = await adapter.waitForExit(sessionId);
+    // Retry loop: agent may auto-retry internally (adapter handles transient failures),
+    // then handleAgentFailure handles auto-resolvable stalls at the CLI level
+    const config = loadConfig();
+    const maxRetries = config.agent.maxRetries ?? 2;
+    let finalExitCode: number | null = null;
+    let attempt = 0;
 
-    // Clear progress display
-    if (progressTimer) {
-      clearInterval(progressTimer);
+    while (attempt <= maxRetries) {
+      const exitCode = await adapter.waitForExit(sessionId);
+
+      // Clear progress display
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = null;
+      }
       process.stdout.write('\r' + ' '.repeat(50) + '\r');
+
+      if (exitCode === 0) {
+        finalExitCode = 0;
+        break;
+      }
+
+      // Agent failed — try auto-retry at CLI level
+      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`\n❌ Agent exited with code ${exitCode} (${elapsed}s)`);
+
+      if (attempt < maxRetries) {
+        const result = await handleAgentFailure(id, exitCode, { maxRetries });
+        if (result.action === 'retry') {
+          attempt = result.retryCount ?? attempt + 1;
+          // Re-create adapter and re-start agent for retry
+          adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
+          const { sessionId: newSessionId } = await adapter.start({
+            sliceId: id, prompt: bundlePath,
+          });
+          sessionId = newSessionId;
+
+          // Restart progress display
+          progressTimer = setInterval(() => {
+            const e = Math.floor((Date.now() - startTime) / 1000);
+            const mins = Math.floor(e / 60);
+            const secs = e % 60;
+            process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+          }, 1000);
+
+          continue; // Retry
+        }
+      }
+
+      // Not retrying — write stall and stop
+      await handleAgentFailure(id, exitCode, { maxRetries });
+      finalExitCode = exitCode;
+      break;
     }
 
-    if (exitCode === 0) {
+    if (finalExitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -944,12 +992,9 @@ register('run', async (args) => {
         await autoGateAfterRun(id);
       }
     } else {
-      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      // All retries exhausted or non-resolvable — already handled by handleAgentFailure
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`\n❌ Agent exited with code ${exitCode} (${elapsed}s)`);
-
-      // Auto-classify stall for non-zero exit
-      await autoClassifyStall(id, exitCode);
+      console.log(`\n❌ Slice "${id}" failed after ${attempt + 1} attempt(s) (${elapsed}s)`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1175,14 +1220,52 @@ async function runParallel(args: string[]): Promise<number> {
   // Start progress updates
   progressTimer = setInterval(renderProgress, 2000);
 
-  // ── Phase 4: Wait for all to complete ────────────────────────────
+  // ── Phase 4: Wait for all to complete with per-slice retry ─────────
+  const config = loadConfig();
+  const maxRetries = config.agent.maxRetries ?? 2;
+
   const results = await Promise.allSettled(
     states.map(async (st, i) => {
       if (st.sessionId === null) return { ...st, exitCode: -1, status: 'failed' as const };
-      const exitCode = await adapters[i].waitForExit(st.sessionId);
-      st.exitCode = exitCode;
-      st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
-      st.status = exitCode === 0 ? 'completed' : 'failed';
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const exitCode = await adapters[i].waitForExit(st.sessionId);
+        st.exitCode = exitCode;
+        st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
+
+        if (exitCode === 0) {
+          st.status = 'completed';
+          return st;
+        }
+
+        // Failed — try auto-retry at CLI level
+        if (attempt < maxRetries) {
+          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
+          const result = await handleAgentFailure(st.id, exitCode, { maxRetries });
+          if (result.action === 'retry') {
+            // Re-create adapter and re-start agent
+            const timeout = slices[i]?.agentTimeout;
+            adapters[i] = createExecutorAdapter(adapterType, agentName, timeout);
+            const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
+            try {
+              const { sessionId } = await adapters[i].start({ sliceId: st.id, prompt: bundlePath });
+              st.sessionId = sessionId;
+              st.status = 'running';
+              continue; // Retry
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`  ❌ ${st.id}: retry start failed: ${msg}`);
+            }
+          }
+        }
+
+        // Not retrying — final failure
+        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
+        st.status = 'failed';
+        return st;
+      }
+
+      st.status = 'failed';
       return st;
     }),
   );
@@ -1193,10 +1276,10 @@ async function runParallel(args: string[]): Promise<number> {
   }
   process.stdout.write(`\x1b[${statusLineCount}A` + ' '.repeat(80) + '\n');
 
-  // ── Phase 5: Process results ─────────────────────────────────────
+  // ── Phase 5: Process results with enhanced summary ────────────────
   console.log('');
-  let successCount = 0;
-  let failCount = 0;
+  const completed: Array<{ id: string; elapsedSec: number }> = [];
+  const stalled: Array<{ id: string; exitCode: number | null }> = [];
 
   for (const result of results) {
     if (result.status === 'fulfilled') {
@@ -1206,17 +1289,33 @@ async function runParallel(args: string[]): Promise<number> {
         await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
         console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
         await autoGateAfterRun(st.id);
-        successCount++;
+        completed.push({ id: st.id, elapsedSec: st.elapsedSec });
       } else {
-        const exitCode = st.exitCode ?? -1;
-        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
-        console.log(`❌ ${st.id}: failed (exit ${st.exitCode ?? 'signal'}, ${st.elapsedSec}s)`);
-        await autoClassifyStall(st.id, st.exitCode);
-        failCount++;
+        stalled.push({ id: st.id, exitCode: st.exitCode });
       }
     } else {
       // Promise rejected
-      failCount++;
+      stalled.push({ id: states.find((s) => s.status === 'failed')?.id ?? 'unknown', exitCode: -1 });
+    }
+  }
+
+  // Enhanced summary
+  console.log('');
+  console.log(`📊 Parallel run complete: ${completed.length} passed, ${stalled.length} stalled`);
+
+  if (stalled.length > 0) {
+    console.log('');
+    console.log(`⚠️  Stalled slices (needs attention):`);
+    for (const s of stalled) {
+      console.log(`  ❌ ${s.id} — exit ${s.exitCode ?? 'signal'} (zelto resume ${s.id})`);
+    }
+  }
+
+  if (completed.length > 0) {
+    console.log('');
+    console.log(`✅  Completed slices:`);
+    for (const s of completed) {
+      console.log(`  ✅ ${s.id} — gate passed, sign created (${s.elapsedSec}s)`);
     }
   }
 
@@ -1231,8 +1330,7 @@ async function runParallel(args: string[]): Promise<number> {
     }
   }
 
-  console.log(`\n📊 Parallel run complete: ${successCount} passed, ${failCount} failed`);
-  return failCount > 0 ? 1 : 0;
+  return stalled.length > 0 ? 1 : 0;
 }
 
 register('admit', async (args) => {
@@ -1351,17 +1449,63 @@ async function autoGateAfterRun(id: string): Promise<void> {
   }
 }
 
-async function autoClassifyStall(id: string, exitCode: number | null): Promise<void> {
+// ─── handle agent failure with auto-retry support ─────────────────────────
+
+/**
+ * Handle a failed agent execution. For auto-resolvable stalls (permission_prompt,
+ * environment_failure, context_exhaustion), automatically retry up to maxRetries.
+ * For non-auto-resolvable stalls, write stall info and return 'stall'.
+ *
+ * @returns 'retry' if auto-retry is happening, 'stall' if the slice should stall
+ */
+export async function handleAgentFailure(
+  id: string,
+  exitCode: number | null,
+  options?: { maxRetries?: number },
+): Promise<{ action: 'retry' | 'stall'; retryCount?: number }> {
   const stallClass = classifyStall({
-    type: exitCode === null ? 'build_failure' : 'environment_failure',
+    type: exitCode === null ? 'build_failure' : 'test_failure',
     message: `Agent exited with code ${exitCode ?? 'signal'}`,
     attempts: 1,
   });
 
+  const maxRetries = options?.maxRetries ?? 2;
+
+  // Check if this stall class is auto-resolvable
+  if (isAutoResolvable(stallClass)) {
+    try {
+      const slice = await store.read(id);
+      const currentRetries = slice.stall.autoResolved ?? 0;
+
+      if (currentRetries < maxRetries) {
+        // Auto-retry: increment counter, log, return retry signal
+        slice.stall.autoResolved = currentRetries + 1;
+        // Don't set stall.class — slice is not stalled, just retrying
+        await store.write(slice);
+
+        await events.append(id, 'stall.classified', 'zelto', {
+          sliceId: id, class: stallClass, exitCode,
+          runAborted: true, autoRetry: true,
+          retryCount: currentRetries + 1, maxRetries,
+        });
+
+        console.log(`  🔄 Auto-retrying (${currentRetries + 1}/${maxRetries})...`);
+        return { action: 'retry', retryCount: currentRetries + 1 };
+      }
+
+      // Max retries exhausted — fall through to stall
+      console.log(`  ⚠️ Auto-retry exhausted (${maxRetries}/${maxRetries}) — stalling`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ⚠️ Could not check retry state: ${msg}`);
+      // Fall through to stall
+    }
+  }
+
+  // Non-auto-resolvable or retries exhausted: write stall info
   try {
     const slice = await store.read(id);
     slice.stall.class = stallClass;
-    slice.stall.autoResolved = 0;
     slice.stall.gateRetries = 0;
     await store.write(slice);
 
@@ -1369,12 +1513,19 @@ async function autoClassifyStall(id: string, exitCode: number | null): Promise<v
       sliceId: id, class: stallClass, exitCode, runAborted: true,
     });
 
-    console.log(`  Stall: ⚠️ Classified as "${stallClass}"`);
-    console.log(`  Run: zelto resume ${id} to handle`);
+    // Prominent stall notification
+    const border = '═'.repeat(46);
+    console.log(`\n  ╔${border}╗`);
+    console.log(`  ║  ⚠️  SLICE STALLED: ${id.padEnd(28)}║`);
+    console.log(`  ║  Class: ${stallClass.padEnd(36)}║`);
+    console.log(`  ║  Action: zelto resume ${id.padEnd(22)}║`);
+    console.log(`  ╚${border}╝\n`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`  ⚠️ Could not write stall info: ${msg}`);
   }
+
+  return { action: 'stall' };
 }
 
 // ─── start ────────────────────────────────────────────────────────────────────
@@ -1506,8 +1657,8 @@ register('start', async (args) => {
 
     const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
     const sliceForTimeout = await store.read(id);
-    const adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
-    const { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
+    let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
@@ -1515,19 +1666,57 @@ register('start', async (args) => {
 
     // Show progress
     let startTime = Date.now();
-    const progressTimer = setInterval(() => {
+    let progressTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       const mins = Math.floor(elapsed / 60);
       const secs = elapsed % 60;
       process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
     }, 1000);
 
-    const exitCode = await adapter.waitForExit(sessionId);
+    // Retry loop
+    const maxRetries = cfg.agent.maxRetries ?? 2;
+    let finalExitCode: number | null = null;
+    let attempt = 0;
 
-    clearInterval(progressTimer);
-    process.stdout.write('\r' + ' '.repeat(50) + '\r');
+    while (attempt <= maxRetries) {
+      const exitCode = await adapter.waitForExit(sessionId);
 
-    if (exitCode === 0) {
+      clearInterval(progressTimer);
+      process.stdout.write('\r' + ' '.repeat(50) + '\r');
+
+      if (exitCode === 0) {
+        finalExitCode = 0;
+        break;
+      }
+
+      // Failed — try auto-retry
+      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`  ❌ Agent exited with code ${exitCode} (${elapsed}s)`);
+
+      if (attempt < maxRetries) {
+        const result = await handleAgentFailure(id, exitCode, { maxRetries });
+        if (result.action === 'retry') {
+          attempt = result.retryCount ?? attempt + 1;
+          adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
+          const { sessionId: newSessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
+          sessionId = newSessionId;
+          progressTimer = setInterval(() => {
+            const e = Math.floor((Date.now() - startTime) / 1000);
+            const mins = Math.floor(e / 60);
+            const secs = e % 60;
+            process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+          }, 1000);
+          continue;
+        }
+      }
+
+      await handleAgentFailure(id, exitCode, { maxRetries });
+      finalExitCode = exitCode;
+      break;
+    }
+
+    if (finalExitCode === 0) {
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1536,12 +1725,8 @@ register('start', async (args) => {
       // Auto-run gate and create sign request on pass
       await autoGateAfterRun(id);
     } else {
-      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`  ❌ Agent exited with code ${exitCode} (${elapsed}s)`);
-
-      // Auto-classify stall for non-zero exit
-      await autoClassifyStall(id, exitCode);
+      console.log(`  ❌ Slice "${id}" failed after ${attempt + 1} attempt(s) (${elapsed}s)`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1635,7 +1820,20 @@ async function monitorTaskInBackground(
       }
     } else {
       await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
-      await autoClassifyStall(sliceId, exitCode);
+      // Background tasks: write stall info without auto-retry (adapter already finished)
+      const stallClass = classifyStall({
+        type: exitCode === null ? 'build_failure' : 'test_failure',
+        message: `Agent exited with code ${exitCode ?? 'signal'}`,
+        attempts: 1,
+      });
+      try {
+        const bgSlice = await store.read(sliceId);
+        bgSlice.stall.class = stallClass;
+        await store.write(bgSlice);
+        await events.append(sliceId, 'stall.classified', 'zelto', {
+          sliceId, class: stallClass, exitCode, runAborted: true,
+        });
+      } catch { /* non-fatal */ }
     }
   } catch {
     // Background monitor failure is non-fatal

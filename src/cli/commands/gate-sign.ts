@@ -5,7 +5,7 @@ import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { register } from './shared.js';
-import { store, events, ZELTO_DIR, loadConfig } from './shared.js';
+import { store, events, ZELTO_DIR, loadConfig, resolveTargetDir } from './shared.js';
 import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
 import { resolve } from 'node:path';
 import { readdir } from 'node:fs/promises';
@@ -59,20 +59,34 @@ register('gate', async (args) => {
 
     const config = loadConfig();
 
+    // Resolve target project directory for cross-project execution
+    const targetDir = resolveTargetDir();
+    const gateCommands = targetDir && config.targetProject?.gate?.commands
+      ? config.targetProject.gate.commands
+      : config.gate.commands;
+    const gateProfiles = targetDir && config.targetProject?.gate?.profiles
+      ? config.targetProject.gate.profiles
+      : config.gate.profiles;
+
+    if (targetDir) {
+      console.log(`  Target:   ${targetDir}`);
+    }
+
     // Dry run: show what would be executed
     if (isDryRun) {
       if (isJson) {
         console.log(JSON.stringify({
           sliceId: id, dryRun: true,
-          commands: config.gate.commands
+          commands: gateCommands
             .filter((c) => !onlyCommand || c.name === onlyCommand)
             .map((c) => ({ name: c.name, run: c.run })),
           timeoutSec: config.gate.timeoutSec,
           retry: config.gate.retry,
           only: onlyCommand,
+          targetDir,
         }));
       } else {
-        const filteredCmds = config.gate.commands.filter((c) => !onlyCommand || c.name === onlyCommand);
+        const filteredCmds = gateCommands.filter((c) => !onlyCommand || c.name === onlyCommand);
         console.log(`  Dry-run for gate ${id}:`);
         console.log(`  Commands: ${filteredCmds.length}${onlyCommand ? ` (filtered: ${onlyCommand})` : ''}`);
         for (const c of filteredCmds) {
@@ -80,22 +94,24 @@ register('gate', async (args) => {
         }
         console.log(`  Timeout: ${config.gate.timeoutSec}s`);
         console.log(`  Retries: ${config.gate.retry.max}`);
+        if (targetDir) console.log(`  CWD:     ${targetDir}`);
         console.log(`\n  Run without --dry-run to execute.`);
       }
       return 0;
     }
 
     const gateConfig = {
-      commands: config.gate.commands
+      commands: gateCommands
         .filter((c) => !onlyCommand || c.name === onlyCommand)
         .map((c) => ({ name: c.name, run: c.run })),
+      profiles: gateProfiles,
       changedLineCoverage: 0.8,
       timeoutSec: config.gate.timeoutSec,
       retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
 
     if (onlyCommand && gateConfig.commands.length === 0) {
-      console.error(`No gate command found with name "${onlyCommand}". Available: ${config.gate.commands.map((c) => c.name).join(', ')}`);
+      console.error(`No gate command found with name "${onlyCommand}". Available: ${gateCommands.map((c) => c.name).join(', ')}`);
       return 1;
     }
 
@@ -123,7 +139,7 @@ register('gate', async (args) => {
       }
     }
 
-    const executor = new GateExecutor(store, events, gateConfig);
+    const executor = new GateExecutor(store, events, gateConfig, targetDir ?? undefined);
     const report = await executor.execute(id);
 
     if (isJson) {
