@@ -20,17 +20,15 @@ export class BudgetCollector {
 
   /**
    * Calculate total cost spent for a slice from event stream.
-   * Sums `cost` from `llm.called` and `budget.spent` events.
+   * Reads `amount` from `budget.spent` events (authoritative cost source).
    */
   async getSpent(sliceId: string): Promise<number> {
     const evts = await this.events.read(sliceId);
     let total = 0;
 
     for (const evt of evts) {
-      if (evt.type === 'llm.called') {
-        total += this.extractCost(evt);
-      } else if (evt.type === 'budget.spent') {
-        total += this.extractCost(evt);
+      if (evt.type === 'budget.spent') {
+        total += this.extractAmount(evt);
       }
     }
 
@@ -78,16 +76,9 @@ export class BudgetCollector {
   }
 
   /**
-   * Extract cost value from an event's payload.
-   * Tries `cost` field first, falls back to `amount`, then 0.
+   * Extract cost amount from a budget.spent event payload.
    */
-  private extractCost(evt: EventEnvelope): number {
-    const cost = evt.payload?.cost;
-    if (typeof cost === 'number') return cost;
-    if (typeof cost === 'string') {
-      const parsed = Number.parseFloat(cost);
-      if (!Number.isNaN(parsed)) return parsed;
-    }
+  private extractAmount(evt: EventEnvelope): number {
     const amount = evt.payload?.amount;
     if (typeof amount === 'number') return amount;
     if (typeof amount === 'string') {

@@ -345,7 +345,7 @@ register('project', async (args) => {
     }
     const projectMap = JSON.parse(readFileSync(mapPath, 'utf-8'));
 
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('panoramic-project', 'cli');
     if (!llm) {
       console.error('LLM not configured. Set up llm section in .zelto/config.yaml first.');
       console.error('Or run "zelto project init" to generate default config.');

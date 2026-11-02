@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { DeepSeekAdapter } from '../../adapters/llm/index.js';
+import { EventEmittingLlmAdapter, type PricingTable } from '../../adapters/llm/event-emitting-adapter.js';
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js';
 import { EventStream } from '../../core/events/stream.js';
@@ -120,7 +121,7 @@ export interface ZeltoConfig {
     retry: { max: number };
   };
   agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
-  llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string };
+  llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
   /** External project configuration for cross-repo workflows.
    *  When set, `zelto gate` and `zelto slice create` operate in the
    *  target project directory instead of the current working directory. */
@@ -233,6 +234,9 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let llmApiKey = '';
   let llmModel = '';
   let llmBaseUrl = '';
+  let inLlmPricingSection = false;
+  let currentPricingModel = '';
+  const llmPricing: Record<string, { inputPer1k: number; outputPer1k: number }> = {};
   let targetProjectPath = '';
   let targetProjectSpecDir = '';
   let targetProjectDepth = 0;
@@ -269,6 +273,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       inAgentSection = false;
       inTargetProjectSection = false;
       inProfileSection = false;
+      inLlmPricingSection = false;
       currentProfile = null;
       continue;
     }
@@ -382,12 +387,31 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
+        inLlmPricingSection = false;
       } else if (trimmed.startsWith('apiKey:')) {
         llmApiKey = stripSurroundingQuotes(trimmed.slice(7).trim());
+        inLlmPricingSection = false;
       } else if (trimmed.startsWith('model:')) {
         llmModel = stripSurroundingQuotes(trimmed.slice(6).trim());
+        inLlmPricingSection = false;
       } else if (trimmed.startsWith('baseUrl:')) {
         llmBaseUrl = stripSurroundingQuotes(trimmed.slice(8).trim());
+        inLlmPricingSection = false;
+      } else if (trimmed === 'pricing:') {
+        inLlmPricingSection = true;
+      } else if (inLlmPricingSection) {
+        // Parse model-level pricing entries
+        const modelMatch = trimmed.match(/^([\w.-]+):\s*$/);
+        if (modelMatch) {
+          currentPricingModel = modelMatch[1];
+          llmPricing[currentPricingModel] = { inputPer1k: 0, outputPer1k: 0 };
+        } else if (currentPricingModel && trimmed.startsWith('inputPer1k:')) {
+          const val = Number.parseFloat(trimmed.slice(11).trim());
+          if (!Number.isNaN(val)) llmPricing[currentPricingModel].inputPer1k = val;
+        } else if (currentPricingModel && trimmed.startsWith('outputPer1k:')) {
+          const val = Number.parseFloat(trimmed.slice(12).trim());
+          if (!Number.isNaN(val)) llmPricing[currentPricingModel].outputPer1k = val;
+        }
       }
     }
 
@@ -502,8 +526,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     }
   }
 
+  const pricingKeys = Object.keys(llmPricing);
   const llm = llmProvider && llmApiKey
-    ? { provider: llmProvider, apiKey: llmApiKey, ...(llmModel ? { model: llmModel } : {}), ...(llmBaseUrl ? { baseUrl: llmBaseUrl } : {}) }
+    ? {
+        provider: llmProvider,
+        apiKey: llmApiKey,
+        ...(llmModel ? { model: llmModel } : {}),
+        ...(llmBaseUrl ? { baseUrl: llmBaseUrl } : {}),
+        ...(pricingKeys.length > 0 ? { pricing: llmPricing } : {}),
+      }
     : undefined;
 
   const gate = commands.length > 0
@@ -639,14 +670,25 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
 
 // ─── LLM Helper ──────────────────────────────────────────────────────────────
 
-export function createLlmFromConfig(): LlmAdapter | null {
+export function createLlmFromConfig(
+  sliceId?: string,
+  actor?: string,
+): LlmAdapter | null {
   const cfg = loadConfig();
   if (!cfg.llm?.apiKey) return null;
-  return new DeepSeekAdapter({
+  const adapter: LlmAdapter = new DeepSeekAdapter({
     apiKey: cfg.llm.apiKey,
     baseUrl: cfg.llm.baseUrl,
     model: cfg.llm.model ?? 'deepseek-chat',
   });
+
+  // Wrap with event-emitting adapter if tracking context is provided
+  if (sliceId && actor) {
+    const pricing = cfg.llm.pricing as PricingTable | undefined;
+    return new EventEmittingLlmAdapter(adapter, events, sliceId, actor, pricing);
+  }
+
+  return adapter;
 }
 
 // ─── Executor Adapter Factory ──────────────────────────────────────────────

@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Slice Meta v2",
+  "description": "Slice metadata v2 — extends v1 with stage, status, milestone, tags, superseded-by",
+  "type": "object",
+  "required": ["id", "title", "state"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "prerequisites": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "state": {
+      "type": "string",
+      "enum": ["draft", "clarifying", "frozen", "running", "completed", "abandoned"]
+    },
+    "spec": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string" },
+        "frozenHash": { "type": ["string", "null"] },
+        "frozenAt": { "type": ["string", "null"] }
+      }
+    },
+    "acceptance": {
+      "type": "object",
+      "properties": {
+        "dir": { "type": "string" },
+        "frozenHash": { "type": ["string", "null"] },
+        "oracleSrc": { "type": ["string", "null"], "enum": [null, "external", "human", "model-transcribed"] }
+      }
+    },
+    "baseCommit": { "type": ["string", "null"] },
+    "drift": {
+      "type": "object",
+      "properties": {
+        "detected": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "at": { "type": ["string", "null"] }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "properties": {
+        "requirements": { "type": "array", "items": { "type": "string" } },
+        "contracts": { "type": "array", "items": { "type": "string" } },
+        "tests": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "traceWaiver": { "type": ["string", "null"] },
+    "baseline": { "type": "boolean" },
+    "writes": { "type": "array", "items": { "type": "string" } },
+    "runs": { "type": "array", "items": { "type": "string" } },
+    "stall": {
+      "type": "object",
+      "properties": {
+        "class": { "type": ["string", "null"] },
+        "autoResolved": { "type": "integer", "minimum": 0 },
+        "gateRetries": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "updatedAt": { "type": "string", "format": "date-time" },
+
+    "stage": {
+      "type": "string",
+      "enum": ["draft", "active", "frozen", "retired"],
+      "default": "draft"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["spec", "accept", "impl", "done"],
+      "default": "spec"
+    },
+    "milestone": { "type": ["string", "null"], "default": null },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 32
+      },
+      "default": []
+    },
+    "superseded-by": { "type": ["string", "null"], "default": null }
+  }
+}

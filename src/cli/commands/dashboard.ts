@@ -157,6 +157,64 @@ function collectRecentEvents(limit = 50): EventInfo[] {
   return all.slice(0, limit);
 }
 
+// ─── Cost Collection ────────────────────────────────────────────────────────────
+
+interface SliceCost {
+  totalCost: number;
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  llmCalls: number;
+}
+
+function collectCosts(): Map<string, SliceCost> {
+  const dir = join(ZELTO_DIR, 'events');
+  const costMap = new Map<string, SliceCost>();
+  if (!existsSync(dir)) return costMap;
+
+  for (const sd of readdirSync(dir, { withFileTypes: true })) {
+    if (!sd.isDirectory()) continue;
+    const sliceId = sd.name;
+    const f = join(dir, sliceId, 'events.jsonl');
+    if (!existsSync(f)) continue;
+
+    let totalCost = 0;
+    let totalTokens = 0;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    let llmCalls = 0;
+
+    try {
+      for (const line of readFileSync(f, 'utf-8').split('\n').filter(Boolean)) {
+        try {
+          const e = JSON.parse(line);
+          if (e.type === 'llm.called') {
+            llmCalls++;
+            totalTokens += e.payload?.totalTokens ?? 0;
+            promptTokens += e.payload?.promptTokens ?? 0;
+            completionTokens += e.payload?.completionTokens ?? 0;
+            totalCost += e.payload?.cost ?? 0;
+          } else if (e.type === 'budget.spent') {
+            totalCost += e.payload?.amount ?? 0;
+          }
+        } catch { /* skip malformed lines */ }
+      }
+    } catch { /* skip unreadable files */ }
+
+    if (llmCalls > 0 || totalCost > 0) {
+      costMap.set(sliceId, { totalCost, totalTokens, promptTokens, completionTokens, llmCalls });
+    }
+  }
+  return costMap;
+}
+
+function fmtCost(cost: number): string {
+  if (cost === 0) return '$0';
+  if (cost < 0.01) return '$' + cost.toFixed(4);
+  if (cost < 1) return '$' + cost.toFixed(3);
+  return '$' + cost.toFixed(2);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const ST_ICON: Record<string, string> = {
@@ -190,7 +248,7 @@ function statusLabel(st: string): string {
 
 function renderHtml(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
-  events: EventInfo[], watchMode: boolean,
+  events: EventInfo[], watchMode: boolean, costMap: Map<string, SliceCost>,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const stateCnt: Record<string, number> = {};
@@ -200,6 +258,16 @@ function renderHtml(
   // Build lookup: planId → plan
   const planMap = new Map(plans.map((p) => [p.planId, p]));
 
+  // Cost calculations
+  let totalCostAll = 0;
+  let totalTokensAll = 0;
+  let totalLlmCalls = 0;
+  for (const c of costMap.values()) {
+    totalCostAll += c.totalCost;
+    totalTokensAll += c.totalTokens;
+    totalLlmCalls += c.llmCalls;
+  }
+
   // ── Summary ──────────────────────────────────────────────────────────────────
   const summary = `
 <div class="g">
@@ -207,6 +275,7 @@ function renderHtml(
   <div class="c"><div class="n">${releases.length}</div><div class="l">Releases</div></div>
   <div class="c"><div class="n">${slices.filter((s) => s.state === 'running').length}</div><div class="l">🔄 Running</div></div>
   <div class="c st"><div class="n">${stalled.length}</div><div class="l">⚠️ Stalled</div></div>
+  <div class="c" style="border-color:#58a6ff66"><div class="n">${fmtCost(totalCostAll)}</div><div class="l">💰 Total ${totalLlmCalls > 0 ? `(${totalLlmCalls} calls)` : ''}</div></div>
 </div>`;
 
   const stateOrder = ['running','frozen','completed','draft','clarifying','abandoned'];
@@ -257,22 +326,29 @@ ${releases.map((r) => {
   const sCnt = relSlices.filter((s) => s.stallClass).length;
   const pct = total > 0 ? Math.round((done / total) * 100) : (r.status === 'completed' ? 100 : 0);
 
+  // Per-release cost
+  let relCost = 0;
+  for (const s of relSlices) { const c = costMap.get(s.id); if (c) relCost += c.totalCost; }
+
   // Per-module breakdown
-  const modMap = new Map<string, number[]>();
+  const modMap = new Map<string, [number, number, number]>(); // [completed, total, cost]
   for (const s of relSlices) {
     const mk = s.module && !isDirModule(s.module) ? s.module : areaDef(s.area).label;
-    if (!modMap.has(mk)) modMap.set(mk, [0, 0]); // [completed, total]
+    if (!modMap.has(mk)) modMap.set(mk, [0, 0, 0]);
     const a = modMap.get(mk)!;
     a[1]++;
     if (s.state === 'completed') a[0]++;
+    const sc = costMap.get(s.id);
+    if (sc) a[2] += sc.totalCost;
   }
 
   const moduleLines = [...modMap.entries()]
     .sort((a, b) => (a[0] > b[0] ? 1 : -1))
-    .map(([mod, [d, t]]) => {
+    .map(([mod, [d, t, c]]) => {
       const mpct = Math.round((d / t) * 100);
       const icon = mpct === 100 ? '✅' : mpct > 0 ? '🔄' : '⏳';
-      return `<span class="rl-mod">${icon} ${mod} <span class="rl-mod-stat">${d}/${t}</span></span>`;
+      const costStr = c > 0 ? ` · ${fmtCost(c)}` : '';
+      return `<span class="rl-mod">${icon} ${mod} <span class="rl-mod-stat">${d}/${t}${costStr}</span></span>`;
     }).join('');
 
   const bg = r.status === 'completed' ? '#1a2e1a' : r.status === 'in_progress' ? '#1a1f2e' : '#161b22';
@@ -286,7 +362,7 @@ ${releases.map((r) => {
     </div>
     <div class="rl-desc">${r.description}</div>
     <div class="rl-bar-wrap"><span class="rl-bar" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></div>
-    <div class="rl-bar-label">${done}/${total} slices${sCnt ? ` · ⚠ ${sCnt} stalled` : ''}${total > 0 ? ` · ${pct}%` : ''}</div>
+    <div class="rl-bar-label">${done}/${total} slices${sCnt ? ` · ⚠ ${sCnt} stalled` : ''}${total > 0 ? ` · ${pct}%` : ''}${relCost > 0 ? ` · ${fmtCost(relCost)}` : ''}</div>
     <div class="rl-mods">${moduleLines || '<span class="rl-mod-stat">(no slices assigned)</span>'}</div>
     ${unresolvedPlans.length > 0 ? `<div class="rl-warn">⚠ ${unresolvedPlans.join(', ')} not found</div>` : ''}
   </div>`;
@@ -316,7 +392,9 @@ ${plans.map((plan) => {
       const rows = modSlices.sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1))
         .map((s) => {
           const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${s.stallClass}</span>` : '';
-          return `<div class="vr"><span class="vtic">${tIcon(s.type)}</span><span class="vsic">${sIcon(s.state)}</span><span class="vid">${s.id}</span><span class="vtl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${stallTag}</div>`;
+          const sc = costMap.get(s.id);
+          const costTag = sc && sc.totalCost > 0 ? `<span class="ct">${fmtCost(sc.totalCost)}</span>` : '';
+          return `<div class="vr"><span class="vtic">${tIcon(s.type)}</span><span class="vsic">${sIcon(s.state)}</span><span class="vid">${s.id}</span><span class="vtl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${costTag}${stallTag}</div>`;
         }).join('');
       if (!modName) return rows;
       return `<div class="vm"><div class="vmt">${modName} <span class="vmc">${modSlices.length}</span></div>${rows}</div>`;
@@ -358,7 +436,9 @@ ${sortedAreas.map(([areaKey, modMap]) => {
     const rows = sorted.map((s) => {
       const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${s.stallClass}</span>` : '';
       const verTag = s.version ? `<span class="vt">${s.version}</span>` : '';
-      return `<div class="ar"><span class="atic">${tIcon(s.type)}</span><span class="asic">${sIcon(s.state)}</span><span class="aid">${s.id}</span><span class="atl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${verTag}${stallTag}</div>`;
+      const sc = costMap.get(s.id);
+      const costTag = sc && sc.totalCost > 0 ? `<span class="ct">${fmtCost(sc.totalCost)}</span>` : '';
+      return `<div class="ar"><span class="atic">${tIcon(s.type)}</span><span class="asic">${sIcon(s.state)}</span><span class="aid">${s.id}</span><span class="atl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${verTag}${costTag}${stallTag}</div>`;
     }).join('');
     if (!modName) return rows;
     return `<div class="am"><div class="amt">${modName} <span class="amc">${modSlices.length}</span></div>${rows}</div>`;
@@ -453,6 +533,7 @@ ${watchMode ? '<meta http-equiv="refresh" content="3">' : ''}
   .vtl{color:#c9d1d9;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .st{display:inline-block;padding:0 5px;border-radius:2px;font-size:9px;font-weight:600;color:#fff;white-space:nowrap;flex-shrink:0}
   .vt{display:inline-block;padding:0 5px;border-radius:3px;font-size:9px;font-weight:600;background:#1f6feb33;color:#58a6ff;border:1px solid #1f6feb44;white-space:nowrap;flex-shrink:0}
+  .ct{display:inline-block;padding:0 5px;border-radius:3px;font-size:9px;font-weight:600;background:#8957e533;color:#d2a8ff;border:1px solid #8957e544;white-space:nowrap;flex-shrink:0}
   .badge{display:inline-block;padding:0 5px;border-radius:8px;font-size:9px;font-weight:600;white-space:nowrap;flex-shrink:0}
   .badge-running{background:#1f6feb33;color:#58a6ff;border:1px solid #1f6feb66}
   .badge-frozen{background:#58a6ff22;color:#79c0ff;border:1px solid #58a6ff44}
@@ -544,7 +625,8 @@ register('dashboard', async (args) => {
     const releases = loadReleases();
     const slices = [...sliceMap.values()].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
     const events = collectRecentEvents();
-    return renderHtml(slices, plans, releases, events, watchMode);
+    const costMap = collectCosts();
+    return renderHtml(slices, plans, releases, events, watchMode, costMap);
   };
 
   writeFileSync(outputPath, generate(), 'utf-8');

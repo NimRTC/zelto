@@ -491,7 +491,7 @@ register('clarify', async (args) => {
     }
 
     // Create LLM-powered question generator if LLM is configured
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('clarify', 'cli');
     const llmGenerator: LlmQuestionGenerator | null = llm
       ? async (s, round) => {
           const questions = await generateClarifyQuestions(llm, {
@@ -1170,7 +1170,8 @@ async function runParallel(args: string[]): Promise<number> {
     const adapter = adapters[i];
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     try {
-      const { sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath });
+      let sessionId: string | undefined;
+      ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath });
       st.sessionId = sessionId;
       st.status = 'running';
     } catch (err) {
@@ -1458,7 +1459,7 @@ async function autoGateAfterRun(id: string): Promise<void> {
  *
  * @returns 'retry' if auto-retry is happening, 'stall' if the slice should stall
  */
-export async function handleAgentFailure(
+export export async function handleAgentFailure(
   id: string,
   exitCode: number | null,
   options?: { maxRetries?: number },

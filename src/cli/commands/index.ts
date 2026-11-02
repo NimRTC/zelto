@@ -71,7 +71,7 @@ export async function runCLI(argv: string[]): Promise<number> {
   const handler = commands[cmd];
   if (!handler) {
     // Unknown command — try LLM-powered natural language routing
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('llm-router', 'cli');
     if (llm) {
       const { routeAndExecute } = await import('../llm-router.js');
       const fullInput = [cmd, ...rest].join(' ');

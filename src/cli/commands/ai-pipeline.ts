@@ -86,7 +86,7 @@ register('require', async (args) => {
       return 1;
     }
 
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
       f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
       return 1;
@@ -116,7 +116,7 @@ register('require', async (args) => {
     return 1;
   }
 
-  const llm = createLlmFromConfig();
+  const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
     f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
     return 1;
@@ -211,7 +211,7 @@ register('design', async (args) => {
       return 1;
     }
 
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
       f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
       return 1;
@@ -257,7 +257,7 @@ register('design', async (args) => {
     return 1;
   }
 
-  const llm = createLlmFromConfig();
+  const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
     f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
     return 1;
@@ -382,7 +382,7 @@ register('plan', async (args) => {
       return 1;
     }
 
-    const llm = createLlmFromConfig();
+    const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
       f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
       return 1;
@@ -426,7 +426,7 @@ register('plan', async (args) => {
     return 1;
   }
 
-  const llm = createLlmFromConfig();
+  const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
     f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
     return 1;
