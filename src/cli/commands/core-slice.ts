@@ -1171,7 +1171,7 @@ async function runParallel(args: string[]): Promise<number> {
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     try {
       let sessionId: string | undefined;
-      ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath });
+      ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath }));
       st.sessionId = sessionId;
       st.status = 'running';
     } catch (err) {
@@ -1459,7 +1459,7 @@ async function autoGateAfterRun(id: string): Promise<void> {
  *
  * @returns 'retry' if auto-retry is happening, 'stall' if the slice should stall
  */
-export export async function handleAgentFailure(
+export async function handleAgentFailure(
   id: string,
   exitCode: number | null,
   options?: { maxRetries?: number },
