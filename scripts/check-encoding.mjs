@@ -29,6 +29,7 @@ const TARGETS = [
   { dir: 'specs', exts: ['.md'] },
   { dir: 'contracts', exts: ['.json'] },
   { dir: 'policy', exts: ['.yaml', '.yml'] },
+  { dir: '.cursor', exts: ['.md'] },
 ];
 
 /** 顶层单独检查的文件。 */
