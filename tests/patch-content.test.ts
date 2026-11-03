@@ -8,6 +8,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execSync } from 'node:child_process';
 
 // ─── Test subject imports ───────────────────────────────────────────────────
@@ -26,6 +27,25 @@ import {
 const TEST_DIR = join('.zelto', 'patches');
 const TEST_SLICES_DIR = join('.zelto', 'slices');
 const TEST_PATCH_FILE = 'src/temp-patch-test-file.txt';
+const ORIGINAL_PATCH_CONTENT = 'original content\n';
+
+/**
+ * The non-interactive mode reads `git diff` of the current working directory,
+ * so it needs a repository whose state the test fully controls — otherwise
+ * the result depends on whatever the developer happens to have modified.
+ */
+const GIT_REPO_DIR = join(
+  tmpdir(),
+  `zelto-patch-content-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+);
+
+function git(args: string): void {
+  execSync(`git ${args}`, {
+    cwd: GIT_REPO_DIR,
+    encoding: 'utf-8',
+    stdio: 'pipe',
+  });
+}
 
 before(() => {
   // Ensure .zelto/slices exists for getSliceIds()
@@ -53,6 +73,16 @@ before(() => {
       updatedAt: new Date().toISOString(),
     }), 'utf-8');
   }
+
+  // ── Isolated git repository for the non-interactive mode ──────────────
+  mkdirSync(join(GIT_REPO_DIR, 'src'), { recursive: true });
+  git('init');
+  git('config user.email "zelto@example.com"');
+  git('config user.name "Zelto Test"');
+  git('config core.autocrlf false');
+  writeFileSync(join(GIT_REPO_DIR, TEST_PATCH_FILE), ORIGINAL_PATCH_CONTENT, 'utf-8');
+  git('add -A');
+  git('commit -m "init"');
 });
 
 after(() => {
@@ -62,14 +92,7 @@ after(() => {
     const testSlicePath = join(TEST_SLICES_DIR, 'test-slice.json');
     if (existsSync(testSlicePath)) rmSync(testSlicePath, { force: true });
   } catch { /* ok */ }
-  try {
-    if (existsSync(TEST_PATCH_FILE)) {
-      execSync(`git checkout -- "${TEST_PATCH_FILE}" 2>nul || del "${TEST_PATCH_FILE}"`, {
-        cwd: process.cwd(),
-        encoding: 'utf-8',
-      });
-    }
-  } catch { /* ok */ }
+  try { rmSync(GIT_REPO_DIR, { recursive: true, force: true }); } catch { /* ok */ }
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -142,9 +165,20 @@ describe('patch-content — writePatchFiles()', () => {
 });
 
 describe('patch-content — non-interactive mode', () => {
+  const originalCwd = process.cwd();
+
+  before(() => {
+    // runPatchContent() runs `git diff` in the current working directory.
+    process.chdir(GIT_REPO_DIR);
+  });
+
+  after(() => {
+    process.chdir(originalCwd);
+  });
+
   it('should handle non-empty diff and produce patch files', async () => {
-    // Write the test file so git detects a change
-    writeFileSync(TEST_PATCH_FILE, 'test content for patch\n', 'utf-8');
+    // Modify the committed file so git detects a change
+    writeFileSync(join(GIT_REPO_DIR, TEST_PATCH_FILE), 'test content for patch\n', 'utf-8');
 
     const result = await runPatchContent('unstaged', 'test-slice');
     assert.ok(result !== null, 'should produce a result');
@@ -153,18 +187,13 @@ describe('patch-content — non-interactive mode', () => {
     assert.equal(result.sliceCount, 1);
 
     // Verify file has content
-    const patchContent = readFileSync(join(TEST_DIR, result.writtenFiles[0]), 'utf-8');
+    const patchContent = readFileSync(join(GIT_REPO_DIR, TEST_DIR, result.writtenFiles[0]), 'utf-8');
     assert.ok(patchContent.includes(TEST_PATCH_FILE), 'patch should reference the test file');
   });
 
   it('should handle empty diff gracefully', async () => {
-    // Stage and then revert to get a clean state
-    try {
-      execSync(`git checkout -- "${TEST_PATCH_FILE}" 2>nul`, { cwd: process.cwd(), encoding: 'utf-8' });
-    } catch { /* ignore */ }
-
-    // Remove the test file entirely
-    try { rmSync(TEST_PATCH_FILE, { force: true }); } catch { /* ignore */ }
+    // Restore the committed content so the working tree is clean again
+    writeFileSync(join(GIT_REPO_DIR, TEST_PATCH_FILE), ORIGINAL_PATCH_CONTENT, 'utf-8');
 
     const result = await runPatchContent('unstaged', 'test-slice');
     // If no diff, result is null

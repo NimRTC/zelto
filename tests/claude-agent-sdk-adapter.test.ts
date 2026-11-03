@@ -2,6 +2,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { ClaudeAgentSdkAdapter } from '../src/adapters/claude-agent-sdk/index.js';
 
@@ -20,6 +22,30 @@ function hasSdk(): boolean {
     return false;
   }
 }
+
+/**
+ * Check whether the SDK has usable credentials.
+ *
+ * The SDK is installed as a dependency, so `hasSdk()` is always true in this
+ * repo. But `startup()` spawns a real Claude Code process, which — without
+ * credentials — keeps retrying and holds the event loop open, hanging the
+ * whole test run. Live-session tests therefore require credentials too.
+ */
+function hasCredentials(): boolean {
+  if (process.env.ANTHROPIC_API_KEY) return true;
+  if (process.env.ANTHROPIC_AUTH_TOKEN) return true;
+  if (process.env.ANTHROPIC_BASE_URL) return true;
+  // Claude Code's own credential store
+  const creds = join(
+    process.env.USERPROFILE ?? process.env.HOME ?? '',
+    '.claude',
+    '.credentials.json',
+  );
+  return existsSync(creds);
+}
+
+/** Live-session tests only run when the SDK is importable AND credentials exist. */
+const canStartSession = hasSdk() && hasCredentials();
 
 describe('ClaudeAgentSdkAdapter', () => {
   it('has required metadata', () => {
@@ -93,12 +119,12 @@ describe('ClaudeAgentSdkAdapter', () => {
     assert.equal(code, null);
   });
 
-  it('resume() does not throw for unknown session (graceful)', { skip: !hasSdk() }, async () => {
+  it('resume() does not throw for unknown session (graceful)', { skip: !canStartSession }, async () => {
     const adapter = new ClaudeAgentSdkAdapter();
     await adapter.resume('nonexistent', 'patch content');
   });
 
-  it('start() returns a session with id', { skip: !hasSdk() }, async () => {
+  it('start() returns a session with id', { skip: !canStartSession }, async () => {
     const adapter = new ClaudeAgentSdkAdapter();
     const result = await adapter.start({ sliceId: 'test', prompt: 'test prompt' });
     assert.ok(result.sessionId);

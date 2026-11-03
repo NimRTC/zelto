@@ -21,8 +21,8 @@ describe('ClaudeAgentAdapter', () => {
   it('has required metadata', () => {
     const adapter = new ClaudeAgentAdapter();
     assert.equal(adapter.name, 'claude-agent');
-    assert.equal(adapter.metadata.version, '2.0.0');
-    assert.equal(adapter.metadata.capabilities.resume, false);
+    assert.equal(adapter.metadata.version, '2.2.0');
+    assert.equal(adapter.metadata.capabilities.resume, true);
     assert.equal(adapter.metadata.capabilities.events, false);
   });
 
@@ -91,12 +91,38 @@ describe('ClaudeAgentAdapter', () => {
     assert.notEqual(exitCode, 0, 'killed process should not exit 0');
   });
 
-  it('resume() throws not supported', async () => {
+  it('resume() throws for an unknown session', async () => {
     const adapter = new ClaudeAgentAdapter();
     await assert.rejects(
       () => adapter.resume('any', 'patch'),
-      /resume not supported/,
+      /Session "any" not found/,
     );
+  });
+
+  it('resume() continues the same agent-side session', async () => {
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: 'echo',
+      cwd: TEST_DIR,
+    });
+
+    const { sessionId } = await adapter.start({
+      sliceId: 'test-resume',
+      prompt: 'hello',
+    });
+    await adapter.waitForExit(sessionId);
+
+    const agentSessionId = adapter.getAgentSessionId(sessionId);
+    assert.ok(agentSessionId, 'the first run should have an agent-side session id');
+
+    const { sessionId: resumedId } = await adapter.resume(sessionId, 'the human answer');
+    assert.notEqual(resumedId, sessionId, 'resume should spawn a new zelto session');
+    assert.equal(
+      adapter.getAgentSessionId(resumedId),
+      agentSessionId,
+      'resume should reuse the agent-side session id',
+    );
+
+    await adapter.waitForExit(resumedId);
   });
 
   it('events() throws not supported', async () => {

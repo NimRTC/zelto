@@ -115,8 +115,11 @@ agent:
     await runCommand('create', 'fail-agent-test');
     await runCommand('freeze', 'fail-agent-test');
 
-    // Run with false as agent (exits 1)
-    const { stdout, code } = await runCommand('run', 'fail-agent-test', '--agent', 'false');
+    // Run with a command that exits non-zero.
+    // `false` exists on POSIX but not on Windows (not a cmd built-in, not on PATH),
+    // so use the platform's own "exit 1" equivalent.
+    const failingAgent = process.platform === 'win32' ? 'cmd /c exit 1' : 'false';
+    const { stdout, code } = await runCommand('run', 'fail-agent-test', '--agent', failingAgent);
     // Should still exit 0 (zelto handles the failure gracefully)
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
     assert.ok(stdout.includes('exit') || stdout.includes('aborted'));
