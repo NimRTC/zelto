@@ -10,6 +10,7 @@ import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
+import { writeOutput } from '../output.js';
 
 // ─── next ────────────────────────────────────────────────────────────────────
 
@@ -407,7 +408,7 @@ register('events', async (args) => {
     const sliceExists = await store.exists(id);
     if (!sliceExists) {
       if (isJson) {
-        f.data({ sliceId: id, error: `Slice "${id}" not found`, events: [] });
+        writeOutput({ sliceId: id, error: `Slice "${id}" not found`, events: [] }, undefined, { json: true });
       } else {
         f.out(`Slice "${id}" not found.`);
       }
@@ -418,12 +419,16 @@ register('events', async (args) => {
 
     if (isJson) {
       const displayed = tailCount > 0 ? evts.slice(-tailCount) : evts;
-      f.data({
-        sliceId: id,
-        total: evts.length,
-        displayed: tailCount > 0 ? Math.min(tailCount, evts.length) : evts.length,
-        events: displayed,
-      });
+      writeOutput(
+        {
+          sliceId: id,
+          total: evts.length,
+          displayed: tailCount > 0 ? Math.min(tailCount, evts.length) : evts.length,
+          events: displayed,
+        },
+        undefined,
+        { json: true },
+      );
       return 0;
     }
 
@@ -454,7 +459,7 @@ register('events', async (args) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (isJson) {
-      f.data({ sliceId: id, error: String(err), events: [] });
+      writeOutput({ sliceId: id, error: String(err), events: [] }, undefined, { json: true });
     } else {
       const msg = String(err);
       if (msg.includes('ENOENT') || msg.includes('not found')) {
@@ -512,6 +517,8 @@ ${colors.bold('Core slice commands:')}
   suggest                Full project overview and suggested actions
   stall [id]             List stalled slices or inspect one (--auto-resolved)
   resume <id>            Resume stalled slice (--skip, --abandon)
+  ask                    List pending agent questions (--slice <id>, --json)
+  answer <qid> "<text>"  Answer an agent question and resume the slice (--list to just list)
   status [--watch]       Show active agent sessions (--json)
   events <id>            View slice event stream [--json]
 
@@ -581,6 +588,7 @@ register('completion', async (args) => {
     'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
     'stall', 'resume', 'status', 'events', 'init', 'summary', 'report',
     'require', 'design', 'plan', 'version', 'pipeline',
+    'ask', 'answer',
     'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'patch-content', 'diff-highlight', 'help', 'completion',
   ];
   const subcommands = {

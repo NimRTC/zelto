@@ -1,7 +1,7 @@
 // Core slice lifecycle commands: slices, create, check, clarify, abandon, freeze, run, admit
 
 import { createInterface } from 'node:readline';
-import { writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -28,37 +28,26 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
+import { type WorktreeInfo } from '../../core/worktree/index.js';
+import { parseScopePaths } from '../../core/spec/scope.js';
 import { register } from './shared.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
+import { detectQuestion, suspendSliceForQuestion } from './question.js';
+import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites } from './run-support.js';
 
-// ─── Helpers ────────────────────────────────────────────────────────────────────
+// 供其它命令复用（ai-pipeline.ts / question.ts）
+export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
 
-/**
- * Detect common source directories for default write-set.
- * Scans the project root for typical source directory names.
- */
-function detectDefaultWrites(): string[] {
-  const candidates = ['src', 'lib', 'app', 'tools', 'scripts', 'tests', 'docs', 'include', 'assets', 'public', 'components', 'pages'];
-  const found: string[] = [];
-  try {
-    const entries = readdirSync(process.cwd());
-    for (const entry of entries) {
-      if (candidates.includes(entry)) {
-        try {
-          if (statSync(join(process.cwd(), entry)).isDirectory()) {
-            found.push(`${entry}/**`);
-          }
-        } catch { /* skip */ }
-      }
-      // Also detect root-level config files
-      if (entry === 'CMakeLists.txt' || entry === 'Makefile' || entry === 'package.json' || entry === 'Cargo.toml' || entry === 'go.mod') {
-        if (!found.includes(entry)) found.push(entry);
-      }
-    }
-  } catch { /* cannot read cwd */ }
-  return found;
-}
+// ─── Write-set resolution ──────────────────────────────────────────────────────
+//
+// resolveWriteSet / checkBudget / autoGateAfterRun / handleAgentFailure 已经移到
+// ./run-support.ts — 并行执行器也要用它们，独立出来可以避免两个模块互相 import。
+
+// ─── Worktree helpers ─────────────────────────────────────────────────────────
+
+// `ensureWorktree` / `worktreeManager` / `removeWorktree` live in ./shared.ts so that
+// gate, diff and sign commands can reuse the same worktree convention.
 
 // ─── slices ──────────────────────────────────────────────────────────────────
 
@@ -149,8 +138,10 @@ register('create', async (args) => {
     return 0;
   }
 
-  // Interactive mode: prompt for values if not provided
-  if (!id || id.startsWith('--')) {
+  // Interactive mode: prompt for values if not provided.
+  // Only when stdin is a TTY — in scripts/CI there is nobody to answer, and
+  // waiting for input would hang forever.
+  if ((!id || id.startsWith('--')) && process.stdin.isTTY) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
 
     const ask = (q: string): Promise<string> => new Promise((r) => rl.question(q, r));
@@ -454,10 +445,10 @@ register('check', async (args) => {
       console.log('  Result:  ✅ All checks passed');
     } else if (slice.state === 'frozen') {
       console.log(`  Issues:  ${issues.join(', ')}`);
-      console.log('  Result:  ⚠️  Fix issues before gate');
+      console.log('  Result:  ??  Fix issues before gate');
     } else {
       console.log(`  Issues:  ${issues.join(', ')}`);
-      console.log('  Result:  ⚠️  Fix issues before freezing');
+      console.log('  Result:  ??  Fix issues before freezing');
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -585,7 +576,7 @@ register('clarify', async (args) => {
     const result = await engine.generateQuestions(current, round);
 
     if (result.converged) {
-      console.log('  ✅ No open questions — slice is already complete.');
+        console.log('  ✅ No open questions — slice is already complete.');
       return 0;
     }
 
@@ -637,7 +628,7 @@ register('clarify', async (args) => {
       sliceId: id, frozenHash: afterConverge.spec.frozenHash, frozenAt: afterConverge.spec.frozenAt,
     });
 
-    console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
+      console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
     console.log(`  Next: zelto run ${id} --dry-run`);
     return 0;
   } catch (err) {
@@ -669,6 +660,18 @@ register('abandon', async (args) => {
     await events.append(id, 'slice.state.changed', 'cli', {
       sliceId: id, from: prevState, to: 'abandoned', event: 'ABANDON',
     });
+
+    // Remove the isolated worktree (if any) — failures are reported, not swallowed
+    if (worktreeManager().exists(id)) {
+      try {
+        await removeWorktree(id, { force: true });
+        console.log(`  Worktree:   removed (${worktreeManager().relativePathFor(id)})`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`  ??  Worktree removal failed: ${msg}`);
+        console.error(`     Remove it manually: git worktree remove --force ${worktreeManager().pathFor(id)}`);
+      }
+    }
 
     console.log(`zelto abandon ${id} — ✅ Slice abandoned`);
     console.log(`  Previous state: ${prevState}`);
@@ -770,19 +773,21 @@ register('run', async (args) => {
       return 1;
     }
 
-    const slice = await store.read(id);
-
-    // Auto-detect write-set if empty
-    if (slice.writes.length === 0) {
-      const detected = detectDefaultWrites();
-      if (detected.length > 0) {
-        slice.writes = detected;
-        await store.write(slice);
-        console.log(`  Auto-detected write-set: ${detected.join(', ')}`);
-      } else {
-        console.warn('  ⚠️  No write-set detected — agent will have no files to modify');
-      }
+    // Resolve write-set: slice.writes → spec 「范围」 → detectDefaultWrites()
+    const resolved = await resolveWriteSet(id);
+    if (resolved.changed) {
+      console.log(
+        resolved.source === 'spec'
+          ? `  Write-set (from spec):  ${resolved.writes.join(', ')}`
+          : `  Auto-detected write-set: ${resolved.writes.join(', ')}`,
+      );
     }
+    if (resolved.writes.length === 0) {
+        console.warn('  ⚠️  No write-set detected — agent will have no files to modify');
+    }
+
+    // Re-read so the constraint bundle carries the resolved write-set
+    const slice = await store.read(id);
 
     // Check budget before starting run
     const budgetOk = await checkBudget(id);
@@ -823,27 +828,26 @@ register('run', async (args) => {
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
-    // Create feature branch for this slice
-    const branchName = `slice/${id}`;
+    // Isolated worktree for this slice — the main working tree is never touched.
+    // Not inside a git repo → no isolation possible, degrade to the current directory.
+    let worktree: WorktreeInfo | null = null;
     try {
-      const { execSync } = await import('node:child_process');
+      worktree = await ensureWorktree(id);
+      if (worktree) {
+        console.log(`  Worktree:      ${worktree.relativePath}`);
+        console.log(`  Branch:        ${worktree.branch}`);
 
-      // Check for uncommitted changes
-      const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
-      if (status) {
-        console.warn(`  ⚠️  You have uncommitted changes. They will be included in slice "${id}".`);
-        console.warn(`       Commit them first if they belong to a different slice.`);
-      }
-
-      const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { encoding: 'utf-8', timeout: 5000 }).trim();
-      if (currentBranch === 'main' || currentBranch === 'master') {
-        execSync(`git checkout -b ${branchName}`, { cwd: process.cwd(), timeout: 10000 });
-        console.log(`  Branch:        ${branchName} (created from ${currentBranch})`);
+        // Mirror the bundle into the worktree so the agent sees it under its own cwd
+        const wtBundleDir = join(worktree.path, ZELTO_DIR);
+        if (!existsSync(wtBundleDir)) mkdirSync(wtBundleDir, { recursive: true });
+        writeFileSync(join(wtBundleDir, `${id}-bundle.json`), JSON.stringify(bundle, null, 2), 'utf-8');
       } else {
-        console.log(`  Branch:        ${currentBranch} (already on feature branch)`);
+        console.log(`  Worktree:      (none — not a git repository, running in current directory)`);
       }
-    } catch {
-      console.log(`  Branch:        (not a git repository or git unavailable)`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ❌ 无法创建隔离 worktree: ${msg}`);
+      return 1;
     }
 
     const cfg = loadConfig();
@@ -874,11 +878,13 @@ register('run', async (args) => {
 
     const sliceData = await store.read(id);
     const agentTimeout = sliceData.agentTimeout;
-    let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
+    const workDir = worktree?.path ?? process.cwd();
+    let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
     let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
+      worktree: worktree?.relativePath ?? null,
     });
 
     // ── Detach mode ─────────────────────────────────────────────────
@@ -912,7 +918,7 @@ register('run', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       const mins = Math.floor(elapsed / 60);
       const secs = elapsed % 60;
-      process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+      process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
     }, 1000);
 
     // Retry loop: agent may auto-retry internally (adapter handles transient failures),
@@ -947,7 +953,7 @@ register('run', async (args) => {
         if (result.action === 'retry') {
           attempt = result.retryCount ?? attempt + 1;
           // Re-create adapter and re-start agent for retry
-          adapter = createExecutorAdapter(adapterType, agentName, agentTimeout);
+          adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
           const { sessionId: newSessionId } = await adapter.start({
             sliceId: id, prompt: bundlePath,
           });
@@ -958,7 +964,7 @@ register('run', async (args) => {
             const e = Math.floor((Date.now() - startTime) / 1000);
             const mins = Math.floor(e / 60);
             const secs = e % 60;
-            process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+            process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
           }, 1000);
 
           continue; // Retry
@@ -972,6 +978,22 @@ register('run', async (args) => {
     }
 
     if (finalExitCode === 0) {
+      // 提问回路：agent 以问题收尾时，不算「运行成功」——挂起切片等人回答
+      // （ADR-013 §3.6）。检测是确定性字符串解析，不调用模型。
+      const question = await detectQuestion(id, adapter, sessionId);
+      if (question) {
+        await suspendSliceForQuestion(id, question);
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        console.log(`\n❓ Agent asked a question (${question.type}) after ${elapsed}s:`);
+        console.log(`   ${question.question}`);
+        if (question.options.length > 0) {
+          console.log(`   Options: ${question.options.join(' | ')}`);
+        }
+        console.log(`   Slice "${id}" is suspended — answer with:`);
+        console.log(`   zelto answer ${question.id} "<your answer>"`);
+        return 0;
+      }
+
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -986,7 +1008,7 @@ register('run', async (args) => {
         const signManager = new SignManager(ZELTO_DIR, events, store);
         const signReq = await signManager.request(id, 'zelto');
         await signManager.approve(signReq.id, 'zelto');
-        console.log(`  🔥 Hotfix: gate skipped, auto-approved (${signReq.id})`);
+        console.log(`  ?? Hotfix: gate skipped, auto-approved (${signReq.id})`);
       } else {
         // Auto-run gate and create sign request on pass
         await autoGateAfterRun(id);
@@ -1013,6 +1035,8 @@ interface ParallelRunState {
   exitCode: number | null;
   sessionId: string | null;
   branchName: string;
+  /** Isolated worktree path for this slice */
+  worktreePath: string | null;
 }
 
 /**
@@ -1046,6 +1070,7 @@ async function runParallel(args: string[]): Promise<number> {
     exitCode: null,
     sessionId: null,
     branchName: `slice/${id}`,
+    worktreePath: null,
   }));
 
   console.log(`zelto run --parallel — admitting ${ids.length} slices...`);
@@ -1058,7 +1083,19 @@ async function runParallel(args: string[]): Promise<number> {
     }
   }
 
-  // Read all slice data
+  // Resolve write-sets first — conflict detection depends on the effective write-set
+  for (const id of ids) {
+    const resolved = await resolveWriteSet(id);
+    if (resolved.changed) {
+      console.log(
+        resolved.source === 'spec'
+          ? `  ??  ${id}: write-set from spec: ${resolved.writes.join(', ')}`
+          : `  ??  ${id}: auto-detected write-set: ${resolved.writes.join(', ')}`,
+      );
+    }
+  }
+
+  // Read all slice data (after write-set resolution so conflicts use effective writes)
   const slices = await Promise.all(ids.map((id) => store.read(id)));
 
   // Check cross-conflicts: no two parallel slices may write the same files
@@ -1072,18 +1109,6 @@ async function runParallel(args: string[]): Promise<number> {
     return 1;
   }
 
-  // Auto-detect writes for empty write-sets
-  for (let i = 0; i < slices.length; i++) {
-    if (slices[i].writes.length === 0) {
-      const detected = detectDefaultWrites();
-      if (detected.length > 0) {
-        slices[i].writes = detected;
-        await store.write(slices[i]);
-        console.log(`  ℹ️  ${ids[i]}: auto-detected write-set: ${detected.join(', ')}`);
-      }
-    }
-  }
-
   // Check budgets
   for (const id of ids) {
     const ok = await checkBudget(id);
@@ -1093,25 +1118,17 @@ async function runParallel(args: string[]): Promise<number> {
     }
   }
 
-  // ── Phase 2: Create feature branches & start agents ──────────────
+  // ── Phase 2: Create isolated worktrees & start agents ───────────
   const { execSync } = await import('node:child_process');
   const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : loadConfig().agent.command;
   const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
 
-  // Record base commit for branch creation
-  let baseCommit: string | null = null;
-  try {
-    baseCommit = execSync('git rev-parse HEAD', { encoding: 'utf-8', timeout: 5000 }).trim();
-  } catch {
-    // Non-git repo
-  }
-
-  // Check for uncommitted changes
+  // Check for uncommitted changes in the main worktree
   try {
     const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
     if (status) {
-      console.warn(`  ⚠️  You have uncommitted changes. They will be included in all parallel slices.`);
-      console.warn(`       Commit them first if they belong to a different slice.`);
+      console.warn(`  ??  You have uncommitted changes in the main worktree. They are NOT copied into slice worktrees.`);
+      console.warn(`       Commit them first if the slices depend on them.`);
     }
   } catch { /* ignore */ }
 
@@ -1127,39 +1144,35 @@ async function runParallel(args: string[]): Promise<number> {
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
-    // Create feature branch from base commit
-    if (baseCommit) {
-      try {
-        execSync(`git checkout -b ${st.branchName} ${baseCommit}`, { cwd: process.cwd(), timeout: 10000 });
-      } catch {
-        // Branch may already exist; try switching
-        try {
-          execSync(`git checkout ${st.branchName}`, { cwd: process.cwd(), timeout: 10000 });
-        } catch { /* give up */ }
+    // Create isolated worktree — the main worktree keeps its current branch.
+    // Not inside a git repo → no isolation possible, degrade to the current directory.
+    try {
+      const wt = await ensureWorktree(st.id);
+      if (wt) {
+        st.worktreePath = wt.path;
+        const wtBundleDir = join(wt.path, ZELTO_DIR);
+        if (!existsSync(wtBundleDir)) mkdirSync(wtBundleDir, { recursive: true });
+        writeFileSync(join(wtBundleDir, `${st.id}-bundle.json`), JSON.stringify(bundle, null, 2), 'utf-8');
+      } else {
+        console.warn(`  ⚠️  ${st.id}: 不在 git 仓库中，无法隔离 worktree，将在当前目录执行`);
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ❌ ${st.id}: 无法创建隔离 worktree: ${msg}`);
+      return 1;
     }
 
     // Write event
     await events.append(st.id, 'run.started', 'zelto', {
       sliceId: st.id, agent: agentName, bundlePath, writes: slice.writes,
+      worktree: st.worktreePath ? worktreeManager().relativePathFor(st.id) : null,
     });
-  }
-
-  // Switch back to main after creating all branches
-  if (baseCommit) {
-    try {
-      execSync('git checkout main', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch {
-      try {
-        execSync('git checkout master', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
-      } catch { /* ignore */ }
-    }
   }
 
   // Start all agent sessions — each with its own timeout from slice config
   const adapters = states.map((st, i) => {
     const timeout = slices[i]?.agentTimeout;
-    return createExecutorAdapter(adapterType, agentName, timeout);
+    return createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
   });
 
   const startTime = Date.now();
@@ -1246,7 +1259,7 @@ async function runParallel(args: string[]): Promise<number> {
           if (result.action === 'retry') {
             // Re-create adapter and re-start agent
             const timeout = slices[i]?.agentTimeout;
-            adapters[i] = createExecutorAdapter(adapterType, agentName, timeout);
+            adapters[i] = createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
             const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
             try {
               const { sessionId } = await adapters[i].start({ sliceId: st.id, prompt: bundlePath });
@@ -1281,11 +1294,30 @@ async function runParallel(args: string[]): Promise<number> {
   console.log('');
   const completed: Array<{ id: string; elapsedSec: number }> = [];
   const stalled: Array<{ id: string; exitCode: number | null }> = [];
+  const asked: Array<{ id: string; questionId: string; question: string }> = [];
 
   for (const result of results) {
     if (result.status === 'fulfilled') {
       const st = result.value;
       if (st.exitCode === 0) {
+        // 提问回路：某个切片以问题收尾 → 只挂起该切片，批次里其它切片不受影响
+        // （ADR-013 §3.5）
+        const idx = states.findIndex((s) => s.id === st.id);
+        const adapter = idx >= 0 ? adapters[idx] : undefined;
+        const sessionId = st.sessionId;
+        const question = adapter && sessionId
+          ? await detectQuestion(st.id, adapter, sessionId)
+          : null;
+
+        if (question) {
+          await suspendSliceForQuestion(st.id, question);
+          console.log(`❓ ${st.id}: asked a question (${question.type}) — suspended`);
+          console.log(`   ${question.question}`);
+          console.log(`   Answer with: zelto answer ${question.id} "<your answer>"`);
+          asked.push({ id: st.id, questionId: question.id, question: question.question });
+          continue;
+        }
+
         await store.transit(st.id, 'RUN_FINISH');
         await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
         console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
@@ -1302,11 +1334,20 @@ async function runParallel(args: string[]): Promise<number> {
 
   // Enhanced summary
   console.log('');
-  console.log(`📊 Parallel run complete: ${completed.length} passed, ${stalled.length} stalled`);
+  console.log(`?? Parallel run complete: ${completed.length} passed, ${stalled.length} stalled, ${asked.length} awaiting answer`);
+
+  if (asked.length > 0) {
+    console.log('');
+    console.log(`❓ Slices waiting for an answer:`);
+    for (const a of asked) {
+      console.log(`  ❓ ${a.id} — ${a.question}`);
+      console.log(`     zelto answer ${a.questionId} "<your answer>"`);
+    }
+  }
 
   if (stalled.length > 0) {
     console.log('');
-    console.log(`⚠️  Stalled slices (needs attention):`);
+    console.log(`??  Stalled slices (needs attention):`);
     for (const s of stalled) {
       console.log(`  ❌ ${s.id} — exit ${s.exitCode ?? 'signal'} (zelto resume ${s.id})`);
     }
@@ -1320,16 +1361,8 @@ async function runParallel(args: string[]): Promise<number> {
     }
   }
 
-  // Switch back to main after parallel run
-  if (baseCommit) {
-    try {
-      execSync('git checkout main', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch {
-      try {
-        execSync('git checkout master', { cwd: process.cwd(), timeout: 10000, stdio: ['pipe', 'pipe', 'pipe'] });
-      } catch { /* ignore */ }
-    }
-  }
+  // Note: the main worktree's branch is never switched — each slice runs in its own
+  // worktree, so there is nothing to switch back to.
 
   return stalled.length > 0 ? 1 : 0;
 }
@@ -1376,159 +1409,6 @@ register('admit', async (args) => {
   }
 });
 
-// ─── budget check (shared helper) ──────────────────────────────────────────────
-
-/**
- * Check if a slice has exceeded its budget limit.
- * Returns true if budget is OK, false if exhausted.
- */
-async function checkBudget(id: string): Promise<boolean> {
-  try {
-    const budget = new BudgetCollector(events, ZELTO_DIR);
-    const exhausted = await budget.isExhausted(id);
-    if (exhausted) {
-      const [spent, limit] = await Promise.all([budget.getSpent(id), budget.getLimit(id)]);
-      console.error(`  ⛔ Budget exhausted: $${spent.toFixed(2)} spent of $${limit.toFixed(2)} limit`);
-      await events.append(id, 'stall.classified', 'zelto', {
-        sliceId: id, class: 'budget_exhausted', spent, limit,
-      });
-      return false;
-    }
-    return true;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    // Budget check failure is non-fatal — proceed without enforcement
-    return true;
-  }
-}
-
-// ─── auto gate after run (shared helper) ─────────────────────────────────────
-
-async function autoGateAfterRun(id: string): Promise<void> {
-  const config = loadConfig();
-  const gateConfig: GateConfig = {
-    commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
-    profiles: config.gate.profiles,
-    changedLineCoverage: 0.8,
-    timeoutSec: config.gate.timeoutSec,
-    retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
-  };
-
-  const executor = new GateExecutor(store, events, gateConfig);
-  console.log(`\n  Auto-running gate②...`);
-  const report = await executor.execute(id);
-
-  console.log(`  Gate commands: ${report.results.length}`);
-  for (const r of report.results) {
-    const icon = r.passed ? '✅' : '❌';
-    console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
-    if (!r.passed && r.stderr) {
-      const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
-      for (const line of stderrLines) {
-        console.log(`       ${line.slice(0, 200)}`);
-      }
-    }
-  }
-
-  if (report.passed) {
-    console.log(`  Gate: ✅ Passed (${report.totalDurationMs.toFixed(0)}ms)`);
-    await store.transit(id, 'GATE_PASS');
-    await events.append(id, 'slice.state.changed', 'zelto', {
-      sliceId: id, from: 'frozen', to: 'completed', event: 'GATE_PASS',
-    });
-
-    const signManager = new SignManager(ZELTO_DIR, events, store);
-    const signReq = await signManager.request(id, 'zelto');
-    console.log(`  Sign: 📋 Request created (${signReq.id})`);
-    console.log(`  Next: zelto sign ${id} --approve`);
-  } else {
-    console.log(`  Gate: ❌ Failed (${report.totalDurationMs.toFixed(0)}ms)`);
-    if (report.retryCount > 0) {
-      console.log(`  Retries: ${report.retryCount}`);
-    }
-    console.log(`  Run: zelto gate ${id} to retry`);
-  }
-}
-
-// ─── handle agent failure with auto-retry support ─────────────────────────
-
-/**
- * Handle a failed agent execution. For auto-resolvable stalls (permission_prompt,
- * environment_failure, context_exhaustion), automatically retry up to maxRetries.
- * For non-auto-resolvable stalls, write stall info and return 'stall'.
- *
- * @returns 'retry' if auto-retry is happening, 'stall' if the slice should stall
- */
-export async function handleAgentFailure(
-  id: string,
-  exitCode: number | null,
-  options?: { maxRetries?: number },
-): Promise<{ action: 'retry' | 'stall'; retryCount?: number }> {
-  const stallClass = classifyStall({
-    type: exitCode === null ? 'build_failure' : 'test_failure',
-    message: `Agent exited with code ${exitCode ?? 'signal'}`,
-    attempts: 1,
-  });
-
-  const maxRetries = options?.maxRetries ?? 2;
-
-  // Check if this stall class is auto-resolvable
-  if (isAutoResolvable(stallClass)) {
-    try {
-      const slice = await store.read(id);
-      const currentRetries = slice.stall.autoResolved ?? 0;
-
-      if (currentRetries < maxRetries) {
-        // Auto-retry: increment counter, log, return retry signal
-        slice.stall.autoResolved = currentRetries + 1;
-        // Don't set stall.class — slice is not stalled, just retrying
-        await store.write(slice);
-
-        await events.append(id, 'stall.classified', 'zelto', {
-          sliceId: id, class: stallClass, exitCode,
-          runAborted: true, autoRetry: true,
-          retryCount: currentRetries + 1, maxRetries,
-        });
-
-        console.log(`  🔄 Auto-retrying (${currentRetries + 1}/${maxRetries})...`);
-        return { action: 'retry', retryCount: currentRetries + 1 };
-      }
-
-      // Max retries exhausted — fall through to stall
-      console.log(`  ⚠️ Auto-retry exhausted (${maxRetries}/${maxRetries}) — stalling`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`  ⚠️ Could not check retry state: ${msg}`);
-      // Fall through to stall
-    }
-  }
-
-  // Non-auto-resolvable or retries exhausted: write stall info
-  try {
-    const slice = await store.read(id);
-    slice.stall.class = stallClass;
-    slice.stall.gateRetries = 0;
-    await store.write(slice);
-
-    await events.append(id, 'stall.classified', 'zelto', {
-      sliceId: id, class: stallClass, exitCode, runAborted: true,
-    });
-
-    // Prominent stall notification
-    const border = '═'.repeat(46);
-    console.log(`\n  ╔${border}╗`);
-    console.log(`  ║  ⚠️  SLICE STALLED: ${id.padEnd(28)}║`);
-    console.log(`  ║  Class: ${stallClass.padEnd(36)}║`);
-    console.log(`  ║  Action: zelto resume ${id.padEnd(22)}║`);
-    console.log(`  ╚${border}╝\n`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`  ⚠️ Could not write stall info: ${msg}`);
-  }
-
-  return { action: 'stall' };
-}
-
 // ─── start ────────────────────────────────────────────────────────────────────
 
 register('start', async (args) => {
@@ -1538,8 +1418,10 @@ register('start', async (args) => {
     return 1;
   }
 
-  // Confirmation prompt (skip with --yes)
-  if (!args.includes('--yes') && !args.includes('-y')) {
+  // Confirmation prompt (skip with --yes, or when stdin is not a TTY).
+  // Non-TTY means the command was invoked from a script/CI — there is nobody
+  // to answer the prompt, so waiting for input would hang forever.
+  if (!args.includes('--yes') && !args.includes('-y') && process.stdin.isTTY) {
     const title = extractFlagValue(args, '--title') ?? id;
     console.log(`About to execute slice "${id}" ("${title}")`);
     console.log(`  This will: create → freeze → run an AI agent`);
@@ -1576,7 +1458,7 @@ register('start', async (args) => {
     }
     isNew = true;
   } else {
-    console.log(`  ℹ️  Already exists: ${id}`);
+    console.log(`  ??  Already exists: ${id}`);
   }
 
   // Step 2: Freeze (if not already frozen)
@@ -1605,7 +1487,7 @@ register('start', async (args) => {
       });
       console.log(`  ✅ Frozen: ${id}`);
     } else {
-      console.log(`  ℹ️  Already frozen: ${id} (state=${current.state})`);
+      console.log(`  ??  Already frozen: ${id} (state=${current.state})`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1671,7 +1553,7 @@ register('start', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       const mins = Math.floor(elapsed / 60);
       const secs = elapsed % 60;
-      process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+      process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
     }, 1000);
 
     // Retry loop
@@ -1706,7 +1588,7 @@ register('start', async (args) => {
             const e = Math.floor((Date.now() - startTime) / 1000);
             const mins = Math.floor(e / 60);
             const secs = e % 60;
-            process.stdout.write(`\r  ⏱️  Agent running... ${mins}m ${secs}s`);
+            process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
           }, 1000);
           continue;
         }
@@ -1718,10 +1600,20 @@ register('start', async (args) => {
     }
 
     if (finalExitCode === 0) {
+      // 提问回路：agent 以问题收尾 → 挂起切片，不跑门禁（ADR-013 §3.6）
+      const question = await detectQuestion(id, adapter, sessionId);
+      if (question) {
+        await suspendSliceForQuestion(id, question);
+        console.log(`\n  ❓ Agent asked a question (${question.type}):`);
+        console.log(`     ${question.question}`);
+        console.log(`  Answer with: zelto answer ${question.id} "<your answer>"`);
+        return 0;
+      }
+
       await store.transit(id, 'RUN_FINISH');
       await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`  ✅ Agent completed successfully (${elapsed}s)`);
+      console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
       // Auto-run gate and create sign request on pass
       await autoGateAfterRun(id);
@@ -1958,7 +1850,7 @@ register('wait', async (args) => {
     task = await loadTask(taskId);
     if (!task || task.status !== 'running') break;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    process.stdout.write(`\r  ⏱️  Waiting... ${elapsed}s`);
+    process.stdout.write(`\r  ??  Waiting... ${elapsed}s`);
   }
 
   process.stdout.write('\r' + ' '.repeat(30) + '\r');

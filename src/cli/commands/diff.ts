@@ -6,7 +6,7 @@
  */
 
 import { register } from '../commands/shared.js';
-import { store } from '../commands/shared.js';
+import { store, existingWorktreePath } from '../commands/shared.js';
 import { colors } from '../color.js';
 import { execSync } from 'node:child_process';
 
@@ -23,6 +23,11 @@ register('diff', async (args) => {
   try {
     const slice = await store.read(id);
 
+    // Diff inside the slice's worktree when it exists — that's where the agent's
+    // (possibly uncommitted) changes live.
+    const worktreePath = existingWorktreePath(id);
+    const cwd = worktreePath ?? process.cwd();
+
     // Determine diff base: use baseCommit, or try git log to find the frozen state
     let baseRef: string | null = slice.baseCommit;
     if (!baseRef) {
@@ -30,7 +35,7 @@ register('diff', async (args) => {
       try {
         const log = execSync(
           `git log --all --oneline --diff-filter=A -- specs/slices/${id}.md`,
-          { encoding: 'utf-8', timeout: 5000, cwd: process.cwd() },
+          { encoding: 'utf-8', timeout: 5000, cwd },
         ).trim();
         if (log) {
           baseRef = log.split('\n')[0].split(' ')[0];
@@ -41,7 +46,11 @@ register('diff', async (args) => {
     }
 
     // Default fallback
-    const diffTarget = baseRef ? `${baseRef}..HEAD` : '--cached';
+    // In a worktree the agent's changes are usually uncommitted, so diff against the
+    // base commit directly (covers both committed and working-tree changes).
+    const diffTarget = worktreePath
+      ? (baseRef ?? 'HEAD')
+      : (baseRef ? `${baseRef}..HEAD` : '--cached');
 
     // Get file change stats
     let statOutput = '';
@@ -51,16 +60,27 @@ register('diff', async (args) => {
     try {
       statOutput = execSync(
         `git diff ${diffTarget} --stat`,
-        { encoding: 'utf-8', timeout: 10000, cwd: process.cwd() },
+        { encoding: 'utf-8', timeout: 10000, cwd },
       ).trim();
     } catch { /* no changes */ }
 
     try {
       nameOutput = execSync(
         `git diff ${diffTarget} --name-status`,
-        { encoding: 'utf-8', timeout: 10000, cwd: process.cwd() },
+        { encoding: 'utf-8', timeout: 10000, cwd },
       ).trim();
     } catch { /* no changes */ }
+
+    // Uncommitted changes inside the worktree are not part of `base..HEAD`
+    let uncommittedOutput = '';
+    if (worktreePath) {
+      try {
+        uncommittedOutput = execSync(
+          'git diff HEAD --stat',
+          { encoding: 'utf-8', timeout: 10000, cwd },
+        ).trim();
+      } catch { /* no changes */ }
+    }
 
     if (isStat && !isJson) {
       console.log(`Changes for slice "${id}":`);
@@ -76,7 +96,7 @@ register('diff', async (args) => {
     try {
       diffOutput = execSync(
         `git diff ${diffTarget}`,
-        { encoding: 'utf-8', timeout: 10000, cwd: process.cwd() },
+        { encoding: 'utf-8', timeout: 10000, cwd },
       ).trim();
     } catch { /* no changes */ }
 
@@ -93,8 +113,10 @@ register('diff', async (args) => {
       console.log(JSON.stringify({
         sliceId: id,
         baseRef,
+        worktree: worktreePath,
         files,
         diff: diffOutput || null,
+        uncommitted: uncommittedOutput || null,
       }, null, 2));
       return 0;
     }
@@ -102,9 +124,12 @@ register('diff', async (args) => {
     // Default: human-readable output
     console.log(`${colors.bold(`Changes for slice "${id}":`)}`);
     console.log(`  ${colors.dim(`Base: ${baseRef ?? '(working tree vs cached)'}`)}`);
+    if (worktreePath) {
+      console.log(`  ${colors.dim(`Worktree: ${worktreePath}`)}`);
+    }
     console.log('');
 
-    if (!nameOutput && !diffOutput) {
+    if (!nameOutput && !diffOutput && !uncommittedOutput) {
       console.log('  No changes detected.');
       return 0;
     }

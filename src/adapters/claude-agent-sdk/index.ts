@@ -120,6 +120,8 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   private readonly progressIntervals = new Map<string, ReturnType<typeof setInterval>>();
   /** Buffer of events per session, for the events() method */
   private readonly sessionEvents = new Map<string, EventEnvelope[]>();
+  /** Accumulated agent text output per session */
+  private readonly sessionText = new Map<string, string>();
   /** Resolve functions for waitForExit promises, keyed by sessionId */
   private readonly exitResolvers = new Map<string, (code: number | null) => void>();
 
@@ -265,9 +267,13 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
         this.sessionEvents.set(sessionId, [...eventBuffer]);
 
         // Capture text output for progress callbacks
-        if (this.onOutput && msgType === 'text') {
-          const text = (msg.text as string) ?? (msg.content as string) ?? '';
-          if (text) {
+        const text = (msg.text as string) ?? (msg.content as string) ?? '';
+        if (msgType === 'text' && text) {
+          this.sessionText.set(
+            sessionId,
+            (this.sessionText.get(sessionId) ?? '') + text,
+          );
+          if (this.onOutput) {
             this.onOutput(sessionId, text);
           }
         }
@@ -347,7 +353,7 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     }
   }
 
-  async resume(_sessionId: string, _patch: string): Promise<void> {
+  async resume(_sessionId: string, _patch: string): Promise<{ sessionId: string }> {
     // Read the session's event history to rebuild context
     const existingEvents = this.sessionEvents.get(_sessionId);
     const contextSummary =
@@ -376,6 +382,42 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     });
 
     this.consumeGenerator(newSessionId, { sliceId: _sessionId, prompt: combinedPrompt }, gen, 0).catch(() => {});
+
+    return { sessionId: newSessionId };
+  }
+
+  /**
+   * Get the agent's output text for a session.
+   *
+   * The SDK adapter keeps the full message history; the text messages make up
+   * the agent's answer.
+   */
+  getOutput(sessionId: string): string {
+    const text = this.sessionText.get(sessionId);
+    if (text) return text;
+    const events = this.sessionEvents.get(sessionId) ?? [];
+    const parts: string[] = [];
+    for (const e of events) {
+      const payload = e.payload as Record<string, unknown> | undefined;
+      if (!payload) continue;
+      if (payload.type === 'text') {
+        const text = (payload.text as string) ?? '';
+        if (text) parts.push(text);
+      } else if (typeof payload.result === 'string') {
+        parts.push(payload.result);
+      }
+    }
+    return parts.join('\n');
+  }
+
+  /**
+   * The agent-side conversation id.
+   *
+   * The SDK adapter does not expose the underlying conversation id, so it
+   * cannot be continued verbatim (ADR-013 §3.4).
+   */
+  getAgentSessionId(_sessionId: string): string | null {
+    return null;
   }
 
   async stop(sessionId: string): Promise<void> {

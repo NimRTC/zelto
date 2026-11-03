@@ -19,6 +19,9 @@ register('slice', async (args) => {
   if (subcommandOrId === 'validate') {
     return handleSliceValidate(rest, f);
   }
+  if (subcommandOrId === 'version') {
+    return handleSliceVersion(rest, f);
+  }
 
   // Default: show slice detail
   const id = subcommandOrId;
@@ -26,6 +29,7 @@ register('slice', async (args) => {
     f.error('USAGE', 'Usage: zelto slice <slice-id> [--json]');
     f.out('       zelto slice create <id> [--title <title>]');
     f.out('       zelto slice validate <id>');
+    f.out('       zelto slice version <id>');
     return 1;
   }
 
@@ -368,6 +372,73 @@ function validateSpecContent(id: string, content: string): string[] {
   }
 
   return errors;
+}
+
+// ─── slice version ────────────────────────────────────────────────────────────
+
+/**
+ * Parse YAML frontmatter from a markdown file.
+ * Returns the parsed frontmatter as a record, or null if no frontmatter exists.
+ * Frontmatter must be delimited by `---` at the start of the file.
+ */
+function parseFrontmatter(content: string): Record<string, string> | null {
+  if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return null;
+
+  const endIdx = content.indexOf('\n---', 3);
+  if (endIdx < 0) return null;
+
+  const fmLines = content.slice(4, endIdx).split('\n');
+  const result: Record<string, string> = {};
+
+  for (const line of fmLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const sepIdx = trimmed.indexOf(':');
+    if (sepIdx < 0) continue;
+    const key = trimmed.slice(0, sepIdx).trim();
+    let value = trimmed.slice(sepIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key) result[key] = value;
+  }
+
+  return result;
+}
+
+/**
+ * Show the version of a slice from its spec file's frontmatter.
+ * Usage: zelto slice version <id>
+ * Output: <id> v<version>
+ */
+async function handleSliceVersion(args: string[], f: ReturnType<typeof getDefaultFormatter>): Promise<number> {
+  const [id] = args;
+
+  if (!id || id === '--help' || id === '-h') {
+    f.error('USAGE', 'Usage: zelto slice version <id>');
+    return 1;
+  }
+
+  const specDir = resolveSpecDir();
+  const specPath = join(specDir, `${id}.md`);
+
+  if (!existsSync(specPath)) {
+    f.error('NOT_FOUND', `slice ${id} not found`);
+    return 1;
+  }
+
+  const content = readFileSync(specPath, 'utf-8');
+  const frontmatter = parseFrontmatter(content);
+
+  if (!frontmatter || !frontmatter.version) {
+    f.error('NO_VERSION', `slice ${id} has no version`);
+    return 1;
+  }
+
+  f.out(`${id} v${frontmatter.version}`);
+  return 0;
 }
 
 /**

@@ -12,6 +12,7 @@ import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js'
 import { EventStream } from '../../core/events/stream.js';
 import type { Decision, PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { SliceStore } from '../../core/slice/store.js';
+import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -223,6 +224,8 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentTimeout: number | undefined;
   let agentMaxRetries: number | undefined;
   let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
+  /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
+  let currentCommandIndent = 0;
   let inGateSection = false;
   let inAgentSection = false;
   let inLlmSection = false;
@@ -243,12 +246,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   const targetProjectCommands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
   const targetProjectProfiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
   let currentTpCommand: { name: string; run: string; timeoutSec?: number } | null = null;
+  /** 缩进层级：区分命令自身的 timeoutSec 与上层配置 */
+  let currentTpCommandIndent = 0;
   let inTpProfileSection = false;
   let currentTpProfile: string | null = null;
 
   const lines = content.split('\n');
   for (const line of lines) {
     const trimmed = line.trim();
+    const indent = line.length - trimmed.length;
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
     if (trimmed === 'gate:' && !inTargetProjectSection) {
@@ -328,6 +334,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
           }
         }
         currentCommand = { name: inlineMatch[1], run: inlineMatch[2] };
+        currentCommandIndent = indent;
         continue;
       }
 
@@ -340,6 +347,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
           }
         }
         currentCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
+        currentCommandIndent = indent;
         continue;
       }
 
@@ -350,13 +358,12 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
-      // Per-command timeout (indented under a command item)
+      // timeoutSec：缩进比命令项更深 → 该命令专属；否则 → gate 全局
       if (trimmed.startsWith('timeoutSec:')) {
-        if (currentCommand && currentCommand.run) {
-          // Per-command timeout
+        const isPerCommand = currentCommand !== null && currentCommand.run !== '' && indent > currentCommandIndent;
+        if (isPerCommand && currentCommand) {
           currentCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
         } else {
-          // Global timeout
           timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
         }
         continue;
@@ -417,7 +424,6 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
 
     if (inTargetProjectSection) {
       // Track indentation depth to detect when targetProject ends
-      const indent = line.length - trimmed.length;
       if (indent <= targetProjectDepth && indent > 0 && trimmed.includes(':')) {
         // Sub-section header within targetProject
       }
@@ -477,6 +483,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
             }
           }
           currentTpCommand = { name: inlineMatch[1], run: inlineMatch[2] };
+          currentTpCommandIndent = indent;
           continue;
         }
 
@@ -489,6 +496,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
             }
           }
           currentTpCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
+          currentTpCommandIndent = indent;
           continue;
         }
 
@@ -500,7 +508,8 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         }
 
         if (trimmed.startsWith('timeoutSec:')) {
-          if (currentTpCommand && currentTpCommand.run) {
+          // 缩进比命令项更深 → 该命令专属；否则忽略（targetProject.gate 没有全局超时）
+          if (currentTpCommand && currentTpCommand.run && indent > currentTpCommandIndent) {
             currentTpCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
           }
           continue;
@@ -596,6 +605,73 @@ export function resolveSpecDir(): string {
     return resolve(projectDir, specDir);
   }
   return resolve(process.cwd(), 'specs', 'slices');
+}
+
+// ─── Worktree Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Shared worktree manager rooted at the current working directory.
+ * Path convention: `.zelto/worktrees/<sliceId>`, branch `slice/<sliceId>`.
+ */
+export function worktreeManager(): WorktreeManager {
+  return new WorktreeManager(process.cwd());
+}
+
+/**
+ * Return the absolute path of a slice's worktree if it exists, else null.
+ * Used by gate / diff / merge paths that must operate inside the isolated directory.
+ */
+export function existingWorktreePath(sliceId: string): string | null {
+  const manager = worktreeManager();
+  return manager.exists(sliceId) ? manager.pathFor(sliceId) : null;
+}
+
+/**
+ * Remove a slice's worktree and write a `worktree.removed` event (C4).
+ * Never swallows errors — the caller decides how to report them.
+ */
+export async function removeWorktree(sliceId: string, options: { force?: boolean } = {}): Promise<void> {
+  const manager = worktreeManager();
+  await manager.remove(sliceId, options);
+  await events.append(sliceId, 'worktree.removed', 'zelto', {
+    sliceId,
+    path: manager.relativePathFor(sliceId),
+    branch: manager.branchFor(sliceId),
+  });
+}
+
+/**
+ * Create (or reuse) the isolated worktree for a slice.
+ *
+ * Returns null when the current directory is not inside a git repository —
+ * worktree isolation is then impossible, and the caller degrades to running
+ * in the current directory (same behaviour as before isolation existed).
+ *
+ * Emits a `worktree.created` event (C4) when a new worktree is created.
+ */
+export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
+  const manager = worktreeManager();
+  if (!manager.isGitRepo()) return null;
+
+  const slice = await store.read(id);
+
+  const existed = manager.exists(id);
+  const info = await manager.create(id, {
+    baseCommit: slice.baseCommit ?? null,
+    specPath: slice.spec.path,
+    acceptanceDir: slice.acceptance.dir,
+  });
+
+  if (!existed) {
+    await events.append(id, 'worktree.created', 'zelto', {
+      sliceId: id,
+      path: info.relativePath,
+      branch: info.branch,
+      baseCommit: info.baseCommit,
+    });
+  }
+
+  return info;
 }
 
 // ─── Policy YAML Parser ─────────────────────────────────────────────────────
@@ -700,19 +776,22 @@ export type AdapterType = 'claude-agent' | 'claude-agent-sdk';
  * @param overrideType — Optional override from CLI --adapter flag
  * @param agentCommand — Agent command string (for claude-agent adapter)
  * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
+ * @param cwd — Optional working directory (e.g. an isolated worktree). Defaults to process.cwd().
  */
 export function createExecutorAdapter(
   overrideType?: string,
   agentCommand?: string,
   timeoutSec?: number,
+  cwd?: string,
 ): ExecutorAdapter {
   const cfg = loadConfig();
   const type = (overrideType ?? cfg.agent.adapter ?? 'claude-agent') as AdapterType;
   const timeoutMs = (timeoutSec ?? cfg.agent.timeout ?? 900) * 1000;
+  const workDir = cwd ?? process.cwd();
 
   if (type === 'claude-agent-sdk') {
     return new ClaudeAgentSdkAdapter({
-      cwd: process.cwd(),
+      cwd: workDir,
       model: cfg.llm?.model,
       env: process.env as Record<string, string>,
     });
@@ -720,7 +799,7 @@ export function createExecutorAdapter(
 
   // Default: claude-agent (shell spawn)
   return new ClaudeAgentAdapter({
-    cwd: process.cwd(),
+    cwd: workDir,
     agentCommand: agentCommand ?? cfg.agent.command,
     timeoutMs,
   });

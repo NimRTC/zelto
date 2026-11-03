@@ -7,6 +7,7 @@ import { OutputFormat, setDefaultFormatter, getDefaultFormatter, initFormatter }
 
 // Import all command group files — these call register() as module-level side effects
 import './core-slice.js';
+import './question.js';
 import './slices.js'; // Overrides slices from core-slice with --active/--json support
 import './slice-detail.js';
 import './config.js';
@@ -26,6 +27,9 @@ import './spec-md.js';
 import './slice-status.js';
 import './drift.js';
 import './dashboard.js';
+import './depgraph.js';
+import './artifact.js';
+import './merge.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────

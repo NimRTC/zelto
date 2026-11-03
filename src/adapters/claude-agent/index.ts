@@ -10,7 +10,8 @@
 // - Output capture for event logging
 // - Temp file cleanup on exit
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { join, dirname } from 'node:path';
 import {
   readFileSync, writeFileSync, mkdtempSync, rmSync,
@@ -36,6 +37,18 @@ export interface PersistentSessionData {
   maxRetries: number;
   prompt: string;        // original bundle path for retry
   output: string[];
+  /**
+   * Agent-side session id (the Claude Code session uuid).
+   *
+   * zelto generates it at start time and passes it via `--session-id`, so that
+   * the very same conversation can be continued later with `--resume`.
+   * Null for agents whose command does not support the flag.
+   */
+  agentSessionId: string | null;
+  /** Working directory the agent ran in — resume must use the same one. */
+  cwd: string;
+  /** zelto session this one continues (null for a fresh start). */
+  resumedFrom: string | null;
 }
 
 function sessionPath(sessionId: string): string {
@@ -85,10 +98,10 @@ interface ClaudeAgentAdapterOptions {
 }
 
 const ADAPTER_META: AdapterMeta = {
-  version: '2.0.0',
-  description: 'Claude Code CLI adapter — spawns npx claude-code with session persistence, timeout, and retry',
+  version: '2.2.0',
+  description: 'Claude Code CLI adapter — spawns npx claude-code with session persistence, timeout, retry, and same-session resume',
   capabilities: {
-    resume: false,
+    resume: true,
     events: false,
     modelSelection: false,
   },
@@ -100,6 +113,14 @@ interface SessionState {
   sliceId: string;
   retryCount: number;
   output: string[];
+  /** True once the child has exited — waitForExit resolves immediately then. */
+  exited: boolean;
+  exitCode: number | null;
+}
+
+/** Flags appended when the agent command is Claude Code. */
+function claudeCodeFlags(extra: string[] = []): string {
+  return ['--print', '--permission-mode', 'bypassPermissions', ...extra].join(' ');
 }
 
 export class ClaudeAgentAdapter implements ExecutorAdapter {
@@ -111,10 +132,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   private readonly env: NodeJS.ProcessEnv;
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
-  private readonly useClaudeCodeFlags: boolean;
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
   private readonly sessions = new Map<string, SessionState>();
+  /** Live session records — the in-memory twin of the persisted session file. */
+  private readonly sessionData = new Map<string, PersistentSessionData>();
   private timeouts = new Map<string, ReturnType<typeof setTimeout>>();
   private progressIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -126,8 +148,6 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     this.maxRetries = options.maxRetries ?? 2;
     this.onOutput = options.onOutput;
     this.onProgress = options.onProgress;
-    // Detect if the command is Claude Code (npx or direct binary)
-    this.useClaudeCodeFlags = /claude(-code)?\b/.test(this.agentCommand);
   }
 
   // ─── Session Recovery ──────────────────────────────────────────────────────
@@ -180,16 +200,61 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       instructions = spec.prompt;
     }
 
+    // Every run gets its own agent-side session id up front, so that the very
+    // same conversation can be continued later with `--resume` (ADR-013 §3.4).
+    const agentSessionId = randomUUID();
+
+    return this.spawn({
+      sessionId,
+      sliceId: spec.sliceId,
+      instructions,
+      bundlePath,
+      retryCount,
+      agentSessionId,
+      resumeAgentSessionId: null,
+      resumedFromZelto: null,
+    });
+  }
+
+  /**
+   * Spawn the agent process.
+   *
+   * Shared by `start` (fresh conversation) and `resume` (continuation).
+   * `agentSessionId` is the Claude Code conversation id; `resumeFrom` is the
+   * agent-side id to continue — when set, `--resume` is used instead of
+   * `--session-id`.
+   */
+  private spawn(opts: {
+    sessionId: string;
+    sliceId: string;
+    instructions: string;
+    bundlePath: string;
+    retryCount: number;
+    agentSessionId: string;
+    /** Agent-side conversation id to continue (null → fresh conversation). */
+    resumeAgentSessionId: string | null;
+    /** zelto session this one continues (null → fresh start). */
+    resumedFromZelto: string | null;
+    cwd?: string;
+    agentCommand?: string;
+  }): { sessionId: string } {
+    const { sessionId, sliceId, instructions, bundlePath, retryCount, agentSessionId } = opts;
+    const workDir = opts.cwd ?? this.cwd;
+    // Resume must use the very same agent command as the original run —
+    // otherwise the continuation would talk to a different agent.
+    const agentCommand = opts.agentCommand ?? this.agentCommand;
+    const isClaudeCode = /claude(-code)?\b/.test(agentCommand);
+
     // Write instructions to a temp file
     const tmpDir = mkdtempSync(join(tmpdir(), 'zelto-prompt-'));
-    const tmpFile = join(tmpDir, `${spec.sliceId}.txt`);
+    const tmpFile = join(tmpDir, `${sliceId}.txt`);
     writeFileSync(tmpFile, instructions, 'utf-8');
 
     // Create persistent session data
     const sessionData: PersistentSessionData = {
       sessionId,
-      sliceId: spec.sliceId,
-      agentCommand: this.agentCommand,
+      sliceId,
+      agentCommand,
       startedAt: new Date().toISOString(),
       status: 'running',
       exitCode: null,
@@ -198,8 +263,14 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       maxRetries: this.maxRetries,
       prompt: bundlePath,
       output: [],
+      agentSessionId,
+      cwd: workDir,
+      resumedFrom: opts.resumedFromZelto,
     };
     saveSession(sessionData);
+    // Keep the live object in memory so the output collected while running is
+    // not lost when the session is finalised (C1 — the file is the truth).
+    this.sessionData.set(sessionId, sessionData);
 
     // Spawn with --print for non-interactive execution
     // Use --permission-mode bypassPermissions since zelto's own policy system governs access
@@ -208,24 +279,31 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const spawnEnv: NodeJS.ProcessEnv = { ...this.env };
     delete spawnEnv.ANTHROPIC_MODEL;
 
-    // Add Claude Code-specific flags only when running Claude Code
-    const claudeFlags = this.useClaudeCodeFlags
-      ? ' --print --permission-mode bypassPermissions'
+    // Add Claude Code-specific flags only when running Claude Code.
+    // Continuing a conversation uses `--resume <agentSessionId>`; a fresh run
+    // pins the conversation id with `--session-id <agentSessionId>`.
+    const claudeFlags = isClaudeCode
+      ? ' ' + claudeCodeFlags(
+          opts.resumeAgentSessionId
+            ? ['--resume', opts.resumeAgentSessionId]
+            : ['--session-id', agentSessionId],
+        )
       : '';
 
     const child = spawn(
-      `${this.agentCommand}${claudeFlags} < "${tmpFile}"`,
+      `${agentCommand}${claudeFlags} < "${tmpFile}"`,
       [],
       {
-        cwd: this.cwd,
+        cwd: workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: true,
         env: {
           ...spawnEnv,
           ZELTO_BUNDLE: bundlePath,
-          ZELTO_SLICE_ID: spec.sliceId,
-          ZELTO_PROJECT_ROOT: this.cwd,
+          ZELTO_SLICE_ID: sliceId,
+          ZELTO_PROJECT_ROOT: workDir,
           ZELTO_SESSION_ID: sessionId,
+          ZELTO_AGENT_SESSION_ID: agentSessionId,
         },
       },
     );
@@ -253,9 +331,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const state: SessionState = {
       child,
       startedAt: sessionData.startedAt,
-      sliceId: spec.sliceId,
+      sliceId,
       retryCount,
       output: [],
+      exited: false,
+      exitCode: null,
     };
 
     this.sessions.set(sessionId, state);
@@ -301,7 +381,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    const data = loadSession(sessionId);
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data && data.status === 'running') {
       data.status = 'timeout';
       data.output.push(`[zelto: timeout after ${this.timeoutMs}ms]`);
@@ -336,19 +416,86 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       this.progressIntervals.delete(sessionId);
     }
 
-    // Update persistent session
-    const data = loadSession(sessionId);
+    // Update persistent session — use the live record so the output captured
+    // while running is preserved (the file on disk still holds the empty
+    // array written at start).
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data) {
       data.exitCode = exitCode;
       data.status = exitCode === 0 ? 'completed' : 'failed';
       saveSession(data);
     }
+
+    const state = this.sessions.get(sessionId);
+    if (state) {
+      state.exited = true;
+      state.exitCode = exitCode;
+    }
   }
 
   // ─── Resume ────────────────────────────────────────────────────────────────
 
-  async resume(_sessionId: string, _patch: string): Promise<void> {
-    throw new Error('resume not supported by ClaudeAgentAdapter');
+  /**
+   * Continue the same agent conversation.
+   *
+   * The agent-side session id is reused with `--resume`, so the agent keeps
+   * the context of the previous run (ADR-013 §3.4). The working directory
+   * stays the slice's worktree, so the write-set reservation is unaffected
+   * (C9).
+   */
+  async resume(sessionId: string, patch: string): Promise<{ sessionId: string }> {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    if (!data) {
+      throw new Error(`Session "${sessionId}" not found — cannot resume`);
+    }
+    if (!data.agentSessionId) {
+      throw new Error(
+        `Session "${sessionId}" has no agent-side session id — cannot continue the same conversation`,
+      );
+    }
+
+    const newSessionId = `claude-agent-${data.sliceId}-${Date.now()}-resume`;
+    const instructions = [
+      'You previously asked a question and the human answered it.',
+      '',
+      'The answer is:',
+      patch,
+      '',
+      'Continue the work in this same session. If anything is still unclear, ask again using the question marker.',
+    ].join('\n');
+
+    return this.spawn({
+      sessionId: newSessionId,
+      sliceId: data.sliceId,
+      instructions,
+      bundlePath: data.prompt,
+      retryCount: data.retryCount,
+      agentSessionId: data.agentSessionId,
+      resumeAgentSessionId: data.agentSessionId,
+      resumedFromZelto: sessionId,
+      cwd: data.cwd || this.cwd,
+      agentCommand: data.agentCommand || this.agentCommand,
+    });
+  }
+
+  // ─── Output ────────────────────────────────────────────────────────────────
+
+  /**
+   * Get the agent's output text for a session.
+   *
+   * Prefers the in-memory record (complete) and falls back to the persisted
+   * file (survives a restart).
+   */
+  getOutput(sessionId: string): string {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    if (!data) return '';
+    return data.output.join('');
+  }
+
+  /** The agent-side conversation id (the Claude Code session uuid). */
+  getAgentSessionId(sessionId: string): string | null {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    return data?.agentSessionId ?? null;
   }
 
   // ─── Stop ──────────────────────────────────────────────────────────────────
@@ -374,7 +521,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     }
 
     // Update persistent session
-    const data = loadSession(sessionId);
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data && data.status === 'running') {
       data.status = 'killed';
       data.output.push('[zelto: session stopped by user]');
@@ -405,6 +552,12 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       return Promise.resolve(null);
     }
 
+    // The child may already have exited before waitForExit was called
+    // (the resume path spawns and then waits) — resolve immediately.
+    if (session.exited) {
+      return Promise.resolve(session.exitCode);
+    }
+
     return new Promise<number | null>((resolve) => {
       const checkExit = async (code: number | null) => {
         if (code === 0) {
@@ -416,6 +569,14 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
         if (code !== null && code !== 0 && session.retryCount < this.maxRetries) {
           const data = loadSession(sessionId);
           if (!data || !data.prompt) {
+            resolve(code);
+            return;
+          }
+
+          // A resumed session must NOT be auto-retried from the original
+          // bundle: that would restart the slice from scratch and throw away
+          // the human's answer. The human decides what to do next.
+          if (data.resumedFrom) {
             resolve(code);
             return;
           }
@@ -495,18 +656,52 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   /**
    * Check if the agent command is available on this system.
    * Returns null if available, or an error message if not.
+   *
+   * `where` / `which` only find executables on PATH — shell built-ins such as
+   * `echo` are reported by neither. Since the agent is spawned through a shell
+   * (`shell: true`), built-ins do run. So when the PATH lookup fails we fall
+   * back to asking the shell whether it knows the command.
    */
   static async checkAgentAvailable(agentCommand: string): Promise<string | null> {
+    const cmd = agentCommand.split(' ')[0]; // Get the base command
+    const lookup = process.platform === 'win32' ? 'where' : 'which';
+
     try {
-      const { execSync } = await import('node:child_process');
-      const cmd = agentCommand.split(' ')[0]; // Get the base command
-      execSync(`${process.platform === 'win32' ? 'where' : 'which'} ${cmd}`, {
-        stdio: 'ignore',
-        timeout: 5000,
-      });
+      execSync(`${lookup} ${cmd}`, { stdio: 'ignore', timeout: 5000 });
       return null;
     } catch {
+      // Not on PATH — check whether the shell can resolve it anyway.
+      if (this.isShellResolvable(cmd)) return null;
       return `Agent command "${agentCommand}" not found. Install it or update .zelto/config.yaml agent.command.`;
+    }
+  }
+
+  /**
+   * Whether the platform's shell can run the given command, even though it is
+   * not an executable on PATH.
+   *
+   * Windows: cmd.exe has a fixed set of built-ins; a command outside that set
+   * is genuinely missing. POSIX: `command -v` resolves built-ins, functions and
+   * aliases without executing them.
+   */
+  private static isShellResolvable(cmd: string): boolean {
+    if (process.platform === 'win32') {
+      const builtins = new Set([
+        'assoc', 'break', 'call', 'cd', 'chdir', 'cls', 'color', 'copy',
+        'date', 'del', 'dir', 'echo', 'endlocal', 'erase', 'exit', 'for',
+        'ftype', 'goto', 'if', 'md', 'mkdir', 'mklink', 'move', 'path',
+        'pause', 'popd', 'prompt', 'pushd', 'rd', 'rmdir', 'rem', 'ren',
+        'rename', 'set', 'setlocal', 'shift', 'start', 'time', 'title',
+        'type', 'ver', 'verify', 'vol',
+      ]);
+      return builtins.has(cmd.toLowerCase());
+    }
+
+    try {
+      execSync(`sh -c "command -v ${cmd} >/dev/null 2>&1"`, { stdio: 'ignore', timeout: 5000 });
+      return true;
+    } catch {
+      return false;
     }
   }
 }
