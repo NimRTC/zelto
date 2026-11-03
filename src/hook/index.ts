@@ -47,9 +47,9 @@ const PROTECTED_PATTERNS: readonly string[] = [
 
 function matchPath(pattern: string, path: string): boolean {
   const regexStr = pattern
-    .replace(/\./g, '\\.')
     .replace(/\*\*\//g, '<<<DS>>>/')   // **/ → sentinel (keeps trailing / for later)
     .replace(/\*\*/g, '<<<DSB>>>')     // bare ** → different sentinel
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')  // escape all regex metacharacters
     .replace(/\*/g, '[^/]*')
     .replace(/<<<DS>>>\//g, '(.+/|)')  // **/ → zero-or-more dirs (with optional /)
     .replace(/<<<DSB>>>/g, '.*');       // bare ** → any path
@@ -155,6 +155,21 @@ interface HookOutput {
 // ── Main ─────────────────────────────────────────────────────────────────
 
 function main() {
+  // Sub-command: `zelto-hook pretool` —— Claude Code PreToolUse 运行时判定（ADR-014）
+  if (process.argv[2] === 'pretool') {
+    void import('./pretool.js')
+      .then((mod) => mod.main(process.argv.slice(3)))
+      .then((code: number) => {
+        process.exitCode = code;
+      })
+      .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`zelto pretool hook error: ${message}\n`);
+        process.exitCode = 2;
+      });
+    return;
+  }
+
   // Determine project root: prefer env var, then cwd, then script-relative
   const projectRoot = process.env.ZELTO_PROJECT_ROOT
     ?? process.cwd()

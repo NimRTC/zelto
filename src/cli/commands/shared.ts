@@ -10,9 +10,14 @@ import { EventEmittingLlmAdapter, type PricingTable } from '../../adapters/llm/e
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js';
 import { EventStream } from '../../core/events/stream.js';
-import type { Decision, PolicyConfig, PolicyRule } from '../../core/policy/types.js';
+import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
+import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
 import { SliceStore } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
+
+// 策略解析的唯一实现在 core/policy/yaml.ts（ADR-014 §4）。
+// 这里转出去是为了不破坏既有调用方。
+export { parsePolicyYaml } from '../../core/policy/yaml.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -202,18 +207,11 @@ function validateConfig(config: ZeltoConfig): void {
 }
 
 /**
- * Strip surrounding double quotes from a string, but only if they wrap the entire value.
- * Preserves embedded quotes inside the string.
- * E.g. '"npx claude-code"' → 'npx claude-code'
- *      'echo "hello"' → 'echo "hello"' (no change)
+ * Parse .zelto/config.yaml into a ZeltoConfig.
+ *
+ * Quote stripping is delegated to core/policy/yaml.ts so that config and
+ * policy parsing share one definition of "surrounding quotes".
  */
-function stripSurroundingQuotes(s: string): string {
-  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-    return s.slice(1, -1);
-  }
-  return s;
-}
-
 export function parseConfigYaml(content: string): ZeltoConfig | null {
   const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
   const profiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
@@ -675,74 +673,7 @@ export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
 }
 
 // ─── Policy YAML Parser ─────────────────────────────────────────────────────
-
-export function parsePolicyYaml(content: string): { rules: PolicyRule[] } {
-  const rules: PolicyRule[] = [];
-  let currentRule: Record<string, unknown> | null = null;
-
-  const lines = content.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#') || trimmed === '') continue;
-
-    if (trimmed.startsWith('- id:')) {
-      if (currentRule?.id) rules.push(currentRule as unknown as PolicyRule);
-      currentRule = { id: trimmed.slice(5).trim(), match: {} };
-      continue;
-    }
-
-    if (!currentRule) continue;
-
-    const matchInline = trimmed.match(
-      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
-    );
-    if (matchInline) {
-      currentRule.match = {
-        path: matchInline[1],
-        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('path:')) {
-      currentRule.match = {
-        ...(currentRule.match as Record<string, unknown>),
-        path: stripSurroundingQuotes(trimmed.slice(5).trim()),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('operation:')) {
-      currentRule.match = {
-        ...(currentRule.match as Record<string, unknown>),
-        operation: stripSurroundingQuotes(trimmed.slice(10).trim()),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('action:')) {
-      currentRule.action = trimmed.slice(7).trim() as Decision;
-      continue;
-    }
-
-    if (trimmed.startsWith('basis:')) {
-      currentRule.basis = stripSurroundingQuotes(trimmed.slice(6).trim());
-      continue;
-    }
-
-    if (trimmed.startsWith('guidance:')) {
-      currentRule.guidance = stripSurroundingQuotes(trimmed.slice(9).trim());
-      continue;
-    }
-
-    if (trimmed.startsWith('priority:')) {
-      currentRule.priority = Number.parseInt(trimmed.slice(9).trim(), 10);
-    }
-  }
-
-  if (currentRule?.id) rules.push(currentRule as unknown as PolicyRule);
-  return { rules };
-}
+// 实现已收敛到 core/policy/yaml.ts；此处保留转出以兼容既有调用方。
 
 // ─── LLM Helper ──────────────────────────────────────────────────────────────
 

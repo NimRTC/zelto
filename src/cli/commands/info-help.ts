@@ -589,7 +589,7 @@ register('completion', async (args) => {
     'stall', 'resume', 'status', 'events', 'init', 'summary', 'report',
     'require', 'design', 'plan', 'version', 'pipeline',
     'ask', 'answer',
-    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'patch-content', 'diff-highlight', 'help', 'completion',
+    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'reservation', 'patch-content', 'diff-highlight', 'help', 'completion',
   ];
   const subcommands = {
     require: ['list', 'confirm', 'refine'],
@@ -623,170 +623,22 @@ register('completion', async (args) => {
   return 0;
 });
 
-// ─── hook ────────────────────────────────────────────────────────────────────
+// ─── hook ────────────────────────────────────────────────────────────────
+//
+// 实现搬到 hook-install.ts：git hooks + Claude Code PreToolUse 钩子（ADR-014）。
 
 register('hook', async (args) => {
-  const action = args[0];
-  const GIT_HOOKS_DIR = join(process.cwd(), '.git', 'hooks');
-  const HOOK_MARKER = '# zelto-hook — DO NOT EDIT';
+  const { hookCommand } = await import('./hook-install.js');
+  return hookCommand(args);
+});
 
-  function hookScript(name: string, condition: string): string {
-    return `#!/bin/sh
-${HOOK_MARKER}
-# Auto-installed by \`zelto hook --install\`
-# Runs zelto-hook policy check on ${name}
+// ─── reservation ────────────────────────────────────────────────────────────
+//
+// 写集预约的查看与释放（C9）。
 
-# Validate zelto-hook binary exists
-ZELTO_HOOK="$(git rev-parse --show-toplevel 2>/dev/null)/dist/hook/index.js"
-if [ ! -f "$ZELTO_HOOK" ]; then
-  echo "⚠️  zelto-hook: Binary not found at \$ZELTO_HOOK"
-  echo "   Run 'pnpm build' or 'npx tsc -p tsconfig.json' first."
-  echo "   To skip zelto check: git commit --no-verify"
-  exit 0
-fi
-
-${condition}
-if [ \$? -ne 0 ]; then
-  FILES="${name === 'pre-commit' ? '$(git diff --cached --name-only --diff-filter=ACMR)' : '$(git diff --name-only @{push}.. 2>/dev/null || git diff --name-only HEAD~1..)'}"
-  if [ -z "$FILES" ]; then
-    exit 0
-  fi
-
-  HAS_DENY=0
-  echo "$FILES" | while IFS= read -r file; do
-    if [ -n "$file" ]; then
-      RESULT=$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"git\\"}" | node "$ZELTO_HOOK" 2>/dev/null)
-      DECISION=$(echo "$RESULT" | grep -o '"decision":"[^"]*"' | head -1 | cut -d'"' -f4)
-      if [ "$DECISION" = "deny" ]; then
-        echo "❌ zelto-hook: DENIED write to $file"
-        BASIS=$(echo "$RESULT" | grep -o '"basis":"[^"]*"' | head -1 | cut -d'"' -f4)
-        echo "   Basis: $BASIS"
-        HAS_DENY=1
-      fi
-    fi
-  done
-
-  if [ "$HAS_DENY" = "1" ]; then
-    echo ""
-    echo "zelto-hook: Policy check failed. Commit blocked."
-    exit 1
-  fi
-fi
-`;
-  }
-
-  async function installHook(name: string, condition: string): Promise<boolean> {
-    // Check if zelto-hook binary exists (warn if not, but don't block install)
-    // The hook script itself validates binary existence at runtime
-    const hookBinary = join(process.cwd(), 'dist', 'hook', 'index.js');
-    if (!existsSync(hookBinary)) {
-      console.warn(`  ⚠️  zelto-hook binary not found at dist/hook/index.js`);
-      console.warn(`     Hooks will be installed but will skip checks until "pnpm build" is run.`);
-    }
-
-    const hookPath = join(GIT_HOOKS_DIR, name);
-    if (existsSync(hookPath)) {
-      const existing = readFileSync(hookPath, 'utf-8');
-      if (!existing.includes(HOOK_MARKER) && !existing.includes('# zelto-hook')) {
-        console.error(`  ⚠️  ${name} already exists (not a zelto hook). Skipping.`);
-        console.error(`     Merge manually: ${hookPath}`);
-        return false;
-      }
-    }
-    writeFileSync(hookPath, hookScript(name, condition), 'utf-8');
-    try {
-      const { chmodSync } = await import('node:fs');
-      chmodSync(hookPath, 0o755);
-    } catch {
-      // Windows: chmod may fail
-    }
-    console.log(`  ✅ ${name} installed`);
-    return true;
-  }
-
-  async function uninstallHook(name: string): Promise<boolean> {
-    const hookPath = join(GIT_HOOKS_DIR, name);
-    if (!existsSync(hookPath)) return false;
-    const existing = readFileSync(hookPath, 'utf-8');
-    if (!existing.includes(HOOK_MARKER)) {
-      console.error(`  ⚠️  ${name} is not a zelto hook. Skipping.`);
-      return false;
-    }
-    try {
-      const { unlinkSync } = await import('node:fs');
-      unlinkSync(hookPath);
-    } catch {
-      writeFileSync(hookPath, '', 'utf-8');
-    }
-    console.log(`  ✅ ${name} uninstalled`);
-    return true;
-  }
-
-  if (action === '--install') {
-    const hookType = args[1] || 'all';
-    console.log('Installing zelto git hooks...');
-    let count = 0;
-    if (hookType === 'pre-commit' || hookType === 'all') {
-      if (await installHook('pre-commit', 'git diff --cached --quiet --exit-code')) count++;
-    }
-    if (hookType === 'pre-push' || hookType === 'all') {
-      if (await installHook('pre-push', 'git diff --quiet @{push}.. 2>/dev/null || git diff --quiet HEAD~1..')) count++;
-    }
-    console.log(`\n✅ ${count} hook(s) installed.`);
-    return 0;
-  }
-
-  if (action === '--uninstall') {
-    const hookType = args[1] || 'all';
-    console.log('Uninstalling zelto git hooks...');
-    let count = 0;
-    if (hookType === 'pre-commit' || hookType === 'all') {
-      if (await uninstallHook('pre-commit')) count++;
-    }
-    if (hookType === 'pre-push' || hookType === 'all') {
-      if (await uninstallHook('pre-push')) count++;
-    }
-    console.log(`\n✅ ${count} hook(s) uninstalled.`);
-    return 0;
-  }
-
-  if (action === '--check' || action === '--status') {
-    const checkType = args[1] || 'all';
-    let allPassed = true;
-    for (const name of checkType === 'all' ? ['pre-commit', 'pre-push'] : [checkType]) {
-      const hookPath = join(GIT_HOOKS_DIR, name);
-      if (existsSync(hookPath)) {
-        const content = readFileSync(hookPath, 'utf-8');
-        if (content.includes(HOOK_MARKER)) {
-          console.log(`  ✅ ${name} — zelto hook installed`);
-        } else {
-          console.log(`  ⚠️  ${name} — exists but not a zelto hook`);
-          allPassed = false;
-        }
-      } else {
-        console.log(`  ⬜ ${name} — not installed`);
-        allPassed = false;
-      }
-    }
-    return allPassed ? 0 : 0; // Always exit 0 for status check; user reads output
-  }
-
-  // Test a single file
-  const testPath = args.find((a) => !a.startsWith('--'));
-  if (testPath) {
-    const { evaluatePolicy, isProtectedPath, hashPolicy } = await import('../../core/policy/engine.js');
-    const config = loadPolicyConfig();
-    const policyVersion = hashPolicy(JSON.stringify(config));
-    const decision = evaluatePolicy(config, testPath, 'write', policyVersion);
-    console.log(JSON.stringify(decision, null, 2));
-    return 0;
-  }
-
-  console.error('Usage: zelto hook --install [pre-commit|pre-push|all]');
-  console.error('       zelto hook --uninstall [pre-commit|pre-push|all]');
-  console.error('       zelto hook --check [pre-commit|pre-push|all]');
-  console.error('       zelto hook <file-path>');
-  return 1;
+register('reservation', async (args) => {
+  const { reservationCommand } = await import('./reservation.js');
+  return reservationCommand(args);
 });
 
 // ─── stall ───────────────────────────────────────────────────────────────────

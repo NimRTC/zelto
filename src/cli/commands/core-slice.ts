@@ -35,6 +35,12 @@ import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, c
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
 import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites } from './run-support.js';
+import {
+  type RuntimeGuard,
+  enforceWriteSet,
+  installRuntimeGuard,
+  releaseGuards,
+} from './runtime-guard.js';
 
 // 供其它命令复用（ai-pipeline.ts / question.ts）
 export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
@@ -757,6 +763,11 @@ register('run', async (args) => {
 
   const isJson = args.includes('--json');
 
+  // 运行时守卫（C9）：预约 + 钩子。离开这个命令时必须释放 ——
+  // 除非是 detach 模式，那时由后台监视器接管。
+  let guard: RuntimeGuard | null = null;
+  let guardTransferred = false;
+
   try {
     const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
@@ -879,6 +890,27 @@ register('run', async (args) => {
     const sliceData = await store.read(id);
     const agentTimeout = sliceData.agentTimeout;
     const workDir = worktree?.path ?? process.cwd();
+
+    // 运行时守卫（C9）：取写集预约 + 装 PreToolUse 钩子。
+    // 钩子装在 agent 真正工作的那个目录里 —— Claude Code 只读 cwd 下的
+    // .claude/settings.local.json；预约与策略仍在主仓库（命令行里给了 --project-root）。
+    let activeGuard: RuntimeGuard;
+    try {
+      activeGuard = await installRuntimeGuard({
+        sliceId: id,
+        writes: bundle.writes,
+        worktree: worktree?.path ?? null,
+        projectRoot: process.cwd(),
+        baseCommit: worktree?.baseCommit ?? null,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ❌ 无法取得写集预约: ${msg}`);
+      return 1;
+    }
+    guard = activeGuard;
+    console.log(`  Reservation:   ${bundle.writes.join(', ') || '(空)'}`);
+
     let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
     let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
@@ -906,7 +938,8 @@ register('run', async (args) => {
       writeFileSync(join(tasksDir, `${taskId}.json`), JSON.stringify(taskInfo, null, 2), 'utf-8');
 
       // Spawn background monitor to update task status
-      monitorTaskInBackground(taskId, sessionId, adapter, id, startTime, isHotfix);
+      guardTransferred = true;
+      monitorTaskInBackground(taskId, sessionId, adapter, id, startTime, isHotfix, activeGuard);
       console.log(`zelto run ${id} — ✅ Detached (task: ${taskId})`);
       console.log(`  Session: ${sessionId}`);
       console.log(`  Run: zelto status ${taskId}`);
@@ -977,6 +1010,10 @@ register('run', async (args) => {
       break;
     }
 
+    // 写集审计（ADR-014 §5）：agent 跑完了，拿 git 的真实改动再对一次写集。
+    // 静态分析拦不住的写（`node -e "fs.writeFileSync(...)"` 之类）到这里兜住。
+    const withinBounds = await enforceWriteSet(id, activeGuard);
+
     if (finalExitCode === 0) {
       // 提问回路：agent 以问题收尾时，不算「运行成功」——挂起切片等人回答
       // （ADR-013 §3.6）。检测是确定性字符串解析，不调用模型。
@@ -992,6 +1029,12 @@ register('run', async (args) => {
         console.log(`   Slice "${id}" is suspended — answer with:`);
         console.log(`   zelto answer ${question.id} "<your answer>"`);
         return 0;
+      }
+
+      if (!withinBounds) {
+        // 越界：不进 gate、不自动签字 —— 等人处理
+        console.log(`\n❌ Slice "${id}" 写集越界 —— 未进入 gate，等人处理。`);
+        return 1;
       }
 
       await store.transit(id, 'RUN_FINISH');
@@ -1022,6 +1065,11 @@ register('run', async (args) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Error running slice "${id}": ${msg}`);
     return 1;
+  } finally {
+    // 释放写集预约 + 撤掉钩子。detach 模式下预约交给后台监视器，这里不动。
+    if (guard && !guardTransferred) {
+      await guard.release();
+    }
   }
   return 0;
 });
@@ -1123,6 +1171,9 @@ async function runParallel(args: string[]): Promise<number> {
   const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : loadConfig().agent.command;
   const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
 
+  // 每个切片一份运行时守卫（C9）：写集预约 + PreToolUse 钩子
+  const guards = new Map<string, RuntimeGuard>();
+
   // Check for uncommitted changes in the main worktree
   try {
     const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
@@ -1146,10 +1197,12 @@ async function runParallel(args: string[]): Promise<number> {
 
     // Create isolated worktree — the main worktree keeps its current branch.
     // Not inside a git repo → no isolation possible, degrade to the current directory.
+    let baseCommit: string | null = null;
     try {
       const wt = await ensureWorktree(st.id);
       if (wt) {
         st.worktreePath = wt.path;
+        baseCommit = wt.baseCommit;
         const wtBundleDir = join(wt.path, ZELTO_DIR);
         if (!existsSync(wtBundleDir)) mkdirSync(wtBundleDir, { recursive: true });
         writeFileSync(join(wtBundleDir, `${st.id}-bundle.json`), JSON.stringify(bundle, null, 2), 'utf-8');
@@ -1159,6 +1212,24 @@ async function runParallel(args: string[]): Promise<number> {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ❌ ${st.id}: 无法创建隔离 worktree: ${msg}`);
+      await releaseGuards(guards);
+      return 1;
+    }
+
+    // 写集预约 + PreToolUse 钩子（C9）
+    try {
+      const g = await installRuntimeGuard({
+        sliceId: st.id,
+        writes: bundle.writes,
+        worktree: st.worktreePath,
+        projectRoot: process.cwd(),
+        baseCommit,
+      });
+      guards.set(st.id, g);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  ❌ ${st.id}: 无法取得写集预约: ${msg}`);
+      await releaseGuards(guards);
       return 1;
     }
 
@@ -1259,7 +1330,12 @@ async function runParallel(args: string[]): Promise<number> {
           if (result.action === 'retry') {
             // Re-create adapter and re-start agent
             const timeout = slices[i]?.agentTimeout;
-            adapters[i] = createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
+            adapters[i] = createExecutorAdapter(
+              adapterType,
+              agentName,
+              timeout,
+              st.worktreePath ?? process.cwd(),
+            );
             const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
             try {
               const { sessionId } = await adapters[i].start({ sliceId: st.id, prompt: bundlePath });
@@ -1318,6 +1394,17 @@ async function runParallel(args: string[]): Promise<number> {
           continue;
         }
 
+        // 写集审计（ADR-014 §5）—— 越界就不进 gate
+        const withinBounds = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
+        if (!withinBounds) {
+          console.log(`❌ ${st.id}: 写集越界 — 未进入 gate，等人处理`);
+          await events.append(st.id, 'run.aborted', 'zelto', {
+            sliceId: st.id, exitCode: 0, reason: 'write-set violation',
+          });
+          stalled.push({ id: st.id, exitCode: 0 });
+          continue;
+        }
+
         await store.transit(st.id, 'RUN_FINISH');
         await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
         console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
@@ -1363,6 +1450,8 @@ async function runParallel(args: string[]): Promise<number> {
 
   // Note: the main worktree's branch is never switched — each slice runs in its own
   // worktree, so there is nothing to switch back to.
+
+  await releaseGuards(guards);
 
   return stalled.length > 0 ? 1 : 0;
 }
@@ -1680,6 +1769,7 @@ async function monitorTaskInBackground(
   sliceId: string,
   startTime: number,
   isHotfix: boolean,
+  guard?: RuntimeGuard,
 ): Promise<void> {
   try {
     const exitCode = await adapter.waitForExit(sessionId);
@@ -1696,8 +1786,11 @@ async function monitorTaskInBackground(
       await saveTask(task);
     }
 
+    // 写集审计（ADR-014 §5）
+    const withinBounds = await enforceWriteSet(sliceId, guard ?? null);
+
     // Process result as if foreground (state transition, gate, etc.)
-    if (exitCode === 0) {
+    if (exitCode === 0 && withinBounds) {
       await store.transit(sliceId, 'RUN_FINISH');
       await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0 });
       if (isHotfix) {
@@ -1711,6 +1804,12 @@ async function monitorTaskInBackground(
       } else {
         await autoGateAfterRun(sliceId);
       }
+    } else if (exitCode === 0) {
+      // 越界：不进 gate、不自动签字 —— 等人处理
+      console.error(`\n❌ Slice "${sliceId}" 写集越界 —— 未进入 gate，等人处理。`);
+      await events.append(sliceId, 'run.aborted', 'zelto', {
+        sliceId, exitCode: 0, reason: 'write-set violation',
+      });
     } else {
       await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
       // Background tasks: write stall info without auto-retry (adapter already finished)
@@ -1735,6 +1834,9 @@ async function monitorTaskInBackground(
       task.status = 'failed';
       await saveTask(task);
     }
+  } finally {
+    // 后台任务结束 —— 预约与钩子在这里收尾
+    if (guard) await guard.release();
   }
 }
 
