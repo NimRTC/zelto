@@ -9,6 +9,9 @@ dist-test
 .env.local
 .claude/plans/
 .claude/worktrees/
+# 排障临时产物（不得进版本库）
+tmp-*
+suite.txt
 # Go companion CLI
 zelto
 zelto.exe

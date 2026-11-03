@@ -9,8 +9,9 @@
   },
   "scripts": {
     "build": "tsc",
+    "check:encoding": "node scripts/check-encoding.mjs",
     "dev": "tsc --watch",
-    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
+    "test": "node scripts/check-encoding.mjs && tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
     "test:quick": "node --test \"dist-test/tests/**/*.test.js\"",
     "test:unit": "tsc -p tsconfig.test.json && node scripts/filter-tests.mjs",
     "test:acceptance": "node --test \"dist-test/tests/acceptance/**/*.test.js\"",
