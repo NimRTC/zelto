@@ -39,10 +39,34 @@ export interface ExecutorAdapter {
 
   /**
    * Resume an existing agent session with additional context.
-   * @param sessionId — The session to resume
+   *
+   * The agent continues the *same* conversation, so the agent-side session id
+   * must be preserved (see ADR-013 §3.4). Adapters that cannot truly resume
+   * must throw rather than silently start a fresh conversation.
+   *
+   * @param sessionId — The zelto session to resume
    * @param patch — Additional instructions or context to inject
+   * @returns The zelto session id of the continued session
    */
-  resume(sessionId: string, patch: string): Promise<void>;
+  resume(sessionId: string, patch: string): Promise<{ sessionId: string }>;
+
+  /**
+   * Get the agent's output text for a session.
+   *
+   * Used to read the agent's final answer — e.g. to parse the question marker
+   * (see `core/question/`). Returns an empty string when the output is
+   * unavailable.
+   */
+  getOutput(sessionId: string): string;
+
+  /**
+   * Get the agent-side conversation id for a session (e.g. the Claude Code
+   * session uuid). Null when the adapter does not expose one.
+   *
+   * This is the id a human sees when asked to continue a conversation — it is
+   * recorded in the question record (ADR-013 §3.2).
+   */
+  getAgentSessionId(sessionId: string): string | null;
 
   /**
    * Stop/kill an agent session.

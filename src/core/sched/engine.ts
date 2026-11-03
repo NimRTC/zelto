@@ -6,6 +6,8 @@ import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
 import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle } from './types.js';
+import { QUESTION_INSTRUCTIONS } from '../question/index.js';
+import { pathMatches, writeSetsOverlap } from './paths.js';
 
 export class Scheduler {
   private readonly store: SliceStore;
@@ -120,7 +122,7 @@ export class Scheduler {
     const relevantRules = this.policy.rules.filter((r) => {
       // Include rules that match the slice's write paths or are general allow/deny
       if (!r.match.path) return true;
-      return slice.writes.some((w) => this.pathMatches(w, r.match.path!));
+      return slice.writes.some((w) => pathMatches(w, r.match.path!));
     });
 
     return {
@@ -204,53 +206,7 @@ export class Scheduler {
   }
 
   private hasOverlap(a: string[], b: string[]): boolean {
-    // Check if any path in 'a' overlaps with any path in 'b'
-    for (const pa of a) {
-      for (const pb of b) {
-        if (this.pathsOverlap(pa, pb)) return true;
-      }
-    }
-    return false;
-  }
-
-  private pathsOverlap(a: string, b: string): boolean {
-    // Exact match
-    if (a === b) return true;
-
-    // Directory prefix: a/b/ matches a/b/anything
-    if (a.endsWith('/') && b.startsWith(a)) return true;
-    if (b.endsWith('/') && a.startsWith(b)) return true;
-
-    // Glob match: check if glob pattern matches the other path or vice versa
-    const hasGlobA = a.includes('*');
-    const hasGlobB = b.includes('*');
-
-    if (hasGlobA && !hasGlobB) {
-      return this.pathMatches(b, a);
-    }
-    if (!hasGlobA && hasGlobB) {
-      return this.pathMatches(a, b);
-    }
-    if (hasGlobA && hasGlobB) {
-      // Both are globs: check if their directory prefixes overlap
-      const dirA = a.includes('/') ? a.slice(0, a.indexOf('*')) : '';
-      const dirB = b.includes('/') ? b.slice(0, b.indexOf('*')) : '';
-      if (dirA && dirB) {
-        return dirA === dirB || dirA.startsWith(dirB) || dirB.startsWith(dirA);
-      }
-    }
-
-    return false;
-  }
-
-  private pathMatches(filePath: string, pattern: string): boolean {
-    // Simple glob matching (same logic as policy engine's matchPath)
-    const regexStr = pattern
-      .replace(/\*\*/g, '<<<DOUBLESTAR>>>')
-      .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '[^/]*')
-      .replace(/<<<DOUBLESTAR>>>/g, '.*');
-    return new RegExp(`^${regexStr}$`).test(filePath);
+    return writeSetsOverlap(a, b);
   }
 
   private buildInstructions(slice: SliceData): string {
@@ -278,6 +234,8 @@ export class Scheduler {
       `2. Do not modify protected paths.`,
       `3. All code must trace back to the spec.`,
       `4. Run acceptance tests before declaring completion.`,
+      '',
+      QUESTION_INSTRUCTIONS,
     ].join('\n');
   }
 

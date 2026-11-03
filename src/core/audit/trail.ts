@@ -49,6 +49,10 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `Gate retry #${String(e.payload?.attempt ?? '?')} for ${String(e.payload?.command ?? '')}`,
   'stall.classified': (e) =>
     `Stall classified: ${String(e.payload?.class ?? '')}`,
+  'question.raised': (e) =>
+    `Question raised (${String(e.payload?.type ?? '?')}): ${String(e.payload?.question ?? '')}`,
+  'question.answered': (e) =>
+    `Question answered: ${String(e.payload?.answer ?? '')}`,
   'budget.spent': (e) =>
     `Budget spent: $${String(e.payload?.amount ?? '0')}`,
   'llm.called': (e) =>
@@ -60,10 +64,30 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
   'sign.approved': () => 'Sign approved',
   'sign.rejected': () => 'Sign rejected',
   'merge.completed': () => 'Merge completed',
+  'merge.planned': (e) =>
+    `Merge planned: ${String(e.payload?.strategy ?? '?')} for ${String(Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '?')} slices`,
+  'merge.phase_complete': (e) =>
+    `Merge phase ${String(e.payload?.phase ?? '?')} complete: ${String(Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '?')}`,
+  'merge.conflict': (e) =>
+    `Merge conflict: ${String(Array.isArray(e.payload?.files) ? (e.payload.files as string[]).join(', ') : '?')}`,
   'sched.admitted': () => 'Scheduled: admitted',
   'sched.blocked': (e) =>
     `Scheduled: blocked by ${String(Array.isArray(e.payload?.blockedBy) ? (e.payload.blockedBy as string[]).join(', ') : '?')}`,
   'merge.stale_base': () => 'Merge blocked: stale base',
+  'worktree.created': (e) =>
+    `Worktree created: ${String(e.payload?.path ?? '')} (branch ${String(e.payload?.branch ?? '')})`,
+  'worktree.removed': (e) =>
+    `Worktree removed: ${String(e.payload?.path ?? '')}`,
+  'coord.dep_added': (e) =>
+    `Dependency added: ${String(e.payload?.sliceId ?? '')} → ${String(Array.isArray(e.payload?.dependsOn) ? (e.payload.dependsOn as string[]).join(', ') : '')} (phase ${String(e.payload?.phase ?? '?')})`,
+  'coord.phase_ready': (e) =>
+    `Phase ${String(e.payload?.phase ?? '?')} ready: ${String(Array.isArray(e.payload?.sliceIds) ? (e.payload.sliceIds as string[]).join(', ') : '')}`,
+  'coord.phase_complete': (e) =>
+    `Phase ${String(e.payload?.phase ?? '?')} complete`,
+  'coord.cycle_detected': (e) =>
+    `Cycle detected: ${String(Array.isArray(e.payload?.cycle) ? (e.payload.cycle as string[]).join(' → ') : '')}`,
+  'artifact.conflict_detected': (e) =>
+    `Artifact conflict: ${String(e.payload?.count ?? '?')} conflict(s) found`,
 };
 
 export class AuditTrail {

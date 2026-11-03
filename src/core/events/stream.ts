@@ -21,6 +21,8 @@ export type EventType =
   | 'gate.result'
   | 'gate.retry'
   | 'stall.classified'
+  | 'question.raised'
+  | 'question.answered'
   | 'budget.spent'
   | 'llm.called'
   | 'queue.enqueued'
@@ -29,9 +31,19 @@ export type EventType =
   | 'sign.approved'
   | 'sign.rejected'
   | 'merge.completed'
+  | 'merge.planned'
+  | 'merge.phase_complete'
+  | 'merge.conflict'
   | 'sched.admitted'
   | 'sched.blocked'
-  | 'merge.stale_base';
+  | 'merge.stale_base'
+  | 'worktree.created'
+  | 'worktree.removed'
+  | 'coord.dep_added'
+  | 'coord.phase_ready'
+  | 'coord.phase_complete'
+  | 'coord.cycle_detected'
+  | 'artifact.conflict_detected';
 
 export interface EventEnvelope {
   ts: string;

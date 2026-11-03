@@ -32,3 +32,33 @@ export interface SpecAnalysis {
   issues: SpecIssue[];
   summary: string;
 }
+
+// ── AI Pipeline v2: Spec overlay & effective spec types ──────────────
+
+export enum SpecOverlayType {
+  Replace = 'replace',
+  Merge = 'merge',
+  Delete = 'delete',
+}
+
+export interface SpecOverlay {
+  id: string;
+  type: SpecOverlayType;
+  path: string; // JSON path to apply the overlay at
+  value?: unknown;
+  description?: string;
+  timestamp: string;
+}
+
+export interface EffectiveSpec {
+  specId: string;
+  specPath: string;
+  content: SpecDocument;
+  appliedOverlays: SpecOverlay[];
+  timestamp: string;
+}
+
+// The shape of a parsed spec document (can be extended as needed)
+export interface SpecDocument {
+  [key: string]: unknown;
+}

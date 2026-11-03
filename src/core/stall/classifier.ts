@@ -11,7 +11,8 @@ export type StallClass =
   | 'cognitive_stuck'     // ④ 认知卡壳 — same thing fails repeatedly
   | 'plan_gate'           // ⑤ 计划门禁 — agent requests plan approval
   | 'budget_exhausted'   // ⑥ 预算耗尽 — max budget reached
-  | 'gate_retry';        // ⑦ 门禁重试 — gate executor retries exhausted
+  | 'gate_retry'         // ⑦ 门禁重试 — gate executor retries exhausted
+  | 'agent_question';    // ⑧ agent 提问 — 等待人回答（ADR-013）
 
 export type StallResolution = 'auto_resolved' | 'needs_attention' | 'escalated';
 
@@ -25,6 +26,12 @@ export interface StallEvent {
   details?: Record<string, unknown>;
 }
 
+/**
+ * Whether a stall class can be resolved without human input.
+ *
+ * `agent_question` is never auto-resolvable: by definition the agent stopped
+ * because it cannot decide on its own (ADR-013 §3.5).
+ */
 export function isAutoResolvable(stallClass: StallClass): boolean {
   return stallClass === 'permission_prompt'
     || stallClass === 'environment_failure'
@@ -37,6 +44,7 @@ export function classifyStall(signal: {
   attempts?: number;
   sameFailureCount?: number;
 }): StallClass {
+  if (signal.type === 'agent_question') return 'agent_question';
   if (signal.type === 'permission_ask') return 'permission_prompt';
   if (signal.type === 'max_turns' || signal.type === 'context_limit') return 'context_exhaustion';
   if (signal.type === 'budget_exhausted') return 'budget_exhausted';

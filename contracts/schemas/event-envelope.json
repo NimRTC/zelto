@@ -19,11 +19,22 @@
         "policy.decision", "policy.anchor_mismatch",
         "gate.executed", "gate.result", "gate.retry",
         "stall.classified",
+        "question.raised",
+        "question.answered",
         "budget.spent", "llm.called",
         "queue.enqueued", "queue.dequeued",
         "sign.requested", "sign.approved", "sign.rejected",
         "merge.completed",
-        "sched.admitted", "sched.blocked", "merge.stale_base"
+        "merge.planned",
+        "merge.phase_complete",
+        "merge.conflict",
+        "sched.admitted", "sched.blocked", "merge.stale_base",
+        "worktree.created", "worktree.removed",
+        "coord.dep_added",
+        "coord.phase_ready",
+        "coord.phase_complete",
+        "coord.cycle_detected",
+        "artifact.conflict_detected"
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },
