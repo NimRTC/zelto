@@ -8,6 +8,7 @@ import { AuditTrail } from '../../core/audit/trail.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
+import { commandsByGroup, findCommand, usageOf } from './catalog.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { writeOutput } from '../output.js';
@@ -228,11 +229,12 @@ This is an example. Replace with your actual slice.
     }
   }
 
-  // Auto-install git hooks
+  // Auto-install git hooks —— 只装进「被管理的项目」（见 hook-install.ts 的作用域规则）
   try {
-    const GIT_HOOKS_DIR = join(process.cwd(), '.git', 'hooks');
-    if (existsSync(GIT_HOOKS_DIR)) {
-      console.log(`\n  Installing git hooks...`);
+    const { resolveHookInstallRoot } = await import('./hook-install.js');
+    const scope = resolveHookInstallRoot(process.cwd());
+    if (scope.root) {
+      console.log(`\n  Installing git hooks (${scope.reason})...`);
       const { execSync } = await import('node:child_process');
       try {
         execSync(
@@ -243,6 +245,8 @@ This is an example. Replace with your actual slice.
         // Hook install may fail if dist/ not built yet — non-fatal
         console.log(`  ℹ️  Auto-install hooks skipped. Run "zelto hook --install" manually.`);
       }
+    } else {
+      console.log(`\n  ℹ️  ${scope.reason}`);
     }
   } catch {
     // Non-fatal
@@ -478,150 +482,58 @@ register('events', async (args) => {
 register('help', async (args) => {
   const [specificCmd] = args;
 
-  // Support: zelto help <cmd> — show command-specific help
+  // zelto help <cmd> —— 从命令目录里取用法，**不执行**该命令。
+  //
+  // 以前这里是 handler(['--help'])，但多数命令不认 --help，
+  // 于是 `zelto help run` 真的去跑 run，把 "--help" 当切片 id 去找，
+  // 报 ENOENT 崩掉。help 是只读入口，不该有副作用。
   if (specificCmd && !specificCmd.startsWith('--')) {
-    const { commands } = await import('./shared.js');
-    const handler = commands[specificCmd];
-    if (handler) {
-      return handler(['--help']);
+    const info = findCommand(specificCmd);
+    if (!info) {
+      console.error(`Unknown command: ${specificCmd}`);
+      console.error('Run "zelto help" for usage.');
+      return 1;
     }
-    console.error(`Unknown command: ${specificCmd}`);
-    console.error('Run "zelto help" for usage.');
-    return 1;
+    console.log(`${colors.bold(usageOf(info))}`);
+    console.log('');
+    console.log(`  ${info.summary}`);
+    if (info.detail) {
+      console.log(`  ${colors.dim(info.detail)}`);
+    }
+    console.log('');
+    console.log(`${colors.dim('Group:')} ${info.group}`);
+    return 0;
   }
 
-  console.log(`
-${colors.bold('zelto — AI Programming Cockpit')}
+  const lines: string[] = [];
+  lines.push('');
+  lines.push(colors.bold('zelto — AI Programming Cockpit'));
+  lines.push('');
+  lines.push(colors.cyan('Usage:'));
+  lines.push('  zelto <command> [options]');
+  lines.push('');
 
-${colors.cyan('Usage:')}
-  zelto <command> [options]
+  for (const { group, commands } of commandsByGroup()) {
+    lines.push(`${colors.bold(`${group}:`)}`);
+    const labels = commands.map((c) => (c.args ? `${c.name} ${c.args}` : c.name));
+    const width = Math.max(...labels.map((l) => l.length));
+    commands.forEach((c, i) => {
+      const label = labels[i].padEnd(width);
+      const tail = c.detail ? `  ${colors.dim(c.detail)}` : '';
+      lines.push(`  ${label}  ${c.summary}${tail}`);
+    });
+    lines.push('');
+  }
 
-${colors.bold('Core slice commands:')}
-  create <id>            Create a new slice (interactive if no args) [--json]
-  slices                 List all slices [--active] [--json]
-  slice <id>             Show slice details [--json]
-  check <id>             Gate① — pre-freeze checks [--json]
-  clarify <id>           Clarify slice spec (interactive, --auto, --dry-run)
-  freeze <id>            Freeze slice baseline [--json]
-  run <id>               Execute slice (--dry-run, --agent <name>, --adapter <type>) [--json]
-  start <id>             One-command: create → check → freeze → run [--yes] [--adapter <type>]
-  admit <id>             Check admission (--json)
-  diff <id>              Show changes made by a slice (--stat, --json)
-  diff-highlight         Read unified diff from stdin, output ANSI-highlighted version
-  gate <id>              Gate② — run acceptance tests [--dry-run] [--json]
-  inbox                  View pending sign requests
-  sign <id> --approve    Approve completed slice [--json]
-  sign <id> --reject     Reject completed slice [--json]
-  abandon <id>           Abandon a slice
-  next                   Suggest next action on a slice
-  suggest                Full project overview and suggested actions
-  stall [id]             List stalled slices or inspect one (--auto-resolved)
-  resume <id>            Resume stalled slice (--skip, --abandon)
-  ask                    List pending agent questions (--slice <id>, --json)
-  answer <qid> "<text>"  Answer an agent question and resume the slice (--list to just list)
-  status [--watch]       Show active agent sessions (--json)
-  events <id>            View slice event stream [--json]
-
-${colors.bold('Project management:')}
-  init                   Initialize .zelto/ directory [--with-examples]
-  summary                Project overview
-  report [--format]      Generate status report (markdown|json)
-  config                 View or modify configuration (get/set)
-
-${colors.bold('Governance:')}
-  policy list            List policy rules [--json]
-  policy show <id>       Show a single policy rule [--json]
-  policy check <path>    Check path against policy [--json]
-  policy validate        Validate policy configuration [--json]
-  policy add <id>        Add a policy rule
-  policy remove <id>     Remove a policy rule [--json]
-  policy edit <id>       Edit a policy rule
-
-${colors.bold('AI Pipeline:')}
-  require <text>         Create requirement document
-  require list           List requirements
-  require confirm <id>   Confirm a requirement
-  require refine <id>    Iteratively refine requirement
-  design <req-id>        Generate design from requirement
-  design list            List designs
-  design confirm <id>    Confirm a design
-  design refine <id>     Iteratively refine design
-  plan <design-id>       Generate version plan from design
-  plan confirm <id>      Confirm plan and create slice specs
-  plan add-version <id>  Append a new version to plan
-  version status         Show version plan status
-  version start <ver>    Execute all slices in a version (--auto for full auto-pilot)
-  version deliver <ver>  Mark version as delivered
-  pipeline status        Full chain overview
-
-${colors.bold('Project takeover:')}
-  project scan           Scan existing project structure
-  project init           Initialize zelto governance
-  project design         Generate design docs (requires LLM)
-  project slice          Create v0 baseline slices
-  project status         View governance status
-
-${colors.bold('Panoramic:')}
-  trace <req-id>         Trace requirement → design → plan → slices
-  impact <req-id>        Change impact analysis
-  audit <slice-id>       Show audit trail for a slice
-  snapshot [cmd]         Capture/list/show project state snapshots
-
-${colors.bold('Other:')}
-  hook --install         Install git hooks
-  hook --uninstall       Uninstall git hooks
-  patch-content          Interactive per-slice patch splitter
-  help                   Show this help
-  completion [shell]     Generate shell completion script (bash|zsh|fish)
-
-${colors.dim('Configuration: .zelto/config.yaml')}
-${colors.dim('Policy:        policy/policy.yaml')}
-  `);
+  lines.push(colors.dim('Configuration: .zelto/config.yaml'));
+  lines.push(colors.dim('Policy:        policy/policy.yaml'));
+  console.log(lines.join('\n'));
   return 0;
 });
 // ─── completion ──────────────────────────────────────────────────────────────
 
-register('completion', async (args) => {
-  const shell = args[0] || 'bash';
-  const commands = [
-    'create', 'slices', 'check', 'clarify', 'freeze', 'run', 'start',
-    'admit', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
-    'stall', 'resume', 'status', 'events', 'init', 'summary', 'report',
-    'require', 'design', 'plan', 'version', 'pipeline',
-    'ask', 'answer',
-    'project', 'trace', 'impact', 'audit', 'snapshot', 'hook', 'reservation', 'patch-content', 'diff-highlight', 'help', 'completion',
-  ];
-  const subcommands = {
-    require: ['list', 'confirm', 'refine'],
-    design: ['list', 'confirm', 'refine'],
-    plan: ['list', 'confirm', 'add-version'],
-    version: ['status', 'start', 'deliver'],
-    project: ['scan', 'init', 'design', 'slice', 'status'],
-    sign: ['--approve', '--reject'],
-    hook: ['--install', '--uninstall'],
-    stall: ['--auto-resolved'],
-    status: ['--watch', '--json'],
-    run: ['--dry-run', '--agent', '--adapter'],
-    start: ['--title', '--writes', '--agent', '--yes', '--adapter'],
-    create: ['--title', '--writes'],
-    clarify: ['--auto', '--dry-run'],
-    report: ['--format'],
-    completion: ['bash', 'zsh', 'fish'],
-  };
-
-  if (shell === 'bash') {
-    const cmdList = commands.join(' ');
-    console.log();
-  } else if (shell === 'zsh') {
-    console.log(':see zelto help');
-  } else if (shell === 'fish') {
-    console.log();
-  } else {
-    console.error();
-    return 1;
-  }
-  return 0;
-});
+// `completion` 的实现在 completion.ts —— 那份才是真正生成补全脚本的。
+// （这里曾经还注册过一份，是被 completion.ts 覆盖掉的死代码。）
 
 // ─── hook ────────────────────────────────────────────────────────────────
 //

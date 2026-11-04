@@ -2,15 +2,10 @@
 // Usage: zelto completion bash | source /dev/stdin
 
 import { register } from './shared.js';
+import { COMMAND_CATALOG } from './catalog.js';
 
-const COMMANDS = [
-  'create', 'slices', 'slice', 'check', 'clarify', 'freeze', 'run', 'start',
-  'admit', 'diff', 'gate', 'inbox', 'sign', 'abandon', 'next', 'suggest',
-  'stall', 'resume', 'status', 'events', 'init', 'summary', 'report', 'config',
-  'require', 'design', 'plan', 'version', 'pipeline',
-  'project', 'trace', 'impact', 'audit', 'snapshot', 'policy',
-  'hook', 'help', 'completion',
-];
+// 命令列表来自命令目录（catalog.ts）——和 `zelto help` 同源，不会各写一份。
+const COMMANDS = COMMAND_CATALOG.map((c) => c.name);
 
 const SUBCOMMANDS: Record<string, string[]> = {
   require: ['list', 'confirm', 'refine'],
@@ -24,10 +19,11 @@ const SUBCOMMANDS: Record<string, string[]> = {
   stall: ['--auto-resolved'],
   status: ['--watch', '--json'],
   snapshot: ['list', 'show'],
-  run: ['--dry-run', '--agent', '--adapter'],
+  run: ['--dry-run', '--agent', '--adapter', '--hotfix', '--yes'],
   start: ['--title', '--writes', '--agent', '--yes', '--adapter'],
   create: ['--title', '--writes'],
   slice: ['--json'],
+  set: ['--field', '--value'],
   config: ['get', 'set'],
   clarify: ['--auto', '--dry-run'],
   report: ['--format'],
@@ -35,6 +31,13 @@ const SUBCOMMANDS: Record<string, string[]> = {
   gate: ['--retry', '--dry-run', '--json'],
   trace: ['--json', '--graph', '--timeline', '--slice'],
   init: ['--force', '--with-examples'],
+  merge: ['plan', '--strategy', '--dry-run', '--push'],
+  artifact: ['check'],
+  reservation: ['list', 'active', 'show', 'release', 'reap'],
+  'spec-md': ['validate', 'run'],
+  dashboard: ['--watch', '--open', '--output'],
+  depgraph: ['--depends-on'],
+  batch: ['--depends-on'],
 };
 
 register('completion', async (args) => {
