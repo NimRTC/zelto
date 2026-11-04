@@ -15,7 +15,8 @@ import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
 import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent, hashSpecFile } from './shared.js';
-import { executeSlicesParallel, printParallelSummary } from './parallel-executor.js';
+import { executeSlicesByPhase, printParallelSummary } from './parallel-executor.js';
+import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { branchExists, isMergedIntoHead } from './merge-executor.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 
@@ -819,16 +820,37 @@ register('version', async (args) => {
       return 0;
     }
 
-    // ── Phase 2: 并行执行 ──────────────────────────────────────────
+    // ── Phase 2: 排阶段 + 并行执行 ─────────────────────────────────
     // 与 `zelto run --parallel` 走同一条路径：每个切片一份隔离 worktree、
     // 一份写集预约守卫、一次门禁②、一次签名请求（ADR-012 / ADR-014）。
-    f.out('\n── Phase 2: Execute agents (parallel, isolated) ──');
+    //
+    // 阶段怎么排（G-1 + G-2）：
+    //   - 依赖分层：规格「前置切片」章节里的依赖，阶段之间串行
+    //   - 写集降级：同阶段写集撞了自动拆成两个阶段，不整批 abort
+    f.out('\n── Phase 2: Execute agents (phased, isolated) ──');
     const cfg = loadConfig();
 
-    const result = await executeSlicesParallel({
+    const plan = await buildExecutionPlan(prepared, args);
+
+    if (plan.cycle) {
+      await events.append(`version-${versionLabel}`, 'coord.cycle_detected', 'zelto', {
+        version: versionLabel,
+        cycle: plan.cycle,
+        slices: prepared,
+      });
+      f.error('BLOCKED', `依赖成环：${plan.cycle.join(' → ')}`);
+      f.out('   环里的切片没法排先后 —— 先解开依赖，再跑 version start。');
+      return 1;
+    }
+
+    printExecutionPlan(plan);
+
+    const result = await executeSlicesByPhase({
       ids: prepared,
+      phases: plan.phases,
       agentName: cfg.agent.command,
       title: `版本 ${versionLabel}`,
+      eventKey: `version-${versionLabel}`,
     });
 
     if (result.aborted) {

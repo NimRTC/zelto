@@ -81,6 +81,8 @@ export interface ParallelExecutionResult {
   aborted: boolean;
   /** 提前退出的原因 */
   abortReason: string | null;
+  /** 因为前面的阶段没过而没来得及执行的切片 */
+  skipped: string[];
 }
 
 // ─── zelto 自己写进 worktree 的文件 ──────────────────────────────────────────
@@ -185,6 +187,7 @@ export async function executeSlicesParallel(
     ok: false,
     aborted: false,
     abortReason: null,
+    skipped: [],
   });
 
   if (ids.length === 0) {
@@ -557,5 +560,132 @@ export async function executeSlicesParallel(
     ok: failed === 0 && stalled === 0 && asked === 0,
     aborted: false,
     abortReason: null,
+    skipped: [],
+  };
+}
+
+// ─── 分阶段执行（G-1 依赖分层 + G-2 写集冲突降级）────────────────────────
+
+export interface PhasedExecutionOptions extends ParallelExecutionOptions {
+  /**
+   * 执行阶段：阶段内切片互不冲突可并行，阶段之间串行。
+   * 由 core/sched/batch.ts 的 planExecutionPhases() 排出来。
+   */
+  phases: string[][];
+  /** 事件归属键（版本级用 version-<label>，run --parallel 用 batch） */
+  eventKey?: string;
+}
+
+/**
+ * 按阶段顺序执行一批切片。
+ *
+ * 与 executeSlicesParallel 的关系：单个阶段的执行语义完全一样
+ * （同一份隔离 worktree、写集预约守卫、门禁②、签名请求），
+ * 区别只在于「阶段之间串行」——依赖要求后面的切片看到前面切片的产物，
+ * 写集冲突要求同一批文件不能被两个 agent 同时改。
+ *
+ * 某个阶段没过（失败 / 停机 / 提问）就停在这里，不启动后面的阶段：
+ * 依赖没满足就跑下去，跑出来的多半也是错的，不如把控制权交回给人。
+ */
+export async function executeSlicesByPhase(
+  options: PhasedExecutionOptions,
+): Promise<ParallelExecutionResult> {
+  const phases = options.phases.filter((p) => p.length > 0);
+
+  if (phases.length === 0) {
+    return {
+      outcomes: [],
+      completed: 0,
+      failed: 0,
+      stalled: 0,
+      asked: 0,
+      ok: false,
+      aborted: true,
+      abortReason: '没有要执行的阶段',
+      skipped: [],
+    };
+  }
+
+  const eventKey = options.eventKey ?? 'batch';
+  const outcomes: SliceOutcome[] = [];
+  const skipped: string[] = [];
+  let ok = true;
+
+  for (let p = 0; p < phases.length; p++) {
+    const phaseIds = phases[p];
+    const parallel = phaseIds.length > 1 ? `（${phaseIds.length} 个并行）` : '';
+
+    console.log('');
+    console.log(`── 阶段 ${p + 1}/${phases.length}: ${phaseIds.join(', ')} ${parallel}`);
+
+    await events.append(eventKey, 'coord.phase_ready', 'zelto', {
+      phase: p,
+      slices: phaseIds,
+      totalPhases: phases.length,
+    });
+
+    const result = await executeSlicesParallel({
+      ...options,
+      ids: phaseIds,
+      title: options.title ?? 'zelto run --parallel',
+    });
+
+    if (result.aborted) {
+      await events.append(eventKey, 'coord.phase_complete', 'zelto', {
+        phase: p,
+        slices: phaseIds,
+        ok: false,
+        aborted: true,
+        reason: result.abortReason,
+      });
+      outcomes.push(...result.outcomes);
+      skipped.push(...phases.slice(p + 1).flat());
+      return {
+        outcomes,
+        completed: 0,
+        failed: 0,
+        stalled: 0,
+        asked: 0,
+        ok: false,
+        aborted: true,
+        abortReason: result.abortReason,
+        skipped,
+      };
+    }
+
+    outcomes.push(...result.outcomes);
+
+    await events.append(eventKey, 'coord.phase_complete', 'zelto', {
+      phase: p,
+      slices: phaseIds,
+      ok: result.ok,
+    });
+
+    if (!result.ok) {
+      ok = false;
+      skipped.push(...phases.slice(p + 1).flat());
+      if (phases.length > p + 1) {
+        console.log('');
+        console.log(`⏸️  阶段 ${p + 1} 未全部通过 —— 后续 ${phases.length - p - 1} 个阶段不再启动`);
+      }
+      break;
+    }
+  }
+
+  const completed = outcomes.filter((o) => o.status === 'completed').length;
+  const asked = outcomes.filter((o) => o.status === 'asked').length;
+  const failed = outcomes.filter((o) => o.status === 'failed').length;
+  const stalled = outcomes.filter((o) => o.status === 'stalled').length;
+
+  return {
+    outcomes,
+    completed,
+    failed,
+    stalled,
+    asked,
+    ok: ok && failed === 0 && stalled === 0 && asked === 0,
+    aborted: false,
+    abortReason: null,
+    skipped,
   };
 }

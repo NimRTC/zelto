@@ -183,6 +183,109 @@ export function planBatchPhases(
 }
 
 /**
+ * 因写集冲突被降级为串行的记录。
+ *
+ * 「降级」= 原本可以同阶段并行，因为写集重叠被排到了更靠后的阶段。
+ */
+export interface PhaseDowngrade {
+  sliceId: string;
+  /** 与它写集重叠、因此它必须让路的切片 */
+  conflictsWith: string[];
+}
+
+/** 执行阶段计划（依赖分层 + 写集冲突降级） */
+export interface ExecutionPhasePlan {
+  /** 阶段序列：阶段内互不冲突可并行，阶段之间串行 */
+  phases: string[][];
+  /** 依赖成环时的环路径；无环为 null */
+  cycle: string[] | null;
+  /** 被降级为串行的切片 */
+  downgrades: PhaseDowngrade[];
+}
+
+/**
+ * 排阶段只需要「id + 写集」——写集是唯一影响能否并行的字段。
+ */
+export interface WriteSetMember {
+  id: string;
+  writes: string[];
+}
+
+/**
+ * 排出「可以直接开跑」的执行阶段。
+ *
+ * 两步判定，都是确定性的：
+ * 1. 依赖分层：按 `deps` 拓扑分层，阶段之间串行（G-1）
+ * 2. 写集降级：同一层里写集重叠的切片自动拆开，排成先后两个阶段（G-2）
+ *
+ * 降级用贪心着色：按 id 排序依次放切片，放进第一个与已有切片都不冲突的
+ * 阶段；都冲突就新开一个阶段。id 排序保证同一批输入永远得到同一份计划。
+ *
+ * 注意：跨阶段的写集重叠不处理——阶段之间本来就允许改同一批文件，
+ * 那正是依赖关系的含义。
+ */
+export function planExecutionPhases(
+  members: WriteSetMember[],
+  deps: Map<string, string[]>,
+): ExecutionPhasePlan {
+  const ids = members.map((m) => m.id);
+  const depPlan = planBatchPhases(ids, deps);
+
+  if (depPlan.cycle) {
+    return { phases: [], cycle: depPlan.cycle, downgrades: [] };
+  }
+
+  const byId = new Map(members.map((m) => [m.id, m]));
+  const phases: string[][] = [];
+  const downgrades: PhaseDowngrade[] = [];
+
+  for (const depPhase of depPlan.phases) {
+    // 依赖层内按 id 排序 —— 贪心着色的结果必须与输入顺序无关
+    const ordered = [...depPhase].sort((a, b) => a.localeCompare(b));
+
+    // 每个子阶段内部的成员
+    const groups: string[][] = [];
+
+    for (const id of ordered) {
+      const member = byId.get(id);
+      const writes = member?.writes ?? [];
+
+      let placed = false;
+      for (let g = 0; g < groups.length; g++) {
+        const conflicting = groups[g].filter((otherId) => {
+          const other = byId.get(otherId);
+          return other ? writeSetsOverlap(writes, other.writes) : false;
+        });
+
+        if (conflicting.length === 0) {
+          groups[g].push(id);
+          placed = true;
+          break;
+        }
+
+        // 放不进这一组 —— 记下降级（与这一组里冲突的切片）
+        const existing = downgrades.find((d) => d.sliceId === id);
+        if (existing) {
+          for (const c of conflicting) {
+            if (!existing.conflictsWith.includes(c)) existing.conflictsWith.push(c);
+          }
+        } else {
+          downgrades.push({ sliceId: id, conflictsWith: [...conflicting] });
+        }
+      }
+
+      if (!placed) {
+        groups.push([id]);
+      }
+    }
+
+    phases.push(...groups);
+  }
+
+  return { phases, cycle: null, downgrades };
+}
+
+/**
  * 检查同一阶段内的切片是否可以并行。
  *
  * 同阶段意味着同时开工，因此：

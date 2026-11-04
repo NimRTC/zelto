@@ -54,10 +54,13 @@ export function detectDefaultWrites(): string[] {
  *
  * C1: resolved write-set is persisted back into `.zelto/slices/<id>.json`.
  *
+ * @param persist false 时只算不写 —— 只读命令（zelto batch）用这个口径，
+ *                免得「只查不跑」的命令把状态改了。
  * @returns the resolved write-set, and whether it was changed
  */
 export async function resolveWriteSet(
   sliceId: string,
+  persist: boolean = true,
 ): Promise<{ writes: string[]; changed: boolean; source: 'slice' | 'spec' | 'default' }> {
   const slice = await store.read(sliceId);
 
@@ -75,16 +78,20 @@ export async function resolveWriteSet(
   }
 
   if (specWrites.length > 0) {
-    slice.writes = specWrites;
-    await store.write(slice);
+    if (persist) {
+      slice.writes = specWrites;
+      await store.write(slice);
+    }
     return { writes: specWrites, changed: true, source: 'spec' };
   }
 
   // 3. Fall back to directory detection
   const detected = detectDefaultWrites();
   if (detected.length > 0) {
-    slice.writes = detected;
-    await store.write(slice);
+    if (persist) {
+      slice.writes = detected;
+      await store.write(slice);
+    }
     return { writes: detected, changed: true, source: 'default' };
   }
 

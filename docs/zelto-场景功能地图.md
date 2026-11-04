@@ -9,10 +9,25 @@
 
 zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI 编程助手。
 
-它的职责不是写代码，而是**保证 agent 的每一行代码都能追溯到一条人批准的规格，且没有走出边界**。
+**它是「一个人 + 一组 agent」做中大型项目时的驾驶舱**：不写业务代码，
+但管住从想法到主干的整个过程——
+
+```
+人做规划（方案设计 → 版本规划 → 模块划分 → 切片设置）
+   ↓  规划确认完
+zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + 门禁）
+   ↓  出错时
+拉闸 —— 越界当场拦下、卡住会来问人，人被交还控制权
+   ↓  验收通过
+逐片签字 → 显式合并 → 版本交付 → 下一个版本
+```
+
+它的底层职责是**保证 agent 的每一行代码都能追溯到一条人批准的规格，且没有走出边界**——
+这条追溯链是规划可校验、并行不打架、出错能定责的共同底座，
+也是 zelto 区别于其它 AI 编程工具的本质特征。
 
 它服务的是**一个人 + 一组 agent** 的中大型项目生产：
-人做规划（方案设计、版本规划、模块划分、切片设置），zelto 把规划切成可并行的作业、
+人做规划（方案设计、版本规划、模块划分、切片设置），zelto 把这些规划切成可并行的作业、
 拉起 agent、在 agent 写文件的那一刻实时校验边界与追溯，出错时拉闸交回控制权。
 
 完整目标、现状差距与待决策项见 `docs/zelto-项目目标.md`。
@@ -168,16 +183,22 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 ### 2.5 并行执行语义（`run --parallel` 与 `version start` 共用）
 
-两个入口走**同一条**执行路径 `executeSlicesParallel()`（`src/cli/commands/parallel-executor.ts`）：
+两个入口走**同一条**执行路径 `executeSlicesByPhase()`（`src/cli/commands/parallel-executor.ts`），
+执行前先由 `buildExecutionPlan()`（`src/cli/commands/execution-plan.ts`）排出阶段：
 
 | 阶段 | 内容 | 失败处理 |
 |---|---|---|
 | ① 准入 | 切片必须 frozen 且有 frozenHash | 整批 abort |
 | ② 写集解析 | 从规格「范围」章节解析生效写集 | 只读，不改状态 |
-| ③ 冲突检测 | 跨切片写集不得重叠 | 整批 abort |
+| ③ 排阶段 | 依赖拓扑分层 + 同阶段写集重叠降级为串行 | 依赖成环 → 整批 abort（`coord.cycle_detected`） |
 | ④ 隔离与守卫 | 建 worktree + 取写集预约 + 装 PreToolUse 钩子 | 整批 abort |
-| ⑤ 拉起 agent | 并行启动，逐个等待退出，失败按配置重试 | 逐片重试 |
+| ⑤ 拉起 agent | 阶段内并行启动，逐个等待退出，失败按配置重试 | 逐片重试 |
 | ⑥ 收尾 | 写集审计 → 状态回写 → 门禁② → 签名请求 | 越界不进 gate |
+
+**阶段之间串行，阶段之内并行**：同阶段切片互不冲突才并行；
+写集重叠的切片自动拆成先后两个阶段，批次继续跑（不整批 abort）。
+某个阶段没过（失守 / 停机 / 提问），**后面的阶段不启动**——
+依赖没满足就跑下去，跑出来的多半也是错的。
 
 主仓工作树全程不被切换分支、也不被 agent 写入。详见 `docs/adr-017-version-level-orchestration.md`。
 
@@ -207,9 +228,10 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **PreToolUse Hook** | `src/hook/pretool.ts` | agent 写文件时的逐写判定（C9 运行时强制） |
 | **Worktree Manager** | `src/core/worktree/manager.ts` | 并行切片的物理隔离（ADR-011） |
 | **Runtime Guard** | `src/cli/commands/runtime-guard.ts` | 写集预约 + 钩子安装 + 运行后越界审计（ADR-014） |
-| **Parallel Executor** | `src/cli/commands/parallel-executor.ts` | 唯一的并行执行实现（ADR-017） |
+| **Parallel Executor** | `src/cli/commands/parallel-executor.ts` | 唯一的并行执行实现（ADR-017），按阶段串行推进 |
+| **Execution Plan** | `src/cli/commands/execution-plan.ts` | 排阶段与执行计划的唯一 CLI 入口（只查与要跑共用） |
 | **Question Protocol** | `src/core/question/protocol.ts` | agent 提问挂起与回答续跑（ADR-013） |
-| **Batch Review** | `src/core/sched/batch.ts` | 批次准入审核、依赖分层、工件冲突 |
+| **Batch Review** | `src/core/sched/batch.ts` | 批次准入审核、依赖分层、写集冲突降级、工件冲突 |
 | **Dependency Graph** | `src/core/sched/depgraph.ts` | 切片依赖图与环检测 |
 | **Merge Orchestration** | `src/core/sched/merge.ts` | 合并计划与冲突可见（ADR-012） |
 | **Requirements Store** | `src/core/requirements/store.ts` | 需求文档持久化与状态 |
