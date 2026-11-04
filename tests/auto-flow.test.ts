@@ -51,8 +51,8 @@ describe('Phase 2 — Auto sign-request & pipeline automation', () => {
     await writeFile(join(TEST_DIR, '.zelto', 'config.yaml'), `# zelto project configuration
 gate:
   commands:
-    - { name: test, run: "node -e process.exit(0)" }
-    - { name: lint, run: "node -e process.exit(0)" }
+    - { name: test, run: "node -e process.exitCode=0" }
+    - { name: lint, run: "node -e process.exitCode=0" }
   timeoutSec: 30
   retry:
     max: 1
