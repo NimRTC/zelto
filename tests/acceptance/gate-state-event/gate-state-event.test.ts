@@ -62,8 +62,8 @@ describe('acceptance: gate-state-event', () => {
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
-      '    - { name: test, run: "node -e process.exit(0)" }',
-      '    - { name: lint, run: "node -e process.exit(0)" }',
+      '    - { name: test, run: "node -e process.exitCode=0" }',
+      '    - { name: lint, run: "node -e process.exitCode=0" }',
       '  timeoutSec: 30',
       '  retry:',
       '    max: 1',

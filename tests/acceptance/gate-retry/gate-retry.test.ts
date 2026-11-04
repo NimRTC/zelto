@@ -56,7 +56,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
-      '    - { name: test, run: "node -e process.exit(1)" }',
+      '    - { name: test, run: "node -e process.exitCode=1" }',
       '  timeoutSec: 10',
       '  retry:',
       '    max: 2',
@@ -120,7 +120,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
     await writeFile(join(BASE_DIR, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
-      '    - { name: test, run: "node -e process.exit(0)" }',
+      '    - { name: test, run: "node -e process.exitCode=0" }',
       '  timeoutSec: 10',
       '  retry:',
       '    max: 2',
@@ -153,7 +153,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
     await writeFile(join(cleanDir, '.zelto', 'config.yaml'), [
       'gate:',
       '  commands:',
-      '    - { name: test, run: "node -e process.exit(1)" }',
+      '    - { name: test, run: "node -e process.exitCode=1" }',
       '  timeoutSec: 10',
       '  retry:',
       '    max: 1',
