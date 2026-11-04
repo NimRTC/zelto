@@ -13,6 +13,9 @@ export interface SpecIssue {
   message: string;
   path?: string;
   suggestion?: string;
+  /** 产生该问题的检查项名字（见 DETERMINISTIC_CHECKS / SEMANTIC_CHECKS）。
+   *  调用方据此区分「阻断项」与「提示项」——同一份结果里，阻断与否是调用方的策略。 */
+  check?: string;
 }
 
 export interface DeterministicCheck {

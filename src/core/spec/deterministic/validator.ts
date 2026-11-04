@@ -4,18 +4,12 @@
 import { createHash } from 'node:crypto';
 import type { SliceData } from '../../slice/store.js';
 import type { SpecValidationResult, SpecIssue, DeterministicCheck } from '../types.js';
-
-const EXPECTED_SECTIONS = [
-  'Title',
-  'Summary',
-  'Motivation',
-  'Design',
-  'API / Interface Changes',
-  'Data Model Changes',
-  'Migration Plan',
-  'Testing Strategy',
-  'Acceptance Criteria',
-];
+import {
+  REQUIRED_SECTIONS as EXPECTED_SECTIONS,
+  extractSection,
+  missingRequiredSections,
+  sectionByConcept,
+} from '../format.js';
 
 function checkFrozenHash(slice: SliceData, specContent: string): SpecIssue | null {
   if (!slice.spec.frozenHash) return null;
@@ -36,23 +30,14 @@ function checkFrozenHash(slice: SliceData, specContent: string): SpecIssue | nul
 }
 
 function checkRequiredSections(slice: SliceData, specContent: string): SpecIssue | null {
-  const missing: string[] = [];
-
-  for (const section of EXPECTED_SECTIONS) {
-    // Match markdown headings: ## Section Name or ### Section Name
-    const escaped = section.replace(/[.*+?^${}()|[\]\\\/]/g, '\\$&');
-    const pattern = new RegExp(`^#{1,6}\\s+${escaped}\\s*$`, 'm');
-    if (!pattern.test(specContent)) {
-      missing.push(section);
-    }
-  }
+  const missing = missingRequiredSections(specContent);
 
   if (missing.length > 0) {
     return {
-      severity: missing.length > 3 ? 'error' : 'warning',
+      severity: 'warning',
       category: 'structure',
-      message: `Missing ${missing.length} recommended section(s): ${missing.join(', ')}`,
-      suggestion: missing.length <= 3 ? 'Consider adding the missing sections' : 'Add essential sections before freezing',
+      message: `Missing ${missing.length} required section(s): ${missing.join(', ')}`,
+      suggestion: `Add the missing section(s): ${missing.join(', ')}`,
     };
   }
 
@@ -60,22 +45,25 @@ function checkRequiredSections(slice: SliceData, specContent: string): SpecIssue
 }
 
 function checkAcceptanceCriteriaNotEmpty(slice: SliceData, specContent: string): SpecIssue | null {
-  // Check if Acceptance Criteria section has content (not just empty after heading)
-  const acMatch = specContent.match(/## Acceptance Criteria\s*\n([\s\S]*?)(?=\n## |$)/);
-  if (acMatch) {
-    const content = acMatch[1].trim();
-    if (!content || content === '-' || content.startsWith('<!--')) {
-      return {
-        severity: 'error',
-        category: 'content',
-        message: 'Acceptance Criteria section is empty',
-        suggestion: 'Define at least one acceptance criterion',
-      };
-    }
+  // 「验收标准 / Acceptance Criteria」章节存在但没有内容 = error
+  const ac = sectionByConcept('Acceptance Criteria');
+  if (!ac) return null;
+
+  const content = extractSection(specContent, ac);
+  if (content === null) {
+    // 章节不存在 —— 已由 checkRequiredSections 报出
     return null;
   }
 
-  // No AC section at all — already caught by checkRequiredSections
+  if (!content || content === '-' || content.startsWith('<!--')) {
+    return {
+      severity: 'error',
+      category: 'content',
+      message: 'Acceptance Criteria section is empty',
+      suggestion: 'Define at least one acceptance criterion',
+    };
+  }
+
   return null;
 }
 
@@ -119,7 +107,7 @@ export function validateDeterministic(slice: SliceData, specContent: string): Sp
   for (const dc of DETERMINISTIC_CHECKS) {
     const issue = dc.check(slice, specContent);
     if (issue) {
-      issues.push(issue);
+      issues.push({ ...issue, check: dc.name });
     }
   }
 

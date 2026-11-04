@@ -4,6 +4,7 @@
 
 import type { SliceData } from '../../slice/store.js';
 import type { SpecAnalysis, SpecIssue, SemanticCheck } from '../types.js';
+import { extractSection, sectionByConcept } from '../format.js';
 
 function countSections(specContent: string): number {
   const matches = specContent.match(/^#{2,3}\s+.+$/gm);
@@ -50,21 +51,37 @@ function checkPlaceholders(slice: SliceData, specContent: string): SpecIssue | n
 }
 
 function checkConsistencyBetweenSections(slice: SliceData, specContent: string): SpecIssue | null {
-  // Check if Design section references terms not defined elsewhere
-  const designMatch = specContent.match(/## Design\s*\n([\s\S]*?)(?=\n## |$)/);
-  const apiMatch = specContent.match(/## API \/ Interface Changes\s*\n([\s\S]*?)(?=\n## |$)/);
+  // 「设计 / Design」章节：写了但是空的 = warning；压根没写 = info
+  //
+  // 区别对待是因为 zelto 自己生成的规格模板（cli/commands/shared.ts 的
+  // generateSliceSpecContent）就不含「设计」这一节——把它当必备会变成
+  // 「每份规格都报缺章节」的噪声。有这一节却写空了才是真问题。
+  const design = sectionByConcept('Design');
+  if (!design) return null;
+  const designBody = extractSection(specContent, design);
 
-  if (!designMatch || designMatch[1].trim().length === 0) {
+  if (designBody === null) {
+    return {
+      severity: 'info',
+      category: 'semantic',
+      message: 'Design section is missing',
+      suggestion: 'Describe the design approach so the implementation stays traceable',
+    };
+  }
+
+  if (designBody.length === 0) {
     return {
       severity: 'warning',
       category: 'semantic',
-      message: 'Design section is empty or missing',
+      message: 'Design section is empty',
       suggestion: 'Describe the design approach before implementation',
     };
   }
 
-  // If there are API changes but no design, flag it
-  if (apiMatch && apiMatch[1].trim().length > 0 && designMatch[1].trim().length < 20) {
+  // 有 API 变更章节但设计章节很短 → 提示补设计
+  const api = sectionByConcept('API / Interface Changes');
+  const apiBody = api ? extractSection(specContent, api) : null;
+  if (apiBody !== null && apiBody.length > 0 && designBody.length < 20) {
     return {
       severity: 'warning',
       category: 'semantic',
@@ -77,18 +94,19 @@ function checkConsistencyBetweenSections(slice: SliceData, specContent: string):
 }
 
 function checkTestingStrategy(slice: SliceData, specContent: string): SpecIssue | null {
-  const testMatch = specContent.match(/## Testing Strategy\s*\n([\s\S]*?)(?=\n## |$)/);
-  if (testMatch) {
-    const content = testMatch[1].trim();
-    if (content.length < 20) {
-      return {
-        severity: 'warning',
-        category: 'semantic',
-        message: 'Testing Strategy section is too brief',
-        suggestion: 'Include unit test, integration test, and acceptance test plans',
-      };
-    }
+  const testing = sectionByConcept('Testing Strategy');
+  if (!testing) return null;
+
+  const content = extractSection(specContent, testing);
+  if (content !== null && content.length < 20) {
+    return {
+      severity: 'warning',
+      category: 'semantic',
+      message: 'Testing Strategy section is too brief',
+      suggestion: 'Include unit test, integration test, and acceptance test plans',
+    };
   }
+
   return null;
 }
 
@@ -104,7 +122,7 @@ export function analyzeSemantic(slice: SliceData, specContent: string): SpecAnal
   for (const sc of SEMANTIC_CHECKS) {
     const issue = sc.check(slice, specContent);
     if (issue) {
-      issues.push(issue);
+      issues.push({ ...issue, check: sc.name });
     }
   }
 
