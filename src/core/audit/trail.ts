@@ -79,6 +79,8 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `Sign requested by ${String(e.payload?.requestedBy ?? '')}`,
   'sign.approved': () => 'Sign approved',
   'sign.rejected': () => 'Sign rejected',
+  'batch.halted': (e) =>
+    `Batch halted (${String(e.payload?.stage ?? 'running')}): ${String(e.payload?.reason ?? '')}`,
   'merge.completed': () => 'Merge completed',
   'merge.planned': (e) =>
     `Merge planned: ${String(e.payload?.strategy ?? '?')} for ${String(Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '?')} slices`,

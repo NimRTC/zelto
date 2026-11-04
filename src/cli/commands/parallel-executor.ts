@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import { Scheduler } from '../../core/sched/engine.js';
 import { listFilesUnder } from '../../core/sched/audit.js';
+import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import type { SliceData } from '../../core/slice/store.js';
 import type { WorktreeInfo } from '../../core/worktree/index.js';
 
@@ -41,7 +42,7 @@ import { detectQuestion, suspendSliceForQuestion } from './question.js';
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /** 单个切片在并行批次里的结局 */
-export type SliceOutcomeStatus = 'completed' | 'failed' | 'stalled' | 'asked';
+export type SliceOutcomeStatus = 'completed' | 'failed' | 'stalled' | 'asked' | 'halted';
 
 export interface SliceOutcome {
   id: string;
@@ -67,6 +68,10 @@ export interface ParallelExecutionOptions {
   title?: string;
   /** 是否自动跑门禁②并发起签名请求（默认 true） */
   autoGate?: boolean;
+  /** 事件归属键（版本级用 version-<label>，run --parallel 用 batch） */
+  eventKey?: string;
+  /** 拉闸作用域（默认取 eventKey）——批次键或 'all' */
+  haltScope?: string;
 }
 
 export interface ParallelExecutionResult {
@@ -75,6 +80,10 @@ export interface ParallelExecutionResult {
   failed: number;
   stalled: number;
   asked: number;
+  /** 被拉闸打断的切片数（人主动喊停） */
+  halted: number;
+  /** 本批次的拉闸作用域（解除时要用它） */
+  haltScope: string;
   /** 是否全部走完且没有失败/停机 */
   ok: boolean;
   /** 准入 / 冲突 / 预算阶段就退出了 —— 一个 agent 都没跑起来 */
@@ -112,7 +121,17 @@ export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): 
  */
 export function printParallelSummary(result: ParallelExecutionResult): void {
   console.log('');
-  console.log(`?? 并行批次结束：${result.completed} 通过，${result.stalled} 停机，${result.asked} 待回答`);
+  console.log(`?? 并行批次结束：${result.completed} 通过，${result.stalled} 停机，${result.asked} 待回答${result.halted > 0 ? `，${result.halted} 已被拉闸` : ''}`);
+
+  const haltedOutcomes = result.outcomes.filter((o) => o.status === 'halted');
+  if (haltedOutcomes.length > 0) {
+    console.log('');
+    console.log(`⏸️  已被拉闸的切片（现场保留，处理完可重跑）:`);
+    for (const o of haltedOutcomes) {
+      console.log(`  ⏸️  ${o.id}`);
+    }
+    console.log(`     处理完：zelto halt --clear --scope ${result.haltScope}  →  重新跑批次`);
+  }
 
   const asked = result.outcomes.filter((o) => o.status === 'asked');
   if (asked.length > 0) {
@@ -144,8 +163,62 @@ export function printParallelSummary(result: ParallelExecutionResult): void {
   }
 }
 
-// ─── 内部状态 ────────────────────────────────────────────────────────────────
+// ─── 拉闸：等待 agent 时也能被叫停 ──────────────────────────────────────────
 
+/** 等待结果：正常退出，或被人拉闸打断 */
+export interface ExitOrHalt {
+  exitCode: number | null;
+  halted: boolean;
+  reason?: string;
+}
+
+/**
+ * 等 agent 退出，同时盯着拉闸请求。
+ *
+ * 为什么要「边等边听」：批次跑起来之后，人往往是在看到某个 agent
+ * 跑偏了才想喊停。等到 agent 自己结束再停，就没有「拉闸」可言了。
+ *
+ * 停了之后现场保留（worktree、写集预约、切片状态都还在），
+ * 人处理完 `zelto halt --clear` 再重跑批次。
+ *
+ * C3：只读文件、比对作用域，没有模型参与。
+ */
+export async function waitForExitOrHalt(
+  adapter: { waitForExit(id: string): Promise<number | null>; stop(id: string): Promise<void> },
+  sessionId: string,
+  haltStore: HaltStore,
+  scope: string,
+): Promise<ExitOrHalt> {
+  let finished = false;
+  let halted = false;
+  let reason: string | undefined;
+
+  // 轮询器：看到暂停请求就停掉 agent；agent 先退出就自己收摊
+  const watcher = (async () => {
+    while (!finished) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      if (finished) return;
+      const req = await haltStore.isHalted(scope);
+      if (!req) continue;
+      halted = true;
+      reason = req.reason;
+      try {
+        await adapter.stop(sessionId);
+      } catch {
+        // agent 已经退出了 —— 停不到也没关系
+      }
+      return;
+    }
+  })();
+
+  const exitCode = await adapter.waitForExit(sessionId);
+  finished = true;
+  await watcher;
+
+  return { exitCode, halted, reason };
+}
+
+// ─── 内部状态 ────────────────────────────────────────────────────────────────
 interface SliceState {
   id: string;
   status: 'admitted' | 'running' | 'completed' | 'failed';
@@ -178,12 +251,20 @@ export async function executeSlicesParallel(
   const title = options.title ?? 'zelto run --parallel';
   const autoGate = options.autoGate !== false;
 
+  // ─── 拉闸：人喊停的通道 ──────────────────────────────────────────────
+  // 批次进程不能常驻（AGENTS.md 禁区），所以人写一份暂停请求到文件，
+  // 正在跑的批次在安全点上读到它就收手（C1：状态只在文件里）。
+  const haltStore = new HaltStore(ZELTO_DIR);
+  const haltScope = options.haltScope ?? options.eventKey ?? 'batch';
+
   const empty = (): ParallelExecutionResult => ({
     outcomes: [],
     completed: 0,
     failed: 0,
     stalled: 0,
     asked: 0,
+    halted: 0,
+    haltScope,
     ok: false,
     aborted: false,
     abortReason: null,
@@ -195,6 +276,12 @@ export async function executeSlicesParallel(
   }
 
   const scheduler = new Scheduler(store, events, loadPolicyConfig());
+
+  /** 被拉闸打断、没能跑起来的切片 */
+  const haltedIds = new Set<string>();
+
+  /** 拉闸原因（人写的）—— 写进事件与 stall 记录，给人自己看 */
+  let haltReason: string | undefined;
 
   const states: SliceState[] = ids.map((id) => ({
     id,
@@ -338,10 +425,33 @@ export async function executeSlicesParallel(
   const startTime = Date.now();
   console.log(`\n${title} — starting ${ids.length} agents...`);
 
+  // 安全点 ①：拉起之前先看有没有人喊停
+  // 喊停了就不该再开新 agent —— 已跑起来的那个会在安全点 ② 收手。
+  const haltBeforeStart = await haltStore.isHalted(haltScope);
+  if (haltBeforeStart) {
+    haltReason = haltBeforeStart.reason;
+    console.log(`⏸️  已拉闸（${haltBeforeStart.reason}）—— 本批次不再启动新的 agent`);
+    await events.append(options.eventKey ?? haltScope, 'batch.halted', 'human', {
+      scope: haltScope,
+      reason: haltBeforeStart.reason,
+      stage: 'before_start',
+      slices: ids,
+    });
+  }
+
   for (let i = 0; i < states.length; i++) {
     const st = states[i];
     const adapter = adapters[i];
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
+
+    // 安全点 ①（逐片）：批次跑到一半人才喊停的，后面的 agent 不再开
+    if (haltBeforeStart || (await haltStore.isHalted(haltScope))) {
+      st.status = 'failed';
+      st.exitCode = null;
+      haltedIds.add(st.id);
+      continue;
+    }
+
     try {
       let sessionId: string | undefined;
       ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath }));
@@ -395,22 +505,44 @@ export async function executeSlicesParallel(
 
   const results = await Promise.allSettled(
     states.map(async (st, i) => {
+      if (haltedIds.has(st.id)) {
+        return { ...st, exitCode: null, status: 'halted' as const };
+      }
       if (st.sessionId === null) return { ...st, exitCode: -1, status: 'failed' as const };
 
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const exitCode = await adapters[i].waitForExit(st.sessionId);
-        st.exitCode = exitCode;
+        // 安全点 ②：等 agent 的时候也在听拉闸
+        // 喊停 → 停掉这个 agent → 现场保留（worktree / 预约都还在）
+        const exitCode = await waitForExitOrHalt(
+          adapters[i],
+          st.sessionId,
+          haltStore,
+          haltScope,
+        );
+        st.exitCode = exitCode.exitCode;
         st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
 
-        if (exitCode === 0) {
+        if (exitCode.halted) {
+          st.status = 'failed';
+          haltedIds.add(st.id);
+          haltReason = exitCode.reason ?? haltReason;
+          await events.append(st.id, 'batch.halted', 'human', {
+            scope: haltScope,
+            reason: exitCode.reason ?? '',
+            sliceId: st.id,
+          });
+          return { ...st, exitCode: null, status: 'halted' as const };
+        }
+
+        if (exitCode.exitCode === 0) {
           st.status = 'completed';
           return st;
         }
 
         // 失败 —— 按配置在 CLI 层自动重试
         if (attempt < maxRetries) {
-          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
-          const result = await handleAgentFailure(st.id, exitCode, { maxRetries });
+          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
+          const result = await handleAgentFailure(st.id, exitCode.exitCode, { maxRetries });
           if (result.action === 'retry') {
             const timeout = slices[i]?.agentTimeout;
             adapters[i] = createExecutorAdapter(
@@ -433,7 +565,7 @@ export async function executeSlicesParallel(
         }
 
         // 不再重试 —— 最终失败
-        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
+        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
         st.status = 'failed';
         return st;
       }
@@ -466,6 +598,32 @@ export async function executeSlicesParallel(
     }
 
     const st = result.value;
+
+    // 被拉闸打断的切片：不进门禁、不发签名请求 —— 现场交回给人
+    if (st.status === 'halted' || haltedIds.has(st.id)) {
+      // 回退：running → frozen，并标记 stall.class='human_halt'。
+      // 不做这一步，切片会永远卡在 running —— 准入只认 frozen/completed，
+      // 于是「处理完继续」这条路直接断了（ADR-020 §3.2）。
+      const rollback = await rollbackHaltedSlice(store, events, st.id, {
+        reason: haltReason ?? '人工拉闸',
+        scope: haltScope,
+      });
+
+      outcomes.push({
+        id: st.id,
+        status: 'halted',
+        exitCode: null,
+        elapsedSec: st.elapsedSec,
+        gatePassed: null,
+        signRequested: false,
+      });
+      console.log(`⏸️  ${st.id}: 已拉闸 —— 现场保留，等人处理（zelto halt --clear 后重跑）`);
+      if (rollback.reverted) {
+        console.log(`   状态: ${rollback.from} → ${rollback.to}（stall: human_halt）`);
+        console.log(`   继续: zelto resume ${st.id} → zelto run ${st.id}`);
+      }
+      continue;
+    }
 
     if (st.exitCode !== 0) {
       outcomes.push({
@@ -544,12 +702,29 @@ export async function executeSlicesParallel(
     });
   }
 
-  await releaseGuards(guards);
+  // 被拉闸的切片保留预约与钩子 —— 现场交回给人（ADR-020 §3.5）。
+  // 释放预约会让仍在跑（或没死透）的 agent 失去写集约束（C9）。
+  const keptGuards: string[] = [];
+  for (const [id, guard] of guards) {
+    if (haltedIds.has(id)) {
+      keptGuards.push(id);
+      continue;
+    }
+    try {
+      await guard.release();
+    } catch {
+      // 释放失败不阻断：残留的预约会被 reap 清理
+    }
+  }
+  if (keptGuards.length > 0) {
+    console.log(`⏸️  ${keptGuards.join(', ')}: 写集预约保留 —— 处理完用 zelto reservation release <id> 释放`);
+  }
 
   const completed = outcomes.filter((o) => o.status === 'completed').length;
   const asked = outcomes.filter((o) => o.status === 'asked').length;
   const failed = outcomes.filter((o) => o.status === 'failed').length;
   const stalled = outcomes.filter((o) => o.status === 'stalled').length;
+  const halted = outcomes.filter((o) => o.status === 'halted').length;
 
   return {
     outcomes,
@@ -557,7 +732,9 @@ export async function executeSlicesParallel(
     failed,
     stalled,
     asked,
-    ok: failed === 0 && stalled === 0 && asked === 0,
+    halted,
+    haltScope,
+    ok: failed === 0 && stalled === 0 && asked === 0 && halted === 0,
     aborted: false,
     abortReason: null,
     skipped: [],
@@ -592,6 +769,15 @@ export async function executeSlicesByPhase(
 ): Promise<ParallelExecutionResult> {
   const phases = options.phases.filter((p) => p.length > 0);
 
+  const eventKey = options.eventKey ?? 'batch';
+  const outcomes: SliceOutcome[] = [];
+  const skipped: string[] = [];
+  let ok = true;
+
+  // 阶段之间是安全点：人在这两阶段之间喊停，后面的阶段不再启动
+  const haltStore = new HaltStore(ZELTO_DIR);
+  const haltScope = options.haltScope ?? eventKey;
+
   if (phases.length === 0) {
     return {
       outcomes: [],
@@ -599,6 +785,8 @@ export async function executeSlicesByPhase(
       failed: 0,
       stalled: 0,
       asked: 0,
+      halted: 0,
+      haltScope,
       ok: false,
       aborted: true,
       abortReason: '没有要执行的阶段',
@@ -606,14 +794,28 @@ export async function executeSlicesByPhase(
     };
   }
 
-  const eventKey = options.eventKey ?? 'batch';
-  const outcomes: SliceOutcome[] = [];
-  const skipped: string[] = [];
-  let ok = true;
-
   for (let p = 0; p < phases.length; p++) {
     const phaseIds = phases[p];
     const parallel = phaseIds.length > 1 ? `（${phaseIds.length} 个并行）` : '';
+
+    // 安全点 ③：阶段之间检查拉闸
+    if (p > 0) {
+      const haltReq = await haltStore.isHalted(haltScope);
+      if (haltReq) {
+        console.log('');
+        console.log(`⏸️  已拉闸（${haltReq.reason}）—— 后续 ${phases.length - p} 个阶段不再启动`);
+        await events.append(eventKey, 'batch.halted', 'human', {
+          scope: haltScope,
+          reason: haltReq.reason,
+          stage: 'between_phases',
+          phase: p,
+          slices: phases.slice(p).flat(),
+        });
+        skipped.push(...phases.slice(p).flat());
+        ok = false;
+        break;
+      }
+    }
 
     console.log('');
     console.log(`── 阶段 ${p + 1}/${phases.length}: ${phaseIds.join(', ')} ${parallel}`);
@@ -646,6 +848,8 @@ export async function executeSlicesByPhase(
         failed: 0,
         stalled: 0,
         asked: 0,
+        halted: outcomes.filter((o) => o.status === 'halted').length,
+        haltScope,
         ok: false,
         aborted: true,
         abortReason: result.abortReason,
@@ -676,6 +880,7 @@ export async function executeSlicesByPhase(
   const asked = outcomes.filter((o) => o.status === 'asked').length;
   const failed = outcomes.filter((o) => o.status === 'failed').length;
   const stalled = outcomes.filter((o) => o.status === 'stalled').length;
+  const halted = outcomes.filter((o) => o.status === 'halted').length;
 
   return {
     outcomes,
@@ -683,7 +888,9 @@ export async function executeSlicesByPhase(
     failed,
     stalled,
     asked,
-    ok: ok && failed === 0 && stalled === 0 && asked === 0,
+    halted,
+    haltScope,
+    ok: ok && failed === 0 && stalled === 0 && asked === 0 && halted === 0,
     aborted: false,
     abortReason: null,
     skipped,

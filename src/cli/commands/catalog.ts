@@ -46,7 +46,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'start', group: '核心切片', args: '<id>', summary: '一条命令走完 create → check → freeze → run', detail: '--yes, --agent, --adapter' },
   { name: 'admit', group: '核心切片', args: '<id>', summary: '检查切片准入', detail: '--json' },
   { name: 'gate', group: '核心切片', args: '<id>', summary: '门禁② 跑验收测试', detail: '--dry-run, --retry, --spec-md, --json' },
-  { name: 'sign', group: '核心切片', args: '<id>', summary: '批准或拒绝已完成的切片', detail: '--approve | --reject, --comment' },
+  { name: 'sign', group: '核心切片', args: '<id>', summary: '批准、拒绝或撤销已完成的切片', detail: '--approve | --reject | --revoke, --comment' },
   { name: 'inbox', group: '核心切片', args: '', summary: '查看待签字队列' },
   { name: 'abandon', group: '核心切片', args: '<id>', summary: '废弃一个切片' },
   { name: 'next', group: '核心切片', args: '', summary: '推荐该切片的下一步动作' },
@@ -79,6 +79,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'merge', group: '治理与运行时', args: '[id ...]', summary: '合并已签字的切片（不带 id 则合并全部待合切片；子命令 plan 只出计划）', detail: '--strategy, --dry-run, --push, --json' },
   { name: 'audit', group: '治理与运行时', args: '<slice-id>', summary: '查看切片的审计追踪', detail: '--json' },
   { name: 'hook', group: '治理与运行时', args: '', summary: '安装 / 卸载 git hooks', detail: '--install, --uninstall, --status' },
+  { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
 
   // ─── AI 流水线 ─────────────────────────────────────────────────────────
   { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, confirm <id>, refine <id> <text>' },
