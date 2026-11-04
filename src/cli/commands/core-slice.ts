@@ -32,7 +32,8 @@ import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
-import { executeSlicesParallel, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
+import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
+import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
 import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites } from './run-support.js';
@@ -1127,11 +1128,28 @@ async function runParallel(args: string[]): Promise<number> {
   const adapterIdx = args.indexOf('--adapter');
   const adapterType = adapterIdx >= 0 ? args[adapterIdx + 1] : undefined;
 
-  const result = await executeSlicesParallel({
+  // 排阶段（G-1 + G-2）：依赖分层 + 写集冲突降级
+  const plan = await buildExecutionPlan(ids, args);
+
+  if (plan.cycle) {
+    await events.append('batch', 'coord.cycle_detected', 'zelto', {
+      cycle: plan.cycle,
+      slices: ids,
+    });
+    console.error(`\n❌ 依赖成环：${plan.cycle.join(' → ')}`);
+    console.error('   环里的切片没法排先后 —— 先解开依赖再跑。');
+    return 1;
+  }
+
+  printExecutionPlan(plan);
+
+  const result = await executeSlicesByPhase({
     ids,
+    phases: plan.phases,
     agentName,
     adapterType,
     title: 'zelto run --parallel',
+    eventKey: 'batch',
   });
 
   if (result.aborted) {
@@ -1140,6 +1158,11 @@ async function runParallel(args: string[]): Promise<number> {
   }
 
   printParallelSummary(result);
+
+  if (result.skipped.length > 0) {
+    console.log('');
+    console.log(`⏸️  没来得及跑的切片：${result.skipped.join(', ')}`);
+  }
 
   return result.ok ? 0 : 1;
 }

@@ -153,13 +153,28 @@ gate:
     assert.ok(result.stdout.includes('偏离'), `Expected drift report, got: ${result.stdout}`);
   });
 
-  it('同阶段写集重叠被判阻断', async () => {
+  it('写集重叠的切片被降级为串行，而不是整批阻断', async () => {
+    // D2=A：写集冲突不再整批 abort —— 冲突的切片拆成先后两个阶段，批次继续跑。
     await setupSlice('batch-overlap-a', { writes: ['src/shared/**'] });
     await setupSlice('batch-overlap-b', { writes: ['src/shared/component.ts'] });
 
     const result = zelto('batch', 'batch-overlap-a', 'batch-overlap-b');
-    assert.equal(result.status, 1);
+    assert.equal(result.status, 0, `Expected exit 0, got ${result.status}: ${result.stdout}`);
     assert.ok(result.stdout.includes('写集重叠'), `Expected overlap report, got: ${result.stdout}`);
+    assert.ok(result.stdout.includes('降级为串行'), `Expected downgrade report, got: ${result.stdout}`);
+  });
+
+  it('写集重叠时排成两个阶段', async () => {
+    await setupSlice('batch-overlap2-a', { writes: ['src/shared2/**'] });
+    await setupSlice('batch-overlap2-b', { writes: ['src/shared2/component.ts'] });
+
+    const result = zelto('batch', 'batch-overlap2-a', 'batch-overlap2-b', '--json');
+    assert.equal(result.status, 0, `Expected exit 0, got ${result.status}: ${result.stdout}`);
+
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.phases.length, 2, `Expected 2 phases, got: ${JSON.stringify(parsed.phases)}`);
+    assert.equal(parsed.downgrades.length, 1);
+    assert.equal(parsed.ready, true);
   });
 
   it('--json 输出可解析且字段齐全', async () => {
