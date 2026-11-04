@@ -33,6 +33,8 @@ export type EventType =
   | 'sign.requested'
   | 'sign.approved'
   | 'sign.rejected'
+  | 'sign.revoked'
+  | 'batch.halted'
   | 'merge.completed'
   | 'merge.planned'
   | 'merge.phase_complete'

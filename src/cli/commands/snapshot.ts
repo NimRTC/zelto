@@ -156,6 +156,29 @@ ${'Options:'}
   // ─── capture (default) ─────────────────────────────────────────────────
   const isJson = args.includes('--json');
 
+  const data = await captureSnapshot();
+
+  if (isJson) {
+    writeOutput(data, undefined, { json: true });
+  } else {
+    console.log(`${colors.green('✓')} ${colors.bold('Snapshot captured:')} ${colors.cyan(data.id)}`);
+    console.log(`  ${colors.dim('Slices:')} ${data.slices.length}`);
+    console.log(`  ${colors.dim('Git:')} ${data.git.branch}@${data.git.commit.substring(0, 8)}`);
+    console.log(`  ${colors.dim('Saved to:')} .zelto/events/snapshots/${data.id}.json`);
+  }
+
+  return 0;
+});
+
+/**
+ * 捕获一份项目状态快照并落盘。
+ *
+ * 抽成函数是因为「拉闸」也要留现场（ADR-020）：人喊停的那一刻，
+ * 现场必须能被事后回看 —— 只有 stdout 上的几行字是不够的。
+ *
+ * C1: 快照落在 `.zelto/events/snapshots/<id>.json`
+ */
+export async function captureSnapshot(): Promise<SnapshotData> {
   // Gather git info
   let gitCommit = 'unknown';
   let gitBranch = 'unknown';
@@ -236,14 +259,5 @@ ${'Options:'}
   }
   writeFileSync(join(SNAPSHOTS_DIR, `${id}.json`), JSON.stringify(data, null, 2), 'utf-8');
 
-  if (isJson) {
-    writeOutput(data, undefined, { json: true });
-  } else {
-    console.log(`${colors.green('✓')} ${colors.bold('Snapshot captured:')} ${colors.cyan(id)}`);
-    console.log(`  ${colors.dim('Slices:')} ${slices.length}`);
-    console.log(`  ${colors.dim('Git:')} ${gitBranch}@${gitCommit.substring(0, 8)}`);
-    console.log(`  ${colors.dim('Saved:')} .zelto/events/snapshots/${id}.json`);
-  }
-
-  return 0;
-});
+  return data;
+}

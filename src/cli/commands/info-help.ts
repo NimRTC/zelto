@@ -22,6 +22,33 @@ register('next', async () => {
     return 0;
   }
 
+  // 停机切片优先：人被交还控制权的那一刻，最该看见的就是「哪些切片等着他处理」。
+  // 停机切片的状态通常还是 frozen（回退后的状态），按状态优先级排会被
+  // draft/clarifying 挤到后面去 —— 而它们才是眼下唯一该做的事。
+  const stalled: Array<{ id: string; title: string; class: string }> = [];
+  for (const id of list) {
+    try {
+      const s = await store.read(id);
+      if (s.stall.class !== null) {
+        stalled.push({ id, title: s.title, class: s.stall.class });
+      }
+    } catch {
+      // Skip unreadable slices
+    }
+  }
+
+  if (stalled.length > 0) {
+    const first = stalled[0];
+    console.log(`Next: ${first.id} (stalled: ${first.class})`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: zelto stall ${first.id}`);
+    console.log(`  Then:  zelto resume ${first.id} && zelto run ${first.id}`);
+    if (stalled.length > 1) {
+      console.log(`  (还有 ${stalled.length - 1} 个停机切片：${stalled.slice(1).map((s) => s.id).join('、')})`);
+    }
+    return 0;
+  }
+
   const priority: Array<string> = ['draft', 'clarifying', 'frozen', 'running', 'completed', 'abandoned'];
   for (const state of priority) {
     for (const id of list) {

@@ -1,4 +1,4 @@
-// Stall classifier — 6 classes of stall
+// Stall classifier — 9 classes of stall
 // See docs/zelto-场景功能地图.md §4.1
 
 import type { StallInfo } from './types.js';
@@ -12,7 +12,8 @@ export type StallClass =
   | 'plan_gate'           // ⑤ 计划门禁 — agent requests plan approval
   | 'budget_exhausted'   // ⑥ 预算耗尽 — max budget reached
   | 'gate_retry'         // ⑦ 门禁重试 — gate executor retries exhausted
-  | 'agent_question';    // ⑧ agent 提问 — 等待人回答（ADR-013）
+  | 'agent_question'     // ⑧ agent 提问 — 等待人回答（ADR-013）
+  | 'human_halt';        // ⑨ 人工拉闸 — 人喊停，等人处理现场（ADR-020）
 
 export type StallResolution = 'auto_resolved' | 'needs_attention' | 'escalated';
 
@@ -31,6 +32,9 @@ export interface StallEvent {
  *
  * `agent_question` is never auto-resolvable: by definition the agent stopped
  * because it cannot decide on its own (ADR-013 §3.5).
+ *
+ * `human_halt` is never auto-resolvable either: 人喊停要的就是「停下来等人」，
+ * agent 自己把它重试起来就违背了拉闸的意图（ADR-020 §3.3）。
  */
 export function isAutoResolvable(stallClass: StallClass): boolean {
   return stallClass === 'permission_prompt'

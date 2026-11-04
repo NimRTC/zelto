@@ -30,6 +30,7 @@ import './dashboard.js';
 import './depgraph.js';
 import './artifact.js';
 import './batch.js';
+import './halt.js';
 import './merge.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
