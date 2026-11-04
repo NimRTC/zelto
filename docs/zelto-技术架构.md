@@ -1,6 +1,7 @@
 # zelto 技术架构
 
-> 版本: v0.2.0 · 最后更新: 2026-10-28
+> 版本: v0.3.0 · 最后更新: 2026-11-04
+> 项目定位见 `docs/zelto-项目目标.md`；功能全貌见 `docs/zelto-场景功能地图.md`
 
 ---
 
@@ -9,35 +10,32 @@
 ```
                     ┌──────────────────────────────────────┐
                     │            CLI (src/cli/)             │
-                    │   commands.ts — 45+ 个命令       │
+                    │   commands/ — 50+ 个命令             │
                     └──────────────┬───────────────────────┘
                                    │
-              ┌────────────────────┼────────────────────┐
-              ▼                    ▼                    ▼
-     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-     │   core/policy  │  │  core/slice    │  │  core/events   │
-     │  策略规则引擎   │  │  切片状态机    │  │  append-only   │
-     │  保护域判定     │  │  文件持久化    │  │  JSONL 流      │
-     └────────────────┘  └────────────────┘  └────────────────┘
-              │                    │                    │
-              ▼                    ▼                    ▼
-     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-     │  core/gate     │  │  core/sched    │  │  core/stall    │
-     │  门禁执行器     │  │  并行准入      │  │  停机分类器    │
-     │  签名管理器     │  │  约束分发      │  │  6 类停机      │
-     └────────────────┘  └────────────────┘  └────────────────┘
-              │                    │                    │
-              ▼                    ▼                    ▼
-     ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-     │  core/clarify  │  │ core/metrics   │  │  core/audit    │
-     │  澄清引擎       │  │  度量收集      │  │  审计追踪      │
-     │  5 类问题       │  │  3 类指标      │  │  29 种摘要     │
-     └────────────────┘  └────────────────┘  └────────────────┘
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+┌───────────────┐        ┌─────────────────┐        ┌─────────────────┐
+│  规划层       │        │   编排层        │        │   治理层        │
+│ core/require │        │ core/sched      │        │ core/policy     │
+│ core/design  │        │ core/worktree   │        │ core/gate       │
+│ core/version │        │ core/question   │        │ core/stall      │
+│ （需求/设计/  │        │ core/slice      │        │ core/spec       │
+│  版本状态）   │        │ （准入/写集/    │        │ core/audit      │
+│ llm/ 仅产草稿 │        │  隔离/提问）    │        │ core/contracts  │
+└───────────────┘        └─────────────────┘        └─────────────────┘
+        │                          │                          │
+        └──────────────────────────┼──────────────────────────┘
+                                   ▼
+                    ┌──────────────────────────────────────┐
+                    │  core/events — append-only 事件流    │
+                    │  47 种事件 · 判定留痕 · 追溯的底座    │
+                    └──────────────────────────────────────┘
 
      ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-     │  core/ports    │  │  core/spec     │  │   hook/       │
-     │  端口接口定义   │  │  规格引擎      │  │  独立判定进程  │
-     │  4 个 Port     │  │  SpecMdExecutor│  │  零依赖可执行  │
+     │  src/hook/     │  │ src/adapters/  │  │  src/llm/      │
+     │  独立判定进程   │  │  执行器适配器   │  │  草案生成       │
+     │  + PreToolUse  │  │  claude-agent  │  │  不参与判定     │
      └────────────────┘  └────────────────┘  └────────────────┘
 ```
 
@@ -51,6 +49,15 @@ adapters/ → core/ports（预留）
 ```
 
 **核心原则 C6**: `core/` 不得 import `adapters/`。依赖单向向下。
+
+### 1.2 分层职责
+
+| 层 | 职责 | 判定性质 |
+|---|---|---|
+| **规划层** | 需求 → 设计（模块划分）→ 版本计划 → 切片规格 | LLM 产出**草稿**，人 `confirm`；不参与任何判定（C7） |
+| **编排层** | 并行准入、写集解析与冲突、worktree 隔离、agent 提问 | **确定性**（C3） |
+| **治理层** | 策略判定、门禁验收、停机分类、规格校验、审计 | **确定性**（C3） |
+| **事件层** | 所有动作的 append-only 留痕 | 追溯链的底座（C4） |
 
 ---
 
@@ -160,7 +167,11 @@ interface EventEnvelope {
 
 **存储**: `.zelto/events/<sliceId>/events.jsonl`
 
-**29 种事件类型**: 见场景功能地图 §5。
+**47 种事件类型**: 见场景功能地图 §5。事件类型的真源是
+`contracts/schemas/event-envelope.json` 的 enum —— 代码与契约不允许不一致。
+
+**版本级事件**用 `version-<label>` 作归属键（版本不是切片，事件流按切片分目录），
+见 `docs/adr-017-version-level-orchestration.md`。
 
 ### 3.4 Gate Executor — `src/core/gate/`
 
@@ -263,7 +274,7 @@ class Scheduler {
 
 **文件**: `trail.ts`
 
-为 29 种事件各定义摘要生成器。支持：
+为 47 种事件各定义摘要生成器。支持：
 - `forSlice(sliceId)` — 获取结构化审计条目
 - `toText(sliceId)` — 生成可读文本报告
 - `latestEvent(sliceId, eventType)` — 获取最新事件
@@ -332,9 +343,76 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 
 ### 3.13 CLI — `src/cli/`
 
-**文件**: `commands.ts`
+**文件**: `commands/`（按域拆分）+ `commands/catalog.ts`（命令目录唯一真源）
 
-40+ 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
+50+ 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
+
+`catalog.ts` 是「有哪些命令、怎么用、分在哪组」的**唯一真源**：
+`zelto help`、`zelto help <cmd>`、shell 补全脚本三者都从它出。
+新增命令只要在 `COMMAND_CATALOG` 加一行，help 与补全自动跟上；
+`tests/cli-catalog.test.ts` 守着「注册了的命令必须在目录里、目录里不能有没实现的命令」。
+
+### 3.14 规划层存储 — `src/core/requirements/` / `design/` / `version/`
+
+三段规划各自有独立的文件化状态（C1）：
+
+| 模块 | 状态文件 | 内容 |
+|---|---|---|
+| `core/requirements/` | `.zelto/requirements/<id>.json` | 需求文档、验收标准、`draft → confirmed` |
+| `core/design/` | `.zelto/designs/<id>.json` | 设计正文、**模块划分**（name / files / deps）、`draft → confirmed` |
+| `core/version/` | `.zelto/versions/<id>.json` | 版本计划（versions / slices / dependsOn）、版本状态 |
+
+**版本状态机**：`planned → in_progress → integrated → delivered`
+（ADR-017 新增 `integrated` 中间态：版本级验收通过但尚未交付）。
+
+模块划分（`DesignDoc.modules`）目前是**文档级的**——
+它描述了模块边界，但还没有被编译期或门禁期校验。这是
+`docs/zelto-项目目标.md` 里记的 G-4 差距。
+
+### 3.15 编排层 — `src/core/worktree/` / `question/` / `sched/`
+
+| 模块 | 职责 |
+|---|---|
+| `core/worktree/manager.ts` | 建/查/删 worktree，路径固定 `.zelto/worktrees/<sliceId>`（ADR-011） |
+| `core/question/protocol.ts` | agent 以提问收尾 → 挂起该切片 → 回答后续跑（ADR-013） |
+| `core/sched/engine.ts` | 准入、写集冲突检测、约束分发 |
+| `core/sched/batch.ts` | 批次审核、依赖分层（`planBatchPhases`）、工件冲突 |
+| `core/sched/depgraph.ts` | 依赖图与环检测（Kahn 拓扑排序） |
+| `core/sched/merge.ts` | 合并计划与冲突可见（ADR-012） |
+| `core/sched/reservation.ts` | 写集预约文件，C9 的落地载体 |
+
+### 3.16 单一并行执行实现 — `src/cli/commands/parallel-executor.ts`
+
+`executeSlicesParallel()` 是**唯一**的并行执行实现，
+`zelto run --parallel` 与 `zelto version start` 共用（ADR-017）。
+
+为什么要共用：版本层若另写一份，迟早漏掉 worktree 隔离或写集预约守卫——
+漏掉隔离 → agent 互相覆盖；漏掉预约 → 越界写入无人拦（C9）。
+
+六个阶段（准入 → 写集解析 → 冲突检测 → 隔离与守卫 → 拉起 agent → 收尾）
+详见 `docs/zelto-场景功能地图.md` §2.5。
+
+### 3.17 显式合并 — `src/cli/commands/merge*.ts`
+
+**文件**: `merge.ts`（命令入口）、`merge-runner.ts`（候选收集 / worktree 提交 / 清理 / 推送）、
+`merge-plan.ts`（计划构建）、`merge-executor.ts`（计划执行）
+
+合并是**签字之后的唯一归并路径**（ADR-018）。四个文件的职责切分：
+
+| 文件 | 职责 |
+|---|---|
+| `merge.ts` | 解析参数（id / `--strategy` / `--plan` / `--dry-run` / `--push`）、收集候选、驱动流程 |
+| `merge-runner.ts` | `collectMergeCandidates()` 收集「已批准且未合入」的切片；`commitPendingWorktrees()` 提交产物；`cleanupMergedSlices()` 清理 worktree 与分支；`pushCurrentBranch()` 推送 |
+| `merge-plan.ts` | 按依赖图与写集冲突构建合并计划（`core/sched/merge.ts` 的纯计算部分） |
+| `merge-executor.ts` | 执行计划：按策略合并、冲突即 `git merge --abort` 回滚、写 `merge.*` 事件 |
+
+**关键设计**：`core/sched/merge.ts` 只做**纯计算**（计划、冲突判定、策略选择），
+不碰 git；碰 git 的部分全在 `cli/`。这样 C3 成立——
+合并判定确定性、不调模型、不触网。
+
+**为什么合并必须在 CLI 层而不在签字路径里**：
+签字是「批准」，合并是「动作」；分开之后，
+批准写进 `sign.*` 事件，动作写进 `merge.*` 事件，追溯链才不会断。
 
 ---
 
@@ -396,7 +474,39 @@ zelto sign --approve → SignManager.request(sliceId)
                         → events.append('sign.requested')
                         → SignManager.approve(id, 'human')
                         → events.append('sign.approved')
+                        → 只改状态，不碰主干（ADR-018）
+                        → 提示下一步：zelto merge <id>
 ```
+
+签字**不自动合并**（`docs/adr-018-no-auto-merge-on-sign.md`）。合并是显式动作：
+
+```
+zelto merge [id ...] [--strategy <s>] [--dry-run] [--push] [--json]
+  1. 不带 id → 收集「已批准且尚未合入」的切片
+  2. 提交各切片 worktree 里未提交的改动（分支必须先带上产物）
+  3. MergePlanner 按依赖图生成合并计划（core/sched/merge.ts）
+  4. executeMergePlan 执行：冲突即 git merge --abort，主干回滚
+  5. 清理已合并切片的 worktree 与分支
+  6. --push → 推送合并后的分支
+```
+
+`--push` 只属于合并，不属于签字——推的必须是合并结果。
+
+### 4.7 版本级流程
+
+```
+zelto version start <ver>
+  Phase 1  准备切片：建切片文件 → 写规格 → 冻结（哈希 + spec.frozen 事件）
+  Phase 2  并行执行：executeSlicesParallel() —— 与 run --parallel 同一条路径
+  Phase 3  结果解读：全部通过 → 打印逐片签字命令；否则提示 --retry-failed
+
+zelto version deliver <ver>
+  第一步  前置条件：切片状态 completed + 分支已合入 HEAD（只读磁盘与 git）
+  第二步  版本级验收：在主仓跑 config.gate.commands（真实主干代码）
+  通过 → events.append('version.accepted') → 状态 integrated → delivered
+```
+
+详见 `docs/adr-017-version-level-orchestration.md`。
 
 ---
 
@@ -410,7 +520,7 @@ zelto sign --approve → SignManager.request(sliceId)
 | **C4** append-only | `EventStream.append()` 使用 `appendFile`；无 delete/update |
 | **C5/C8** 保护域 | `PROTECTED_PATTERNS` 硬编码常量，策略规则无法覆盖 |
 | **C6** 单向依赖 | tsconfig 无反向路径映射；代码级无 import 从 adapters 到 core |
-| **C7** llm 不判定 | `llm/` 目录预留；所有判定模块（policy/gate/sched）不引用 llm |
+| **C7** llm 不判定 | `llm/` 只用于需求/设计/计划的**草案**生成；所有判定模块（policy/gate/sched）不引用 llm；草案须经人 `confirm` 才进入下游 |
 | **C9** 写集预约 | 准入：`Scheduler.admit()` 检查 running 切片的 writes 数组；运行期：`.zelto/locks/<id>.json` 预约 + PreToolUse 钩子逐写判定 + 运行后 git 改动审计（ADR-014） |
 
 ---
@@ -489,7 +599,7 @@ agent 写文件
 
 ### 7.3 当前覆盖
 
-- **925+ tests, 193+ suites, 全部通过**
+- **976 tests, 203 suites, 0 fail**（2026-11-04 全量验证）
 - 核心模块覆盖率 > 90%
 - Hook 可执行体 7 个集成测试
 - 运行时守卫 1 个验收测试（起真实 CLI 进程 + 假 agent，验钩子判定 + 审计兜底）
@@ -498,22 +608,35 @@ agent 写文件
 
 ## 8. 未来架构方向
 
-### 8.1 adapters/ 实现
+完整的目标、现状差距与待决策项见 `docs/zelto-项目目标.md` §6 与 §7。
+此处只列架构层面的方向。
 
-Port 接口已定义，待实现：
-- `adapters/claude-agent-sdk` — Claude Agent SDK 适配器
-- 其他 agent 平台适配器
+### 8.1 架构护栏（G-4 的一部分）
 
-### 8.2 llm/ 集成
+当前 zelto 自身的 C2/C6（`core/` 不依赖 `adapters/`）只约束 zelto 自己。
+**被 zelto 管理的项目没有对应机制**——`DesignDoc.modules[].dependencies`
+只是文档里的字，没有被校验。
 
-`llm/` 目录预留，用于：
+方向：先做「设计里的模块图 vs 实际 import 图」的报告（只读、不拦），
+再考虑做成 policy 的可配置规则（涉及 policy 契约扩展 → 需 ADR）。
+
+### 8.2 版本内依赖分层（G-1）
+
+`core/sched/batch.ts` 已有 `planBatchPhases()` 能做拓扑分层，
+但 `version start` 还没用它——目前版本内切片是全并行跑的，
+依赖后置的切片会抢跑。这是最影响「高速并行」真实度的一处。
+
+### 8.3 批次级闸门（G-3）
+
+目前只有被动停机（agent 自己挂了、被 hook 拦了），没有主动刹车。
+需要的是：暂停 → 快照现场 → 人处理 → 继续；以及签错后的回退路径。
+
+### 8.4 llm/ 集成
+
+`llm/` 已用于需求/设计/计划的草案生成，后续可用于：
 - 丰富澄清问题生成（现为规则引擎）
 - 语义发现（代码库分析）
-- **不参与任何判定**
-
-### 8.3 验收测试
-
-`tests/acceptance/` 预留，用于端到端验收测试。
+- **永远不参与任何判定**（C7）
 
 ---
 

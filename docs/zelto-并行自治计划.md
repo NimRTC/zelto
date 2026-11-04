@@ -35,7 +35,7 @@
 | 写集冲突检测按目录前缀粗判 | `src/core/sched/engine.ts:194`、`:216` | `src/**` 与 `src/a/**` 判为冲突（可接受），但反向的误杀来自上一行的回退 |
 | 门禁在主仓库 cwd 执行 | `src/cli/commands/core-slice.ts:1407`、`src/core/gate/executor.ts:76` | 校验的不是 agent 改的那份代码 |
 | `zelto diff` 在主仓库比对 `baseCommit..HEAD` | `src/cli/commands/diff.ts:31` | 看不到隔离目录里的未提交改动 |
-| 签字通过后 `git merge --ff-only` + `git branch -d` + 自动 push | `src/cli/commands/gate-sign.ts:288`、`:380` | 第二个并行分支必然 ff 失败；与负向清单"自动合并"抵触（见 §6） |
+| ~~签字通过后 `git merge --ff-only` + `git branch -d` + 自动 push~~ | ~~`src/cli/commands/gate-sign.ts:288`、`:380`~~ | **已解决（ADR-018）**：签字不再自动合并，合并走显式 `zelto merge` |
 | 停机分类器有 6 类，但调用点只用 `type: 'test_failure'` | `src/core/stall/classifier.ts:34` vs `src/cli/commands/core-slice.ts:1462` | `permission_prompt` / `plan_gate` / `cognitive_stuck` 永远不会被判定出来 |
 | `isAutoResolvable` 把 `environment_failure` 视为可自动解决 | `src/core/stall/classifier.ts:28` | 所有非零退出都被当成环境故障重试，掩盖真实原因 |
 | agent 以 `--permission-mode bypassPermissions` 启动 | `src/adapters/claude-agent/index.ts:213` | 运行期没有权限拦截点 |
@@ -117,9 +117,9 @@
 **目标**：多个并行切片签字后能安全汇入主分支，冲突可见、失败可回滚。
 
 - **范围**
-  - 替代 `src/cli/commands/gate-sign.ts:288` 的 `git merge --ff-only` 串行合并：按 base commit 拓扑排序分批合并，冲突时停下并报告冲突文件，而不是删分支。
+  - 替代签字路径里的 `git merge --ff-only` 串行合并：按 base commit 拓扑排序分批合并，冲突时停下并报告冲突文件，而不是删分支。**（已由 ADR-012 + ADR-018 实现）**
   - 合并结果写 `merge.completed` / `merge.stale_base` 事件（类型已存在，见 §2）。
-  - 明确"自动 push"与负向清单"自动合并"的关系（见 §6 问项 1），按结论实现。
+  - 合并是显式动作：`zelto merge`，不走签字路径。**（已由 ADR-018 拍板）**
 - **不变量自查**：C1（合并状态只落文件与 git）；C4（合并事件可追溯）。
 - **验收标准**
   1. 两个并行切片签字后依次合入主分支，第二个不会因 ff-only 失败。
@@ -162,7 +162,9 @@ M3  C（受控合并）  与  D（运行时策略）可并行
 
 ## 6. 待人决策（不自行拍板）
 
-1. **签字后是否自动合并、自动 push？** 负向清单写明"自动合并"不在做，但现存的 `autoMergeSlice` 已在做（`gate-sign.ts:288`）。二者必须择一，需要一份 ADR 说明现状与目标。
+1. **签字后是否自动合并、自动 push？** ~~待决策~~ → **已由 ADR-018 拍板**：
+   签字只改状态，合并统一走显式的 `zelto merge`，`--push` 挂在合并上。
+   见 `docs/adr-018-no-auto-merge-on-sign.md`。
 2. **非阻塞问题是否允许 agent 自行决定？** 例如规格只给了 A/B 两个候选时，能否按"选更保守者"自动继续。这会触及 C7，需要明确"允许自动决定"的清单从哪来。
 3. **阻塞问题是否允许在问题未答时让 agent 用临时假设继续？** 允许则违反"每行代码可追溯到已批准规格"的初衷，不允许则并行批次可能被一个切片拖住。
 4. **`node_modules` / 构建产物在 worktree 中如何共享？** 软链、junction、还是每次重装，影响跨平台一致性与门禁可靠性。
@@ -182,7 +184,7 @@ M3  C（受控合并）  与  D（运行时策略）可并行
 - SDK adapter：`src/adapters/claude-agent-sdk/index.ts`
 - 门禁执行：`src/core/gate/executor.ts:76`
 - 门禁触发：`src/cli/commands/core-slice.ts:1407` `autoGateAfterRun`
-- 合并：`src/cli/commands/gate-sign.ts:288` `autoMergeSlice`
+- 合并：显式 `zelto merge`（`src/cli/commands/merge.ts`、`merge-runner.ts`、`merge-plan.ts`、`merge-executor.ts`）
 - diff：`src/cli/commands/diff.ts`
 - hook 安装：`src/cli/commands/info-help.ts:623`
 - 事件类型：`src/core/events/stream.ts`

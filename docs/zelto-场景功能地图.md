@@ -1,6 +1,7 @@
 # zelto 场景功能地图
 
-> 版本: v0.2.2 · 最后更新: 2026-10-28（文档同步至代码当前状态）
+> 版本: v0.3.0 · 最后更新: 2026-11-04（文档同步至代码当前状态）
+> 项目定位与目标见 `docs/zelto-项目目标.md`
 
 ---
 
@@ -10,20 +11,31 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 它的职责不是写代码，而是**保证 agent 的每一行代码都能追溯到一条人批准的规格，且没有走出边界**。
 
+它服务的是**一个人 + 一组 agent** 的中大型项目生产：
+人做规划（方案设计、版本规划、模块划分、切片设置），zelto 把规划切成可并行的作业、
+拉起 agent、在 agent 写文件的那一刻实时校验边界与追溯，出错时拉闸交回控制权。
+
+完整目标、现状差距与待决策项见 `docs/zelto-项目目标.md`。
+
 ### 1.1 三个角色
 
 | 角色 | 是谁 | 做什么 |
 |---|---|---|
-| **主用户** | 开发者 | 定意图、定架构、回答澄清问题、审契约、签字 |
+| **主用户** | 开发者 | 定意图、做设计、划分模块、排版本、确认切片、审契约、签字、显式合并 |
 | **执行者** | agent（如 Claude Code） | 由 zelto 拉起，无人值守实现切片 |
-| **看守者** | **zelto** | 校验追溯、分类停机、执行门禁、记录事件、分派任务 |
+| **看守者** | **zelto** | 校验追溯、并行编排、隔离执行、门禁验收、分类停机、记录事件、派发作业 |
+
+**zelto 的自动化止步于「待签字」** —— 签字必须由人行使（AGENTS.md 禁区）。
+签字之后合入主干也要人显式发起（`zelto merge`，ADR-018）。
 
 ### 1.2 核心理念
 
 - **约束优先于功能**：宁可少一个功能，也不许破一条不变量
-- **追溯性**：每行代码 → 测试 → 契约 → 规格 → 人批准的意图
+- **追溯性**：每行代码 → 测试 → 契约 → 规格 → 人批准的意图（**zelto 区别于其它 AI 编程工具的本质特征**）
 - **append-only 审计**：每个动作都记录为不可变事件
 - **确定性判定**：所有策略判定（policy/gate/sched）不调用模型、不触网
+- **签字 ≠ 合并**：签字只改状态，合入主干由人显式跑 `zelto merge`（ADR-018）——
+  批准与动作分开，追溯链才不会在合并这一步断掉
 
 ---
 
@@ -62,6 +74,10 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
     │◄──────────────────────────────│──────────────────────────────│ sign.pending
     │  审批/拒绝                    │                              │
     │───────────────────────────────│─────────────────────────────►│ completed/abandoned
+    │                               │                              │
+    │  ⑨ 人显式合并                 │                              │
+    │◄──────────────────────────────│──────────────────────────────│ merge.*
+    │  zelto merge                  │  提交产物 → 合并计划 → 执行
 ```
 
 ### 2.2 状态机
@@ -114,6 +130,57 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | SIGN_REJECT | completed | abandoned |
 | ABANDON | draft, clarifying, frozen, running, completed | abandoned |
 
+### 2.4 版本级流程（规划 → 并行 → 交付）
+
+切片是一条链，**版本是一条链的集合**。版本层复用切片层的执行语义（ADR-017），
+只在两端加东西：前面是规划确认，后面是交付验收。
+
+```
+人（开发者）              zelto（规划 + 闸门）              agent 群
+    │
+    │ ① 需求               require <文字>            ──► 需求草案
+    │ ② 确认需求            require confirm <id>
+    │
+    │ ③ 设计 + 模块划分      design <req-id>           ──► 设计草案（含 modules）
+    │ ④ 确认设计            design confirm <id>
+    │
+    │ ⑤ 版本规划 + 切片划分  plan <design-id>          ──► 版本计划（含 slices）
+    │ ⑥ 确认计划            plan confirm <id>         ──► 写出 specs/slices/*.md
+    │
+    │ ⑦ 启动版本            version start <ver>       ──► 并行拉起 N 个 agent
+    │                                          ◄─────────  各自隔离 worktree 跑
+    │                                          ◄─────────  实时写集守卫（C9）
+    │
+    │ ⑧ 逐片签字            sign <id> --approve       ──► 只改状态，不碰主干
+    │                                                        签字 ≠ 合并（ADR-018）
+    │
+    │ ⑨ 显式合并            merge [id...]             ──► 提交 worktree 产物
+    │                                                        → 合并计划 → 执行 → 清理
+    │
+    │ ⑩ 版本交付            version deliver <ver>     ──► 前置条件 + 版本级验收
+    │                                             ──► version.accepted / version.delivered
+    │
+    ▼ 下一个版本
+```
+
+**规划层的每一次 `confirm` 都是人点头**，未确认不往下走。
+**执行层的自动化止步于「待签字」** —— `version start --auto` 已被移除（AGENTS.md 禁区）。
+
+### 2.5 并行执行语义（`run --parallel` 与 `version start` 共用）
+
+两个入口走**同一条**执行路径 `executeSlicesParallel()`（`src/cli/commands/parallel-executor.ts`）：
+
+| 阶段 | 内容 | 失败处理 |
+|---|---|---|
+| ① 准入 | 切片必须 frozen 且有 frozenHash | 整批 abort |
+| ② 写集解析 | 从规格「范围」章节解析生效写集 | 只读，不改状态 |
+| ③ 冲突检测 | 跨切片写集不得重叠 | 整批 abort |
+| ④ 隔离与守卫 | 建 worktree + 取写集预约 + 装 PreToolUse 钩子 | 整批 abort |
+| ⑤ 拉起 agent | 并行启动，逐个等待退出，失败按配置重试 | 逐片重试 |
+| ⑥ 收尾 | 写集审计 → 状态回写 → 门禁② → 签名请求 | 越界不进 gate |
+
+主仓工作树全程不被切换分支、也不被 agent 写入。详见 `docs/adr-017-version-level-orchestration.md`。
+
 ---
 
 ## 3. 功能清单
@@ -125,7 +192,7 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **Policy Engine** | `src/core/policy/engine.ts` | 策略规则匹配、保护域、路径逃逸检测、锚点校验 |
 | **Slice State Machine** | `src/core/slice/state.ts` | 6 状态状态机，9 事件转换 |
 | **Slice Store** | `src/core/slice/store.ts` | 切片文件持久化（`.zelto/slices/<id>.json`） |
-| **Event Stream** | `src/core/events/stream.ts` | 29 种事件的 append-only JSONL 流 |
+| **Event Stream** | `src/core/events/stream.ts` | 47 种事件的 append-only JSONL 流 |
 | **Gate Executor** | `src/core/gate/executor.ts` | Shell 命令执行器（门禁②） |
 | **Sign Manager** | `src/core/gate/sign.ts` | 签名请求、审批/拒绝工作流 |
 | **Stall Classifier** | `src/core/stall/classifier.ts` | 6 类停机分类 |
@@ -133,9 +200,22 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
-| **Audit Trail** | `src/core/audit/trail.ts` | 29 种事件摘要、可读审计报告 |
+| **Audit Trail** | `src/core/audit/trail.ts` | 47 种事件摘要、可读审计报告 |
 | **Spec Executor** | `src/core/spec/SpecMdExecutor.ts` | Markdown 规格文件自校验（parse/validate/runChecklists） |
+| **Spec Format** | `src/core/spec/format.ts` | 规格章节契约唯一真源（概念 + 双语别名，ADR-016） |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
+| **PreToolUse Hook** | `src/hook/pretool.ts` | agent 写文件时的逐写判定（C9 运行时强制） |
+| **Worktree Manager** | `src/core/worktree/manager.ts` | 并行切片的物理隔离（ADR-011） |
+| **Runtime Guard** | `src/cli/commands/runtime-guard.ts` | 写集预约 + 钩子安装 + 运行后越界审计（ADR-014） |
+| **Parallel Executor** | `src/cli/commands/parallel-executor.ts` | 唯一的并行执行实现（ADR-017） |
+| **Question Protocol** | `src/core/question/protocol.ts` | agent 提问挂起与回答续跑（ADR-013） |
+| **Batch Review** | `src/core/sched/batch.ts` | 批次准入审核、依赖分层、工件冲突 |
+| **Dependency Graph** | `src/core/sched/depgraph.ts` | 切片依赖图与环检测 |
+| **Merge Orchestration** | `src/core/sched/merge.ts` | 合并计划与冲突可见（ADR-012） |
+| **Requirements Store** | `src/core/requirements/store.ts` | 需求文档持久化与状态 |
+| **Design Store** | `src/core/design/store.ts` | 设计文档与模块划分持久化 |
+| **Version Store** | `src/core/version/store.ts` | 版本计划持久化与版本状态 |
+| **Project Scanner** | `src/core/project/scanner.ts` | 既有项目扫描，生成项目地图 |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
 ### 3.2 CLI 命令
@@ -153,6 +233,8 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto freeze <id> [--json]` | 冻结切片基线 | freeze |
 | `zelto start <id> [--yes] [--agent <name>]` | 一键执行：create→check→freeze→run | run |
 | `zelto run <id> [--dry-run] [--agent <name>] [--json]` | 执行切片（含并行准入） | run |
+| `zelto run --parallel <id...>` | 并行执行多个切片（隔离 + 写集守卫 + 门禁 + 签字请求） | run |
+| `zelto run --hotfix <id> --yes` | 跳过门禁② 的紧急修复路径（需显式确认，ADR-015） | run |
 | `zelto admit <id> [--json]` | 准入检查 | run 前 |
 | `zelto gate <id> [--dry-run] [--retry <N>] [--spec-md] [--json]` | 门禁② 验收测试 | gate |
 | `zelto gate --spec-md` | 批量校验所有新格式规格文件 | gate |
@@ -177,8 +259,8 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto plan confirm <id>` | 确认计划并创建切片规格 | AI pipeline |
 | `zelto plan add-version <id> <d>` | 追加新版本到已有计划 | AI pipeline |
 | `zelto version status` | 显示版本计划状态 | AI pipeline |
-| `zelto version start <ver>` | 执行版本切片（agent 并行） | AI pipeline |
-| `zelto version deliver <ver>` | 标记版本为已交付 | AI pipeline |
+| `zelto version start <ver> [--plan <id>] [--retry-failed]` | 执行版本切片（agent 并行；`--auto` 已移除，签字必须由人行使） | AI pipeline |
+| `zelto version deliver <ver> [--plan <id>]` | 版本交付：前置条件 + 主仓版本级验收（ADR-017） | AI pipeline |
 | `zelto pipeline status` | 全链一览：需求→设计→计划→版本→切片 | 全景 |
 | `zelto trace <req-id> [--json\|--graph\|--timeline]` | 追溯需求到下游全链路 | 全景 |
 | `zelto impact <req-id>` | 变更影响分析 | 全景 |
@@ -201,6 +283,20 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 | `zelto slice-status [id] [--json]` | 查看切片运行状态详情 | 通用 |
 | `zelto ss [id] [--json]` | slice-status 别名 | 通用 |
 | `zelto patch-content` | 补丁内容管理 | 通用 |
+| `zelto ask [--slice <id>] [--json]` | 列出待回答的 agent 提问 | 运行时 |
+| `zelto answer <qid> "<text>"` | 回答 agent 提问并恢复切片 | 运行时 |
+| `zelto report [--format markdown\|json]` | 生成状态报告 | 治理 |
+| `zelto set <id> --field <f> --value <v>` | 设置切片的可写字段 | 通用 |
+| `zelto reservation list\|active\|show\|release\|reap` | 写集预约的查看与释放 | 治理 |
+| `zelto merge [plan] [<id...>] [--strategy <s>] [--dry-run] [--push]` | 显式合并已签字的切片（不带 id = 全部已批准且未合入） | 治理 |
+| `zelto hook --install\|--uninstall\|--status` | 安装 / 卸载 git hooks | 治理 |
+| `zelto project scan\|init\|design\|slice\|status` | 接管既有项目 | 接管 |
+| `zelto depgraph <id...> [--depends-on <id>=<dep>]` | 查看切片之间的依赖图 | 全景 |
+| `zelto artifact check <id...>` | 检测切片之间的工件级冲突 | 全景 |
+| `zelto batch <id...> [--depends-on ...]` | 审核这批切片能否一起开工，并排出执行阶段 | 全景 |
+| `zelto dashboard [--watch] [--open]` | 生成项目看板 HTML | 全景 |
+| `zelto tasks` / `zelto task-status <id>` / `zelto wait <id>` | 后台任务查看与等待 | 通用 |
+| `zelto suggest` | 项目全貌与建议动作 | 通用 |
 
 ### 3.3 独立 Hook
 
@@ -229,23 +325,34 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 ---
 
-## 5. 事件类型（29 种）
+## 5. 事件类型（47 种）
+
+事件类型是**契约**：`contracts/schemas/event-envelope.json` 的 enum 是真源，
+`core/events/stream.ts` 与 `core/audit/trail.ts` 必须与它一致。
 
 | 类别 | 事件 |
 |---|---|
-| 切片 | `slice.state.changed`, `slice.drift_detected` |
+| 切片 | `slice.state.changed`, `slice.drift_detected`, `slice.hotfix` |
 | 规格 | `spec.drafted`, `spec.checked`, `spec.frozen` |
 | 澄清 | `clarify.question`, `clarify.answer` |
 | 运行 | `run.started`, `run.resumed`, `run.stalled`, `run.finished`, `run.aborted` |
-| 策略 | `policy.decision`, `policy.anchor_mismatch` |
+| 策略 | `policy.decision`, `policy.anchor_mismatch`, `policy.violation` |
+| 预约 | `reservation.acquired`, `reservation.released` |
 | 门禁 | `gate.executed`, `gate.result`, `gate.retry` |
 | 停机 | `stall.classified` |
+| 提问 | `question.raised`, `question.answered` |
 | 资源 | `budget.spent`, `llm.called` |
 | 队列 | `queue.enqueued`, `queue.dequeued` |
 | 签名 | `sign.requested`, `sign.approved`, `sign.rejected` |
-| 合并 | `merge.completed`, `merge.stale_base` |
+| 合并 | `merge.completed`, `merge.planned`, `merge.phase_complete`, `merge.conflict`, `merge.stale_base` |
 | 调度 | `sched.admitted`, `sched.blocked` |
-| 预算 | `budget.spent` |
+| 隔离 | `worktree.created`, `worktree.removed` |
+| 协调 | `coord.dep_added`, `coord.phase_ready`, `coord.phase_complete`, `coord.cycle_detected` |
+| 工件 | `artifact.conflict_detected` |
+| 版本 | `version.accepted`, `version.delivered` |
+
+**版本级事件**用 `version-<label>` 作归属键（版本不是切片，事件流按切片分目录），
+见 `docs/adr-017-version-level-orchestration.md`。
 
 ---
 
@@ -253,14 +360,14 @@ zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI �
 
 | ID | 约束 | 说明 |
 |---|---|---|
-| C1 | 状态只在文件里 | 无数据库、无内存状态 |
+| C1 | 状态只在文件里 | 无数据库、无内存状态、无常驻 daemon |
 | C2 | `core/` 零 SDK 依赖 | 只用 Node 内置 |
 | C3 | 判定确定性 | policy/gate/sched 无模型无网络 |
 | C4 | append-only 事件流 | 每个动作都记录 |
-| C5/C8 | 保护域硬编码 | 不可被策略规则覆盖 |
+| C5/C8 | 保护域硬编码 | 不可被策略规则覆盖；锚点外部化 |
 | C6 | 依赖单向向下 | `core/` 不 import `adapters/` |
 | C7 | llm 不参与判定 | 产出仅为草稿/建议 |
-| C9 | 写集预约强制 | sched 运行时强制执行 |
+| C9 | 写集预约强制 | 由 hook 在 agent 写文件的那一刻执行 |
 
 ---
 
@@ -275,31 +382,42 @@ zelto/
 │   │   ├── events/        append-only 事件流
 │   │   ├── gate/          门禁执行器 + 签名管理
 │   │   ├── stall/         停机分类器
-│   │   ├── sched/         并行准入 + 约束分发
+│   │   ├── sched/         并行准入 + 约束分发 + 批次审核 + 依赖图 + 合并编排
+│   │   ├── worktree/      并行隔离（worktree 管理）
+│   │   ├── question/      agent 提问挂起协议
 │   │   ├── clarify/       澄清引擎
 │   │   ├── budget/        预算跟踪
 │   │   ├── metrics/       度量收集
 │   │   ├── audit/         审计追踪
 │   │   ├── ports/         端口接口定义
-│   │   └── spec/          规格引擎（SpecMdExecutor）
-│   ├── cli/               CLI 命令实现（40+ 个命令）
-│   ├── hook/              独立可执行判定进程
-│   └── adapters/          执行器适配器（claude-agent）
+│   │   ├── spec/          规格引擎（SpecMdExecutor + 章节契约）
+│   │   ├── requirements/  需求文档存储
+│   │   ├── design/        设计文档 + 模块划分存储
+│   │   ├── version/       版本计划 + 版本状态存储
+│   │   ├── project/       既有项目扫描与治理初始化
+│   │   └── contracts/     契约注册表
+│   ├── cli/               CLI 命令实现（50+ 个命令）
+│   ├── hook/              独立可执行判定进程（+ PreToolUse 钩子）
+│   ├── llm/               AI 流水线草案生成（仅产出草稿，不参与判定）
+│   └── adapters/          执行器适配器（claude-agent / claude-agent-sdk）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
+├── docs/                  目标 / 场景地图 / 技术架构 / 开工包 / ADR
 ├── tests/                 测试
-│   ├── acceptance/        验收测试（27 suites）
+│   ├── acceptance/        验收测试（24 个文件）
 │   │   ├── e2e-full-cycle/  端到端全生命周期测试
 │   │   ├── events-command/  事件命令验收测试
 │   │   ├── admit-command/   准入命令验收测试
 │   │   ├── event-emission/  事件发射验收测试
-│   │   ├── ... (19 acceptance test suites total)
-│   ├── *.test.ts          单元测试（44 个文件）
+│   │   ├── batch-command/   批次审核验收测试
+│   │   └── ...
+│   ├── *.test.ts          单元测试（72 个文件）
 │   └── ...
 └── .zelto/                运行时状态
     ├── slices/            切片文件
     ├── events/            事件日志
-    ├── locks/             签名请求
+    ├── locks/             签名请求 + 写集预约
+    ├── worktrees/         并行切片的隔离工作目录
     └── config.yaml        项目配置
 ```
 
@@ -307,13 +425,14 @@ zelto/
 
 ## 附录 A：测试清单
 
-| 类别 | 测试数 | Suites |
+| 类别 | 测试数 | 文件数 |
 |------|--------|--------|
-| 单元测试 | 520+ | 100+ |
-| 验收测试 | 152 | 27 |
-| **总计** | **676+** | **128+** |
+| 单元测试 | 881 | 72 |
+| 验收测试 | （含在上） | 24 |
+| **总计** | **976（974 pass / 2 skipped / 0 fail）** | **96** |
 
-> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-10-28，520+ 单元 + 152 验收 = 676+ 全绿。
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-11-04，
+> 976 tests / 203 suites / 0 fail。
 
 ---
 
@@ -335,10 +454,10 @@ zelto/
 ```bash
 pnpm build          # 编译（tsc, ~2.4s）
 pnpm dev            # 监听模式
-pnpm test           # 编译 + 全量测试（208 文件, 676+ tests）
+pnpm test           # 编译 + 全量测试（96 文件, 976 tests）
 pnpm test:quick     # 跳过编译直接跑全量测试
-pnpm test:unit      # 编译 + 仅运行纯单元测试（482 tests, ~1.8s）
-pnpm test:acceptance # 仅运行验收测试（22 suites）
+pnpm test:unit      # 编译 + 仅运行纯单元测试
+pnpm test:acceptance # 仅运行验收测试
 pnpm test:watch     # 监听模式跑测试
 pnpm lint           # Biome 检查
 pnpm format         # Biome 格式化

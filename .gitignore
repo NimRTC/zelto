@@ -17,3 +17,6 @@ zelto
 zelto.exe
 go.work
 go.work.sum
+
+# 看板 HTML 是 `zelto dashboard` 的产物，不入库（每次生成都会污染 diff）
+zelto-dashboard.html

@@ -1,6 +1,7 @@
 # zelto 开工包
 
-> 版本: v0.2.2 · 最后更新: 2026-10-28
+> 版本: v0.3.0 · 最后更新: 2026-11-04
+> 项目定位与目标见 `docs/zelto-项目目标.md`
 
 ---
 
@@ -24,9 +25,9 @@ pnpm test
 期望输出：
 
 ```
-ℹ tests 676+
-ℹ suites 128+
-ℹ pass 676+
+ℹ tests 976
+ℹ suites 203
+ℹ pass 974
 ℹ fail 0
 ```
 
@@ -39,7 +40,64 @@ zelto help
 
 ---
 
-## 2. 第一个切片
+## 2. 完整主线：一个人 + 一组 agent 做中大型项目
+
+这是 zelto 的**主用法**。单切片流程（§3）是小项目或调试时用的。
+
+```
+想做一个东西
+   │
+   ├─ ① zelto require "用自然语言说清需求"
+   ├─ ② zelto require confirm <id>          ← 人点头
+   │
+   ├─ ③ zelto design <req-id>               ← 生成设计 + 模块划分
+   ├─ ④ zelto design confirm <id>           ← 人点头
+   │
+   ├─ ⑤ zelto plan <design-id>              ← 生成版本计划 + 切片划分
+   ├─ ⑥ zelto plan confirm <id>             ← 人点头，同时写出 specs/slices/*.md
+   │
+   ├─ ⑦ zelto version start v1              ← 并行拉起 N 个 agent 高速开发
+   │      （各自隔离 worktree + 写集守卫；出错的当场拦下）
+   │
+   ├─ ⑧ zelto sign <slice-id> --approve     ← 逐片签字（只改状态，不碰主干）
+   │      zelto inbox                       ← 看还有哪些待签
+   │
+   ├─ ⑨ zelto merge [<slice-id> ...]         ← 显式合并（不带 id = 全部待合切片）
+   │      zelto merge plan <slice-id>       ← 先看合并计划
+   │
+   └─ ⑩ zelto version deliver v1            ← 前置条件 + 主仓版本级验收
+```
+
+**每一次 `confirm` 都是人点头**，未确认不往下走。
+**自动化止步于「待签字」** —— `version start --auto` 已被移除。
+**签字 ≠ 合并** —— 签字只改状态，合入主干必须显式跑 `zelto merge`（ADR-018）。
+
+### 2.1 开工前的批次预检
+
+正式开跑前，先看一眼这批切片能不能一起开工：
+
+```bash
+zelto batch <slice-id...> --depends-on a=b
+# 输出：准入审核结果 + 依赖分层 + 写集/工件冲突
+```
+
+它只查不跑，判定逻辑在 `core/sched/batch.ts`（确定性，不调模型、不触网）。
+
+### 2.2 中途出问题时
+
+```bash
+zelto ask                       # agent 有问题在等你回答
+zelto answer <qid> "回答内容"     # 回答后续跑
+
+zelto stall                     # 哪些切片停机了、什么类别
+zelto resume <id>               # 恢复（--skip / --abandon 也行）
+
+zelto version start v1 --retry-failed   # 处理完之后重跑版本
+```
+
+---
+
+## 3. 单切片流程（小项目 / 调试）
 
 ### 2.1 创建切片
 
