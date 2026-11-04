@@ -7,9 +7,10 @@
 // C4: 安装/卸载都写事件（由调用方负责，这里只做纯文件操作）。
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadPolicyConfig } from './shared.js';
+import { spawnSync } from 'node:child_process';
+import { loadPolicyConfig, parseConfigYaml } from './shared.js';
 
 // ─── 常量 ───────────────────────────────────────────────────────────────────
 
@@ -207,26 +208,67 @@ export function claudeCodeHookInstalled(root: string): boolean {
 
 // ─── git hooks ──────────────────────────────────────────────────────────────
 
+export interface HookScriptOptions {
+  /**
+   * zelto-hook 二进制的绝对路径（正斜杠形式）。
+   * 不给就退回「仓库内 dist/hook/index.js」。
+   */
+  binaryPath?: string | null;
+  /**
+   * 策略所在的项目根绝对路径（正斜杠形式）——
+   * hook 靠它找到 policy/policy.yaml。给空就退回 git 仓库根。
+   */
+  projectRoot?: string | null;
+  /** node 可执行文件路径；给空就用 PATH 里的 node。 */
+  nodePath?: string | null;
+}
+
 /**
  * 生成 git hook 脚本。
  *
  * 注意判定循环用的是 `while ... done < 文件` 而不是 `echo | while ... done`：
  * 后者会在子 shell 里跑循环，循环里给 HAS_DENY 赋值传不回外层，
  * 于是「有文件被拒绝」永远传不到退出码上（这个 bug 让 pre-commit 形同虚设）。
+ *
+ * 拦截口径：**只有显式 deny 规则才拦**（matched_rule 不是 default）。
+ * 「没有规则匹配」产生的 default deny 只告警放行 ——
+ * 否则策略没覆盖到的文件会把整条提交堵死，钩子反而变成摆设。
  */
-export function hookScript(name: string, condition: string): string {
+export function hookScript(name: string, condition: string, options: HookScriptOptions = {}): string {
+  const binary = (options.binaryPath ?? '').replace(/\\/g, '/');
+  const projectRoot = (options.projectRoot ?? '').replace(/\\/g, '/');
+  const nodeBin = (options.nodePath ?? 'node').replace(/\\/g, '/');
+
   return `#!/bin/sh
 ${GIT_HOOK_MARKER}
 # Auto-installed by \`zelto hook --install\`
 # Runs zelto-hook policy check on ${name}
 
-# Validate zelto-hook binary exists
-ZELTO_HOOK="$(git rev-parse --show-toplevel 2>/dev/null)/dist/hook/index.js"
-if [ ! -f "$ZELTO_HOOK" ]; then
+# --- 定位 zelto-hook 二进制 ---
+ZELTO_HOOK="${binary}"
+if [ ! -f "\$ZELTO_HOOK" ]; then
+  FALLBACK="\$(git rev-parse --show-toplevel 2>/dev/null)/dist/hook/index.js"
+  if [ -f "\$FALLBACK" ]; then
+    ZELTO_HOOK="\$FALLBACK"
+  fi
+fi
+if [ ! -f "\$ZELTO_HOOK" ]; then
   echo "⚠️  zelto-hook: Binary not found at \$ZELTO_HOOK"
-  echo "   Run 'pnpm build' or 'npx tsc -p tsconfig.json' first."
+  echo "   Rebuild zelto, then re-run 'zelto hook --install'."
   echo "   To skip zelto check: git commit --no-verify"
   exit 0
+fi
+
+# --- 策略所在的项目根 ---
+ZELTO_PROJECT_ROOT="${projectRoot}"
+if [ -z "\$ZELTO_PROJECT_ROOT" ]; then
+  ZELTO_PROJECT_ROOT="\$(git rev-parse --show-toplevel 2>/dev/null)"
+fi
+export ZELTO_PROJECT_ROOT
+
+NODE_BIN="${nodeBin}"
+if [ ! -f "\$NODE_BIN" ]; then
+  NODE_BIN="node"
 fi
 
 ${condition}
@@ -242,13 +284,16 @@ if [ \$? -ne 0 ]; then
 
   while IFS= read -r file; do
     if [ -n "$file" ]; then
-      RESULT=\$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"git\\"}" | node "\$ZELTO_HOOK" 2>/dev/null)
+      RESULT=\$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"git\\"}" | "\$NODE_BIN" "\$ZELTO_HOOK" 2>/dev/null)
       DECISION=\$(echo "\$RESULT" | grep -o '"decision":"[^"]*"' | head -1 | cut -d'"' -f4)
-      if [ "\$DECISION" = "deny" ]; then
+      RULE=\$(echo "\$RESULT" | grep -o '"matched_rule":"[^"]*"' | head -1 | cut -d'"' -f4)
+      if [ "\$DECISION" = "deny" ] && [ "\$RULE" != "default" ]; then
         echo "❌ zelto-hook: DENIED write to \$file"
         BASIS=\$(echo "\$RESULT" | grep -o '"basis":"[^"]*"' | head -1 | cut -d'"' -f4)
         echo "   Basis: \$BASIS"
         HAS_DENY=1
+      elif [ "\$DECISION" = "deny" ]; then
+        echo "⚠️  zelto-hook: \$file 不在策略允许范围内（默认拒绝）—— 提交放行，但请确认"
       fi
     fi
   done < "\$FILE_LIST"
@@ -264,18 +309,111 @@ fi
 `;
 }
 
+// ─── 安装作用域：只装进「被管理的项目」 ───────────────────────────────────
+
+export interface HookInstallScope {
+  /** git hooks 装到哪个仓库根；null 表示不装 */
+  root: string | null;
+  /** 判定依据（打印给用户看） */
+  reason: string;
+}
+
+/** 读一个目录下的 .zelto/config.yaml（用与 shared.ts 相同的解析器）。 */
+function readConfigAt(dir: string): ReturnType<typeof parseConfigYaml> {
+  const configPath = join(dir, ZELTO_DIR_NAME, 'config.yaml');
+  if (!existsSync(configPath)) return null;
+  try {
+    return parseConfigYaml(readFileSync(configPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+const ZELTO_DIR_NAME = '.zelto';
+
+/** 这个目录是不是 zelto 工具自己的源码库（而不是被管理的项目）。 */
+export function isZeltoToolCheckout(dir: string): boolean {
+  const pkgPath = join(dir, 'package.json');
+  if (!existsSync(pkgPath)) return false;
+  try {
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: string };
+    if (pkg.name !== 'zelto') return false;
+  } catch {
+    return false;
+  }
+  return existsSync(join(dir, 'src', 'hook', 'index.ts'));
+}
+
+/** 这个目录是不是被 zelto 管理的项目（有 .zelto/）。 */
+export function isManagedProject(dir: string): boolean {
+  return existsSync(join(dir, ZELTO_DIR_NAME));
+}
+
+/**
+ * 决定 git hooks 装到哪个仓库。
+ *
+ * 规则：
+ * 1. 当前目录是 zelto 工具自身的源码库 → git hooks 属于「被管理的项目」，
+ *    不装在工具仓库里。改用配置里的 targetProject（若指向一个真实目录）。
+ * 2. 当前目录是被管理的项目（有 .zelto/）→ 装在这里。
+ * 3. 其余情况（随便一个目录）→ 不装，并说明原因。
+ */
+export function resolveHookInstallRoot(cwd: string = process.cwd()): HookInstallScope {
+  if (isZeltoToolCheckout(cwd)) {
+    const cfg = readConfigAt(cwd);
+    const target = cfg?.targetProject?.path;
+    if (target) {
+      const dir = resolve(cwd, target);
+      if (existsSync(dir)) {
+        return { root: dir, reason: `zelto 工具仓库 → 被管理的项目（targetProject）：${dir}` };
+      }
+      return { root: null, reason: `zelto 工具仓库 → targetProject 指向的目录不存在：${dir}` };
+    }
+    return {
+      root: null,
+      reason: '这是 zelto 工具自身的源码库，且没有配置 targetProject —— git hooks 只装在被管理的项目里',
+    };
+  }
+
+  if (isManagedProject(cwd)) {
+    return { root: cwd, reason: `当前项目：${cwd}` };
+  }
+
+  return {
+    root: null,
+    reason: '当前目录不是被 zelto 管理的项目（缺少 .zelto/）—— git hooks 只装在被管理的项目里',
+  };
+}
+
+/** 解析某个仓库的 git hooks 目录（worktree 下也能定位到真正的 hooks 目录）。 */
+export function gitHooksDir(root: string): string | null {
+  const result = spawnSync('git', ['rev-parse', '--git-path', 'hooks'], {
+    cwd: root,
+    encoding: 'utf-8',
+  });
+  if (result.status !== 0) return null;
+  const raw = result.stdout.trim();
+  if (!raw) return null;
+  return isAbsolute(raw) ? raw : resolve(root, raw);
+}
+
 // ─── 命令实现 ───────────────────────────────────────────────────────────────
 
 export async function hookCommand(args: string[]): Promise<number> {
   const action = args[0];
-  const GIT_HOOKS_DIR = join(process.cwd(), '.git', 'hooks');
   const wantClaude = args.includes('--claude');
   const onlyClaude = args.includes('--claude-only');
 
+  // git hooks 的作用域：只装在被管理的项目里。
+  const scope = resolveHookInstallRoot(process.cwd());
+  const GIT_HOOKS_DIR = scope.root ? gitHooksDir(scope.root) : null;
+
   async function installHook(name: string, condition: string): Promise<boolean> {
-    const hookBinary = join(process.cwd(), 'dist', 'hook', 'index.js');
+    if (!GIT_HOOKS_DIR) return false;
+
+    const hookBinary = hookEntryPath();
     if (!existsSync(hookBinary)) {
-      console.warn(`  ⚠️  zelto-hook binary not found at dist/hook/index.js`);
+      console.warn(`  ⚠️  zelto-hook binary not found at ${hookBinary}`);
       console.warn(`     Hooks will be installed but will skip checks until "pnpm build" is run.`);
     }
 
@@ -288,18 +426,28 @@ export async function hookCommand(args: string[]): Promise<number> {
         return false;
       }
     }
-    writeFileSync(hookPath, hookScript(name, condition), 'utf-8');
+    mkdirSync(GIT_HOOKS_DIR, { recursive: true });
+    writeFileSync(
+      hookPath,
+      hookScript(name, condition, {
+        binaryPath: hookBinary,
+        projectRoot: scope.root,
+        nodePath: process.execPath,
+      }),
+      'utf-8',
+    );
     try {
       const { chmodSync } = await import('node:fs');
       chmodSync(hookPath, 0o755);
     } catch {
       // Windows: chmod may fail
     }
-    console.log(`  ✅ ${name} installed`);
+    console.log(`  ✅ ${name} installed → ${hookPath}`);
     return true;
   }
 
   async function uninstallHook(name: string): Promise<boolean> {
+    if (!GIT_HOOKS_DIR) return false;
     const hookPath = join(GIT_HOOKS_DIR, name);
     if (!existsSync(hookPath)) return false;
     const existing = readFileSync(hookPath, 'utf-8');
@@ -327,8 +475,14 @@ export async function hookCommand(args: string[]): Promise<number> {
       if (onlyClaude) return 0;
     }
 
+    if (!scope.root || !GIT_HOOKS_DIR) {
+      console.log(`  ℹ️  ${scope.reason}`);
+      console.log(`     Claude Code 钩子仍然安装在当前目录（agent 实际工作的地方）。`);
+      return 0;
+    }
+
     const hookType = args.find((a) => a.startsWith('pre-')) ?? 'all';
-    console.log('Installing zelto git hooks...');
+    console.log(`Installing zelto git hooks... (${scope.reason})`);
     let count = 0;
     if (hookType === 'pre-commit' || hookType === 'all') {
       if (await installHook('pre-commit', 'git diff --cached --quiet --exit-code')) count++;
@@ -348,8 +502,13 @@ export async function hookCommand(args: string[]): Promise<number> {
       if (onlyClaude) return 0;
     }
 
+    if (!scope.root || !GIT_HOOKS_DIR) {
+      console.log(`  ℹ️  ${scope.reason}`);
+      return 0;
+    }
+
     const hookType = args.find((a) => a.startsWith('pre-')) ?? 'all';
-    console.log('Uninstalling zelto git hooks...');
+    console.log(`Uninstalling zelto git hooks... (${scope.reason})`);
     let count = 0;
     if (hookType === 'pre-commit' || hookType === 'all') {
       if (await uninstallHook('pre-commit')) count++;
@@ -363,17 +522,22 @@ export async function hookCommand(args: string[]): Promise<number> {
 
   if (action === '--check' || action === '--status') {
     const checkType = args.find((a) => a.startsWith('pre-')) ?? 'all';
-    for (const name of checkType === 'all' ? ['pre-commit', 'pre-push'] : [checkType]) {
-      const hookPath = join(GIT_HOOKS_DIR, name);
-      if (existsSync(hookPath)) {
-        const content = readFileSync(hookPath, 'utf-8');
-        if (content.includes(GIT_HOOK_MARKER)) {
-          console.log(`  ✅ ${name} — zelto hook installed`);
+    if (!scope.root || !GIT_HOOKS_DIR) {
+      console.log(`  ℹ️  ${scope.reason}`);
+    } else {
+      console.log(`  ℹ️  ${scope.reason}`);
+      for (const name of checkType === 'all' ? ['pre-commit', 'pre-push'] : [checkType]) {
+        const hookPath = join(GIT_HOOKS_DIR, name);
+        if (existsSync(hookPath)) {
+          const content = readFileSync(hookPath, 'utf-8');
+          if (content.includes(GIT_HOOK_MARKER)) {
+            console.log(`  ✅ ${name} — zelto hook installed`);
+          } else {
+            console.log(`  ⚠️  ${name} — exists but not a zelto hook`);
+          }
         } else {
-          console.log(`  ⚠️  ${name} — exists but not a zelto hook`);
+          console.log(`  ⬜ ${name} — not installed`);
         }
-      } else {
-        console.log(`  ⬜ ${name} — not installed`);
       }
     }
 
