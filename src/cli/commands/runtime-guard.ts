@@ -48,6 +48,14 @@ export interface RuntimeGuardOptions {
   projectRoot: string;
   /** 建分支时的基点 commit；审计时把已提交的改动也算进来 */
   baseCommit?: string | null;
+  /**
+   * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
+   *
+   * 这些文件不是 agent 写的：规格副本、验收目录副本、约束包镜像。
+   * 审计时它们不能算成「agent 越界写入」；但内容被改动就是篡改
+   * —— 改了规格副本等于自动改规格，改了钩子设置等于关掉门禁。
+   */
+  managedPaths?: string[];
 }
 
 export interface RuntimeGuard {
@@ -106,6 +114,7 @@ export async function installRuntimeGuard(
 
   const hookOptions: ClaudeHookOptions = {
     root: hookRoot,
+    projectRoot,
     sliceId: options.sliceId,
     worktree: options.worktree,
   };
@@ -121,6 +130,11 @@ export async function installRuntimeGuard(
 
   // 托管文件的内容哈希：运行后比对，agent 改了这个文件就是关掉了门禁
   const managed: ManagedFile[] = [];
+  for (const rel of options.managedPaths ?? []) {
+    const path = rel.replace(/\\/g, '/');
+    const hash = hashFile(join(hookRoot, path));
+    if (hash) managed.push({ path, hash });
+  }
   if (installed.installed) {
     const hash = hashFile(join(hookRoot, MANAGED_SETTINGS_PATH));
     if (hash) managed.push({ path: MANAGED_SETTINGS_PATH, hash });

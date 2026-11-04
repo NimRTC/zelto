@@ -21,4 +21,5 @@ export {
   auditWorktreeWrites,
   parsePorcelainStatus,
   hashFile,
+  listFilesUnder,
 } from './audit.js';

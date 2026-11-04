@@ -22,6 +22,8 @@ function extractFlagValue(args: string[], flag: string): string | undefined {
 }
 import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
+import { listFilesUnder } from '../../core/sched/audit.js';
+import type { SliceData } from '../../core/slice/store.js';
 import { BudgetCollector } from '../../core/budget/collector.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
@@ -54,6 +56,25 @@ export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
 
 // `ensureWorktree` / `worktreeManager` / `removeWorktree` live in ./shared.ts so that
 // gate, diff and sign commands can reuse the same worktree convention.
+
+/**
+ * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
+ *
+ * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
+ * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
+ * 但内容被改动就是篡改：改了规格副本等于自动改规格（AGENTS.md 禁区）。
+ */
+function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): string[] {
+  if (!worktreePath) return [];
+
+  const paths: string[] = [];
+  if (slice.spec.path) paths.push(slice.spec.path);
+  if (slice.acceptance.dir) {
+    paths.push(...listFilesUnder(worktreePath, slice.acceptance.dir));
+  }
+  paths.push(join(ZELTO_DIR, `${slice.id}-bundle.json`));
+  return paths;
+}
 
 // ─── slices ──────────────────────────────────────────────────────────────────
 
@@ -902,6 +923,7 @@ register('run', async (args) => {
         worktree: worktree?.path ?? null,
         projectRoot: process.cwd(),
         baseCommit: worktree?.baseCommit ?? null,
+        managedPaths: zeltoOwnedPaths(worktree?.path ?? null, slice),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1224,6 +1246,7 @@ async function runParallel(args: string[]): Promise<number> {
         worktree: st.worktreePath,
         projectRoot: process.cwd(),
         baseCommit,
+        managedPaths: zeltoOwnedPaths(st.worktreePath, slice),
       });
       guards.set(st.id, g);
     } catch (err) {

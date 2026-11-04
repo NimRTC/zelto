@@ -136,9 +136,25 @@ Claude Code 在每次工具调用**之前**触发 `PreToolUse` 钩子。zelto �
 落在写集之外的改动 = 越界 = **不进 gate②、不自动生成签字请求**，
 并写一条 `policy.violation` 事件。人来看。
 
-**托管文件单独校验。** zelto 自己写进 worktree 的文件（`.claude/settings.local.json`）
-不计入越界，但它们的**内容**必须原样：agent 改掉 hook 设置就等于关掉了门禁。
-所以运行前记下哈希，运行后比对——对不上就是篡改，同样记 `policy.violation`。
+**托管文件单独校验。** zelto 自己写进 worktree 的文件不计入越界，
+但它们的**内容**必须原样：agent 改掉 hook 设置就等于关掉了门禁，
+改了规格副本等于自动改规格。所以运行前记下哈希，运行后比对——
+对不上就是篡改，同样记 `policy.violation`。
+
+托管文件有三类：
+
+| 文件 | 来源 | 篡改的后果 |
+|---|---|---|
+| `.claude/settings.local.json` | `installClaudeCodeHook` 写入 | 门禁被关掉 |
+| 规格副本（`specs/slices/<id>.md`） | `syncContext` 从主仓库复制 | 自动改规格（AGENTS.md 禁区） |
+| 验收目录副本（`tests/acceptance/<id>/**`） | `syncContext` 从主仓库复制 | 改验收标准 |
+
+验收目录是目录，登记托管文件时要展开成里面每一个文件——
+`core/sched/audit.ts` 的 `listFilesUnder` 干这件事。
+
+**这些副本必须登记成托管文件，否则每次运行都会被自己的文件拦下。**
+worktree 是从 baseCommit 检出的，规格与验收测试通常还没提交，
+`syncContext` 把它们复制进去后就是未跟踪文件——审计阶段会被算成 agent 的越界写入。
 
 ### 3.4 生命周期
 
@@ -186,6 +202,7 @@ zelto run <id>
 | 新增模块 `src/core/sched/audit.ts` | — | 运行后写集审计 |
 | 新增模块 `src/hook/pretool.ts` | — | PreToolUse 判定进程 |
 | 新增模块 `src/cli/commands/runtime-guard.ts` | — | 预约 + 钩子 + 审计 + 释放的编排 |
+| 新增验收测试 | `tests/acceptance/runtime-guard/runtime-guard.test.ts` | 起真实 CLI 进程 + 假 agent，验四件事：钩子放行写集内 / 拦下写集外、绕过钩子的写由审计兜住、zelto 自己的文件不算越界、预约用完就释放 |
 
 **`src/hook/pretool.ts` 刻意不 import `core/` 的其余部分**——hook 必须能被单独
 编译分发（它跑在 agent 进程里，依赖越少越可靠）。`pathInWriteSet` 因此在

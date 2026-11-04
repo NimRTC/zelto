@@ -12,8 +12,8 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { pathInWriteSet } from './paths.js';
 
 /**
@@ -95,6 +95,47 @@ export function hashFile(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 列出目录下所有文件的相对路径（正斜杠）。
+ *
+ * 用来把「zelto 自己复制进 worktree 的目录」（例如验收目录）登记成托管文件：
+ * 目录本身不是文件，审计要的是里面每一个文件。
+ *
+ * 目录不存在时返回空数组 —— 切片可能还没有验收测试。
+ */
+export function listFilesUnder(root: string, relativeDir: string): string[] {
+  const base = resolve(root, relativeDir);
+  if (!existsSync(base)) return [];
+
+  const results: string[] = [];
+
+  const walk = (dir: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry);
+      let isDir = false;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (isDir) {
+        walk(full);
+      } else {
+        results.push(relative(resolve(root), full).replace(/\\/g, '/'));
+      }
+    }
+  };
+
+  walk(base);
+  return results.sort();
 }
 
 /**

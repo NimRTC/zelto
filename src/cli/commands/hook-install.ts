@@ -47,8 +47,13 @@ export function hookEntryPath(): string {
 // ─── Claude Code PreToolUse 钩子 ────────────────────────────────────────────
 
 export interface ClaudeHookOptions {
-  /** 写 .claude/settings.local.json 的目录 */
+  /** 写 .claude/settings.local.json 的目录 —— agent 实际工作的目录（worktree） */
   root: string;
+  /**
+   * 主仓库根 —— policy.yaml 与 .zelto/locks 都在这里。
+   * 不给就退回 `root`（没有 worktree 时两者相同）。
+   */
+  projectRoot?: string | null;
   /** 切片 id；给了就按写集预约强制 */
   sliceId?: string | null;
   /** agent 实际工作目录（worktree） */
@@ -82,12 +87,15 @@ export function buildPreToolHookExec(options: ClaudeHookOptions): {
   args: string[];
 } {
   const entry = hookEntryPath().replace(/\\/g, '/');
-  const root = resolve(options.root).replace(/\\/g, '/');
+  // `--project-root` 指的是**主仓库**：policy.yaml 与 .zelto/locks/<sliceId>.json 都在那里。
+  // 这里曾误填成 worktree —— worktree 里没有 .zelto/（它不入版本库），
+  // 于是 hook 读不到写集预约，按「预约缺失 = 拒绝」把所有写入一律拦下。
+  const projectRoot = resolve(options.projectRoot ?? options.root).replace(/\\/g, '/');
   const args = [
     entry,
     'pretool',
     '--project-root',
-    root,
+    projectRoot,
   ];
   if (options.worktree) {
     args.push('--worktree', resolve(options.worktree).replace(/\\/g, '/'));

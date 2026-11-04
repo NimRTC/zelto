@@ -411,7 +411,7 @@ zelto sign --approve → SignManager.request(sliceId)
 | **C5/C8** 保护域 | `PROTECTED_PATTERNS` 硬编码常量，策略规则无法覆盖 |
 | **C6** 单向依赖 | tsconfig 无反向路径映射；代码级无 import 从 adapters 到 core |
 | **C7** llm 不判定 | `llm/` 目录预留；所有判定模块（policy/gate/sched）不引用 llm |
-| **C9** 写集预约 | `Scheduler.admit()` 检查 running 切片的 writes 数组 |
+| **C9** 写集预约 | 准入：`Scheduler.admit()` 检查 running 切片的 writes 数组；运行期：`.zelto/locks/<id>.json` 预约 + PreToolUse 钩子逐写判定 + 运行后 git 改动审计（ADR-014） |
 
 ---
 
@@ -450,6 +450,27 @@ C:\path     → deny
 └─────────────────────────────────────┘
 ```
 
+### 6.4 运行时写集强制（ADR-014）
+
+写集不只在准入时被读。agent 运行期间每一层强制都在：
+
+```
+agent 写文件
+   │
+   ├─ PreToolUse 钩子（src/hook/pretool.ts）
+   │    判定顺序：路径逃逸 → 保护域 → 写集预约 → policy.yaml
+   │    预约缺失 = 一律拒绝（fail closed）
+   │    每次判定写一条 policy.decision 事件
+   │
+   └─ 运行结束后审计（src/core/sched/audit.ts）
+        拿 git 真实改动对写集：未提交改动 + baseCommit..HEAD 的已提交改动
+        钩子拦不住的写（解释器里的 writeFileSync）在这里兜住
+        越界 → 不进 gate②、不自动生成签字请求
+```
+
+钩子装在 worktree（agent 实际工作的目录），但它读的预约与策略在主仓库——
+命令行里显式给了 `--project-root`。详见 `docs/adr-014-runtime-policy-enforcement.md`。
+
 ---
 
 ## 7. 测试架构
@@ -468,9 +489,10 @@ C:\path     → deny
 
 ### 7.3 当前覆盖
 
-- **676+ tests, 128+ suites, 全部通过**
+- **925+ tests, 193+ suites, 全部通过**
 - 核心模块覆盖率 > 90%
 - Hook 可执行体 7 个集成测试
+- 运行时守卫 1 个验收测试（起真实 CLI 进程 + 假 agent，验钩子判定 + 审计兜底）
 
 ---
 
