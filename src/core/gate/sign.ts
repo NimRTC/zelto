@@ -12,7 +12,7 @@ export interface SignRequest {
   sliceId: string;
   requestedAt: string;
   requestedBy: string;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'revoked';
   decidedAt: string | null;
   decidedBy: string | null;
   comment: string | null;
@@ -128,6 +128,36 @@ export class SignManager {
     } catch {
       // Non-fatal: slice may not be in completed state
     }
+
+    return req;
+  }
+
+  /**
+   * 撤销一次已经通过的签字（签错了要能回退）。
+   *
+   * 只有 `approved` 能撤销：`pending` 直接作废走 reject，`rejected` 没什么可撤。
+   * 撤销不改变切片状态 —— 签字本来就没改状态（SIGN_APPROVE 停在 completed），
+   * 撤销后切片仍是 completed：门禁过了，只是「批准」这条记录作废了，
+   * 需要重新发起签名请求才能再合入主干。
+   */
+  async revoke(id: string, decidedBy: string = 'human', comment: string | null = null): Promise<SignRequest> {
+    const req = await this.get(id);
+    if (req.status !== 'approved') {
+      throw new Error(`Sign request ${id} is ${req.status}, only "approved" can be revoked`);
+    }
+
+    req.status = 'revoked';
+    req.decidedAt = new Date().toISOString();
+    req.decidedBy = decidedBy;
+    req.comment = comment;
+
+    await writeFile(this.path(id), JSON.stringify(req, null, 2), 'utf-8');
+
+    await this.appendEvent(req.sliceId, 'sign.revoked', decidedBy, {
+      signId: id,
+      sliceId: req.sliceId,
+      comment,
+    });
 
     return req;
   }

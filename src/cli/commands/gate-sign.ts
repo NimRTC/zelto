@@ -406,12 +406,33 @@ register('sign', async (args) => {
       } else {
         console.log(`zelto sign ${id} -- ❌ Rejected`);
       }
+    } else if (action === '--revoke') {
+      // 签错了要能回退：撤销已经通过的签字记录（ADR-021）
+      const approved = await signManager.list('approved');
+      const req = approved.find((r) => r.sliceId === id);
+      if (!req) {
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'revoked', error: 'No approved sign request' }));
+        } else {
+          console.error(`No approved sign request for slice "${id}".`);
+          console.error('  只有已签字（approved）的切片才能撤销。');
+        }
+        return 1;
+      }
+      await signManager.revoke(req.id, 'human', comment);
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, action: 'revoked', signId: req.id }));
+      } else {
+        console.log(`zelto sign ${id} -- ↩️  Revoked (签字已作废)`);
+        console.log('  切片仍是 completed：门禁结论保留，批准记录作废。');
+        console.log('  修好之后重新发起签名请求，再走 zelto merge。');
+      }
     } else {
       if (isJson) {
         console.log(JSON.stringify({ error: `Unknown action: ${action}` }));
       } else {
         console.error(`Unknown action: ${action}`);
-        console.error('Usage: zelto sign <slice-id> [--approve|--reject]');
+        console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke]');
       }
       return 1;
     }
