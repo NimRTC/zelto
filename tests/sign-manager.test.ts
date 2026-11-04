@@ -71,6 +71,64 @@ describe('SignManager', () => {
     );
   });
 
+  it('revokes an approved sign request', async () => {
+    const req = await manager.request('slice-006', 'agent');
+    await manager.approve(req.id, 'human', 'Approved too early');
+    const revoked = await manager.revoke(req.id, 'human', 'Signed the wrong slice');
+
+    assert.equal(revoked.status, 'revoked');
+    assert.equal(revoked.decidedBy, 'human');
+    assert.equal(revoked.comment, 'Signed the wrong slice');
+  });
+
+  it('refuses to revoke a request that is not approved', async () => {
+    const req = await manager.request('slice-007', 'agent');
+    await assert.rejects(
+      () => manager.revoke(req.id, 'human'),
+      /only "approved" can be revoked/,
+    );
+
+    await manager.approve(req.id, 'human');
+    await manager.revoke(req.id, 'human');
+    await assert.rejects(
+      () => manager.revoke(req.id, 'human'),
+      /only "approved" can be revoked/,
+    );
+  });
+
+  it('keeps the slice completed when a sign is revoked', async () => {
+    const slice = store.create('sign-revoke-test', 'Sign Revoke Test');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'sha256:test';
+    slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
+
+    await store.transit('sign-revoke-test', 'GATE_PASS');
+
+    const req = await manager.request('sign-revoke-test', 'agent');
+    await manager.approve(req.id, 'human');
+    await manager.revoke(req.id, 'human', 'Misread the diff');
+
+    const updated = await store.read('sign-revoke-test');
+    assert.equal(updated.state, 'completed');
+  });
+
+  it('emits sign.revoked and drops the request from the approved list', async () => {
+    const req = await manager.request('slice-008', 'agent');
+    await manager.approve(req.id, 'human');
+    await manager.revoke(req.id, 'human', 'Sign revoked');
+
+    const evts = await events.read('slice-008');
+    const types = evts.map((e: EventEnvelope) => e.type);
+    assert.ok(types.includes('sign.revoked'));
+
+    const approved = await manager.list('approved');
+    assert.ok(!approved.some((r: SignRequest) => r.id === req.id));
+
+    const revoked = await manager.list('revoked');
+    assert.ok(revoked.some((r: SignRequest) => r.id === req.id));
+  });
+
   it('filters list by status', async () => {
     const pending = await manager.list('pending');
     const approved = await manager.list('approved');
