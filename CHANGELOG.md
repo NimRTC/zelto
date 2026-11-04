@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.4.0] — 2026-11-04
+
+### Added
+- `zelto halt` — emergency halt for a running batch; halted slices roll back to
+  `frozen` with `human_halt` (ADR-020)
+- `zelto batch` — admission review for a batch of slices: freeze / traceability /
+  acceptance / budget checks plus dependency layering and write-set conflict detection
+- `zelto merge` — merge is now an explicit action, decoupled from signing;
+  `--push` lives on `merge` (ADR-018)
+- `sign --revoke` — revoke an approved sign-off; writes `sign.revoked`, keeps the record (ADR-021)
+- Version-level orchestration and a single parallel execution path
+  (`executeSlicesParallel()`) shared by `run --parallel` and `version start` (ADR-017)
+- Phased execution — topological layering by slice dependencies; overlapping write
+  sets within a phase degrade to serial (ADR-019)
+- Git hooks are installed only into managed projects; default-deny rules warn
+  instead of blocking
+
+### Changed
+- `sign --approve` no longer auto-merges
+- `zelto run --hotfix` requires an explicit `--yes`
+- Removed `zelto version start --auto`
+
+### Fixed
+- Acceptance-test mock commands now use `process.exitCode=N`, fixing a POSIX shell
+  syntax error that failed 8 tests on Linux CI
+
 ## [0.1.0] — 2026-10-19
 
 ### Added

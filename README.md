@@ -1,170 +1,223 @@
-# zelto — AI Programming Cockpit
+# zelto
 
-**Let machines watch the machines.**
+**Your agents do the work. zelto makes sure they stay inside the spec you approved.**
 
 [![CI](https://github.com/NimRTC/zelto/actions/workflows/ci.yml/badge.svg)](https://github.com/NimRTC/zelto/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/typescript-7-blue)](https://www.typescriptlang.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI 编程助手。
+English | [简体中文](README.zh-CN.md)
 
-它的职责不是写代码，而是**保证 agent 的每一行代码都能追溯到一条人批准的规格，且没有走出边界**。
+> **Status: v0.4.0 — pre-1.0.** CLI flags, config schema, and event format may change
+> without migration. Pin a commit if you need stability.
 
----
+zelto is a local-first cockpit for AI coding agents. You write a slice spec, approve it,
+and zelto runs the agent unattended — then refuses to merge anything that doesn't pass
+the acceptance checks frozen alongside that spec.
 
-## 架构总览
+- **Unattended, not babysat.** Stalls are classified. Environment failures retry on their
+  own; everything that needs a human lands in one inbox instead of five terminal windows.
+- **Gates you can't argue with.** The deterministic layer never calls a model. Acceptance
+  checks are frozen with the spec, so an agent cannot make a gate pass by editing the test.
+- **Agent-agnostic by construction.** Policy and gate decisions live in zelto, not in the
+  harness. Claude Agent SDK is the executor today; others plug in as adapters.
+- **Everything is a file.** Slices, events, locks — no daemon, no database, no account.
+  `grep` and `git log` are your audit tools.
+
+## Quick start
+
+```bash
+git clone https://github.com/NimRTC/zelto && cd zelto
+pnpm install && pnpm build && pnpm link --global
+
+cd <your-project>
+zelto init
+zelto create rate-limit-gateway --title "add per-IP rate limiting to the gateway"
+zelto check rate-limit-gateway   # gate 1 — deterministic: traceable? contracts? acceptance frozen?
+zelto freeze rate-limit-gateway  # freeze the baseline the agent must stay inside
+zelto run rate-limit-gateway     # runs the agent unattended
+zelto dashboard --tty            # what's stuck, what's waiting for your signature
+zelto sign rate-limit-gateway --approve  # you approve; merging stays a separate, explicit step
+zelto merge rate-limit-gateway   # explicit merge, never automatic on sign
+```
+
+Run `zelto help` for the full command list. Run `zelto help <cmd>` for one command's usage.
+
+## How it works
+
+```
+clarify (shape the spec) → draft + acceptance skeleton → check (gate 1) → freeze
+  → run (unattended) → gate (gate 2: acceptance) → sign (human) → merge (explicit)
+```
+
+1. **Write a slice spec.** One unit of work: scope, write-set, acceptance criteria.
+2. **Freeze it.** Gate 1 checks traceability and contracts deterministically — no model involved.
+3. **Run unattended.** zelto launches the agent inside an isolated worktree with the write-set enforced at runtime.
+4. **Gate it.** Gate 2 runs the frozen acceptance checks. A red gate blocks the merge, with evidence on disk.
+5. **Sign and merge.** You approve in the inbox. Merging is always an explicit `zelto merge` step.
+
+Humans set intent and sign. Agents implement. zelto guards the boundary in between.
+
+## Why it's different
+
+| Tool | What it solves | What it leaves out |
+|---|---|---|
+| **Cursor / Copilot** | How to write this code well in one session | Beyond the session: who approved it, what gate it passed, whether it still runs tomorrow |
+| **Spec Kit / Kiro** | How specs are written and drive generation | After approval: who stops the agent when it drifts off-spec |
+| **zelto** | How a batch of slices lands on-spec, verifiably, with minimal supervision | Completion feel, chat experience — that layer belongs to your agent |
+
+One line: **zelto doesn't write code. It decides whether the code that was written is allowed to land.**
+
+## Guarantees
+
+What the architecture constraints mean for you:
+
+- **No hidden state.** Everything lives in files under `.zelto/`. No daemon, no database.
+- **Deterministic verdicts.** Policy and gate decisions never call a model and never touch the network.
+- **Frozen acceptance.** The tests that decide the gate are frozen with the spec — the agent can't move the goalposts.
+- **Isolation by default.** Agents run in isolated worktrees; write-set reservations are enforced at runtime by a standalone hook process.
+- **Every action leaves a trace.** Append-only event logs back every state change, so failures can be attributed.
+- **Sign ≠ merge.** Approving a slice never touches the branch. Merging is always explicit.
+- **Hotfix is explicit.** Skipping gate 2 requires `zelto run --hotfix --yes`, and everything else (write-set, audit, protected paths) still applies.
+
+Protected paths are hard-coded outside policy reach, and `core/` has zero third-party runtime dependencies (Node built-ins only).
+
+## Status
+
+- **Pre-1.0.** CLI flags, config schema, and event format may change without migration.
+- **One executor today.** Claude Agent SDK. The policy/gate layer is harness-agnostic,
+  but claiming multi-agent support before the adapters exist would be a lie.
+- **Install from source.** Not on npm yet (`private: true`). Planned for 0.5.
+
+## CLI reference
+
+Everyday commands (`zelto help <cmd>` for flags):
+
+```bash
+zelto slices          # list all slices
+zelto next            # recommended next action
+zelto check <id>      # gate 1: deterministic pre-freeze checks
+zelto freeze <id>     # freeze the slice baseline
+zelto run <id>        # run the slice (parallel admission + runtime guard)
+zelto gate <id>       # gate 2: run frozen acceptance checks
+zelto inbox           # pending signature queue
+zelto sign <id> --approve | --reject | --revoke
+zelto halt            # emergency stop: pause the batch, hand control back to you
+zelto merge <id>      # merge an approved slice (explicit; never automatic)
+zelto dashboard --tty # terminal status: stalled, running, next actions
+```
+
+Hotfix skips gate 2 only, and requires explicit confirmation:
+
+```bash
+zelto run <id> --hotfix --yes
+```
+
+## Architecture
 
 ```
                     ┌─────────────────┐
-                    │    人 (开发者)    │
-                    │  定意图 · 签字   │
+                    │  human (dev)    │
+                    │  intent · sign  │
                     └────────┬────────┘
                              │
               ┌──────────────┼──────────────┐
               ▼              ▼              ▼
        ┌──────────┐  ┌──────────┐  ┌──────────┐
        │ clarify  │  │   sign   │  │  inbox   │
-       │ 澄清规格  │  │  审批/拒  │  │  待签队列 │
+       │ shape    │  │ approve /│  │ pending  │
+       │ the spec │  │ reject   │  │ queue    │
        └────┬─────┘  └──────────┘  └──────────┘
             │
        ┌────▼─────┐     ┌──────────┐     ┌──────────┐
        │  slice   │────►│  sched   │────►│   gate   │
-       │ 状态机    │     │ 并行准入  │     │  门禁执行  │
+       │ state    │     │ parallel │     │ gate     │
+       │ machine  │     │ admission│     │ executor │
        └──────────┘     └──────────┘     └──────────┘
             │
        ┌────▼─────┐     ┌──────────┐     ┌──────────┐
-       │  policy  │     │  stall   │     │  metrics │
-       │ 策略引擎  │     │ 停机分类  │     │  度量收集  │
+       │  policy  │     │  stall   │     │ metrics  │
+       │ engine   │     │ classifi-│     │ rework / │
+       │ determ.  │     │ cation   │     │ cycle    │
        └──────────┘     └──────────┘     └──────────┘
 
        ┌──────────┐     ┌──────────┐     ┌──────────┐
        │  events  │     │  audit   │     │   hook   │
-       │ 事件流    │     │ 审计追踪  │     │ 判定进程  │
+       │ append-  │     │ readable │     │ standalone│
+       │ only log │     │ trail    │     │ verdict  │
        └──────────┘     └──────────┘     └──────────┘
 ```
 
-## 核心流程
+Core loop: `clarify → draft → check (gate 1) → freeze → run → gate (gate 2) → sign → merge`.
 
-```
-clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ freeze
-  → plan → run（无人值守）→ gate（门禁②）→ sign（人签字）
-```
+Roles: the developer sets intent and signs; the agent implements unattended;
+zelto validates traceability, classifies stalls, enforces gates, records events, and routes work.
 
-## 定位
+Key invariants:
 
-| 角色 | 是谁 | 做什么 |
-|---|---|---|
-| **主用户** | 开发者 | 定意图、定架构、回答澄清问题、审契约、签字 |
-| **执行者** | agent (Claude Code) | 由 zelto 拉起，无人值守实现切片 |
-| **看守者** | **zelto** | 校验追溯、分类停机、执行门禁、记录事件、分派任务 |
-
-## 核心特性
-
-- **切片状态机** — 6 状态（draft → clarifying → frozen → running → completed → abandoned），9 事件，文件持久化
-- **策略引擎** — 规则匹配 + 保护域硬编码 + 路径逃逸检测 + 锚点校验，纯确定性
-- **门禁执行** — 双门禁：① 确定性检查（freeze 前）② 验收测试（run 后），支持重试
-- **并行准入** — 写集冲突检测，保证切片不会互相踩踏
-- **停机分类** — 9 类停机（权限确认、环境失败、上下文耗尽、认知卡壳、计划门禁、预算耗尽、门禁重试、agent 提问、人工拉闸）
-- **签名管理** — 审批/拒绝/撤销工作流，待签队列（签字只改状态，合并需显式跑 `zelto merge`）
-- **事件流** — 49 种事件的 append-only JSONL 日志
-- **审计追踪** — 覆盖主要事件摘要，可读文本报告
-- **度量收集** — rework rate、cycle time、stall counts
-- **澄清引擎** — 按缺失项生成结构化问题（需求追溯、契约、验收测试、写集、验收依据），支持自动回答
-- **独立 hook** — 可独立编译的策略判定进程，零依赖，可用于 git hooks / CI 门禁
-- **架构约束** — `core/` 零第三方运行时依赖，纯 Node 内置
-
-## 快速开始
-
-```bash
-# 安装
-pnpm install
-pnpm build
-
-# 运行测试
-pnpm test
-
-# 全局安装（可选）
-pnpm link --global
-zelto help
-zelto-hook < input.json
-
-# CLI 命令（常用；完整 57 个命令以 `zelto help` 为准）
-zelto slices          # 列出所有切片
-zelto next            # 推荐下一步动作
-zelto check <id>      # 门禁① 确定性检查
-zelto freeze <id>     # 冻结切片基线
-zelto run <id>        # 执行切片（含并行准入检查）
-zelto gate <id>       # 门禁② 验收测试
-zelto inbox           # 待签名队列
-zelto sign <id>       # 审批/拒绝
-zelto halt            # 拉闸暂停，交回控制权
-zelto merge           # 合并已签字的切片（显式动作）
-```
-
-## 开发
-
-```bash
-pnpm dev              # 监听模式编译
-pnpm test             # 运行全部测试（含验收测试）
-pnpm test:quick       # 跳过重编，直接跑测试
-pnpm test:watch       # 监听模式跑测试
-pnpm lint             # 代码检查（biome）
-pnpm format           # 自动格式化
-pnpm clean            # 清理构建产物
-```
-
-## 技术栈
-
-| 层 | 技术 |
+| Constraint | Meaning |
 |---|---|
-| 语言 | TypeScript 7, strict: true |
-| 运行时 | Node 22, ESM |
-| 测试 | `node --test`（零测试框架依赖） |
-| 格式化/Lint | Biome |
-| 包管理 | pnpm 9 |
-| 运行时依赖 | `core/` 零第三方依赖（仅 Node 内置）；整包另含 CLI/adapter 依赖 |
+| **C1** | State lives in files only — no database, no in-memory state |
+| **C2** | `core/` depends on no SDK and no `adapters/` |
+| **C3** | Verdicts are deterministic — `core/policy/` and `core/gate/` never call models or network |
+| **C4** | Every action appends to the event stream |
+| **C5/C8** | Protected paths are hard-coded and cannot be overridden by policy rules |
+| **C6** | One-way dependencies — `core/` never imports `adapters/` |
+| **C7** | `llm/` output is always a draft or suggestion, never part of a verdict |
+| **C9** | Write-set reservations are enforced at runtime by the hook |
 
-## 架构约束
-
-| 约束 | 说明 |
-|---|---|
-| **C1** | 状态只在文件里 — 无数据库、无内存状态 |
-| **C2** | `core/` 不依赖任何 SDK、不依赖 `adapters/` |
-| **C3** | 判定必须确定性 — `core/policy/` 与 `core/gate/` 不得调用模型、不得触网 |
-| **C4** | 每个动作写 append-only 事件流 |
-| **C5/C8** | 保护域硬编码，不可被策略规则覆盖 |
-| **C6** | 依赖单向向下 — `core/` 不得 import `adapters/` |
-| **C7** | `llm/` 产出永远只能是草稿或建议，不参与任何判定 |
-| **C9** | 写集预约由 hook 在运行时强制执行 |
-
-## 项目结构
+## Project structure
 
 ```
 zelto/
 ├── src/
-│   ├── core/
-│   │   ├── policy/     策略引擎（规则匹配·保护域·锚点校验）
-│   │   ├── slice/      切片状态机（6 状态·文件持久化）
-│   │   ├── events/     append-only 事件流（49 种事件）
-│   │   ├── gate/       门禁执行器 + 签名管理器
-│   │   ├── stall/      停机分类器（9 类）
-│   │   ├── sched/      并行准入 + 约束分发
-│   │   ├── clarify/    对话引擎（按缺失项生成结构化问题）
-│   │   ├── metrics/    度量收集
-│   │   ├── audit/      审计追踪
-│   │   ├── halt/       拉闸暂停 + 交回控制权
-│   │   └── ports/      端口接口定义
-│   │   └── …          其余 core 模块（artifacts/budget/contracts/design/project/requirements/route/spec/version/worktree 等）详见 src/core/
-│   ├── cli/            CLI 命令实现（57 个命令，以 `zelto help` 为准）
-│   ├── hook/           独立可执行判定进程
-│   └── adapters/       执行器适配器（claude-agent / claude-agent-sdk / ai-chat / llm）
-├── contracts/schemas/  JSON Schema 真源（13 个）
+│   ├── core/           slice state machine · policy · gate · sched · stall
+│   │                    clarify · events · audit · metrics · halt · ports
+│   │                    (+ artifacts/budget/contracts/design/project/question
+│   │                     report/requirements/route/spec/version/worktree)
+│   ├── cli/            CLI implementation (`zelto help` is the source of truth)
+│   │   ├── commands/   slice/pipeline/governance/panoramic command groups
+│   │   └── policy/     policy CLI entry
+│   ├── hook/           standalone verdict process (git hooks / CI gate)
+│   ├── adapters/       executor adapters (Claude Agent SDK today)
+│   └── llm/            passage B only: drafts and suggestions, never verdicts
+├── contracts/schemas/  JSON Schema source of truth
 ├── policy/             policy.yaml + lock.json
-├── tests/              单元测试 + 验收测试
-└── .zelto/             运行时状态（slices/ events/ locks/ halts/ worktrees/ 等，详见目录）
+├── tests/              unit tests + acceptance suites (tests/acceptance/)
+├── specs/slices/       slice specs
+└── .zelto/             runtime state (slices/ events/ locks/ halts/ worktrees/ ...)
 ```
 
-## 许可
+## Tech stack
 
-MIT
+| Layer | Choice |
+|---|---|
+| Language | TypeScript 7, `strict: true` |
+| Runtime | Node 22, ESM |
+| Tests | `node --test` (no test framework dependency) |
+| Format / Lint | Biome |
+| Package manager | pnpm 9 |
+| Runtime deps | `core/` has zero third-party dependencies (Node built-ins only) |
+
+## Development
+
+```bash
+pnpm dev              # watch-mode compile
+pnpm test             # build + run all tests (including acceptance)
+pnpm test:quick       # run tests without rebuilding
+pnpm test:watch       # watch-mode tests
+pnpm lint             # biome check on src/
+pnpm format           # biome format src/
+pnpm clean            # remove build output
+```
+
+Build first: acceptance tests spawn the real `dist/cli/index.js` binary,
+so always `npm run build` (or `npm test`, which builds) after changing `src/`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and DCO sign-off.
+Design records live in [docs/](docs/adr-018-no-auto-merge-on-sign.md); start with the ADR index.
+
+## License
+
+[MIT](LICENSE)

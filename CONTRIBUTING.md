@@ -34,3 +34,15 @@ Run `zelto help` for all available commands.
 - C4: Every action writes to append-only event stream
 - C6: Dependency direction is one-way — `core/` never imports `adapters/`
 - C7: `llm/` output is draft/suggestion only — never participates in decisions
+
+## Developer Certificate of Origin (DCO)
+
+Every commit must be signed off. Use `git commit -s` (or `git commit --signoff`),
+which appends a line like:
+
+    Signed-off-by: Your Name <you@example.com>
+
+By signing off you certify the [Developer Certificate of Origin 1.1](https://developercertificate.org/).
+Commits without a `Signed-off-by` line are rejected by CI.
+
+If you forgot, amend the last commit with `git commit --amend -s --no-edit`.
