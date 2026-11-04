@@ -29,6 +29,7 @@ import './drift.js';
 import './dashboard.js';
 import './depgraph.js';
 import './artifact.js';
+import './batch.js';
 import './merge.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
