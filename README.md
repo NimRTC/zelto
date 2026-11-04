@@ -61,16 +61,16 @@ clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ fr
 
 ## 核心特性
 
-- **切片状态机** — 6 状态（draft → clarifying → frozen → admitted → running → done），9 事件，文件持久化
+- **切片状态机** — 6 状态（draft → clarifying → frozen → running → completed → abandoned），9 事件，文件持久化
 - **策略引擎** — 规则匹配 + 保护域硬编码 + 路径逃逸检测 + 锚点校验，纯确定性
 - **门禁执行** — 双门禁：① 确定性检查（freeze 前）② 验收测试（run 后），支持重试
 - **并行准入** — 写集冲突检测，保证切片不会互相踩踏
-- **停机分类** — 6 类停机（权限提示、上下文耗尽、预算超限、认知卡住等）
-- **签名管理** — 审批/拒绝工作流，待签队列
-- **事件流** — 29 种事件的 append-only JSONL 日志
-- **审计追踪** — 30 种事件摘要，可读文本报告
+- **停机分类** — 9 类停机（权限确认、环境失败、上下文耗尽、认知卡壳、计划门禁、预算耗尽、门禁重试、agent 提问、人工拉闸）
+- **签名管理** — 审批/拒绝/撤销工作流，待签队列（签字只改状态，合并需显式跑 `zelto merge`）
+- **事件流** — 49 种事件的 append-only JSONL 日志
+- **审计追踪** — 覆盖主要事件摘要，可读文本报告
 - **度量收集** — rework rate、cycle time、stall counts
-- **澄清引擎** — 5 类结构化问题（路径、操作、约束、验收、风险），自动回答
+- **澄清引擎** — 按缺失项生成结构化问题（需求追溯、契约、验收测试、写集、验收依据），支持自动回答
 - **独立 hook** — 可独立编译的策略判定进程，零依赖，可用于 git hooks / CI 门禁
 - **架构约束** — `core/` 零第三方运行时依赖，纯 Node 内置
 
@@ -89,7 +89,7 @@ pnpm link --global
 zelto help
 zelto-hook < input.json
 
-# CLI 命令
+# CLI 命令（常用；完整 57 个命令以 `zelto help` 为准）
 zelto slices          # 列出所有切片
 zelto next            # 推荐下一步动作
 zelto check <id>      # 门禁① 确定性检查
@@ -98,13 +98,15 @@ zelto run <id>        # 执行切片（含并行准入检查）
 zelto gate <id>       # 门禁② 验收测试
 zelto inbox           # 待签名队列
 zelto sign <id>       # 审批/拒绝
+zelto halt            # 拉闸暂停，交回控制权
+zelto merge           # 合并已签字的切片（显式动作）
 ```
 
 ## 开发
 
 ```bash
 pnpm dev              # 监听模式编译
-pnpm test             # 运行测试（62 tests, 15 suites）
+pnpm test             # 运行全部测试（含验收测试）
 pnpm test:quick       # 跳过重编，直接跑测试
 pnpm test:watch       # 监听模式跑测试
 pnpm lint             # 代码检查（biome）
@@ -121,7 +123,7 @@ pnpm clean            # 清理构建产物
 | 测试 | `node --test`（零测试框架依赖） |
 | 格式化/Lint | Biome |
 | 包管理 | pnpm 9 |
-| 运行时依赖 | **零**（`core/` 仅用 Node 内置模块） |
+| 运行时依赖 | `core/` 零第三方依赖（仅 Node 内置）；整包另含 CLI/adapter 依赖 |
 
 ## 架构约束
 
@@ -129,12 +131,12 @@ pnpm clean            # 清理构建产物
 |---|---|
 | **C1** | 状态只在文件里 — 无数据库、无内存状态 |
 | **C2** | `core/` 不依赖任何 SDK、不依赖 `adapters/` |
-| **C3** | 判定必须确定性 — policy/gate/sched 不得调用模型、不得触网 |
+| **C3** | 判定必须确定性 — `core/policy/` 与 `core/gate/` 不得调用模型、不得触网 |
 | **C4** | 每个动作写 append-only 事件流 |
 | **C5/C8** | 保护域硬编码，不可被策略规则覆盖 |
 | **C6** | 依赖单向向下 — `core/` 不得 import `adapters/` |
 | **C7** | `llm/` 产出永远只能是草稿或建议，不参与任何判定 |
-| **C9** | 写集预约由 sched 在运行时强制执行 |
+| **C9** | 写集预约由 hook 在运行时强制执行 |
 
 ## 项目结构
 
@@ -144,21 +146,23 @@ zelto/
 │   ├── core/
 │   │   ├── policy/     策略引擎（规则匹配·保护域·锚点校验）
 │   │   ├── slice/      切片状态机（6 状态·文件持久化）
-│   │   ├── events/     append-only 事件流（29 种事件）
+│   │   ├── events/     append-only 事件流（49 种事件）
 │   │   ├── gate/       门禁执行器 + 签名管理器
-│   │   ├── stall/      停机分类器（6 类）
+│   │   ├── stall/      停机分类器（9 类）
 │   │   ├── sched/      并行准入 + 约束分发
-│   │   ├── clarify/    对话引擎（5 类结构化问题）
+│   │   ├── clarify/    对话引擎（按缺失项生成结构化问题）
 │   │   ├── metrics/    度量收集
 │   │   ├── audit/      审计追踪
+│   │   ├── halt/       拉闸暂停 + 交回控制权
 │   │   └── ports/      端口接口定义
-│   ├── cli/            CLI 命令实现（10 个命令）
+│   │   └── …          其余 core 模块（artifacts/budget/contracts/design/project/requirements/route/spec/version/worktree 等）详见 src/core/
+│   ├── cli/            CLI 命令实现（57 个命令，以 `zelto help` 为准）
 │   ├── hook/           独立可执行判定进程
-│   └── adapters/       执行器适配器（预留）
-├── contracts/schemas/  JSON Schema 真源（6 个）
+│   └── adapters/       执行器适配器（claude-agent / claude-agent-sdk / ai-chat / llm）
+├── contracts/schemas/  JSON Schema 真源（13 个）
 ├── policy/             policy.yaml + lock.json
-├── tests/              验收测试
-└── .zelto/             运行时状态（slices/ events/ locks/ config.yaml）
+├── tests/              单元测试 + 验收测试
+└── .zelto/             运行时状态（slices/ events/ locks/ halts/ worktrees/ 等，详见目录）
 ```
 
 ## 许可
