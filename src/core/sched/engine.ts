@@ -144,8 +144,27 @@ export class Scheduler {
 
   /**
    * Mark a slice as running and record the admission.
+   *
+   * 开跑即意味着「停机结束了」：如果切片还带着停机分类（比如人工拉闸
+   * 回退后留下的 `human_halt`），这里把它清掉并留一条 `run.resumed` 事件。
+   *
+   * 为什么必须在这里清：`zelto next` 会把停机切片排在最前面。
+   * 如果开跑不清，下次 `zelto next` 还是指着这个已经跑过的切片 ——
+   * 人会陷入「resume → run → next 还在说 resume」的死循环。
    */
   async startRun(sliceId: string, actor: string = 'zelto'): Promise<SliceData> {
+    const slice = await this.store.read(sliceId);
+
+    if (slice.stall.class !== null) {
+      const previousStallClass = slice.stall.class;
+      await this.appendEvent(sliceId, 'run.resumed', actor, {
+        resolution: 'run_restart',
+        previousStallClass,
+      });
+      slice.stall.class = null;
+      await this.store.write(slice);
+    }
+
     return this.store.transit(sliceId, 'RUN_START', actor);
   }
 

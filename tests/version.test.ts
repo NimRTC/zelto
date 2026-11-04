@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { VERSION, getVersionString } from '../src/cli/version.js';
 
 describe('zelto version', () => {
@@ -8,8 +10,13 @@ describe('zelto version', () => {
     assert.ok(VERSION.length > 0);
   });
 
-  it('should match package.json version (0.1.0)', () => {
-    assert.equal(VERSION, '0.1.0');
+  it('should match package.json version', () => {
+    // 不写死版本号 —— 版本一改这个测试就假失败。
+    // 真源是 package.json，测试读同一份真源比对。
+    const pkg = JSON.parse(
+      readFileSync(join(import.meta.dirname, '..', '..', 'package.json'), 'utf-8'),
+    ) as { version: string };
+    assert.equal(VERSION, pkg.version);
   });
 
   it('getVersionString should return formatted version', () => {

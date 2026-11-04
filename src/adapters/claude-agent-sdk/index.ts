@@ -71,6 +71,10 @@ interface SdkSessionState {
   abortController: AbortController;
   /** Current retry attempt (0 = first try) */
   retryCount: number;
+  /** True once the session's generator loop has ended */
+  exited: boolean;
+  /** Exit code of the session (null = aborted / no exit code) */
+  exitCode: number | null;
 }
 
 /**
@@ -124,6 +128,10 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   private readonly sessionText = new Map<string, string>();
   /** Resolve functions for waitForExit promises, keyed by sessionId */
   private readonly exitResolvers = new Map<string, (code: number | null) => void>();
+  /** Resolvers for "the generator loop has fully unwound", keyed by sessionId */
+  private readonly drainResolvers = new Map<string, () => void>();
+  /** Sessions whose generator loop has already fully unwound */
+  private readonly drainedSessions = new Set<string>();
 
   constructor(options: ClaudeAgentSdkAdapterOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
@@ -188,11 +196,17 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       startedAt,
       abortController,
       retryCount,
+      exited: false,
+      exitCode: null,
     });
 
     // Start the agent session via SDK
+    // The abortController MUST be handed to the SDK — it is the only thing that
+    // actually tears down the spawned Claude Code process. Without it, stop()
+    // and the timeout timer would only clear local bookkeeping while the
+    // child process kept running (and kept the event loop alive).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const warm = await startup({ options: sdkOptions as any });
+    const warm = await startup({ options: { ...sdkOptions, abortController } as any });
 
     // Send the prompt
     const gen = warm.query(spec.prompt);
@@ -218,15 +232,31 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     }
 
     // Start consuming the generator in the background
-    this.consumeGenerator(sessionId, spec, gen, retryCount).catch((err) => {
+    const done = this.consumeGenerator(sessionId, spec, gen, retryCount).catch((err) => {
       // If the session was intentionally stopped, ignore the error
       if ((err as Error).message?.includes('abort') || (err as Error).message?.includes('AbortError')) {
         return;
       }
       console.error(`[sdk-adapter] Session ${sessionId} error:`, err);
     });
+    this.trackDrain(sessionId, done);
 
     return { sessionId };
+  }
+
+  /**
+   * Remember when a session's generator loop has fully unwound, so stop() can
+   * wait for the child process to actually be gone.
+   */
+  private trackDrain(sessionId: string, done: Promise<void>): void {
+    void done.finally(() => {
+      this.drainedSessions.add(sessionId);
+      const resolve = this.drainResolvers.get(sessionId);
+      if (resolve) {
+        this.drainResolvers.delete(sessionId);
+        resolve();
+      }
+    });
   }
 
   /**
@@ -345,6 +375,14 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       this.progressIntervals.delete(sessionId);
     }
 
+    // Record the exit on the session state so a later waitForExit() call can
+    // resolve immediately instead of waiting forever.
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.exited = true;
+      session.exitCode = exitCode;
+    }
+
     // Resolve the exit promise
     const resolve = this.exitResolvers.get(sessionId);
     if (resolve) {
@@ -364,10 +402,15 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     // Start a new query with the patch appended to the context
     const combinedPrompt = `${contextSummary}\n\n${_patch}`;
 
+    const abortController = new AbortController();
+
     const warm = await startup({
       options: {
         cwd: this.cwd,
         permissionMode: this.permissionMode,
+        // Same as start(): the controller is what actually stops the child
+        // process, so it has to reach the SDK.
+        abortController,
       },
     });
 
@@ -377,11 +420,14 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     this.sessions.set(newSessionId, {
       sessionId: newSessionId,
       startedAt: new Date().toISOString(),
-      abortController: new AbortController(),
+      abortController,
       retryCount: 0,
+      exited: false,
+      exitCode: null,
     });
 
-    this.consumeGenerator(newSessionId, { sliceId: _sessionId, prompt: combinedPrompt }, gen, 0).catch(() => {});
+    const done = this.consumeGenerator(newSessionId, { sliceId: _sessionId, prompt: combinedPrompt }, gen, 0).catch(() => {});
+    this.trackDrain(newSessionId, done);
 
     return { sessionId: newSessionId };
   }
@@ -440,10 +486,42 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
       this.progressIntervals.delete(sessionId);
     }
 
-    // Abort the generator to stop the agent
+    // Abort the generator to stop the agent. The controller is wired into the
+    // SDK, so this tears down the spawned Claude Code process.
     session.abortController.abort();
     this.handleExit(sessionId, null);
     this.sessions.delete(sessionId);
+
+    // Wait for the generator loop to unwind so the child process is really
+    // gone before we return — otherwise the caller (and the test process)
+    // still has a live `claude.exe` holding the event loop open.
+    await this.waitForDrain(sessionId, 5_000);
+  }
+
+  /**
+   * Wait until a session's generator loop has unwound, or until the timeout
+   * elapses. Never rejects — a stuck teardown must not mask the stop() result.
+   */
+  private async waitForDrain(sessionId: string, timeoutMs: number): Promise<void> {
+    if (this.drainedSessions.has(sessionId)) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.drainResolvers.delete(sessionId);
+        resolve();
+      }, timeoutMs);
+      this.drainResolvers.set(sessionId, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      // The loop may have unwound between the check above and the registration.
+      if (this.drainedSessions.has(sessionId)) {
+        clearTimeout(timer);
+        this.drainResolvers.delete(sessionId);
+        resolve();
+      }
+    });
   }
 
   async events(sessionId: string): Promise<AsyncIterable<EventEnvelope>> {
@@ -468,6 +546,12 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     const session = this.sessions.get(sessionId);
     if (!session) {
       return null;
+    }
+
+    // The session may already have ended before waitForExit() was called —
+    // resolve immediately rather than hanging forever.
+    if (session.exited) {
+      return session.exitCode;
     }
 
     return new Promise<number | null>((resolve) => {

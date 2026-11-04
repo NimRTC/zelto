@@ -155,3 +155,57 @@ describe('Scheduler — buildConstraints', () => {
     assert.ok(bundle.instructions.includes('Protected paths'));
   });
 });
+
+describe('Scheduler — startRun 清停机分类', () => {
+  let store: SliceStore;
+  let events: EventStream;
+  let scheduler: Scheduler;
+
+  before(async () => {
+    store = new SliceStore(SLICES_DIR);
+    events = new EventStream(EVENTS_DIR);
+    scheduler = new Scheduler(store, events, samplePolicy);
+  });
+
+  it('开跑时清掉挂着的停机分类（否则 zelto next 会一直指着它）', async () => {
+    const slice = store.create('stalled-run', 'Stalled run');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'abc';
+    slice.stall.class = 'human_halt';
+    await store.write(slice);
+
+    await scheduler.startRun('stalled-run');
+
+    const after = await store.read('stalled-run');
+    assert.equal(after.state, 'running');
+    assert.equal(after.stall.class, null, '停机分类应当在开跑时清掉');
+  });
+
+  it('清分类时留一条 run.resumed 事件', async () => {
+    const slice = store.create('stalled-run-2', 'Stalled run 2');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'abc';
+    slice.stall.class = 'human_halt';
+    await store.write(slice);
+
+    await scheduler.startRun('stalled-run-2');
+
+    const evts = await events.read('stalled-run-2');
+    const resumed = evts.find((e) => e.type === 'run.resumed');
+    assert.ok(resumed, '应当留下续跑事件');
+    assert.equal(resumed?.payload.previousStallClass, 'human_halt');
+  });
+
+  it('没有停机分类时不写多余事件', async () => {
+    const slice = store.create('clean-run', 'Clean run');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'abc';
+    await store.write(slice);
+
+    await scheduler.startRun('clean-run');
+
+    const evts = await events.read('clean-run');
+    assert.equal(evts.filter((e) => e.type === 'run.resumed').length, 0);
+    assert.equal((await store.read('clean-run')).state, 'running');
+  });
+});
