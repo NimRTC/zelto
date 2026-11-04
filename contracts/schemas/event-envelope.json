@@ -12,7 +12,7 @@
     "type": {
       "type": "string",
       "enum": [
-        "slice.state.changed", "slice.drift_detected",
+        "slice.state.changed", "slice.drift_detected", "slice.hotfix",
         "spec.drafted", "spec.checked", "spec.frozen",
         "clarify.question", "clarify.answer",
         "run.started", "run.resumed", "run.stalled", "run.finished", "run.aborted",
@@ -35,7 +35,9 @@
         "coord.phase_ready",
         "coord.phase_complete",
         "coord.cycle_detected",
-        "artifact.conflict_detected"
+        "artifact.conflict_detected",
+        "version.accepted",
+        "version.delivered"
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },

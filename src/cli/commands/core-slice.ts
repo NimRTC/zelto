@@ -22,9 +22,7 @@ function extractFlagValue(args: string[], flag: string): string | undefined {
 }
 import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
-import { listFilesUnder } from '../../core/sched/audit.js';
 import type { SliceData } from '../../core/slice/store.js';
-import { BudgetCollector } from '../../core/budget/collector.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
@@ -34,6 +32,7 @@ import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
+import { executeSlicesParallel, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
 import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites } from './run-support.js';
@@ -63,18 +62,9 @@ export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
  * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
  * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
  * 但内容被改动就是篡改：改了规格副本等于自动改规格（AGENTS.md 禁区）。
+ *
+ * 实现在 ./parallel-executor.ts —— 单切片运行与并行执行器共用同一份定义。
  */
-function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): string[] {
-  if (!worktreePath) return [];
-
-  const paths: string[] = [];
-  if (slice.spec.path) paths.push(slice.spec.path);
-  if (slice.acceptance.dir) {
-    paths.push(...listFilesUnder(worktreePath, slice.acceptance.dir));
-  }
-  paths.push(join(ZELTO_DIR, `${slice.id}-bundle.json`));
-  return paths;
-}
 
 // ─── slices ──────────────────────────────────────────────────────────────────
 
@@ -784,6 +774,23 @@ register('run', async (args) => {
 
   const isJson = args.includes('--json');
 
+  // hotfix 跳过门禁② —— 等于放弃「签字前必须过门禁」这条约束。
+  // 所以必须显式确认（ADR-015 §3.1）：--hotfix 必须配 --yes。
+  if (isHotfix && !args.includes('--yes') && !args.includes('-y')) {
+    if (isJson) {
+      console.log(JSON.stringify({
+        sliceId: id,
+        error: 'hotfix requires --yes',
+        message: 'zelto run <slice-id> --hotfix --yes',
+      }));
+    } else {
+      console.error('zelto run --hotfix 会跳过门禁②（验收测试），并把切片直接置为已签字。');
+      console.error('        这等于放弃「签字前必须过门禁」这条约束，所以必须显式确认：');
+      console.error('        zelto run <slice-id> --hotfix --yes');
+    }
+    return 1;
+  }
+
   // 运行时守卫（C9）：预约 + 钩子。离开这个命令时必须释放 ——
   // 除非是 detach 模式，那时由后台监视器接管。
   let guard: RuntimeGuard | null = null;
@@ -1098,28 +1105,13 @@ register('run', async (args) => {
 
 // ─── run:parallel — concurrent slice execution ─────────────────────
 
-interface ParallelRunState {
-  id: string;
-  status: 'admitted' | 'running' | 'completed' | 'failed';
-  elapsedSec: number;
-  exitCode: number | null;
-  sessionId: string | null;
-  branchName: string;
-  /** Isolated worktree path for this slice */
-  worktreePath: string | null;
-}
-
 /**
  * Run multiple non-conflicting slices in parallel.
  *
  * Usage: zelto run --parallel <id1> [id2 ...] [--agent <name>] [--adapter <type>]
  *
- * Flow:
- * 1. Admit all slices + check cross-conflicts
- * 2. Create feature branches from same base commit
- * 3. Start all agent sessions concurrently
- * 4. Monitor progress with multi-line display
- * 5. Process results (gate + sign requests)
+ * 执行语义全部在 ./parallel-executor.ts —— `zelto version start` 走同一条路径，
+ * 保证版本层的并行与单切片并行的隔离、守卫、门禁行为完全一致。
  */
 async function runParallel(args: string[]): Promise<number> {
   // Collect slice IDs: all non-flag args, regardless of --parallel position
@@ -1130,353 +1122,26 @@ async function runParallel(args: string[]): Promise<number> {
     return 1;
   }
 
-  const scheduler = new Scheduler(store, events, loadPolicyConfig());
+  const agentIdx = args.indexOf('--agent');
+  const agentName = agentIdx >= 0 ? args[agentIdx + 1] : undefined;
+  const adapterIdx = args.indexOf('--adapter');
+  const adapterType = adapterIdx >= 0 ? args[adapterIdx + 1] : undefined;
 
-  // ── Phase 1: Admit all slices ────────────────────────────────────
-  const states: ParallelRunState[] = ids.map((id) => ({
-    id,
-    status: 'admitted',
-    elapsedSec: 0,
-    exitCode: null,
-    sessionId: null,
-    branchName: `slice/${id}`,
-    worktreePath: null,
-  }));
+  const result = await executeSlicesParallel({
+    ids,
+    agentName,
+    adapterType,
+    title: 'zelto run --parallel',
+  });
 
-  console.log(`zelto run --parallel — admitting ${ids.length} slices...`);
-
-  for (const st of states) {
-    const result = await scheduler.admit(st.id);
-    if (result.decision !== 'admitted') {
-      console.error(`  ❌ ${st.id}: ${result.reason}`);
-      return 1;
-    }
-  }
-
-  // Resolve write-sets first — conflict detection depends on the effective write-set
-  for (const id of ids) {
-    const resolved = await resolveWriteSet(id);
-    if (resolved.changed) {
-      console.log(
-        resolved.source === 'spec'
-          ? `  ??  ${id}: write-set from spec: ${resolved.writes.join(', ')}`
-          : `  ??  ${id}: auto-detected write-set: ${resolved.writes.join(', ')}`,
-      );
-    }
-  }
-
-  // Read all slice data (after write-set resolution so conflicts use effective writes)
-  const slices = await Promise.all(ids.map((id) => store.read(id)));
-
-  // Check cross-conflicts: no two parallel slices may write the same files
-  const conflicts = scheduler.checkConflicts(slices.map((s) => s.writes));
-  if (conflicts.length > 0) {
-    for (const [i, j] of conflicts) {
-      console.error(`  ❌ Write-set conflict: ${ids[i]} ↔ ${ids[j]}`);
-      console.error(`     "${ids[i]}" writes: ${slices[i].writes.join(', ')}`);
-      console.error(`     "${ids[j]}" writes: ${slices[j].writes.join(', ')}`);
-    }
+  if (result.aborted) {
+    console.error(`\n❌ 并行执行未开始：${result.abortReason}`);
     return 1;
   }
 
-  // Check budgets
-  for (const id of ids) {
-    const ok = await checkBudget(id);
-    if (!ok) {
-      console.error(`  ❌ ${id}: budget exhausted`);
-      return 1;
-    }
-  }
+  printParallelSummary(result);
 
-  // ── Phase 2: Create isolated worktrees & start agents ───────────
-  const { execSync } = await import('node:child_process');
-  const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : loadConfig().agent.command;
-  const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
-
-  // 每个切片一份运行时守卫（C9）：写集预约 + PreToolUse 钩子
-  const guards = new Map<string, RuntimeGuard>();
-
-  // Check for uncommitted changes in the main worktree
-  try {
-    const status = execSync('git status --porcelain', { encoding: 'utf-8', timeout: 5000 }).trim();
-    if (status) {
-      console.warn(`  ??  You have uncommitted changes in the main worktree. They are NOT copied into slice worktrees.`);
-      console.warn(`       Commit them first if the slices depend on them.`);
-    }
-  } catch { /* ignore */ }
-
-  for (let i = 0; i < ids.length; i++) {
-    const st = states[i];
-    const slice = slices[i];
-
-    // Start run
-    await scheduler.startRun(st.id);
-
-    // Build constraint bundle
-    const bundle = scheduler.buildConstraints(slice);
-    const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
-    writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
-
-    // Create isolated worktree — the main worktree keeps its current branch.
-    // Not inside a git repo → no isolation possible, degrade to the current directory.
-    let baseCommit: string | null = null;
-    try {
-      const wt = await ensureWorktree(st.id);
-      if (wt) {
-        st.worktreePath = wt.path;
-        baseCommit = wt.baseCommit;
-        const wtBundleDir = join(wt.path, ZELTO_DIR);
-        if (!existsSync(wtBundleDir)) mkdirSync(wtBundleDir, { recursive: true });
-        writeFileSync(join(wtBundleDir, `${st.id}-bundle.json`), JSON.stringify(bundle, null, 2), 'utf-8');
-      } else {
-        console.warn(`  ⚠️  ${st.id}: 不在 git 仓库中，无法隔离 worktree，将在当前目录执行`);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`  ❌ ${st.id}: 无法创建隔离 worktree: ${msg}`);
-      await releaseGuards(guards);
-      return 1;
-    }
-
-    // 写集预约 + PreToolUse 钩子（C9）
-    try {
-      const g = await installRuntimeGuard({
-        sliceId: st.id,
-        writes: bundle.writes,
-        worktree: st.worktreePath,
-        projectRoot: process.cwd(),
-        baseCommit,
-        managedPaths: zeltoOwnedPaths(st.worktreePath, slice),
-      });
-      guards.set(st.id, g);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`  ❌ ${st.id}: 无法取得写集预约: ${msg}`);
-      await releaseGuards(guards);
-      return 1;
-    }
-
-    // Write event
-    await events.append(st.id, 'run.started', 'zelto', {
-      sliceId: st.id, agent: agentName, bundlePath, writes: slice.writes,
-      worktree: st.worktreePath ? worktreeManager().relativePathFor(st.id) : null,
-    });
-  }
-
-  // Start all agent sessions — each with its own timeout from slice config
-  const adapters = states.map((st, i) => {
-    const timeout = slices[i]?.agentTimeout;
-    return createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
-  });
-
-  const startTime = Date.now();
-  console.log(`\nzelto run --parallel — starting ${ids.length} agents...`);
-
-  for (let i = 0; i < states.length; i++) {
-    const st = states[i];
-    const adapter = adapters[i];
-    const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
-    try {
-      let sessionId: string | undefined;
-      ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath }));
-      st.sessionId = sessionId;
-      st.status = 'running';
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`  ❌ ${st.id}: failed to start agent: ${msg}`);
-      st.status = 'failed';
-    }
-  }
-
-  // ── Phase 3: Monitor progress ────────────────────────────────────
-  const statusLineCount = states.length + 2; // header + N slices + blank
-  let progressTimer: ReturnType<typeof setInterval> | null = null;
-
-  function renderProgress(): void {
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const lines: string[] = [];
-    const running = states.filter((s) => s.status === 'running').length;
-    const done = states.filter((s) => s.status === 'completed' || s.status === 'failed').length;
-    lines.push(`  ⏱️  ${elapsed}s elapsed — ${running} running, ${done} done`);
-    for (const st of states) {
-      const icon = st.status === 'completed' ? '✅' : st.status === 'failed' ? '❌' : st.status === 'running' ? '🔄' : '⏳';
-      // Use frozen elapsedSec for completed/failed slices, live calculation for running
-      const elapsedStr = st.elapsedSec > 0 ? `${st.elapsedSec}s` : st.status !== 'admitted' ? `${Math.floor((Date.now() - startTime) / 1000)}s` : '—';
-      const exitStr = st.exitCode !== null ? ` exit=${st.exitCode}` : '';
-      lines.push(`    ${icon} ${st.id.padEnd(22)} ${elapsedStr.padEnd(6)}${exitStr}`);
-    }
-    // Move cursor up and rewrite
-    process.stdout.write(`\x1b[${statusLineCount}A` + lines.join('\n') + '\n');
-
-    // Stop timer when all slices are done
-    if (done === states.length && progressTimer) {
-      clearInterval(progressTimer);
-      progressTimer = null;
-    }
-  }
-
-  // Initial status
-  {
-    const lines: string[] = [];
-    lines.push(`  ⏱️  0s elapsed — ${states.length} starting...`);
-    for (const st of states) {
-      lines.push(`    ⏳ ${st.id.padEnd(22)} —`);
-    }
-    console.log(lines.join('\n'));
-  }
-
-  // Start progress updates
-  progressTimer = setInterval(renderProgress, 2000);
-
-  // ── Phase 4: Wait for all to complete with per-slice retry ─────────
-  const config = loadConfig();
-  const maxRetries = config.agent.maxRetries ?? 2;
-
-  const results = await Promise.allSettled(
-    states.map(async (st, i) => {
-      if (st.sessionId === null) return { ...st, exitCode: -1, status: 'failed' as const };
-
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const exitCode = await adapters[i].waitForExit(st.sessionId);
-        st.exitCode = exitCode;
-        st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
-
-        if (exitCode === 0) {
-          st.status = 'completed';
-          return st;
-        }
-
-        // Failed — try auto-retry at CLI level
-        if (attempt < maxRetries) {
-          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
-          const result = await handleAgentFailure(st.id, exitCode, { maxRetries });
-          if (result.action === 'retry') {
-            // Re-create adapter and re-start agent
-            const timeout = slices[i]?.agentTimeout;
-            adapters[i] = createExecutorAdapter(
-              adapterType,
-              agentName,
-              timeout,
-              st.worktreePath ?? process.cwd(),
-            );
-            const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
-            try {
-              const { sessionId } = await adapters[i].start({ sliceId: st.id, prompt: bundlePath });
-              st.sessionId = sessionId;
-              st.status = 'running';
-              continue; // Retry
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error(`  ❌ ${st.id}: retry start failed: ${msg}`);
-            }
-          }
-        }
-
-        // Not retrying — final failure
-        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode });
-        st.status = 'failed';
-        return st;
-      }
-
-      st.status = 'failed';
-      return st;
-    }),
-  );
-
-  // Clear progress display
-  if (progressTimer) {
-    clearInterval(progressTimer);
-  }
-  process.stdout.write(`\x1b[${statusLineCount}A` + ' '.repeat(80) + '\n');
-
-  // ── Phase 5: Process results with enhanced summary ────────────────
-  console.log('');
-  const completed: Array<{ id: string; elapsedSec: number }> = [];
-  const stalled: Array<{ id: string; exitCode: number | null }> = [];
-  const asked: Array<{ id: string; questionId: string; question: string }> = [];
-
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      const st = result.value;
-      if (st.exitCode === 0) {
-        // 提问回路：某个切片以问题收尾 → 只挂起该切片，批次里其它切片不受影响
-        // （ADR-013 §3.5）
-        const idx = states.findIndex((s) => s.id === st.id);
-        const adapter = idx >= 0 ? adapters[idx] : undefined;
-        const sessionId = st.sessionId;
-        const question = adapter && sessionId
-          ? await detectQuestion(st.id, adapter, sessionId)
-          : null;
-
-        if (question) {
-          await suspendSliceForQuestion(st.id, question);
-          console.log(`❓ ${st.id}: asked a question (${question.type}) — suspended`);
-          console.log(`   ${question.question}`);
-          console.log(`   Answer with: zelto answer ${question.id} "<your answer>"`);
-          asked.push({ id: st.id, questionId: question.id, question: question.question });
-          continue;
-        }
-
-        // 写集审计（ADR-014 §5）—— 越界就不进 gate
-        const withinBounds = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
-        if (!withinBounds) {
-          console.log(`❌ ${st.id}: 写集越界 — 未进入 gate，等人处理`);
-          await events.append(st.id, 'run.aborted', 'zelto', {
-            sliceId: st.id, exitCode: 0, reason: 'write-set violation',
-          });
-          stalled.push({ id: st.id, exitCode: 0 });
-          continue;
-        }
-
-        await store.transit(st.id, 'RUN_FINISH');
-        await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
-        console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
-        await autoGateAfterRun(st.id);
-        completed.push({ id: st.id, elapsedSec: st.elapsedSec });
-      } else {
-        stalled.push({ id: st.id, exitCode: st.exitCode });
-      }
-    } else {
-      // Promise rejected
-      stalled.push({ id: states.find((s) => s.status === 'failed')?.id ?? 'unknown', exitCode: -1 });
-    }
-  }
-
-  // Enhanced summary
-  console.log('');
-  console.log(`?? Parallel run complete: ${completed.length} passed, ${stalled.length} stalled, ${asked.length} awaiting answer`);
-
-  if (asked.length > 0) {
-    console.log('');
-    console.log(`❓ Slices waiting for an answer:`);
-    for (const a of asked) {
-      console.log(`  ❓ ${a.id} — ${a.question}`);
-      console.log(`     zelto answer ${a.questionId} "<your answer>"`);
-    }
-  }
-
-  if (stalled.length > 0) {
-    console.log('');
-    console.log(`??  Stalled slices (needs attention):`);
-    for (const s of stalled) {
-      console.log(`  ❌ ${s.id} — exit ${s.exitCode ?? 'signal'} (zelto resume ${s.id})`);
-    }
-  }
-
-  if (completed.length > 0) {
-    console.log('');
-    console.log(`✅  Completed slices:`);
-    for (const s of completed) {
-      console.log(`  ✅ ${s.id} — gate passed, sign created (${s.elapsedSec}s)`);
-    }
-  }
-
-  // Note: the main worktree's branch is never switched — each slice runs in its own
-  // worktree, so there is nothing to switch back to.
-
-  await releaseGuards(guards);
-
-  return stalled.length > 0 ? 1 : 0;
+  return result.ok ? 0 : 1;
 }
 
 register('admit', async (args) => {

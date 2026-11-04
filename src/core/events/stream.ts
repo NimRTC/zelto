@@ -46,7 +46,9 @@ export type EventType =
   | 'coord.phase_ready'
   | 'coord.phase_complete'
   | 'coord.cycle_detected'
-  | 'artifact.conflict_detected';
+  | 'artifact.conflict_detected'
+  | 'version.accepted'
+  | 'version.delivered';
 
 export interface EventEnvelope {
   ts: string;

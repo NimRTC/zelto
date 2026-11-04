@@ -136,10 +136,18 @@ agent:
     assert.ok(stdout.includes('Approved'), `should say approved: ${stdout}`);
   });
 
-  it('version start --help shows auto flag', async () => {
+  it('version start usage shows the human-signature path, not --auto', async () => {
     const { stderr, code } = await runCli('version', 'start');
     assert.equal(code, 1, 'version start without args should fail');
-    assert.ok(stderr.includes('--auto'), `help should mention --auto: ${stderr}`);
+    assert.ok(stderr.includes('--retry-failed'), `help should mention --retry-failed: ${stderr}`);
+    assert.ok(!stderr.includes('--auto'), `usage should not offer --auto: ${stderr}`);
+  });
+
+  it('version start --auto is rejected — signature must stay with a human', async () => {
+    const { stdout, stderr, code } = await runCli('version', 'start', 'v1', '--auto');
+    assert.equal(code, 1, 'version start --auto should be rejected');
+    const out = `${stdout}\n${stderr}`;
+    assert.ok(out.includes('--auto'), `should explain that --auto was removed: ${out}`);
   });
 
   it('version status shows no plans in test dir', async () => {

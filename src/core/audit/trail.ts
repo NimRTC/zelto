@@ -25,6 +25,8 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `State changed: ${String(e.payload?.from ?? '?')} → ${String(e.payload?.to ?? '?')}`,
   'slice.drift_detected': (e) =>
     `Drift detected: ${String(e.payload?.reason ?? 'unknown reason')}`,
+  'slice.hotfix': (e) =>
+    `Hotfix applied (gate skipped, auto-approved) in ${String(e.payload?.elapsed ?? '?')}s: ${String(e.payload?.note ?? '')}`,
   'spec.drafted': () => 'Spec drafted',
   'spec.checked': () => 'Spec checked',
   'spec.frozen': () => 'Spec frozen',
@@ -41,6 +43,20 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
   'policy.decision': (e) =>
     `Policy decision: ${String(e.payload?.decision ?? '')} for ${String(e.payload?.path ?? '')}`,
   'policy.anchor_mismatch': () => 'Policy anchor mismatch detected',
+  'policy.violation': (e) =>
+    `Policy violation (${String(e.payload?.kind ?? 'unknown')}): ${
+      e.payload?.error
+        ? String(e.payload.error)
+        : `${String(Array.isArray(e.payload?.violations) ? (e.payload.violations as string[]).length : 0)} write(s) outside the write-set`
+    }${
+      Array.isArray(e.payload?.tampered) && (e.payload.tampered as unknown[]).length > 0
+        ? `, ${String((e.payload.tampered as unknown[]).length)} managed file(s) tampered`
+        : ''
+    }`,
+  'reservation.acquired': (e) =>
+    `Write reservation acquired for ${String(e.payload?.writes ? (e.payload.writes as string[]).join(', ') : '')}`,
+  'reservation.released': (e) =>
+    `Write reservation released for ${String(e.payload?.writes ? (e.payload.writes as string[]).join(', ') : '')}`,
   'gate.executed': (e) =>
     `Gate executed: ${String(e.payload?.commandCount ?? '?')} commands`,
   'gate.result': (e) =>
@@ -88,6 +104,12 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `Cycle detected: ${String(Array.isArray(e.payload?.cycle) ? (e.payload.cycle as string[]).join(' → ') : '')}`,
   'artifact.conflict_detected': (e) =>
     `Artifact conflict: ${String(e.payload?.count ?? '?')} conflict(s) found`,
+  'version.accepted': (e) =>
+    `Version ${String(e.payload?.version ?? '?')} accepted — version-level acceptance passed on main`,
+  'version.delivered': (e) =>
+    `Version ${String(e.payload?.version ?? '?')} delivered — slices: ${String(
+      Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '',
+    )}`,
 };
 
 export class AuditTrail {

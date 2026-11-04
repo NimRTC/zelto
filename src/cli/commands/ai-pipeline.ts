@@ -1,28 +1,87 @@
 // AI pipeline commands: require, design, plan, version
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
+import { dirname, join } from 'node:path';
+import type { VersionPlan } from '../../core/version/types.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { VersionStore } from '../../core/version/store.js';
 import { SliceStore } from '../../core/slice/store.js';
 import type { SliceData } from '../../core/slice/store.js';
-import type { VersionPlan, VersionSlice } from '../../core/version/types.js';
 import type { RequirementDoc } from '../../core/requirements/types.js';
 import type { DesignDoc } from '../../core/design/types.js';
-import type { GateConfig } from '../../core/gate/types.js';
-import { GateExecutor } from '../../core/gate/executor.js';
-import { SignManager } from '../../core/gate/sign.js';
-import { EventStream } from '../../core/events/stream.js';
 import { generateRequirements, refineRequirements } from '../../llm/generators/requirements.js';
 import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
-import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent } from './shared.js';
-import { handleAgentFailure } from './core-slice.js';
-import { isAutoResolvable } from '../../core/stall/classifier.js';
+import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent, hashSpecFile } from './shared.js';
+import { executeSlicesParallel, printParallelSummary } from './parallel-executor.js';
+import { branchExists, isMergedIntoHead } from './merge-executor.js';
 import { getDefaultFormatter } from '../output-formatter.js';
+
+// ─── 版本级验收 ──────────────────────────────────────────────────────────────
+
+/**
+ * 版本级事件在事件流里的归属键。
+ *
+ * 事件流是按切片分目录的（`.zelto/events/<slice>/events.jsonl`），
+ * 版本不是切片，但版本级动作同样要留痕（C4）——所以用 `version-<label>` 当键，
+ * 不与任何切片 id 冲突。
+ */
+function versionEventKey(versionLabel: string): string {
+  return `version-${versionLabel}`;
+}
+
+/**
+ * 版本级验收：在主仓跑项目自己的门禁命令。
+ *
+ * 判据是「合入主干之后的整体能不能过验收」，所以：
+ * - 跑在主仓（cwd = 当前项目根），跑的是真实的主干代码
+ * - 命令取自 `.zelto/config.yaml` 的 `gate.commands` —— 项目自己的验收口径
+ * - 超时按 `gate.timeoutSec`，超时算失败
+ *
+ * 判定是确定性的：不调模型、不触网（C3）。
+ */
+async function runVersionAcceptance(
+  versionLabel: string,
+  commands: Array<{ name: string; run: string }>,
+  timeoutSec: number,
+): Promise<{
+  passed: boolean;
+  results: Array<{ name: string; passed: boolean; code: number | null; output: string }>;
+}> {
+  const { exec } = await import('node:child_process');
+  const results: Array<{ name: string; passed: boolean; code: number | null; output: string }> = [];
+
+  for (const cmd of commands) {
+    process.stdout.write(`  ▸ ${cmd.name}: ${cmd.run}\n`);
+    const outcome = await new Promise<{ code: number | null; output: string }>((resolve) => {
+      exec(
+        cmd.run,
+        { cwd: process.cwd(), timeout: timeoutSec * 1000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
+        (err, stdout, stderr) => {
+          const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1) : 0;
+          resolve({ code, output: `${stdout ?? ''}${stderr ?? ''}` });
+        },
+      );
+    });
+    results.push({ name: cmd.name, passed: outcome.code === 0, code: outcome.code, output: outcome.output });
+  }
+
+  const passed = results.every((r) => r.passed);
+  for (const r of results) {
+    const icon = r.passed ? '✅' : '❌';
+    process.stdout.write(`    ${icon} ${r.name}（exit ${r.code ?? 'signal'}）\n`);
+    if (!r.passed) {
+      const tail = r.output.split('\n').filter((l) => l.trim()).slice(-8);
+      for (const line of tail) {
+        process.stdout.write(`       ${line.slice(0, 200)}\n`);
+      }
+    }
+  }
+
+  return { passed, results };
+}
 
 // ─── require ─────────────────────────────────────────────────────────────────
 
@@ -506,7 +565,7 @@ register('version', async (args) => {
     return 0;
   }
 
-  // zelto version deliver
+// zelto version deliver
   if (subcmd === 'deliver') {
     const versionLabel = args[1];
     if (!versionLabel || versionLabel.startsWith('--')) {
@@ -530,7 +589,7 @@ register('version', async (args) => {
       const plans = await versionStore.list();
       const confirmed = plans.filter((p) => p.status === 'confirmed');
       if (confirmed.length === 0) {
-        f.error('NOT_FOUND', 'No confirmed plans found.');
+        f.error('NOT_FOUND', 'No confirmed plans found. Confirm a plan first.');
         return 1;
       }
       targetPlan = await versionStore.read(confirmed[0].id);
@@ -542,15 +601,75 @@ register('version', async (args) => {
       return 1;
     }
 
-    if (version.status !== 'integrated') {
-      f.error('INVALID_STATE', `Version "${versionLabel}" is ${version.status}. Must be "integrated" to deliver.`);
+    if (version.status !== 'in_progress' && version.status !== 'integrated') {
+      f.error('INVALID_STATE', `Version "${versionLabel}" is ${version.status}. Must be "in_progress" to deliver.`);
       return 1;
     }
 
+    // ── 第一步：前置条件 —— 切片都已完成，且产物已合入主干 ──────────
+    // 「合入主干」由显式的 zelto merge 完成（ADR-018），zelto 不自己合。
+    // 这里只检查这件事是否真的发生了——分支没进 HEAD，版本就不可交付。
+    f.out(`── 版本级验收：${versionLabel} ──`);
+
+    const sliceStore = new SliceStore(SLICES_DIR);
+    const problems: string[] = [];
+
+    for (const s of version.slices) {
+      const data = await sliceStore.read(s.id).catch(() => null);
+      if (!data) {
+        problems.push(`${s.id}：切片不存在`);
+        continue;
+      }
+      if (data.state !== 'completed') {
+        problems.push(`${s.id}：状态是 ${data.state}，还没到「已完成」`);
+      }
+      const branch = `slice/${s.id}`;
+      if (branchExists(branch, process.cwd()) && !isMergedIntoHead(branch, process.cwd())) {
+        problems.push(`${s.id}：分支 ${branch} 还没合入主干`);
+      }
+    }
+
+    if (problems.length > 0) {
+      f.out('');
+      f.out('❌ 验收前置条件不满足：');
+      for (const p of problems) f.out(`   - ${p}`);
+      f.out('');
+      f.out('👉 先签字，再显式合并：zelto sign <slice-id> --approve  然后  zelto merge <slice-id>');
+      return 1;
+    }
+
+    // ── 第二步：版本级验收 —— 在主仓跑项目自己的门禁命令 ──────────
+    // 判据是「合入主干之后的整体能不能过验收」，所以跑在主仓、跑真实代码。
+    const cfg = loadConfig();
+    const acceptance = await runVersionAcceptance(versionLabel, cfg.gate.commands, cfg.gate.timeoutSec);
+
+    if (!acceptance.passed) {
+      f.out('');
+      f.out(`❌ 版本 ${versionLabel} 的版本级验收未通过 —— 状态保持 in_progress`);
+      for (const r of acceptance.results) {
+        if (!r.passed) f.out(`   - ${r.name}（exit ${r.code ?? 'signal'}）`);
+      }
+      f.out('');
+      f.out('👉 修好之后重新验收：zelto version deliver ' + versionLabel);
+      return 1;
+    }
+
+    await events.append(versionEventKey(versionLabel), 'version.accepted', 'zelto', {
+      version: versionLabel,
+      commands: acceptance.results.map((r) => ({ name: r.name, passed: r.passed })),
+    });
+
+    await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
     await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'delivered');
-    f.out(`\n🚀 Version ${versionLabel} delivered!`);
+    await events.append(versionEventKey(versionLabel), 'version.delivered', 'zelto', {
+      version: versionLabel,
+      slices: version.slices.map((s) => s.id),
+    });
+
+    f.out('');
+    f.out(`🚀 版本 ${versionLabel} 已交付`);
     f.out(`   ${version.description}`);
-    f.out(`   Slices: ${version.slices.map((s) => s.id).join(', ')}`);
+    f.out(`   切片：${version.slices.map((s) => s.id).join(', ')}`);
 
     const nextVersion = targetPlan.versions.find((v) => v.status === 'planned');
     if (nextVersion) {
@@ -559,7 +678,7 @@ register('version', async (args) => {
         return dv && (dv.status === 'integrated' || dv.status === 'delivered');
       });
       if (depsReady) {
-        f.out(`\n👉 Next: zelto version start ${nextVersion.version} [--plan ${targetPlan.id}]`);
+        f.out(`\n👉 下一步：zelto version start ${nextVersion.version} [--plan ${targetPlan.id}]`);
       }
     }
     return 0;
@@ -569,11 +688,16 @@ register('version', async (args) => {
   if (subcmd === 'start') {
     const versionLabel = args[1];
     if (!versionLabel || versionLabel.startsWith('--')) {
-      f.error('USAGE', 'Usage: zelto version start <version-label> [--plan <plan-id>] [--auto] [--retry-failed]');
+      f.error('USAGE', 'Usage: zelto version start <version-label> [--plan <plan-id>] [--retry-failed]');
       return 1;
     }
 
-    const isAuto = args.includes('--auto');
+    if (args.includes('--auto')) {
+      f.error('INVALID_ARGS', 'zelto version start --auto 已移除：签字必须由人行使（AGENTS.md 禁区：一键批准 / 自动合并）。');
+      f.out('   请逐个签字：zelto sign <slice-id> --approve');
+      return 1;
+    }
+
     const isRetry = args.includes('--retry-failed');
     const planIdx = args.indexOf('--plan');
     const planId = planIdx >= 0 ? args[planIdx + 1] : null;
@@ -625,253 +749,118 @@ register('version', async (args) => {
     await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'in_progress');
 
     const sliceStore = new SliceStore(SLICES_DIR);
-    const cfg = loadConfig();
 
-    // Phase 1: Prepare all slices
+    // ── Phase 1: 准备切片（建切片文件 → 写规格 → 冻结）──────────────
     f.out('\n── Phase 1: Prepare slices ──');
-    interface SliceCtx { def: VersionSlice; specContent: string; bundlePath: string }
-    const sliceCtxs: SliceCtx[] = [];
+    const prepared: string[] = [];
 
     for (const sliceDef of version.slices) {
-      if (isRetry) {
-        const existingSlice = await sliceStore.read(sliceDef.id).catch(() => null);
-        if (existingSlice && existingSlice.state === 'completed') {
-          f.out(`  ✅ "${sliceDef.id}" already completed — skipping`);
-          continue;
-        }
-        if (existingSlice && existingSlice.state === 'frozen') {
-          f.out(`  ❄️  "${sliceDef.id}" already frozen — will re-run`);
-        }
+      const existing = await sliceStore.read(sliceDef.id).catch(() => null);
+
+      if (existing && existing.state === 'completed') {
+        f.out(`  ✅ "${sliceDef.id}" 已完成 —— 跳过`);
+        continue;
       }
 
-      if (!(await sliceStore.exists(sliceDef.id))) {
-        const sliceData = sliceStore.create(sliceDef.id, sliceDef.title, { writes: sliceDef.writes });
-        await sliceStore.write(sliceData);
-        f.out(`  ✅ "${sliceDef.id}" created`);
-      } else {
-        f.out(`  ℹ️  "${sliceDef.id}" already exists`);
+      if (existing && existing.state !== 'draft' && existing.state !== 'clarifying' && existing.state !== 'frozen') {
+        f.error('INVALID_STATE', `"${sliceDef.id}" 处于 ${existing.state}，不能直接开跑。先处理它（zelto resume / zelto abandon）。`);
+        return 1;
       }
 
-      const specPath = sliceDef.specPath;
+      if (!existing) {
+        const created = sliceStore.create(sliceDef.id, sliceDef.title, { writes: sliceDef.writes });
+        await sliceStore.write(created);
+        f.out(`  ✅ "${sliceDef.id}" 已创建`);
+      }
+
+      const sliceData = await sliceStore.read(sliceDef.id);
+
+      // 规格写到切片自己的路径 —— worktree 复制的是这一份
+      const specPath = sliceData.spec.path;
       let specContent = '';
       try {
         specContent = readFileSync(specPath, 'utf-8');
       } catch {
         specContent = generateSliceSpecContent(sliceDef.id, sliceDef.title, sliceDef.module, sliceDef.writes, versionLabel);
-        if (!existsSync('specs/slices')) mkdirSync('specs/slices', { recursive: true });
-        writeFileSync(specPath, specContent, 'utf-8');
+      }
+      const specDir = dirname(specPath);
+      if (!existsSync(specDir)) mkdirSync(specDir, { recursive: true });
+      writeFileSync(specPath, specContent, 'utf-8');
+
+      // 计划里指定的规格路径也同步一份 —— 那是给人看的版本
+      if (sliceDef.specPath && sliceDef.specPath !== specPath) {
+        const planSpecDir = dirname(sliceDef.specPath);
+        if (!existsSync(planSpecDir)) mkdirSync(planSpecDir, { recursive: true });
+        writeFileSync(sliceDef.specPath, specContent, 'utf-8');
       }
 
-      const bundlePath = join(ZELTO_DIR, `${sliceDef.id}-bundle.json`);
-      const promptContent = [
-        `You are working on slice "${sliceDef.id}" of version ${versionLabel}.`,
-        '',
-        '## Spec',
-        specContent,
-        '',
-        '## Write permissions',
-        ...sliceDef.writes.map((w) => `- ${w}`),
-        '',
-        'Implement the spec above. Write code to satisfy the acceptance criteria.',
-      ].join('\n');
-      const bundle = {
-        sliceId: sliceDef.id,
-        specPath: sliceDef.specPath,
-        writes: sliceDef.writes,
-        instructions: promptContent,
-        protectedPaths: ['policy/**', '.zelto/**', 'AGENTS.md'],
-        policyRules: [],
-      };
-      writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
-
-      const currentSlice = await sliceStore.read(sliceDef.id).catch(() => null);
-      if (currentSlice && currentSlice.state === 'frozen') {
-        f.out(`  ❄️  "${sliceDef.id}" already frozen`);
-      } else {
+      // 冻结：规格哈希 + 时间戳 + 事件 —— 与 `zelto freeze` 同一套判据
+      if (sliceData.state !== 'frozen') {
+        sliceData.spec.frozenHash = hashSpecFile(specPath) ?? `sha256:${Date.now()}`;
+        sliceData.spec.frozenAt = new Date().toISOString();
+        await sliceStore.write(sliceData);
         await sliceStore.transit(sliceDef.id, 'FREEZE');
-        f.out(`  ❄️  "${sliceDef.id}" frozen`);
+        await events.append(sliceDef.id, 'spec.frozen', 'cli', {
+          sliceId: sliceDef.id,
+          frozenHash: sliceData.spec.frozenHash,
+          frozenAt: sliceData.spec.frozenAt,
+        });
+        f.out(`  ❄️  "${sliceDef.id}" 已冻结`);
+      } else {
+        f.out(`  ❄️  "${sliceDef.id}" 已经是冻结状态`);
       }
 
-      sliceCtxs.push({ def: sliceDef, specContent, bundlePath });
+      prepared.push(sliceDef.id);
     }
 
-    // Phase 2: Run agents in parallel with per-slice auto-retry
-    f.out('\n── Phase 2: Execute agents (parallel) ──');
-    const maxRetries = cfg.agent.maxRetries ?? 2;
+    if (prepared.length === 0) {
+      f.out('');
+      f.out(`ℹ️  版本 ${versionLabel} 没有待执行的切片（全部已完成）`);
+      return 0;
+    }
 
-    const agentResults = await Promise.all(sliceCtxs.map(async (ctx) => {
-      await sliceStore.transit(ctx.def.id, 'RUN_START');
+    // ── Phase 2: 并行执行 ──────────────────────────────────────────
+    // 与 `zelto run --parallel` 走同一条路径：每个切片一份隔离 worktree、
+    // 一份写集预约守卫、一次门禁②、一次签名请求（ADR-012 / ADR-014）。
+    f.out('\n── Phase 2: Execute agents (parallel, isolated) ──');
+    const cfg = loadConfig();
 
-      for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        const agent = new ClaudeAgentAdapter({ cwd: process.cwd(), agentCommand: cfg.agent.command });
-        const { sessionId } = await agent.start({ sliceId: ctx.def.id, prompt: ctx.bundlePath });
-        const exitCode = await agent.waitForExit(sessionId);
+    const result = await executeSlicesParallel({
+      ids: prepared,
+      agentName: cfg.agent.command,
+      title: `版本 ${versionLabel}`,
+    });
 
-        if (exitCode === 0) {
-          return { id: ctx.def.id, exitCode: 0, attempts: attempt + 1 };
-        }
+    if (result.aborted) {
+      f.error('BLOCKED', `并行执行未开始：${result.abortReason}`);
+      return 1;
+    }
 
-        // Failed — try auto-retry at CLI level
-        f.out(`  ❌ "${ctx.def.id}" agent failed (exit ${exitCode})`);
+    // ── Phase 3: 结果 ───────────────────────────────────────────────
+    f.out('\n── Phase 3: 结果 ──');
+    printParallelSummary(result);
 
-        if (attempt < maxRetries) {
-          const result = await handleAgentFailure(ctx.def.id, exitCode, { maxRetries });
-          if (result.action === 'retry') {
-            f.out(`  🔄 "${ctx.def.id}" auto-retry (${result.retryCount}/${maxRetries})`);
-            continue;
-          }
-        } else {
-          // Ensure stall info is written on final failure
-          await handleAgentFailure(ctx.def.id, exitCode, { maxRetries });
-        }
-
-        return { id: ctx.def.id, exitCode, attempts: attempt + 1 };
+    if (!result.ok) {
+      f.out('');
+      f.out(`❌ 版本 ${versionLabel} 未全部通过 —— 状态保持 in_progress`);
+      for (const o of result.outcomes) {
+        if (o.status !== 'completed') f.out(`   - ${o.id}: ${o.status}`);
       }
-
-      return { id: ctx.def.id, exitCode: -1, attempts: maxRetries + 1 };
-    }));
+      f.out('');
+      f.out(`👉 处理完之后重跑：zelto version start ${versionLabel} --retry-failed`);
+      return 1;
+    }
 
     f.out('');
-    for (const r of agentResults) {
-      if (r.exitCode === 0) {
-        f.out(`  ✅ "${r.id}" agent completed (${r.attempts} attempt(s))`);
-        await sliceStore.transit(r.id, 'RUN_FINISH');
-      } else {
-        f.out(`  ❌ "${r.id}" agent failed after ${r.attempts} attempt(s)`);
-      }
+    f.out(`✅ 版本 ${versionLabel} 的切片全部通过门禁 —— 等人签字`);
+    f.out('   先签字（签字只改状态，不碰主干）：');
+    for (const o of result.outcomes) {
+      f.out(`     zelto sign ${o.id} --approve`);
     }
+    f.out('   再显式合入主干：zelto merge');
+    f.out(`   全部合入之后：zelto version deliver ${versionLabel}`);
 
-    // Phase 3: Run gates sequentially
-    f.out('\n── Phase 3: Gate checks + sign requests ──');
-    const gateResults: Array<{ id: string; passed: boolean }> = [];
-    const signManager = new SignManager(ZELTO_DIR, events, sliceStore);
-    for (const ctx of sliceCtxs) {
-      const agentOk = agentResults.find((r) => r.id === ctx.def.id)?.exitCode === 0;
-      if (!agentOk) {
-        gateResults.push({ id: ctx.def.id, passed: false });
-        continue;
-      }
-
-      const gateConfig = {
-        commands: cfg.gate.commands.map((c) => ({ name: c.name, run: c.run })),
-        changedLineCoverage: 0.8,
-        timeoutSec: cfg.gate.timeoutSec,
-        retry: { max: cfg.gate.retry.max, budgetStepUsd: 0.05 },
-      } satisfies GateConfig;
-      const gate = new GateExecutor(sliceStore, events, gateConfig);
-      const gateResult = await gate.execute(ctx.def.id);
-
-      if (gateResult.passed) {
-        await sliceStore.transit(ctx.def.id, 'GATE_PASS');
-        const signReq = await signManager.request(ctx.def.id, 'zelto');
-        f.out(`  ✅ "${ctx.def.id}" gate passed → sign request created (${signReq.id})`);
-        gateResults.push({ id: ctx.def.id, passed: true });
-      } else {
-        const failedCmds = gateResult.results.filter((r) => !r.passed).map((r) => r.command);
-        f.out(`  ❌ "${ctx.def.id}" gate failed: ${failedCmds.join(', ')}`);
-        gateResults.push({ id: ctx.def.id, passed: false });
-      }
-    }
-
-    const allAgentsOk = agentResults.every((r) => r.exitCode === 0);
-    const allGatesOk = gateResults.every((r) => r.passed);
-
-    if (allAgentsOk && allGatesOk) {
-      f.out('\n── Phase 4: Integration ──');
-      const integrationTestDir = version.integrationTestDir;
-      let integrated = false;
-
-      if (existsSync(integrationTestDir)) {
-        const { execSync } = await import('node:child_process');
-        try {
-          execSync(`pnpm test -- --test-path-pattern "${integrationTestDir}"`, {
-            cwd: process.cwd(), stdio: 'inherit', timeout: 120000,
-          });
-          f.out(`  ✅ Integration tests passed for ${versionLabel}`);
-          integrated = true;
-        } catch {
-          f.out(`  ❌ Integration tests failed for ${versionLabel}`);
-          integrated = true;
-        }
-      } else {
-        f.out(`  ℹ️  No integration tests at ${integrationTestDir}`);
-        integrated = true;
-      }
-
-      if (integrated) {
-        await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
-        f.out(`\n✅ Version ${versionLabel} integrated!`);
-
-        if (isAuto) {
-          f.out('\n── Phase 5: Auto-approve & deliver ──');
-          for (const ctx of sliceCtxs) {
-            const pending = await signManager.list('pending');
-            const req = pending.find((r) => r.sliceId === ctx.def.id);
-            if (req) {
-              await signManager.approve(req.id, 'zelto (auto)', null);
-              f.out(`  ✅ "${ctx.def.id}" sign approved`);
-            }
-          }
-
-          await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'delivered');
-          f.out(`  🚀 Version ${versionLabel} delivered`);
-
-          f.out('\n── Phase 6: Auto-merge ──');
-          try {
-            const { execSync } = await import('node:child_process');
-            const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', {
-              encoding: 'utf-8', timeout: 5000,
-            }).trim();
-
-            if (currentBranch !== 'main') {
-              execSync('git add -A', { cwd: process.cwd(), timeout: 10000 });
-              try {
-                execSync(`git commit -m "chore: auto-commit for version ${versionLabel}"`, {
-                  cwd: process.cwd(), timeout: 10000,
-                });
-              } catch { /* nothing to commit */ }
-
-              try {
-                execSync('git rev-parse --verify main', { timeout: 3000 });
-                execSync(`git checkout main && git merge --ff-only ${currentBranch}`, {
-                  cwd: process.cwd(), timeout: 15000,
-                });
-                f.out(`  ✅ Merged "${currentBranch}" → main`);
-              } catch {
-                f.out(`  ℹ️  No main branch to merge into. Current: ${currentBranch}`);
-              }
-            } else {
-              f.out(`  ℹ️  Already on main branch, skipping merge`);
-            }
-          } catch (mergeErr) {
-            f.out(`  ⚠️  Auto-merge skipped: ${mergeErr}`);
-          }
-
-          f.out(`\n🎉 Version ${versionLabel} fully automated!`);
-        } else {
-          const pendingSigns = await signManager.list('pending');
-          const signCmds = pendingSigns
-            .filter((r) => sliceCtxs.some((ctx) => ctx.def.id === r.sliceId))
-            .map((r) => `zelto sign ${r.sliceId} --approve`);
-          if (signCmds.length > 0) {
-            f.out(`👉 Next: ${signCmds.join(' && ')}`);
-            f.out(`👉 Then: zelto version deliver ${versionLabel}`);
-          } else {
-            f.out(`👉 Next: zelto version deliver ${versionLabel}`);
-          }
-        }
-      }
-    } else {
-      f.out(`\n❌ Version ${versionLabel} has failures:`);
-      for (const r of agentResults) {
-        if (r.exitCode !== 0) f.out(`   ❌ Agent: ${r.id} (exit ${r.exitCode})`);
-      }
-      for (const r of gateResults) {
-        if (!r.passed) f.out(`   ❌ Gate: ${r.id}`);
-      }
-    }
-
-    return allAgentsOk && allGatesOk ? 0 : 1;
+    return 0;
   }
 
   f.error('USAGE', 'Usage: zelto version status | zelto version start <ver> [--plan <id>] [--auto] | zelto version deliver <ver> [--plan <id>]');
