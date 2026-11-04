@@ -42,6 +42,15 @@ zelto sign rate-limit-gateway --approve  # you approve; merging stays a separate
 zelto merge rate-limit-gateway   # explicit merge, never automatic on sign
 ```
 
+The optional LLM path (clarify / spec drafting) needs a key. Keep it out of files:
+
+```bash
+export ZELTO_LLM_API_KEY=sk-...   # or DEEPSEEK_API_KEY; falls back to llm.apiKey in .zelto/config.yaml
+```
+
+Only the key comes from the environment — `baseUrl`, `model` and `pricing` stay in
+`.zelto/config.yaml` so the project stays reproducible (ADR-022).
+
 Run `zelto help` for the full command list. Run `zelto help <cmd>` for one command's usage.
 
 ## How it works

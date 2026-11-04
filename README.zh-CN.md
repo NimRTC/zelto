@@ -107,6 +107,15 @@ zelto halt            # 拉闸暂停，交回控制权
 zelto merge           # 合并已签字的切片（显式动作）
 ```
 
+LLM 通路（clarify / spec 草稿，可选）需要密钥。建议走环境变量，不落文件：
+
+```bash
+export ZELTO_LLM_API_KEY=sk-...   # 或 DEEPSEEK_API_KEY；都没有时回退到 .zelto/config.yaml 的 llm.apiKey
+```
+
+只有密钥走环境变量；`baseUrl` / `model` / `pricing` 仍留在 `.zelto/config.yaml`，
+这样项目配置才是可复现的（ADR-022）。
+
 ## 开发
 
 ```bash

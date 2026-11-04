@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- LLM credentials can come from the environment instead of a file:
+  `ZELTO_LLM_API_KEY` > `DEEPSEEK_API_KEY` > `llm.apiKey` in `.zelto/config.yaml`
+  (ADR-022). `baseUrl` / `model` / `pricing` stay in the config file so the
+  project remains reproducible.
+- `pnpm check:credentials` — scans changed, untracked and tracked files for
+  credentials before a commit; wired into CI as a gate
+
+### Fixed
+- The Claude Agent SDK adapter now passes its `AbortController` to the SDK, so
+  `stop()` and the timeout actually terminate the spawned Claude Code process.
+  Previously the controller was created but never wired up, which left the child
+  process running and made "halt" a no-op in practice.
+- `waitForExit()` no longer hangs when the session already exited before the
+  call
+- `run*.txt` is git-ignored — test-run logs are local artifacts, not sources
+
 ## [0.4.0] — 2026-11-04
 
 ### Added

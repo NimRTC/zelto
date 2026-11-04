@@ -349,7 +349,28 @@ gate:
   timeoutSec: 120
   retry:
     max: 2
+
+# LLM 通路（可选）。密钥建议走环境变量，不落文件（ADR-022）：
+#   export ZELTO_LLM_API_KEY=sk-...
+llm:
+  provider: deepseek
+  baseUrl: https://api.deepseek.com/v1
+  model: deepseek-chat
 ```
+
+**密钥来源优先级**（ADR-022）：
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | `ZELTO_LLM_API_KEY` | zelto 专用，不与其它工具抢 |
+| 2 | `DEEPSEEK_API_KEY` | 生态通用命名 |
+| 3 | `llm.apiKey`（配置文件） | 回退路径，存量用户不用改 |
+
+`llm.baseUrl` / `llm.model` / `llm.pricing` 是配置不是密钥，**不读环境变量**，
+留在文件里才能保证项目可复现。
+
+没有 key 不是错误 —— 通路 B（clarify / spec / stall）本来就可选，
+相关命令只是会报 `LLM_NOT_CONFIGURED`。
 
 ### 5.2 `policy/policy.yaml`
 
