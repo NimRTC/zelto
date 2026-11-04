@@ -2,7 +2,7 @@
 
 **Let machines watch the machines.**
 
-[![CI](https://github.com/myopen/zelto/actions/workflows/ci.yml/badge.svg)](https://github.com/myopen/zelto/actions/workflows/ci.yml)
+[![CI](https://github.com/NimRTC/zelto/actions/workflows/ci.yml/badge.svg)](https://github.com/NimRTC/zelto/actions/workflows/ci.yml)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/typescript-7-blue)](https://www.typescriptlang.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
