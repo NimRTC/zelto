@@ -90,6 +90,60 @@ register('halt', async (args) => {
   const isJson = args.includes('--json');
   const halts = haltStore();
 
+  // ── zelto halt --help：用法说明 ─────────────────────────────────────
+  // 不拦住的话 `--help` 会被当成一次真的拉闸 —— 拉闸是副作用动作，
+  // 不能被一个只是想看说明的参数触发。
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('Usage: zelto halt [--scope <scope>] [--reason <text>]');
+    console.log('       zelto halt --list                       查看当前暂停请求');
+    console.log('       zelto halt --clear [--scope <scope>]    解除暂停（不带 scope 时解除全部）');
+    console.log('       zelto halt --rollback [--reason <text>] 回退卡在 running 的切片（批次已崩时用）');
+    console.log('');
+    console.log('Scopes: all（所有批次）| batch（zelto run --parallel）| version-<label>');
+    return 0;
+  }
+
+  // ── fail closed：未知参数直接拒绝，绝不默认拉闸 ─────────────────────
+  // 拉闸是状态型副作用（写 .zelto/halts/ + batch.halted 事件）。
+  // 未识别的参数（拼写错误、多余的位置参数、缺值的 --scope/--reason）
+  // 必须返回非零退出码且不产生任何副作用，而不是按 scope=all 执行。
+  const KNOWN_VALUE_FLAGS = new Set(['--scope', '--reason']);
+  const KNOWN_BOOL_FLAGS = new Set(['--list', '--clear', '--rollback', '--json']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (KNOWN_VALUE_FLAGS.has(a)) {
+      const v = args[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        console.error(`halt: ${a} 缺少取值`);
+        console.error('Usage: zelto halt [--scope <scope>] [--reason <text>] [--json]');
+        return 1;
+      }
+      i++;
+      continue;
+    }
+    if (KNOWN_BOOL_FLAGS.has(a)) continue;
+    if (a.startsWith('-')) {
+      console.error(`halt: 未识别的参数 ${a}`);
+      console.error('Usage: zelto halt [--scope <scope>] [--reason <text>]');
+      console.error('       zelto halt --list | --clear [--scope <scope>] | --rollback');
+      return 1;
+    }
+    console.error(`halt: 未识别的参数 ${a}`);
+    console.error('Usage: zelto halt [--scope <scope>] [--reason <text>]');
+    console.error('       zelto halt --list | --clear [--scope <scope>] | --rollback');
+    return 1;
+  }
+
+  // 模式互斥：--list / --clear / --rollback 一次只能用一个
+  const modeCount =
+    (args.includes('--list') ? 1 : 0) +
+    (args.includes('--clear') ? 1 : 0) +
+    (args.includes('--rollback') ? 1 : 0);
+  if (modeCount > 1) {
+    console.error('halt: --list、--clear、--rollback 一次只能用一个');
+    return 1;
+  }
+
   // ── zelto halt --list：看当前暂停请求 ───────────────────────────────
   if (args.includes('--list')) {
     const list = await halts.list();

@@ -344,7 +344,7 @@ async function runSpecMdOnAllSlices(): Promise<number> {
 register('sign', async (args) => {
   const [id, action] = args;
   if (!id || !action) {
-    console.error('Usage: zelto sign <slice-id> [--approve|--reject] [--comment <text>]');
+    console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke] [--comment <text>]');
     return 1;
   }
 

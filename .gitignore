@@ -26,6 +26,7 @@ stderr.txt
 stdout.txt
 test_out.txt
 test_err.txt
+run*.txt
 
 # 会话交接文档（仅本地，不公开）
 GIT-STATE-NOTICE.md

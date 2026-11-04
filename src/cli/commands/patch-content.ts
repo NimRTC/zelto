@@ -43,11 +43,46 @@ export interface PatchResult {
 // ─── Registration ────────────────────────────────────────────────────────────
 
 register('patch-content', async (args: string[]) => {
+  // ── --help：只读说明，不能进交互 ────────────────────────────────────
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('Usage: zelto patch-content --source <unstaged|staged> --all-to <slice-id>');
+    console.log('       zelto patch-content                  (interactive)');
+    return 0;
+  }
+
+  // ── fail closed：未知参数直接拒绝，不进交互也不写文件 ───────────────
+  const KNOWN_VALUE_FLAGS = new Set(['--source', '--all-to']);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (KNOWN_VALUE_FLAGS.has(a)) {
+      const v = args[i + 1];
+      if (v === undefined || v.startsWith('--')) {
+        console.error(`patch-content: ${a} 缺少取值`);
+        console.error('Usage: zelto patch-content --source <unstaged|staged> --all-to <slice-id>');
+        return 1;
+      }
+      i++;
+      continue;
+    }
+    if (a.startsWith('-')) {
+      console.error(`patch-content: 未识别的参数 ${a}`);
+      console.error('Usage: zelto patch-content --source <unstaged|staged> --all-to <slice-id>');
+      return 1;
+    }
+    console.error(`patch-content: 未识别的参数 ${a}`);
+    console.error('Usage: zelto patch-content --source <unstaged|staged> --all-to <slice-id>');
+    return 1;
+  }
+
   // Check for non-interactive flags
   const nonInteractiveSource = getFlagValue(args, '--source');
   const allToSlice = getFlagValue(args, '--all-to');
 
   if (nonInteractiveSource && allToSlice) {
+    if (nonInteractiveSource !== 'unstaged' && nonInteractiveSource !== 'staged') {
+      console.error(`patch-content: --source 必须是 unstaged 或 staged，收到 "${nonInteractiveSource}"`);
+      return 1;
+    }
     // Non-interactive mode: assign all lines to one slice
     const result = await runPatchContent(nonInteractiveSource, allToSlice);
     if (!result) return 1;
@@ -74,12 +109,21 @@ register('patch-content', async (args: string[]) => {
 
 /**
  * Run patch-content with explicit parameters (non-interactive mode).
- * Returns null on failure.
+ * Returns null on failure (reason already printed to stderr).
  */
 export async function runPatchContent(
   source: string,
   allToSlice: string,
 ): Promise<PatchResult | null> {
+  if (source !== 'unstaged' && source !== 'staged') {
+    console.error(`patch-content: --source 必须是 unstaged 或 staged，收到 "${source}"`);
+    return null;
+  }
+  if (!allToSlice || allToSlice.startsWith('--')) {
+    console.error('patch-content: --all-to 缺少取值');
+    return null;
+  }
+
   const diffArg = source === 'staged' ? '--cached' : '';
 
   let diffOutput: string;
@@ -89,10 +133,12 @@ export async function runPatchContent(
       { encoding: 'utf-8', timeout: 15000, cwd: process.cwd() },
     ).trim();
   } catch {
+    console.error('patch-content: git diff 执行失败（不是 git 仓库，或 git 不可用）');
     return null;
   }
 
   if (!diffOutput) {
+    console.error(`patch-content: 没有检测到变更（source: ${source}），未生成任何 patch 文件`);
     return null;
   }
 
