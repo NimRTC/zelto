@@ -144,6 +144,25 @@
 - **依赖**：切片 A（需要把切片 id 传给运行时）、切片 B（拒绝信息可回流给 agent）。
 - **风险**：接入方式依赖 Claude Code 的钩子契约；契约不支持时需退化方案并写 ADR。
 
+### 切片 E：`phased-execution` —— 分阶段并行（已实现）
+
+**目标**：并行度由 zelto **算**出来，而不是让人去猜。
+
+- **范围**
+  - `core/sched/batch.ts` 的 `planExecutionPhases()`：先按依赖拓扑分层（D1=A，依赖来自规格「前置切片」章节），再在层内按写集重叠贪心着色，把冲突切片降级为先后两个阶段（D2=A）。
+  - `src/cli/commands/execution-plan.ts` 的 `buildExecutionPlan()`：CLI 侧唯一入口。`zelto batch`（只查）、`version start` 与 `run --parallel`（要跑）消费同一份计划。
+  - `src/cli/commands/parallel-executor.ts` 的 `executeSlicesByPhase()`：阶段之间串行、阶段之内并行。某阶段没过则不启动后续阶段。
+  - 依赖成环时写 `coord.cycle_detected` 事件并拒绝开跑。
+  - `src/cli/commands/batch-facts.ts`：把「读事实」从 `batch` 里抽出来，只查与要跑共用同一口径。
+- **不变量自查**：C1（计划只落文件）；C3（排阶段是纯计算，不调模型、不触网）；C4（成环与阶段推进各写事件）；C7（依赖不来自 LLM 推断，只来自规格与命令行）。
+- **验收标准**
+  1. 依赖 B→A 时，B 不会与 A 同阶段启动。
+  2. 写集重叠的两个切片被排成两个阶段，批次不整批 abort，降级原因对人可见。
+  3. `zelto batch` 排出的阶段与 `version start` 实际跑的阶段一致。
+  4. 依赖成环时拒绝开跑，并留下 `coord.cycle_detected` 事件。
+- **依赖**：切片 A（需要精确写集才能判定重叠）。
+- **风险**：跨阶段的写集重叠不处理——阶段之间本来就允许改同一批文件，那正是依赖关系的含义。
+
 ---
 
 ## 5. 顺序与里程碑
@@ -154,6 +173,8 @@ M1  A（并行隔离 + 精确写集）   ← 解除"并行跑不起来"
 M2  B（提问回路 + 停机续跑）   ← 解除"agent 停下来等"
       ↓
 M3  C（受控合并）  与  D（运行时策略）可并行
+      ↓
+M4  E（分阶段执行）             ← 让并行度"算得出来"（G-1 / G-2）
 ```
 
 每个里程碑结束时跑一次完整回归：`pnpm build` + `pnpm test` + 至少一条并行路径的验收测试。

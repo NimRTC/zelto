@@ -200,7 +200,34 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 某个阶段没过（失守 / 停机 / 提问），**后面的阶段不启动**——
 依赖没满足就跑下去，跑出来的多半也是错的。
 
-主仓工作树全程不被切换分支、也不被 agent 写入。详见 `docs/adr-017-version-level-orchestration.md`。
+主仓工作树全程不被切换分支、也不被 agent 写入。详见 `docs/adr-017-version-level-orchestration.md`、
+`docs/adr-019-phased-execution.md`（阶段怎么排、怎么降级）。
+
+### 2.6 拉闸（`zelto halt`）—— 人能主动喊停
+
+批次跑起来之后，人是在看到某个 agent 跑偏的那一刻才想喊停。
+`zelto halt` 把这件事变成一条正经通道：
+
+```
+人喊停（另一个终端）        zelto halt --reason "跑偏了"
+   ↓  写暂停请求（文件）      .zelto/halts/<scope>.json
+批次在安全点读到            ① 拉起前：不再开新 agent
+   ↓                        ② 等待时：adapter.stop() 停掉这个 agent
+现场保留                    ③ 阶段间：后续阶段不启动
+   ↓
+人处理完                    zelto halt --clear → 重跑批次
+```
+
+被拉闸的切片结局标成 `halted`（不是失败）：不进门禁、不发签名请求、不触发重试；
+worktree 与写集预约都保留，**现场交回给人**。
+
+被拉闸的切片会**回退到 `frozen`** 并标记 `stall.class = 'human_halt'` ——
+不回退的话它永远卡在 `running`，而准入只认 `frozen`，「处理完继续」这条路就断了。
+人处理完走 `zelto resume <id>` → `zelto run <id>`。
+
+批次进程崩了 / 被 Ctrl-C 杀了的时候（没人喊停，但切片卡在 `running`），
+用 `zelto halt --rollback` 强制回退。判定是确定性的：
+状态是 `running`，且持有写集预约的进程已经死了。详见 `docs/adr-020-halt.md`。
 
 ---
 
@@ -213,15 +240,15 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 | **Policy Engine** | `src/core/policy/engine.ts` | 策略规则匹配、保护域、路径逃逸检测、锚点校验 |
 | **Slice State Machine** | `src/core/slice/state.ts` | 6 状态状态机，9 事件转换 |
 | **Slice Store** | `src/core/slice/store.ts` | 切片文件持久化（`.zelto/slices/<id>.json`） |
-| **Event Stream** | `src/core/events/stream.ts` | 47 种事件的 append-only JSONL 流 |
+| **Event Stream** | `src/core/events/stream.ts` | 49 种事件的 append-only JSONL 流 |
 | **Gate Executor** | `src/core/gate/executor.ts` | Shell 命令执行器（门禁②） |
 | **Sign Manager** | `src/core/gate/sign.ts` | 签名请求、审批/拒绝工作流 |
-| **Stall Classifier** | `src/core/stall/classifier.ts` | 6 类停机分类 |
+| **Stall Classifier** | `src/core/stall/classifier.ts` | 9 类停机分类 |
 | **Scheduler** | `src/core/sched/engine.ts` | 并行准入、写集冲突检测、约束分发 |
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
-| **Audit Trail** | `src/core/audit/trail.ts` | 47 种事件摘要、可读审计报告 |
+| **Audit Trail** | `src/core/audit/trail.ts` | 49 种事件摘要、可读审计报告 |
 | **Spec Executor** | `src/core/spec/SpecMdExecutor.ts` | Markdown 规格文件自校验（parse/validate/runChecklists） |
 | **Spec Format** | `src/core/spec/format.ts` | 规格章节契约唯一真源（概念 + 双语别名，ADR-016） |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
@@ -231,6 +258,7 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 | **Parallel Executor** | `src/cli/commands/parallel-executor.ts` | 唯一的并行执行实现（ADR-017），按阶段串行推进 |
 | **Execution Plan** | `src/cli/commands/execution-plan.ts` | 排阶段与执行计划的唯一 CLI 入口（只查与要跑共用） |
 | **Question Protocol** | `src/core/question/protocol.ts` | agent 提问挂起与回答续跑（ADR-013） |
+| **Halt Store** | `src/core/halt/store.ts` | 拉闸请求的文件化存储（ADR-020） |
 | **Batch Review** | `src/core/sched/batch.ts` | 批次准入审核、依赖分层、写集冲突降级、工件冲突 |
 | **Dependency Graph** | `src/core/sched/depgraph.ts` | 切片依赖图与环检测 |
 | **Merge Orchestration** | `src/core/sched/merge.ts` | 合并计划与冲突可见（ADR-012） |
@@ -307,6 +335,7 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 | `zelto patch-content` | 补丁内容管理 | 通用 |
 | `zelto ask [--slice <id>] [--json]` | 列出待回答的 agent 提问 | 运行时 |
 | `zelto answer <qid> "<text>"` | 回答 agent 提问并恢复切片 | 运行时 |
+| `zelto halt [--scope <s>] [--reason <r>]` | 拉闸：暂停正在跑的批次（`--list` 查看，`--clear` 解除，`--rollback` 回退卡死的切片） | 运行时 |
 | `zelto report [--format markdown\|json]` | 生成状态报告 | 治理 |
 | `zelto set <id> --field <f> --value <v>` | 设置切片的可写字段 | 通用 |
 | `zelto reservation list\|active\|show\|release\|reap` | 写集预约的查看与释放 | 治理 |
@@ -344,10 +373,15 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 | plan_gate | agent 请求计划审批 | ❌ |
 | budget_exhausted | 预算超限 | ❌ |
 | gate_retry | 门禁重试耗尽 | ❌ |
+| agent_question | agent 提问，等人回答（ADR-013） | ❌ |
+| human_halt | 人工拉闸，等人处理现场（ADR-020） | ❌ |
+
+`human_halt` 是拉闸回退后打上的停机标记 —— 它不可自动恢复，
+因为人喊停要的就是「停下来等人」（ADR-020 §3.5）。
 
 ---
 
-## 5. 事件类型（47 种）
+## 5. 事件类型（49 种）
 
 事件类型是**契约**：`contracts/schemas/event-envelope.json` 的 enum 是真源，
 `core/events/stream.ts` 与 `core/audit/trail.ts` 必须与它一致。
@@ -365,7 +399,8 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 | 提问 | `question.raised`, `question.answered` |
 | 资源 | `budget.spent`, `llm.called` |
 | 队列 | `queue.enqueued`, `queue.dequeued` |
-| 签名 | `sign.requested`, `sign.approved`, `sign.rejected` |
+| 签名 | `sign.requested`, `sign.approved`, `sign.rejected`, `sign.revoked` |
+| 拉闸 | `batch.halted` |
 | 合并 | `merge.completed`, `merge.planned`, `merge.phase_complete`, `merge.conflict`, `merge.stale_base` |
 | 调度 | `sched.admitted`, `sched.blocked` |
 | 隔离 | `worktree.created`, `worktree.removed` |

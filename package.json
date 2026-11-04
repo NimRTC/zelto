@@ -1,7 +1,13 @@
 {
   "name": "zelto",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "AI Programming Cockpit — let machines watch the machines",
+  "license": "MIT",
+  "author": "Runshine",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NimRTC/zelto.git"
+  },
   "type": "module",
   "bin": {
     "zelto": "./dist/cli/index.js",
@@ -10,6 +16,7 @@
   "scripts": {
     "build": "tsc",
     "check:encoding": "node scripts/check-encoding.mjs",
+    "check:credentials": "node scripts/scan-credentials.mjs",
     "dev": "tsc --watch",
     "test": "node scripts/check-encoding.mjs && tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
     "test:quick": "node --test \"dist-test/tests/**/*.test.js\"",

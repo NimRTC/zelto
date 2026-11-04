@@ -46,7 +46,7 @@ zelto 是「一个人 + 一组 agent」做中大型项目时的**驾驶舱**，�
                                    ▼
                     ┌──────────────────────────────────────┐
                     │  core/events — append-only 事件流    │
-                    │  47 种事件 · 判定留痕 · 追溯的底座    │
+                    │  49 种事件 · 判定留痕 · 追溯的底座    │
                     └──────────────────────────────────────┘
 
      ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
@@ -184,7 +184,7 @@ interface EventEnvelope {
 
 **存储**: `.zelto/events/<sliceId>/events.jsonl`
 
-**47 种事件类型**: 见场景功能地图 §5。事件类型的真源是
+**49 种事件类型**: 见场景功能地图 §5。事件类型的真源是
 `contracts/schemas/event-envelope.json` 的 enum —— 代码与契约不允许不一致。
 
 **版本级事件**用 `version-<label>` 作归属键（版本不是切片，事件流按切片分目录），
@@ -237,11 +237,14 @@ type StallClass =
   | 'cognitive_stuck'      // 同种失败 ≥ 3 次
   | 'plan_gate'            // agent 请求计划审批
   | 'budget_exhausted'     // 预算超限
-  | 'gate_retry';          // 门禁重试耗尽
+  | 'gate_retry'           // 门禁重试耗尽
+  | 'agent_question'       // agent 提问，等人回答（ADR-013）
+  | 'human_halt';          // 人工拉闸，等人处理现场（ADR-020）
 
 function classifyStall(signal): StallClass
 function isAutoResolvable(stallClass): boolean
   // permission_prompt / environment_failure / context_exhaustion 可自动恢复
+  // agent_question / human_halt 永远不可自动恢复 —— 都要人介入
 ```
 
 ### 3.6 Scheduler — `src/core/sched/`
@@ -291,7 +294,7 @@ class Scheduler {
 
 **文件**: `trail.ts`
 
-为 47 种事件各定义摘要生成器。支持：
+为 49 种事件各定义摘要生成器。支持：
 - `forSlice(sliceId)` — 获取结构化审计条目
 - `toText(sliceId)` — 生成可读文本报告
 - `latestEvent(sliceId, eventType)` — 获取最新事件
@@ -509,6 +512,17 @@ zelto merge [id ...] [--strategy <s>] [--dry-run] [--push] [--json]
 
 `--push` 只属于合并，不属于签字——推的必须是合并结果。
 
+**签错了能撤**（`docs/adr-021-sign-revoke.md`）：
+
+```
+zelto sign <id> --revoke → SignManager.revoke(id, 'human')
+                         → events.append('sign.revoked')
+                         → 签字记录状态 approved → revoked
+```
+
+撤销只作废「人批准」这条记录，不改切片状态（门禁②的结论仍然成立）。
+记录不删、只改状态并留事件——签字记录是证据，删掉等于把历史从链上抹掉。
+
 ### 4.7 版本级流程
 
 ```
@@ -689,11 +703,18 @@ GateExecutor.execute(sliceId, actor): GateReport
 SignManager.request(sliceId, requestedBy): SignRequest
 SignManager.approve(id, decidedBy, comment): SignRequest
 SignManager.reject(id, decidedBy, comment): SignRequest
+SignManager.revoke(id, decidedBy, comment): SignRequest   // 撤销已通过的签字（ADR-021）
 
 // Stall
 classifyStall(signal): StallClass
 isAutoResolvable(stallClass): boolean
 isSliceStalled(slice): boolean
+
+// Halt
+HaltStore.request(scope, requestedBy, reason): HaltRequest
+HaltStore.isHalted(scope): HaltRequest | null
+rollbackHaltedSlice(store, events, sliceId, options): HaltRollbackResult
+findStuckRunningSlices(store, reservations): string[]
 
 // Sched
 Scheduler.admit(sliceId, actor): SchedResult
