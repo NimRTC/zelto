@@ -231,7 +231,7 @@ fi
 
 ${condition}
 if [ \$? -ne 0 ]; then
-  FILES="${name === 'pre-commit' ? '$(git diff --cached --name-only --diff-filter=ACMR)' : '$(git diff --name-only @{push}.. 2>/dev/null || git diff --name-only HEAD~1..)'}"
+  FILES="${name === 'pre-commit' ? '$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)' : '$(git -c core.quotePath=false diff --name-only @{push}.. 2>/dev/null || git -c core.quotePath=false diff --name-only HEAD~1..)'}"
   if [ -z "$FILES" ]; then
     exit 0
   fi

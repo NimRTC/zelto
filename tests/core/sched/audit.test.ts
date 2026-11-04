@@ -49,6 +49,18 @@ describe('parsePorcelainStatus', () => {
     assert.deepEqual(paths, ['src/a bé.ts']);
   });
 
+  it('decodes the octal escapes git uses for non-ASCII paths', () => {
+    // git 默认把非 ASCII 路径转义成八进制字节：
+    // 技 = \346\212\200、术 = \346\234\257、档 = \346\241\243
+    const paths = parsePorcelainStatus('?? "docs/\\346\\212\\200\\346\\234\\257\\346\\241\\243.md"');
+    assert.deepEqual(paths, ['docs/技术档.md']);
+  });
+
+  it('decodes mixed octal and plain segments', () => {
+    const paths = parsePorcelainStatus('?? "src/a b\\303\\251.ts"');
+    assert.deepEqual(paths, ['src/a bé.ts']);
+  });
+
   it('returns nothing for empty output', () => {
     assert.deepEqual(parsePorcelainStatus(''), []);
   });

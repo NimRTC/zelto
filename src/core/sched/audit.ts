@@ -47,8 +47,15 @@ export interface WriteAuditResult {
   error: string | null;
 }
 
+/**
+ * 跑一条 git 命令。
+ *
+ * 统一加上 `core.quotePath=false`：默认配置下 git 会把非 ASCII 路径转义成
+ * 八进制并加引号（`"docs/\346\212\200.md"`），后面每次用都得先解码，
+ * 漏掉一处路径就错了。关掉引号后路径原样输出。
+ */
 function git(args: string[], cwd: string): string {
-  return execFileSync('git', args, {
+  return execFileSync('git', ['-c', 'core.quotePath=false', ...args], {
     cwd,
     encoding: 'utf-8',
     timeout: 60_000,
@@ -56,16 +63,81 @@ function git(args: string[], cwd: string): string {
   });
 }
 
-/** 去掉 git 对特殊字符路径的 C 风格引号。 */
-function unquotePath(path: string): string {
-  if (path.length >= 2 && path.startsWith('"') && path.endsWith('"')) {
-    try {
-      return JSON.parse(path) as string;
-    } catch {
-      return path.slice(1, -1);
+/** git 的 C 风格转义与字节值。 */
+const GIT_ESCAPES: Record<string, number> = {
+  a: 0x07,
+  b: 0x08,
+  f: 0x0c,
+  n: 0x0a,
+  r: 0x0d,
+  t: 0x09,
+  v: 0x0b,
+  '"': 0x22,
+  '\\': 0x5c,
+};
+
+/**
+ * 解码 git 对特殊字符路径的 C 风格引号。
+ *
+ * git 把非 ASCII 字节转义成八进制（`\346\212\200`），这**不是** JSON 转义，
+ * 所以 `JSON.parse` 会失败。早期的实现因此把中文路径整个当成乱码留在字符串里，
+ * 审计时把正常文件判成越界、把越界文件判不出来。
+ *
+ * 解出来的是字节序列，最后按 UTF-8 还原成字符串。
+ */
+export function decodeGitPath(path: string): string {
+  if (path.length < 2 || !path.startsWith('"') || !path.endsWith('"')) return path;
+
+  const body = path.slice(1, -1);
+  const bytes: number[] = [];
+
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+
+    if (ch !== '\\') {
+      const code = body.codePointAt(i) ?? 0;
+      bytes.push(...Buffer.from(String.fromCodePoint(code), 'utf-8'));
+      if (code > 0xffff) i += 1; // 代理对占两个 UTF-16 码元
+      continue;
     }
+
+    const next = body[i + 1];
+    if (next === undefined) {
+      bytes.push(0x5c);
+      break;
+    }
+
+    // \uXXXX —— JSON 风格的 Unicode 转义（占 6 个字符：反斜杠、u 和 4 位十六进制）
+    if (next === 'u') {
+      const hex = body.slice(i + 2, i + 6);
+      if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+        bytes.push(...Buffer.from(String.fromCharCode(Number.parseInt(hex, 16)), 'utf-8'));
+        i += 5;
+        continue;
+      }
+    }
+
+    // \NNN —— git 的八进制字节转义
+    if (next >= '0' && next <= '7') {
+      const octal = body.slice(i + 1, i + 4);
+      bytes.push(Number.parseInt(octal, 8) & 0xff);
+      i += 3;
+      continue;
+    }
+
+    const escaped = GIT_ESCAPES[next];
+    if (escaped !== undefined) {
+      bytes.push(escaped);
+      i += 1;
+      continue;
+    }
+
+    // 认不出来的转义：原样保留反斜杠
+    bytes.push(0x5c, ...Buffer.from(next, 'utf-8'));
+    i += 1;
   }
-  return path;
+
+  return Buffer.from(bytes).toString('utf-8');
 }
 
 /**
@@ -81,7 +153,7 @@ export function parsePorcelainStatus(output: string): string[] {
     // 重命名：`old -> new`
     const arrow = filePath.indexOf(' -> ');
     if (arrow >= 0) filePath = filePath.slice(arrow + 4);
-    filePath = unquotePath(filePath);
+    filePath = decodeGitPath(filePath);
     paths.push(filePath.replace(/\\/g, '/'));
   }
   return paths;
