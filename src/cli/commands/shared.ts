@@ -127,7 +127,7 @@ export interface ZeltoConfig {
     retry: { max: number };
   };
   agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
-  llm?: { provider: string; apiKey: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
+  llm?: { provider: string; apiKey?: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
   /** External project configuration for cross-repo workflows.
    *  When set, `zelto gate` and `zelto slice create` operate in the
    *  target project directory instead of the current working directory. */
@@ -143,6 +143,31 @@ export interface ZeltoConfig {
     /** Spec directory relative to target project root. Default = "specs/slices". */
     specDir?: string;
   };
+}
+
+/**
+ * Resolve the LLM API key (ADR-022).
+ *
+ * Priority, highest first:
+ *   1. `ZELTO_LLM_API_KEY`  — zelto-specific, never collides with other tools
+ *   2. `DEEPSEEK_API_KEY`   — the ecosystem convention
+ *   3. `llm.apiKey` in `.zelto/config.yaml` — the existing fallback
+ *
+ * The key never has to live in a file: set it in the environment and the
+ * config file only carries the non-secret parts (baseUrl, model, pricing).
+ *
+ * `llm.baseUrl` / `llm.model` are NOT read from the environment — they are
+ * not secrets, and keeping them in the config file is what makes a project
+ * reproducible.
+ */
+export function resolveApiKey(
+  configApiKey: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const fromEnv = env.ZELTO_LLM_API_KEY?.trim() || env.DEEPSEEK_API_KEY?.trim();
+  if (fromEnv) return fromEnv;
+  const fromConfig = configApiKey?.trim();
+  return fromConfig ? fromConfig : undefined;
 }
 
 export function loadConfig(): ZeltoConfig {
@@ -162,7 +187,7 @@ export function loadConfig(): ZeltoConfig {
     },
   };
 
-  if (!existsSync(configPath)) return defaultConfig;
+  if (!existsSync(configPath)) return withEnvApiKey(defaultConfig);
 
   try {
     const content = readFileSync(configPath, 'utf-8');
@@ -170,17 +195,40 @@ export function loadConfig(): ZeltoConfig {
     if (parsed) {
       // Validate config and warn about common issues
       validateConfig(parsed);
-      return {
+      return withEnvApiKey({
         gate: parsed.gate,
         agent: parsed.agent ?? defaultConfig.agent,
         llm: parsed.llm,
         targetProject: parsed.targetProject,
-      };
+      });
     }
-    return defaultConfig;
+    return withEnvApiKey(defaultConfig);
   } catch {
-    return defaultConfig;
+    return withEnvApiKey(defaultConfig);
   }
+}
+
+/**
+ * Apply the environment-variable API key to a config (ADR-022).
+ *
+ * The environment wins over the config file. If the file has no `llm` section
+ * at all but the environment provides a key, an `llm` section is synthesised
+ * so the LLM path (clarify / spec / stall) stays usable with a key that never
+ * touched the disk.
+ */
+function withEnvApiKey(config: ZeltoConfig): ZeltoConfig {
+  const envKey = resolveApiKey(undefined);
+  if (!envKey) {
+    // No environment key — keep whatever the config file had.
+    if (!config.llm?.apiKey) return config;
+    return config;
+  }
+
+  const llm = config.llm
+    ? { ...config.llm, provider: config.llm.provider || 'deepseek', apiKey: envKey }
+    : { provider: 'deepseek', apiKey: envKey };
+
+  return { ...config, llm };
 }
 
 /**
@@ -201,8 +249,8 @@ function validateConfig(config: ZeltoConfig): void {
   if (!config.agent?.command) {
     console.warn('  ⚠️  Config: no agent command defined. "zelto run" will fail.');
   }
-  if (config.llm?.apiKey && config.llm.apiKey === 'sk-your-key-here') {
-    console.warn('  ⚠️  Config: LLM API key appears to be a placeholder. Update .zelto/config.yaml with a real key.');
+  if (config.llm?.apiKey && config.llm.apiKey === 'sk-your-key-here' && !resolveApiKey(undefined)) {
+    console.warn('  ⚠️  Config: LLM API key appears to be a placeholder. Set ZELTO_LLM_API_KEY or update .zelto/config.yaml with a real key.');
   }
 }
 
@@ -534,7 +582,11 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   }
 
   const pricingKeys = Object.keys(llmPricing);
-  const llm = llmProvider && llmApiKey
+  // The llm section is kept as long as it carries any of its own fields.
+  // The apiKey may come from the environment (ADR-022), so requiring
+  // `provider && apiKey` here would drop baseUrl/model/pricing along with it.
+  const hasLlm = Boolean(llmProvider || llmApiKey || llmModel || llmBaseUrl || pricingKeys.length > 0);
+  const llm = hasLlm
     ? {
         provider: llmProvider,
         apiKey: llmApiKey,

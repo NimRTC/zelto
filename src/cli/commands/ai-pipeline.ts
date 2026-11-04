@@ -148,7 +148,7 @@ register('require', async (args) => {
 
     const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
-      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
       return 1;
     }
 
@@ -178,7 +178,7 @@ register('require', async (args) => {
 
   const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
-    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
     return 1;
   }
 
@@ -273,7 +273,7 @@ register('design', async (args) => {
 
     const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
-      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
       return 1;
     }
 
@@ -319,7 +319,7 @@ register('design', async (args) => {
 
   const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
-    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
     return 1;
   }
 
@@ -444,7 +444,7 @@ register('plan', async (args) => {
 
     const llm = createLlmFromConfig('ai-pipeline', 'cli');
     if (!llm) {
-      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+      f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
       return 1;
     }
 
@@ -488,7 +488,7 @@ register('plan', async (args) => {
 
   const llm = createLlmFromConfig('ai-pipeline', 'cli');
   if (!llm) {
-    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Add llm.apiKey to .zelto/config.yaml');
+    f.error('LLM_NOT_CONFIGURED', 'LLM not configured. Set ZELTO_LLM_API_KEY (or add llm.apiKey to .zelto/config.yaml).');
     return 1;
   }
 

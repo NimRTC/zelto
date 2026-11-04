@@ -11,6 +11,7 @@ import {
   parsePolicyYaml,
   generateSliceSpecContent,
   hashSpecFile,
+  resolveApiKey,
 } from '../src/cli/commands/shared.js';
 
 // ─── parseConfigYaml ──────────────────────────────────────────────────────
@@ -298,5 +299,125 @@ describe('generateSliceSpecContent', () => {
   it('handles single write path', () => {
     const spec = generateSliceSpecContent('single', 'Single', 'Core', ['src/only.ts'], 'v1');
     assert.ok(spec.includes('- `src/only.ts`'));
+  });
+});
+
+// ─── resolveApiKey (ADR-022) ───────────────────────────────────────────────
+//
+// 凭据解析：环境变量优先于配置文件。
+//   ZELTO_LLM_API_KEY > DEEPSEEK_API_KEY > llm.apiKey（配置文件）
+//
+// resolveApiKey 接受 env 参数，所以这些判定不需要改 process.env ——
+// 纯函数，无副作用，判定是确定的。
+
+describe('resolveApiKey', () => {
+  it('prefers ZELTO_LLM_API_KEY over everything else', () => {
+    const key = resolveApiKey('sk-from-config', {
+      ZELTO_LLM_API_KEY: 'sk-from-zelto-env',
+      DEEPSEEK_API_KEY: 'sk-from-deepseek-env',
+    });
+    assert.equal(key, 'sk-from-zelto-env');
+  });
+
+  it('falls back to DEEPSEEK_API_KEY when the zelto-specific one is absent', () => {
+    const key = resolveApiKey('sk-from-config', {
+      DEEPSEEK_API_KEY: 'sk-from-deepseek-env',
+    });
+    assert.equal(key, 'sk-from-deepseek-env');
+  });
+
+  it('falls back to the config file when no environment variable is set', () => {
+    const key = resolveApiKey('sk-from-config', {});
+    assert.equal(key, 'sk-from-config');
+  });
+
+  it('returns undefined when neither environment nor config has a key', () => {
+    const key = resolveApiKey(undefined, {});
+    assert.equal(key, undefined);
+  });
+
+  it('ignores an empty environment variable and falls through', () => {
+    const key = resolveApiKey('sk-from-config', {
+      ZELTO_LLM_API_KEY: '',
+      DEEPSEEK_API_KEY: '   ',
+    });
+    assert.equal(key, 'sk-from-config');
+  });
+
+  it('trims surrounding whitespace', () => {
+    const key = resolveApiKey(undefined, { ZELTO_LLM_API_KEY: '  sk-padded  ' });
+    assert.equal(key, 'sk-padded');
+  });
+
+  it('treats an empty config key as absent', () => {
+    const key = resolveApiKey('   ', {});
+    assert.equal(key, undefined);
+  });
+});
+
+// ─── llm 段与 apiKey 解耦（ADR-022） ───────────────────────────────────────
+//
+// 密钥走环境变量时，配置文件里的 baseUrl / model / pricing 不能跟着丢。
+
+describe('parseConfigYaml — llm section survives without an apiKey', () => {
+  it('keeps baseUrl and model when apiKey is absent', () => {
+    const yaml = `
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  baseUrl: "https://api.example.com"
+`;
+    const result = parseConfigYaml(yaml);
+    assert.ok(result !== null);
+    assert.ok(result.llm !== undefined);
+    assert.equal(result.llm!.provider, 'deepseek');
+    assert.equal(result.llm!.model, 'deepseek-chat');
+    assert.equal(result.llm!.baseUrl, 'https://api.example.com');
+    // 密钥不在文件里 —— 由环境变量提供
+    assert.equal(result.llm!.apiKey, '');
+  });
+
+  it('keeps pricing when apiKey is absent', () => {
+    const yaml = `
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  pricing:
+    deepseek-chat:
+      inputPer1k: 0.00027
+      outputPer1k: 0.00110
+`;
+    const result = parseConfigYaml(yaml);
+    assert.ok(result !== null);
+    assert.ok(result.llm !== undefined);
+    assert.ok(result.llm!.pricing !== undefined);
+    assert.equal(result.llm!.pricing!['deepseek-chat'].inputPer1k, 0.00027);
+  });
+
+  it('keeps the llm section when only baseUrl is given', () => {
+    const yaml = `
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  baseUrl: "https://api.example.com"
+`;
+    const result = parseConfigYaml(yaml);
+    assert.ok(result !== null);
+    assert.ok(result.llm !== undefined);
+    assert.equal(result.llm!.baseUrl, 'https://api.example.com');
+  });
+
+  it('omits the llm section entirely when no llm field is present', () => {
+    const yaml = `
+gate:
+  - { name: test, run: "pnpm test" }
+`;
+    const result = parseConfigYaml(yaml);
+    assert.ok(result !== null);
+    assert.equal(result.llm, undefined);
   });
 });
