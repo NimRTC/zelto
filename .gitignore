@@ -27,6 +27,8 @@ stdout.txt
 test_out.txt
 test_err.txt
 run*.txt
+unmapped.txt
+arch-dump.json
 
 # 会话交接文档（仅本地，不公开）
 GIT-STATE-NOTICE.md

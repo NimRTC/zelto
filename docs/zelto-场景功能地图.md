@@ -275,7 +275,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | 命令 | 用途 | 对应流程阶段 |
 |---|---|---|
 | `zelto init [--with-examples]` | 初始化 `.zelto/` 运行时目录 | 通用 |
-| `zelto config [get\|set] [key] [value]` | 查看/修改配置 | 通用 |
+| `zelto config [get\|set] [key] [value]` | 查看/修改配置。`zelto config` 显示当前配置；`config get` 默认遮蔽密钥，`--raw` 才输出真值 | 通用 |
 | `zelto slices [--active] [--json]` | 列出所有切片 | 通用 |
 | `zelto slice <id> [--json]` | 查看切片详情 | 通用 |
 | `zelto create <id> [--json]` | 创建新切片 | create |
