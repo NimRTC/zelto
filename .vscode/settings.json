@@ -1,0 +1,13 @@
+{
+  "search.exclude": {
+    "**/.zelto": true,
+    "**/.claude/worktrees": true,
+    "**/dist": true,
+    "**/dist-test": true,
+    "**/node_modules": true,
+    "**/coverage": true,
+    "**/specs/slices": true,
+    "**/*.log": true,
+    "**/zelto-dashboard.html": true
+  }
+}

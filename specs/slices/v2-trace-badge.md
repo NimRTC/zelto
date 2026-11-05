@@ -1,4 +1,4 @@
-# Slice: v2-状态徽章渲染模块
+# Slice: v2-trace-badge
 
 ## 目的
 版本 v2 — 状态徽章渲染模块

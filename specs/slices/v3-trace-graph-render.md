@@ -1,4 +1,4 @@
-# Slice: v3-依赖图ASCII树渲染模块
+# Slice: v3-trace-graph-render
 
 ## 目的
 版本 v3 — 依赖图ASCII树渲染模块

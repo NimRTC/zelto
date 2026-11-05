@@ -1,4 +1,4 @@
-# Slice: v2-进度指示器渲染模块
+# Slice: v2-trace-progress
 
 ## 目的
 版本 v2 — 进度指示器渲染模块

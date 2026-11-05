@@ -1,4 +1,4 @@
-# Slice: v3-主协调模块扩展
+# Slice: v3-trace-coordinator-ext
 
 ## 目的
 版本 v3 — 主协调模块扩展（支持graph和timeline渲染）

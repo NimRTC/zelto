@@ -1,4 +1,4 @@
-# Slice: v1-主协调模块
+# Slice: v1-trace-coordinator
 
 ## 目的
 版本 v1 — 主协调模块（JSON输出路径）

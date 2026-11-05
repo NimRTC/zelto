@@ -1,4 +1,4 @@
-# Slice: v3-时间线视图渲染模块
+# Slice: v3-trace-timeline-render
 
 ## 目的
 版本 v3 — 时间线视图渲染模块
