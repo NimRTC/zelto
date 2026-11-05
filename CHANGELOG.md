@@ -18,10 +18,21 @@
   `ZELTO_LLM_API_KEY` > `DEEPSEEK_API_KEY` > `llm.apiKey` in `.zelto/config.yaml`
   (ADR-022). `baseUrl` / `model` / `pricing` stay in the config file so the
   project remains reproducible.
+- The config file can point at the environment itself: `apiKey: "${NIMRTC_LLM_API_KEY}"`
+  in `.zelto/config.yaml` is replaced with that variable's value, so the key never
+  touches disk (ADR-026). If the variable is unset, zelto reports "no key" with a
+  warning — the literal `${...}` text is never sent as a credential. Only whole-value
+  references are expanded; `"prefix-${FOO}"` is left as-is.
 - `pnpm check:credentials` — scans changed, untracked and tracked files for
   credentials before a commit; wired into CI as a gate
 
 ### Fixed
+- `zelto config` with no subcommand now shows the configuration instead of
+  printing usage text — the "show configuration" branch was unreachable.
+- `zelto config get llm.apiKey` masks the credential by default; the real
+  value requires an explicit `--raw`. Previously the full key went to stdout,
+  which is a leak vector in terminals and CI logs. `zelto config set` masks
+  the value it echoes back for secret keys too.
 - Files written with a UTF-8 BOM (common on Windows) no longer break requirement
   / design / plan / revision parsing; `show` reports a readable error instead
   of throwing a stack trace.

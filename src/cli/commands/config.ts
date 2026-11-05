@@ -3,13 +3,14 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { register, ZELTO_DIR, loadConfig, parseConfigYaml } from './shared.js';
+import { register, ZELTO_DIR, loadConfig } from './shared.js';
 
 register('config', async (args) => {
   const subcmd = args[0];
 
-  // zelto config — show current config
-  if (!subcmd || subcmd === '--help' || subcmd === '-h') {
+  // `zelto config --help` — usage only. `zelto config` with no subcommand
+  // falls through to the "show configuration" branch at the bottom.
+  if (subcmd === '--help' || subcmd === '-h') {
     console.log(`
 Usage:
   zelto config              Show current configuration
@@ -19,8 +20,12 @@ Usage:
 Examples:
   zelto config
   zelto config get gate.timeoutSec
+  zelto config get llm.apiKey --raw
   zelto config set gate.timeoutSec 300
   zelto config set agent.command "npx claude-code"
+
+Secrets are masked by default. "zelto config get llm.apiKey --raw" prints the
+real value — use it only when a script needs the actual credential.
     `);
     return 0;
   }
@@ -33,6 +38,10 @@ Examples:
       console.error('Usage: zelto config get <key>');
       return 1;
     }
+    // Secrets are masked unless --raw is passed. Printing a live credential to
+    // the terminal is a leak vector; scripts that genuinely need the value can
+    // opt in explicitly.
+    const raw = args.includes('--raw');
     const cfg = loadConfig();
     const parts = key.split('.');
     let val: unknown = cfg as unknown as Record<string, unknown>;
@@ -47,6 +56,10 @@ Examples:
     if (val === undefined) {
       console.error(`Config key "${key}" not found.`);
       return 1;
+    }
+    if (!raw && isSecretKey(key) && typeof val === 'string' && val.length > 0) {
+      console.log(maskSecret(val));
+      return 0;
     }
     console.log(typeof val === 'string' ? val : JSON.stringify(val, null, 2));
     return 0;
@@ -151,7 +164,7 @@ Examples:
     }
 
     writeFileSync(configPath, newLines.join('\n'), 'utf-8');
-    console.log(`✅ ${key} = ${value}`);
+    console.log(isSecretKey(key) ? `✅ ${key} = ${maskSecret(value)}` : `✅ ${key} = ${value}`);
     return 0;
   }
 
@@ -163,12 +176,30 @@ Examples:
   console.log(`  Gate retries:  ${cfg.gate?.retry?.max ?? 2}`);
   console.log(`  Agent command: ${cfg.agent?.command || '(not set)'}`);
   if (cfg.llm) {
-    const maskedKey = cfg.llm.apiKey ? cfg.llm.apiKey.slice(0, 8) + '...' : '(not set)';
     console.log(`  LLM provider:  ${cfg.llm.provider || '(not set)'}`);
-    console.log(`  LLM API key:   ${maskedKey}`);
+    console.log(`  LLM API key:   ${cfg.llm.apiKey ? maskSecret(cfg.llm.apiKey) : '(not set)'}`);
     if (cfg.llm.model) console.log(`  LLM model:     ${cfg.llm.model}`);
     if (cfg.llm.baseUrl) console.log(`  LLM base URL:  ${cfg.llm.baseUrl}`);
   }
   console.log(`\nConfig file: ${configPath}`);
   return 0;
 });
+
+/**
+ * Config keys whose values are credentials. Only the API key exists today;
+ * the list exists so new secret fields are masked by default too.
+ */
+const SECRET_KEYS = new Set(['llm.apiKey']);
+
+export function isSecretKey(key: string): boolean {
+  return SECRET_KEYS.has(key);
+}
+
+/**
+ * Mask a secret for display: keep a short prefix so the user can tell
+ * *which* credential is configured, never enough to use it.
+ */
+export function maskSecret(value: string): string {
+  if (value.length <= 4) return '***';
+  return `${value.slice(0, 4)}***(${value.length} chars)`;
+}
