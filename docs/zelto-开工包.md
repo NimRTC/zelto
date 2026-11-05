@@ -447,17 +447,17 @@ zelto 可拉起 agent 执行切片，约束包（ConstraintBundle）包含：
 
 ## 7. 架构约束速查
 
+有效约束 7 条，C1–C9 编号保留作兼容（C6 并入 C2，C8 并入 C5）。
+
 | ID | 约束 | 检查方式 |
 |---|---|---|
-| C1 | 状态只在文件里 | 无数据库依赖，无全局变量状态 |
-| C2 | core/ 无 SDK | `package.json` 无 dependencies |
-| C3 | 判定确定性 | policy/gate/sched 无 import llm，无 fetch |
+| C1 | 状态只在文件里 | 无数据库依赖，无全局变量状态；状态变更只经文件读写 |
+| C2 | core/ 核心纯洁性 | `package.json` 无 dependencies；无 `core/` import `adapters/` |
+| C3 | 判定确定性 | policy/gate/sched 无 import llm，无 fetch；只读文件、纯计算 |
 | C4 | append-only | EventStream 只用 appendFile |
-| C5 | 保护域不可覆盖 | PROTECTED_PATTERNS 硬编码 |
-| C6 | 依赖单向向下 | tsconfig 路径映射只 core → 外部 |
-| C7 | llm 不判定 | llm/ 目录独立，不被判定模块引用 |
-| C8 | 锚点外部化 | lock.json 存储策略哈希 |
-| C9 | 写集预约强制 | Scheduler.admit 检查冲突 |
+| C5 | 保护域与锚点外部化 | PROTECTED_PATTERNS 硬编码；lock.json 存储策略哈希 |
+| C7 | llm 不判定 | llm/ 目录独立，不被判定模块引用；进下游须人 confirm |
+| C9 | 写集预约强制 | Scheduler.admit 检查冲突；运行时 hook 逐写判定 + 审计兜底，缺预约 fail closed |
 
 ---
 

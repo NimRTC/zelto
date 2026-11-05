@@ -267,6 +267,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Version Store** | `src/core/version/store.ts` | 版本计划持久化与版本状态 |
 | **Draft Review** | `src/core/review/` | 草稿评审：摘要 + 行级 diff + 决策点抽取 + 修订快照（ADR-023） |
 | **Project Scanner** | `src/core/project/scanner.ts` | 既有项目扫描，生成项目地图 |
+| **Architecture Scan** | `src/core/arch/` | 架构偏离检查：设计模块图 vs 实际 import 图，只读报告（G-4/B） |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
 ### 3.2 CLI 命令
@@ -350,6 +351,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto tasks` / `zelto task-status <id>` / `zelto wait <id>` | 后台任务查看与等待 | 通用 |
 | `zelto suggest` | 项目全貌与建议动作 | 通用 |
 | `zelto require\|design\|plan show <id> [--diff] [--full]` | 草稿评审：摘要 + 决策点 + 与上一版的差异（ADR-023） | 规划 |
+| `zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]` | 架构偏离检查：设计模块图 vs 实际 import 图（只读报告，`--strict` 有偏离时退出码 1） | 治理 |
 
 ### 3.3 独立 Hook
 
@@ -421,16 +423,17 @@ worktree 与写集预约都保留，**现场交回给人**。
 
 ## 6. 不变量（硬约束）
 
+有效约束为 7 条，保留 C1–C9 编号以兼容历史引用（C6 并入 C2，C8 并入 C5；新文档优先引用 C2 / C5）。
+
 | ID | 约束 | 说明 |
 |---|---|---|
-| C1 | 状态只在文件里 | 无数据库、无内存状态、无常驻 daemon |
-| C2 | `core/` 零 SDK 依赖 | 只用 Node 内置 |
-| C3 | 判定确定性 | policy/gate/sched 无模型无网络 |
-| C4 | append-only 事件流 | 每个动作都记录 |
-| C5/C8 | 保护域硬编码 | 不可被策略规则覆盖；锚点外部化 |
-| C6 | 依赖单向向下 | `core/` 不 import `adapters/` |
-| C7 | llm 不参与判定 | 产出仅为草稿/建议 |
-| C9 | 写集预约强制 | 由 hook 在 agent 写文件的那一刻执行 |
+| C1 | 状态只在文件里 | 无数据库、无内存状态、无常驻 daemon；状态变更只经文件读写 |
+| C2 | `core/` 核心纯洁性 | 零第三方运行时依赖（只用 Node 内置），且不得 import `adapters/` |
+| C3 | 判定确定性 | policy/gate/sched 无模型无网络；只读文件、纯计算 |
+| C4 | append-only 事件流 | 每个动作都记录；事件是追溯的唯一证据载体 |
+| C5 | 保护域与锚点外部化 | 保护域硬编码、不可被策略规则覆盖；锚点存于 `policy/lock.json` |
+| C7 | llm 不参与判定 | 产出仅为草稿/建议；进下游须经人 `confirm` |
+| C9 | 写集预约强制 | 以 hook 逐写判定为主、运行后 git 审计兜底；预约缺失 fail closed |
 
 ---
 
@@ -458,8 +461,9 @@ zelto/
 │   │   ├── design/        设计文档 + 模块划分存储
 │   │   ├── version/       版本计划 + 版本状态存储
 │   │   ├── project/       既有项目扫描与治理初始化
+│   │   ├── arch/          架构偏离检查（设计模块图 vs 实际 import 图，只读报告）
 │   │   └── contracts/     契约注册表
-│   ├── cli/               CLI 命令实现（50+ 个命令）
+│   ├── cli/               CLI 命令实现（58 个命令）
 │   ├── hook/              独立可执行判定进程（+ PreToolUse 钩子）
 │   ├── llm/               AI 流水线草案生成（仅产出草稿，不参与判定）
 │   └── adapters/          执行器适配器（claude-agent / claude-agent-sdk）
@@ -490,12 +494,12 @@ zelto/
 
 | 类别 | 测试数 | 文件数 |
 |------|--------|--------|
-| 单元测试 | 881 | 72 |
-| 验收测试 | （含在上） | 24 |
-| **总计** | **976（974 pass / 2 skipped / 0 fail）** | **96** |
+| 单元测试 | 943 | 81 |
+| 验收测试 | 154 | 25 |
+| **总计** | **1097（1097 pass / 0 fail）** | **106** |
 
-> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-11-04，
-> 976 tests / 203 suites / 0 fail。
+> 数据由测试运行器实时统计，运行 `npm test` 验证。最后一次全量验证：2026-11-05，
+> 1097 tests / 226 suites / 0 fail。
 
 ---
 

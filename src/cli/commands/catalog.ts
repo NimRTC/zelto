@@ -80,6 +80,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'audit', group: '治理与运行时', args: '<slice-id>', summary: '查看切片的审计追踪', detail: '--json' },
   { name: 'hook', group: '治理与运行时', args: '', summary: '安装 / 卸载 git hooks', detail: '--install, --uninstall, --status' },
   { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
+  { name: 'arch', group: '治理与运行时', args: 'check', summary: '架构偏离检查：设计模块图 vs 实际 import 图（只读报告）', detail: '--design, --root, --strict, --json' },
 
   // ─── AI 流水线 ─────────────────────────────────────────────────────────
   { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },

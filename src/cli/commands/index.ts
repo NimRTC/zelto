@@ -32,6 +32,7 @@ import './artifact.js';
 import './batch.js';
 import './halt.js';
 import './merge.js';
+import './architecture.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────
