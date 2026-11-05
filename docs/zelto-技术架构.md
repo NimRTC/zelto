@@ -27,7 +27,7 @@ zelto 是「一个人 + 一组 agent」做中大型项目时的**驾驶舱**，�
 ```
                     ┌──────────────────────────────────────┐
                     │            CLI (src/cli/)             │
-                    │   commands/ — 50+ 个命令             │
+                    │   commands/ — 58 个命令              │
                     └──────────────┬───────────────────────┘
                                    │
         ┌──────────────────────────┼──────────────────────────┐
@@ -365,7 +365,7 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 
 **文件**: `commands/`（按域拆分）+ `commands/catalog.ts`（命令目录唯一真源）
 
-50+ 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
+58 个命令，全部对接真实实现。配置从 `.zelto/config.yaml` 读取。
 
 `catalog.ts` 是「有哪些命令、怎么用、分在哪组」的**唯一真源**：
 `zelto help`、`zelto help <cmd>`、shell 补全脚本三者都从它出。
@@ -392,9 +392,10 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 决策点按稳定 id 跨版本对齐，标出新增 / 移除 / 变更。
 判定不调模型、不触网（C3），快照只落在文件里（C1）。
 
-模块划分（`DesignDoc.modules`）目前是**文档级的**——
-它描述了模块边界，但还没有被编译期或门禁期校验。这是
-`docs/zelto-项目目标.md` 里记的 G-4 差距。
+模块划分（`DesignDoc.modules`）过去是**文档级**的——
+它描述了模块边界，但没有被校验过。现在 `core/arch/` 会拿它跟代码里实际的
+import 图比一遍，出**只读偏离报告**（`zelto arch check`，见 §3.18）。
+做成硬护栏（门禁期拦截）仍待做，那是 G-4/A。
 
 ### 3.15 编排层 — `src/core/worktree/` / `question/` / `sched/`
 
@@ -440,6 +441,65 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 **为什么合并必须在 CLI 层而不在签字路径里**：
 签字是「批准」，合并是「动作」；分开之后，
 批准写进 `sign.*` 事件，动作写进 `merge.*` 事件，追溯链才不会断。
+
+### 3.18 架构偏离检查 — `src/core/arch/`
+
+**文件**: `imports.ts`（import 解析）、`scan.ts`（扫描与归属）、`report.ts`（比对出偏离）、
+`types.ts`
+
+**职责**：把「设计里画的模块图」和「代码里实际的 import 图」摆在一起比，
+差出来的东西就是**架构腐化的证据**。
+
+```typescript
+scanArchitecture(root: string, modules: ModuleSpec[]): ScanResult
+  // 扫源码 → 算每个文件的模块归属 → 算模块间的实际依赖边
+
+buildArchitectureReport(modules: ModuleSpec[], scan: ScanResult): ArchitectureReport
+  // 设计与实际比对 → 偏离列表 + 依赖环
+```
+
+**七类偏离**：
+
+| kind | 含义 |
+|---|---|
+| `undeclared_dependency` | 代码里有这条 import，设计里没声明 |
+| `missing_dependency` | 设计声明了，代码里没有 |
+| `unknown_module` | 依赖指向的模块在设计里根本不存在 |
+| `unverifiable_dependency` | 目标模块没有源文件（契约 JSON、规格 md），无法用 import 验证 |
+| `ambiguous_module` | 一个文件同时落在多个同样具体的模块范围里 |
+| `unmapped_file` | 一个文件不在任何模块的 glob 范围里 |
+| `cycle` | 实际依赖成环（跨模块边之间） |
+
+其中 `unverifiable_dependency` 是**软偏离**：目标模块本来就没有代码，
+无法用 import 验证，不计入「是否一致」的结论。
+
+**层级模块的处理**：设计里的模块常是层级的——`src/core` 是组，
+`src/core/events` 是成员。「`src/core` 声明依赖 `src/core/events`」
+不是一条 import 边，按字面比会报一堆假缺失。所以判定用**包含关系**
+（scope containment）：A 覆盖 B ⟺ B 拥有的每个文件都落在 A 的 glob 范围内，
+包含关系从**实际归属结果**算出来，不是从名字猜的。
+
+scope(A) 与 scope(B) 有交集的边算**内部边**——它只是组与成员的关系，
+不算「未声明依赖」，也不参与成环判定。只有 scope 互不相交的边
+才是真正的跨模块依赖。
+
+**实现要点**：
+
+- import 解析用正则，不解析 AST——`core/` 零第三方依赖，装不起解析器
+- 相对路径解析用**正斜杠**拼接（不用 `node:path` 的 `join`，那在 Windows 上产出反斜杠）
+- 扫描分两遍：先定完所有文件的归属，再算依赖边——否则「a 引用 b」
+  这类边会因为 b 的文件还没扫到而被丢掉
+- glob 匹配复用 `core/sched/paths.ts` 的 `pathMatches`（policy engine 同源，ADR-014 §4）
+- 归属冲突按**模式最具体者胜**——`src/core/**` 与 `src/core/audit/*.ts`
+  同时命中时后者拿走，前者只是组；同样具体才算真歧义
+- 设计声明先归一化——反引号、「无」类占位词、`无（仅定义类型和接口）` 这类写法
+  不该变成假偏离
+
+**只报告、不拦**（G-4/B）：偏离是给人看的证据，不是判定。
+要做成硬护栏是 G-4/A——要扩展 policy 契约，届时另写 ADR。
+
+CLI 入口：`zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]`。
+`--strict` 在有偏离时返回退出码 1（给 CI 用），默认只报告不拦人。
 
 ---
 
@@ -552,14 +612,13 @@ zelto version deliver <ver>
 
 | 约束 | 实现方式 |
 |---|---|
-| **C1** 状态只在文件里 | `SliceStore` 读写 `.zelto/slices/*.json`；`EventStream` 追加 `.zelto/events/*/events.jsonl` |
-| **C2** core/ 无 SDK | `package.json` 无运行时 dependencies；只 import `node:*` |
-| **C3** 确定性 | policy 无网络无模型；gate 仅 spawn 子进程；sched 纯计算 |
-| **C4** append-only | `EventStream.append()` 使用 `appendFile`；无 delete/update |
-| **C5/C8** 保护域 | `PROTECTED_PATTERNS` 硬编码常量，策略规则无法覆盖 |
-| **C6** 单向依赖 | tsconfig 无反向路径映射；代码级无 import 从 adapters 到 core |
+| **C1** 状态只在文件里 | `SliceStore` 读写 `.zelto/slices/*.json`；`EventStream` 追加 `.zelto/events/*/events.jsonl`；状态变更只经文件读写 |
+| **C2** 核心纯洁性（含原 C6 单向依赖） | `package.json` 无运行时 dependencies；只 import `node:*`；tsconfig 无反向路径映射；代码级无 `core/` import `adapters/` |
+| **C3** 确定性 | policy 无网络无模型；gate 仅 spawn 子进程；sched 纯计算、只读文件 |
+| **C4** append-only | `EventStream.append()` 使用 `appendFile`；无 delete/update；事件是追溯的唯一证据载体 |
+| **C5** 保护域与锚点外部化（含原 C8） | `PROTECTED_PATTERNS` 硬编码常量，策略规则无法覆盖；策略哈希锚点存于 `policy/lock.json` |
 | **C7** llm 不判定 | `llm/` 只用于需求/设计/计划的**草案**生成；所有判定模块（policy/gate/sched）不引用 llm；草案须经人 `confirm` 才进入下游 |
-| **C9** 写集预约 | 准入：`Scheduler.admit()` 检查 running 切片的 writes 数组；运行期：`.zelto/locks/<id>.json` 预约 + PreToolUse 钩子逐写判定 + 运行后 git 改动审计（ADR-014） |
+| **C9** 写集预约 | 准入：`Scheduler.admit()` 检查 running 切片的 writes 数组；运行期：`.zelto/locks/<id>.json` 预约 + PreToolUse 钩子逐写判定（主） + 运行后 git 改动审计兜底（ADR-014）；预约缺失 fail closed |
 
 ---
 
@@ -637,10 +696,11 @@ agent 写文件
 
 ### 7.3 当前覆盖
 
-- **976 tests, 203 suites, 0 fail**（2026-11-04 全量验证）
+- **1097 tests, 226 suites, 0 fail**（2026-11-05 全量验证）
 - 核心模块覆盖率 > 90%
 - Hook 可执行体 7 个集成测试
 - 运行时守卫 1 个验收测试（起真实 CLI 进程 + 假 agent，验钩子判定 + 审计兜底）
+- 架构偏离检查 1 组测试（判定层直测 `core/arch/`，命令层起真实 CLI 进程）
 
 ---
 
@@ -655,8 +715,31 @@ agent 写文件
 **被 zelto 管理的项目没有对应机制**——`DesignDoc.modules[].dependencies`
 只是文档里的字，没有被校验。
 
-方向：先做「设计里的模块图 vs 实际 import 图」的报告（只读、不拦），
-再考虑做成 policy 的可配置规则（涉及 policy 契约扩展 → 需 ADR）。
+**G-4/B 已落地（只读报告层）**：`zelto arch check` 把设计里画的模块图
+和代码里实际的 import 图摆在一起比，列出七类偏离：
+
+| 偏离 | 含义 |
+|---|---|
+| 未声明依赖 | 代码里有这条 import，设计里没写（架构腐化的主要来源） |
+| 缺失依赖 | 设计写了，代码里没有 |
+| 未知模块 | 依赖指向的模块在设计里不存在 |
+| 依赖无法验证 | 目标模块没有源文件（契约 / 规格），没法用 import 验证 |
+| 模块归属歧义 | 一个文件同时落在多个同样具体的模块范围里 |
+| 文件无归属 | 一个文件不在任何模块的 glob 范围里 |
+| 依赖成环 | 跨模块的实际依赖形成了环 |
+
+设计里的模块常是层级的（`src/core` 是组，`src/core/events` 是成员），
+所以判定走**包含关系**而不是名字相等：组依赖自己的成员不算偏离，
+组与成员之间的边也不参与成环判定。细节见 §3.18。
+
+实现落在 `core/arch/`（纯计算，C3：不调模型不触网；C6：不依赖 `adapters/`）：
+
+- `imports.ts` —— 正则抽 import 说明符，分相对 / 包 / 内置三类
+- `scan.ts` —— 扫源码、算文件归属、算模块间的实际依赖边
+- `report.ts` —— 拿设计与实际比，产出偏离列表与依赖环
+
+这一层**只报告、不拦**。要做成硬护栏是 G-4/A——
+那要扩展 policy 契约（让模块依赖方向成为可配置规则），需另写 ADR。
 
 ### 8.2 版本内依赖分层（G-1）——已落地
 
