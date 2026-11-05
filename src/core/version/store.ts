@@ -29,7 +29,9 @@ export class VersionStore {
     if (!existsSync(filePath)) {
       throw new Error(`Version plan "${id}" not found`);
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as VersionPlan;
+    const content = readFileSync(filePath, 'utf-8');
+    // Windows 编辑器可能带 BOM —— 去掉再解析
+    return JSON.parse(content.replace(/^\uFEFF/, '')) as VersionPlan;
   }
 
   async list(): Promise<VersionSummary[]> {

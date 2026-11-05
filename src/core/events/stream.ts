@@ -50,7 +50,10 @@ export type EventType =
   | 'coord.cycle_detected'
   | 'artifact.conflict_detected'
   | 'version.accepted'
-  | 'version.delivered';
+  | 'version.delivered'
+  | 'draft.created'
+  | 'draft.revised'
+  | 'draft.confirmed';
 
 export interface EventEnvelope {
   ts: string;

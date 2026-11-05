@@ -15,6 +15,8 @@ import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
 import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent, hashSpecFile } from './shared.js';
+import { RevisionStore } from '../../core/review/index.js';
+import { designFacts, planFacts, requirementFacts, showDraft } from './draft-review.js';
 import { executeSlicesByPhase, printParallelSummary } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { branchExists, isMergedIntoHead } from './merge-executor.js';
@@ -31,6 +33,16 @@ import { getDefaultFormatter } from '../output-formatter.js';
  */
 function versionEventKey(versionLabel: string): string {
   return `version-${versionLabel}`;
+}
+
+/**
+ * 草稿（需求 / 设计 / 版本计划）的事件归属键。
+ *
+ * 草稿不是切片，但草稿的每一次改动同样要留痕（C4）——
+ * 「这一版规划是谁改的、改了什么」必须能查。
+ */
+function draftEventKey(kind: string, id: string): string {
+  return `draft-${kind}-${id}`;
 }
 
 /**
@@ -93,6 +105,7 @@ register('require', async (args) => {
   if (!subcmd) {
     f.error('USAGE', 'Usage: zelto require <description>');
     f.out('       zelto require list');
+    f.out('       zelto require show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto require confirm <id>');
     f.out('       zelto require refine <id> <feedback>');
     return 1;
@@ -107,6 +120,18 @@ register('require', async (args) => {
     }
     f.data(list.map((r) => ({ id: r.id, status: r.status, title: r.title })));
     return 0;
+  }
+
+  if (subcmd === 'show') {
+    const id = args[1];
+    if (!id || id.startsWith('--')) {
+      f.error('USAGE', 'Usage: zelto require show <id> [--diff] [--no-diff] [--full]');
+      return 1;
+    }
+    return showDraft('requirement', id, {
+      diff: !args.includes('--no-diff'),
+      full: args.includes('--full'),
+    });
   }
 
   if (subcmd === 'confirm') {
@@ -124,6 +149,11 @@ register('require', async (args) => {
     doc.status = 'confirmed';
     doc.confirmedAt = new Date().toISOString();
     await reqStore.save(doc);
+    await events.append(draftEventKey('requirement', id), 'draft.confirmed', 'zelto', {
+      kind: 'requirement',
+      id,
+      title: doc.title,
+    });
     f.success(`Requirement "${id}" confirmed.`);
     return 0;
   }
@@ -153,6 +183,11 @@ register('require', async (args) => {
     }
 
     f.out(`Refining requirement "${id}" with feedback...`);
+
+    // 覆盖前先留一份快照 —— 之后 `show --diff` 才有得可对（G-5）
+    const revisions = new RevisionStore(ZELTO_DIR);
+    await revisions.snapshot('requirement', id, requirementFacts(doc));
+
     const result = await refineRequirements(llm, doc.spec, feedback);
 
     doc.title = result.title;
@@ -160,10 +195,18 @@ register('require', async (args) => {
     doc.acceptanceCriteria = result.acceptanceCriteria;
     await reqStore.save(doc);
 
+    await events.append(draftEventKey('requirement', id), 'draft.revised', 'zelto', {
+      kind: 'requirement',
+      id,
+      title: doc.title,
+      feedback,
+    });
+
     f.success(`Requirement "${id}" updated.`);
     f.out(`   Title: ${result.title}`);
     f.out(`\nAcceptance Criteria:`);
     f.data(result.acceptanceCriteria);
+    f.out(`Review the change: zelto require show ${id} --diff`);
     f.out(`Run again: zelto require refine ${id} <more feedback>`);
     f.out(`Or confirm: zelto require confirm ${id}`);
     return 0;
@@ -201,10 +244,17 @@ register('require', async (args) => {
   const reqStore = new RequirementStore(ZELTO_DIR);
   await reqStore.save(doc);
 
+  await events.append(draftEventKey('requirement', id), 'draft.created', 'zelto', {
+    kind: 'requirement',
+    id,
+    title: doc.title,
+  });
+
   f.success(`Requirement created: ${id}`);
   f.out(`   Title: ${result.title}`);
   f.out(`\nAcceptance Criteria:`);
   f.data(result.acceptanceCriteria);
+  f.out(`Review it: zelto require show ${id}`);
   f.out(`Run: zelto require confirm ${id}`);
   return 0;
 });
@@ -218,6 +268,7 @@ register('design', async (args) => {
   if (!subcmd) {
     f.error('USAGE', 'Usage: zelto design <req-id>');
     f.out('       zelto design list');
+    f.out('       zelto design show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto design confirm <id>');
     f.out('       zelto design refine <id> <feedback>');
     return 1;
@@ -232,6 +283,18 @@ register('design', async (args) => {
     }
     f.data(list.map((d) => ({ id: d.id, status: d.status, reqId: d.requirementId, title: d.title, modules: d.moduleCount })));
     return 0;
+  }
+
+  if (subcmd === 'show') {
+    const id = args[1];
+    if (!id || id.startsWith('--')) {
+      f.error('USAGE', 'Usage: zelto design show <id> [--diff] [--no-diff] [--full]');
+      return 1;
+    }
+    return showDraft('design', id, {
+      diff: !args.includes('--no-diff'),
+      full: args.includes('--full'),
+    });
   }
 
   if (subcmd === 'confirm') {
@@ -249,6 +312,11 @@ register('design', async (args) => {
     doc.status = 'confirmed';
     doc.confirmedAt = new Date().toISOString();
     await designStore.save(doc);
+    await events.append(draftEventKey('design', id), 'draft.confirmed', 'zelto', {
+      kind: 'design',
+      id,
+      title: doc.title,
+    });
     f.success(`Design "${id}" confirmed.`);
     return 0;
   }
@@ -278,12 +346,24 @@ register('design', async (args) => {
     }
 
     f.out(`Refining design "${id}" with feedback...`);
+
+    // 覆盖前先留一份快照 —— 之后 `show --diff` 才有得可对（G-5）
+    const revisions = new RevisionStore(ZELTO_DIR);
+    await revisions.snapshot('design', id, designFacts(doc));
+
     const result = await refineDesign(llm, doc.body, feedback);
 
     doc.title = result.title;
     doc.body = result.body;
     doc.modules = result.modules;
     await designStore.save(doc);
+
+    await events.append(draftEventKey('design', id), 'draft.revised', 'zelto', {
+      kind: 'design',
+      id,
+      title: doc.title,
+      feedback,
+    });
 
     f.success(`Design "${id}" updated.`);
     f.out(`   Title: ${result.title}`);
@@ -294,6 +374,7 @@ register('design', async (args) => {
       files: m.filePatterns.length > 0 ? m.filePatterns.join(', ') : '(none)',
       deps: m.dependencies.length > 0 ? m.dependencies.join(', ') : '(none)',
     })));
+    f.out(`Review the change: zelto design show ${id} --diff`);
     f.out(`Run again: zelto design refine ${id} <more feedback>`);
     f.out(`Or confirm: zelto design confirm ${id}`);
     return 0;
@@ -342,6 +423,13 @@ register('design', async (args) => {
   const designStore = new DesignStore(ZELTO_DIR);
   await designStore.save(doc);
 
+  await events.append(draftEventKey('design', id), 'draft.created', 'zelto', {
+    kind: 'design',
+    id,
+    title: doc.title,
+    requirementId: reqId,
+  });
+
   f.success(`Design created: ${id}`);
   f.out(`   Title: ${result.title}`);
   f.out(`\nModules:`);
@@ -352,6 +440,7 @@ register('design', async (args) => {
     deps: m.dependencies.length > 0 ? m.dependencies.join(', ') : '(none)',
   })));
   f.out(`Run: zelto design confirm ${id}`);
+  f.out(`Review it: zelto design show ${id}`);
   return 0;
 });
 
@@ -364,6 +453,7 @@ register('plan', async (args) => {
   if (!subcmd) {
     f.error('USAGE', 'Usage: zelto plan <design-id>');
     f.out('       zelto plan list');
+    f.out('       zelto plan show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto plan confirm <id>');
     f.out('       zelto plan add-version <id> <description>');
     return 1;
@@ -378,6 +468,18 @@ register('plan', async (args) => {
     }
     f.data(list.map((p) => ({ id: p.id, status: p.status, title: p.title, versions: p.versionCount })));
     return 0;
+  }
+
+  if (subcmd === 'show') {
+    const id = args[1];
+    if (!id || id.startsWith('--')) {
+      f.error('USAGE', 'Usage: zelto plan show <id> [--diff] [--no-diff] [--full]');
+      return 1;
+    }
+    return showDraft('plan', id, {
+      diff: !args.includes('--no-diff'),
+      full: args.includes('--full'),
+    });
   }
 
   if (subcmd === 'confirm') {
@@ -413,6 +515,12 @@ register('plan', async (args) => {
     for (const v of plan.versions) {
       f.out(`   ${v.version}: ${v.slices.length} slices — ${v.description}`);
     }
+    await events.append(draftEventKey('plan', id), 'draft.confirmed', 'zelto', {
+      kind: 'plan',
+      id,
+      title: plan.title,
+      versions: plan.versions.map((v) => v.version),
+    });
     f.out('Run "zelto version start <version>" to begin execution.');
     return 0;
   }
@@ -449,6 +557,11 @@ register('plan', async (args) => {
     }
 
     f.out(`Generating new version for plan "${id}"...`);
+
+    // 覆盖前先留一份快照 —— 之后 `show --diff` 才有得可对（G-5）
+    const revisions = new RevisionStore(ZELTO_DIR);
+    await revisions.snapshot('plan', id, planFacts(plan));
+
     const newVersion = await generateVersion(llm, designBody, plan.versions, description);
 
     if (plan.versions.some((v) => v.version === newVersion.version)) {
@@ -459,11 +572,19 @@ register('plan', async (args) => {
     plan.versions.push(newVersion);
     await versionStore.save(plan);
 
+    await events.append(draftEventKey('plan', id), 'draft.revised', 'zelto', {
+      kind: 'plan',
+      id,
+      title: plan.title,
+      addedVersion: newVersion.version,
+    });
+
     f.success(`Version ${newVersion.version} added to plan "${id}":`);
     f.out(`   Description: ${newVersion.description}`);
     f.out(`   Depends on: ${newVersion.dependsOn.join(', ') || '(none)'}`);
     f.out(`   Slices:`);
     f.data(newVersion.slices.map((s) => ({ id: s.id, title: s.title, module: s.module })));
+    f.out(`Review the change: zelto plan show ${id} --diff`);
     f.out(`Run "zelto plan confirm ${id}" to lock the updated plan.`);
     return 0;
   }
@@ -508,6 +629,13 @@ register('plan', async (args) => {
 
   const versionStore = new VersionStore(ZELTO_DIR);
   await versionStore.save(plan);
+
+  await events.append(draftEventKey('plan', id), 'draft.created', 'zelto', {
+    kind: 'plan',
+    id,
+    title: plan.title,
+    versions: plan.versions.map((v) => v.version),
+  });
 
   f.success(`Plan created: ${id}`);
   f.out(`   Title: ${result.title}`);

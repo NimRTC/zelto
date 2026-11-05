@@ -29,7 +29,9 @@ export class DesignStore {
     if (!existsSync(filePath)) {
       throw new Error(`Design "${id}" not found`);
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as DesignDoc;
+    const content = readFileSync(filePath, 'utf-8');
+    // Windows 编辑器可能带 BOM —— 去掉再解析
+    return JSON.parse(content.replace(/^\uFEFF/, '')) as DesignDoc;
   }
 
   async list(): Promise<DesignSummary[]> {

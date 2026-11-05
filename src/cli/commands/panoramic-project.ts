@@ -91,6 +91,20 @@ register('pipeline', async (args) => {
     }
   }
 
+  // 待确认的草稿——给出「下一步看什么」的入口（G-5：规划确认体验）
+  const drafts: Array<{ kind: string; id: string }> = [];
+  for (const req of reqs) if (req.status === 'draft') drafts.push({ kind: 'require', id: req.id });
+  for (const d of designList) if (d.status === 'draft') drafts.push({ kind: 'design', id: d.id });
+  for (const p of planList) if (p.status === 'draft') drafts.push({ kind: 'plan', id: p.id });
+
+  if (drafts.length > 0) {
+    console.log('');
+    console.log('待确认的草稿（先看决策点，再决定 confirm）:');
+    for (const d of drafts) {
+      console.log(`  📝 zelto ${d.kind} show ${d.id}   → 看完再 zelto ${d.kind} confirm ${d.id}`);
+    }
+  }
+
   return 0;
 });
 

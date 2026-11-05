@@ -38,7 +38,10 @@
         "coord.cycle_detected",
         "artifact.conflict_detected",
         "version.accepted",
-        "version.delivered"
+        "version.delivered",
+        "draft.created",
+        "draft.revised",
+        "draft.confirmed"
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },
