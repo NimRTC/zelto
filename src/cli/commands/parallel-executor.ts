@@ -72,6 +72,10 @@ export interface ParallelExecutionOptions {
   eventKey?: string;
   /** 拉闸作用域（默认取 eventKey）——批次键或 'all' */
   haltScope?: string;
+  /** 亲和分组（ADR-024）：sliceId → groupId，无命中为 null；缺省等价全 null */
+  affinity?: Map<string, string | null>;
+  /** 组内排在本片之前的切片 id（按执行序）；缺省为空 */
+  affinityPrevious?: Map<string, string[]>;
 }
 
 export interface ParallelExecutionResult {
@@ -363,8 +367,14 @@ export async function executeSlicesParallel(
 
     await scheduler.startRun(st.id);
 
-    // 约束包：规格路径 + 写集 + 保护域 + 相关策略规则
-    const bundle = scheduler.buildConstraints(slice);
+    // 约束包：规格路径 + 写集 + 保护域 + 相关策略规则 + 亲和上下文（只读建议）
+    const affinityGroup = options.affinity?.get(st.id) ?? null;
+    const affinityPrev = options.affinityPrevious?.get(st.id) ?? [];
+    const affinityCtx =
+      affinityGroup !== null
+        ? await scheduler.buildAffinityContext(st.id, affinityGroup, affinityPrev)
+        : null;
+    const bundle = scheduler.buildConstraints(slice, affinityCtx);
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
@@ -413,6 +423,8 @@ export async function executeSlicesParallel(
       bundlePath,
       writes: slice.writes,
       worktree: st.worktreePath ? worktreeManager().relativePathFor(st.id) : null,
+      affinityGroup,
+      previousSlices: affinityPrev,
     });
   }
 
@@ -680,7 +692,8 @@ export async function executeSlicesParallel(
     }
 
     await store.transit(st.id, 'RUN_FINISH');
-    await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0 });
+    const finishedAffinity = options.affinity?.get(st.id) ?? null;
+    await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0, affinityGroup: finishedAffinity });
     console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
 
     let gatePassed: boolean | null = null;
@@ -820,10 +833,15 @@ export async function executeSlicesByPhase(
     console.log('');
     console.log(`── 阶段 ${p + 1}/${phases.length}: ${phaseIds.join(', ')} ${parallel}`);
 
+    const affinityRecord: Record<string, string | null> = {};
+    for (const id of phaseIds) {
+      affinityRecord[id] = options.affinity?.get(id) ?? null;
+    }
     await events.append(eventKey, 'coord.phase_ready', 'zelto', {
       phase: p,
       slices: phaseIds,
       totalPhases: phases.length,
+      affinity: affinityRecord,
     });
 
     const result = await executeSlicesParallel({

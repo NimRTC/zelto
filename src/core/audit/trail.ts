@@ -99,7 +99,13 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
   'coord.dep_added': (e) =>
     `Dependency added: ${String(e.payload?.sliceId ?? '')} → ${String(Array.isArray(e.payload?.dependsOn) ? (e.payload.dependsOn as string[]).join(', ') : '')} (phase ${String(e.payload?.phase ?? '?')})`,
   'coord.phase_ready': (e) =>
-    `Phase ${String(e.payload?.phase ?? '?')} ready: ${String(Array.isArray(e.payload?.sliceIds) ? (e.payload.sliceIds as string[]).join(', ') : '')}`,
+    `Phase ${String(e.payload?.phase ?? '?')} ready: ${String(
+      Array.isArray(e.payload?.slices)
+        ? (e.payload.slices as string[]).join(', ')
+        : Array.isArray(e.payload?.sliceIds)
+          ? (e.payload.sliceIds as string[]).join(', ')
+          : '',
+    )}`,
   'coord.phase_complete': (e) =>
     `Phase ${String(e.payload?.phase ?? '?')} complete`,
   'coord.cycle_detected': (e) =>

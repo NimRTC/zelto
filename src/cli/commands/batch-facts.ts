@@ -12,9 +12,11 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
 import type { BatchMember } from '../../core/sched/batch.js';
+import { pathsOverlap } from '../../core/sched/paths.js';
 import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { parsePrerequisites, parseScopePaths } from '../../core/spec/scope.js';
 import { BudgetCollector } from '../../core/budget/collector.js';
+import { DesignStore } from '../../core/design/store.js';
 import { events, hashSpecFile, store, ZELTO_DIR } from './shared.js';
 import { resolveWriteSet } from './run-support.js';
 
@@ -101,6 +103,56 @@ export async function readEffectiveWriteSet(id: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+/**
+ * 读出切片→设计模块名的映射（ADR-024 §3.1 规则 3）。
+ *
+ * 做法：取最近一份已确认的设计（与 `zelto arch check` 的找设计逻辑一致），
+ * 把每片的生效写集与各模块的 filePatterns 做重叠判定（pathsOverlap），
+ * 命中的模块名即为该片的模块归属。一片可属多模块。
+ *
+ * 全部是字符串/集合运算，不调模型、不触网（C3）。没有确认设计时返回空映射，
+ * 调用方视为无模块命中（宁可不分组，不错分组）。
+ */
+export async function readModuleMap(ids: string[]): Promise<Map<string, string[]>> {
+  const result = new Map<string, string[]>();
+  for (const id of ids) result.set(id, []);
+
+  try {
+    const designStore = new DesignStore(ZELTO_DIR);
+    const list = await designStore.list();
+    const confirmed = list.filter((d) => d.status === 'confirmed');
+    if (confirmed.length === 0) return result;
+    const doc = await designStore.read(confirmed[0].id);
+    if (!doc.modules || doc.modules.length === 0) return result;
+
+    const writesOf = new Map<string, string[]>();
+    for (const id of ids) {
+      try {
+        writesOf.set(id, await readEffectiveWriteSet(id));
+      } catch {
+        writesOf.set(id, []);
+      }
+    }
+
+    for (const id of ids) {
+      const writes = writesOf.get(id) ?? [];
+      const hits: string[] = [];
+      for (const mod of doc.modules) {
+        if (!mod.name || !mod.filePatterns) continue;
+        const hit = (mod.filePatterns as string[]).some((pat) =>
+          writes.some((w) => pathsOverlap(w, pat) || pathsOverlap(pat, w)),
+        );
+        if (hit) hits.push(mod.name);
+      }
+      hits.sort((a, b) => a.localeCompare(b));
+      result.set(id, hits);
+    }
+  } catch {
+    /* 读不到设计就没有模块归属 */
+  }
+  return result;
 }
 
 /**

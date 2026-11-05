@@ -5,7 +5,7 @@
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
-import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle } from './types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
 
@@ -116,8 +116,11 @@ export class Scheduler {
   /**
    * Build a constraint bundle for an agent session.
    * Contains: spec path, frozen hash, acceptance dir, write-set, protected paths, policy rules.
+   *
+   * affinity 只读建议（ADR-024 §3.3）：调用方把算好的上下文传进来，
+   * 这里只装包、不判定。null/缺省表示无亲和，语义与原来完全一致。
    */
-  buildConstraints(slice: SliceData): ConstraintBundle {
+  buildConstraints(slice: SliceData, affinity?: AffinityContext | null): ConstraintBundle {
     // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
     const relevantRules = this.policy.rules.filter((r) => {
       // Include rules that match the slice's write paths or are general allow/deny
@@ -138,8 +141,68 @@ export class Scheduler {
         '.cursor/rules/**',
       ],
       policyRules: relevantRules,
-      instructions: this.buildInstructions(slice),
+      instructions: this.buildInstructions(slice, affinity ?? null),
+      affinity: affinity ?? null,
     };
+  }
+
+  /**
+   * 组装亲和上下文（ADR-024 §3.3，只读建议）。
+   *
+   * 只读三样东西：前片的冻结规格（frozenHash + 标题 + 写集）、
+   * 已合入 commit（merge.* 事件里的 mergeCommit）、门禁结论不单独存
+   * （前片能进到这里即视为可引用）。不读 worktree 中间态、不调模型（C3/C7）。
+   *
+   * @param sliceId 本片 id（仅用于校验，不参与摘要）
+   * @param groupId 亲和组 id
+   * @param previousSlices 组内排在本片之前的切片 id（按执行序，已按 id 排序）
+   */
+  async buildAffinityContext(
+    sliceId: string,
+    groupId: string,
+    previousSlices: string[],
+  ): Promise<AffinityContext | null> {
+    if (!groupId || previousSlices.length === 0) return null;
+    // 本片不在前序里才有意义；调用方保证顺序，这里只做防御
+    const prev = previousSlices.filter((id) => id !== sliceId);
+    if (prev.length === 0) return null;
+
+    const summaries: AffinityContext['summaries'] = [];
+    for (const id of prev) {
+      let data: SliceData | null = null;
+      try {
+        data = await this.store.read(id);
+      } catch {
+        continue;
+      }
+      const frozenHash = data.spec.frozenHash;
+      const commit = await this.readMergedCommit(id);
+      const shortHash = frozenHash ? frozenHash.replace(/^sha256:/, '').slice(0, 12) : 'unfrozen';
+      const summary = `${data.title} | writes: ${data.writes.join(', ') || '(none)'} | frozen: ${shortHash}`;
+      summaries.push({ sliceId: id, frozenHash, commit, summary });
+    }
+
+    if (summaries.length === 0) return null;
+    return {
+      groupId,
+      previousSlices: summaries.map((s) => s.sliceId),
+      summaries,
+    };
+  }
+
+  /** 读某片的已合入 commit：只认 merge.* 事件，不读 worktree 中间态 */
+  private async readMergedCommit(sliceId: string): Promise<string | null> {
+    try {
+      const evts = await this.events.read(sliceId);
+      for (let i = evts.length - 1; i >= 0; i--) {
+        const p = evts[i].payload as Record<string, unknown>;
+        const c = p?.['mergeCommit'];
+        if (typeof c === 'string' && c.length > 0) return c;
+      }
+    } catch {
+      /* 读不到事件就没有合入记录 */
+    }
+    return null;
   }
 
   /**
@@ -228,8 +291,8 @@ export class Scheduler {
     return writeSetsOverlap(a, b);
   }
 
-  private buildInstructions(slice: SliceData): string {
-    return [
+  private buildInstructions(slice: SliceData, affinity?: AffinityContext | null): string {
+    const lines = [
       `You are implementing slice "${slice.id}": ${slice.title}`,
       '',
       `## Spec`,
@@ -248,6 +311,18 @@ export class Scheduler {
       `## Acceptance tests`,
       `Run \`${slice.acceptance.dir}\` tests to verify your implementation.`,
       '',
+    ];
+    // 亲和上下文只是只读建议（C7）：前片做了什么、供参考，不参与任何判定
+    if (affinity && affinity.summaries.length > 0) {
+      lines.push(`## Related slices (read-only context, advisory only)`);
+      lines.push(`Same affinity group \`${affinity.groupId}\` — earlier slices in this group:`);
+      for (const s of affinity.summaries) {
+        lines.push(`  - \`${s.sliceId}\`: ${s.summary}`);
+      }
+      lines.push(`Do NOT modify their files; follow your own frozen spec.`);
+      lines.push('');
+    }
+    lines.push(
       `## Rules`,
       `1. Do not modify files outside your write-set.`,
       `2. Do not modify protected paths.`,
@@ -255,7 +330,8 @@ export class Scheduler {
       `4. Run acceptance tests before declaring completion.`,
       '',
       QUESTION_INSTRUCTIONS,
-    ].join('\n');
+    );
+    return lines.join('\n');
   }
 
   private async appendEvent(
