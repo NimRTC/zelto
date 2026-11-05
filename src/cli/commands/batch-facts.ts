@@ -81,7 +81,7 @@ export async function readSliceFacts(id: string): Promise<BatchMember | { missin
       contracts: slice.trace.contracts.length,
       tests: slice.trace.tests.length,
     },
-    traceWaiver: slice.traceWaiver !== null,
+    traceWaiver: slice.traceWaiver,
     acceptancePresent,
     budgetExhausted,
   };

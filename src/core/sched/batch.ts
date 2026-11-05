@@ -12,6 +12,7 @@
 import { detectArtifactConflicts } from './artifact.js';
 import { DependencyGraph } from './depgraph.js';
 import { writeSetsOverlap } from './paths.js';
+import { judgeTrace } from '../trace/index.js';
 
 /** 问题严重程度 */
 export type BatchSeverity = 'error' | 'warning';
@@ -49,8 +50,8 @@ export interface BatchMember {
     contracts: number;
     tests: number;
   };
-  /** 是否豁免了「必须引用契约」的要求 */
-  traceWaiver: boolean;
+  /** 豁免理由原文；null 表示未豁免（空串/纯空白同样视为未豁免） */
+  traceWaiver: string | null;
   /** 验收测试目录是否存在 */
   acceptancePresent: boolean;
   /** 预算是否已耗尽 */
@@ -114,16 +115,9 @@ export function reviewBatch(members: BatchMember[]): BatchReview {
       add('error', 'spec_drift', '规格内容已偏离冻结时的哈希，需重新冻结');
     }
 
-    if (m.trace.requirements === 0) {
-      add('error', 'no_requirements', '追溯信息里没有需求引用，无法证明代码出处');
-    }
-
-    if (m.trace.contracts === 0 && !m.traceWaiver) {
-      add('error', 'no_contracts', '追溯信息里没有契约引用（也没有豁免记录）');
-    }
-
-    if (m.trace.tests === 0) {
-      add('error', 'no_tests', '追溯信息里没有测试引用，无法验证');
+    // 追溯判据唯一真源：core/trace/judgment.ts —— 这里只做呈现翻译
+    for (const v of judgeTrace({ trace: m.trace, waiver: m.traceWaiver }).violations) {
+      add('error', v.code, v.message);
     }
 
     if (!m.acceptancePresent) {

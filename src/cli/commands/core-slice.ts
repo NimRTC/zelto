@@ -30,6 +30,7 @@ import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
+import { judgeTrace, traceCountsOf } from '../../core/trace/index.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
@@ -407,9 +408,10 @@ register('check', async (args) => {
     console.log(`  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts${waiverNote}, ${slice.trace.tests.length} tests`);
 
     const issues: string[] = [];
-    if (slice.trace.requirements.length === 0) issues.push('No requirements traced');
-    if (slice.trace.contracts.length === 0 && !slice.traceWaiver) issues.push('No contracts traced');
-    if (slice.trace.tests.length === 0) issues.push('No tests traced');
+    // 追溯判据唯一真源：core/trace/judgment.ts —— 这里只做呈现翻译
+    for (const v of judgeTrace({ trace: traceCountsOf(slice.trace), waiver: slice.traceWaiver }).violations) {
+      issues.push(v.short);
+    }
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 
     // Validate write-set paths exist in the repo

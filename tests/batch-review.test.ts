@@ -27,7 +27,7 @@ function makeMember(id: string, overrides: Partial<BatchMember> = {}): BatchMemb
     specFrozen: true,
     specDrift: false,
     trace: { requirements: 1, contracts: 1, tests: 1 },
-    traceWaiver: false,
+    traceWaiver: null,
     acceptancePresent: true,
     budgetExhausted: false,
     ...overrides,
@@ -76,12 +76,14 @@ describe('reviewBatch — 准入审核', () => {
     assert.ok(r.issues.some((i) => i.code === 'no_contracts'));
   });
 
-  it('有豁免记录时允许没有契约引用', () => {
+  it('有豁免理由时整体豁免三条', () => {
     const r = reviewBatch([
-      makeMember('a', { trace: { requirements: 1, contracts: 0, tests: 1 }, traceWaiver: true }),
+      makeMember('a', { trace: { requirements: 0, contracts: 0, tests: 0 }, traceWaiver: '基线切片 — 不修改代码' }),
     ]);
     assert.equal(r.ready, true);
+    assert.ok(!r.issues.some((i) => i.code === 'no_requirements'));
     assert.ok(!r.issues.some((i) => i.code === 'no_contracts'));
+    assert.ok(!r.issues.some((i) => i.code === 'no_tests'));
   });
 
   it('没有测试追溯时阻断', () => {

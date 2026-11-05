@@ -20,7 +20,7 @@ export interface SpecIssue {
 
 export interface DeterministicCheck {
   name: string;
-  check: (slice: SliceData, specContent: string) => SpecIssue | null;
+  check: (slice: SliceData, specContent: string) => SpecIssue[];
 }
 
 export interface SemanticCheck {
