@@ -1150,6 +1150,8 @@ async function runParallel(args: string[]): Promise<number> {
     adapterType,
     title: 'zelto run --parallel',
     eventKey: 'batch',
+    affinity: plan.affinity,
+    affinityPrevious: plan.affinityPrevious,
   });
 
   if (result.aborted) {

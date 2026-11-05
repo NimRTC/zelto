@@ -979,6 +979,8 @@ register('version', async (args) => {
       agentName: cfg.agent.command,
       title: `版本 ${versionLabel}`,
       eventKey: `version-${versionLabel}`,
+      affinity: plan.affinity,
+      affinityPrevious: plan.affinityPrevious,
     });
 
     if (result.aborted) {

@@ -11,21 +11,32 @@
 // C3: 排阶段是确定性计算（不调模型、不触网）
 // C1: 状态只在文件里——这里只读文件、只产出计划
 
-import { planExecutionPhases } from '../../core/sched/batch.js';
-import type { PhaseDowngrade } from '../../core/sched/batch.js';
-import { readDependencies, readEffectiveWriteSet } from './batch-facts.js';
+import { affinityPreviousOf, planAffinityGroups, planExecutionPhases, splitPhaseByAffinity } from '../../core/sched/batch.js';
+import type { AffinityPlan, PhaseDowngrade } from '../../core/sched/batch.js';
+import { readDependencies, readEffectiveWriteSet, readModuleMap } from './batch-facts.js';
 
 export interface ExecutionPlan {
-  /** 阶段序列：阶段内可并行，阶段之间串行 */
+  /** 阶段序列：阶段内可并行，阶段之间串行（已含亲和串行切分） */
   phases: string[][];
   /** 依赖成环时的环路径；无环为 null */
   cycle: string[] | null;
   /** 因写集冲突被降级为串行的切片 */
   downgrades: PhaseDowngrade[];
+  /** 亲和分组（ADR-024）：sliceId → groupId，无命中为 null（全局组，用于上下文与追溯） */
+  affinity: Map<string, string | null>;
+  /** 亲和组列表：仅含两人以上的组 */
+  affinityGroups: AffinityPlan['affinityGroups'];
+  /** 每片的组内前序（按执行序 = 组内 id 排序）；无组与组首为空数组 */
+  affinityPrevious: Map<string, string[]>;
 }
 
 /**
  * 为这批切片排出执行阶段。
+ *
+ * 排法（G-1 + G-2 + ADR-024）：
+ * 1. 依赖分层 + 写集降级（planExecutionPhases，不变）
+ * 2. 亲和分组（planAffinityGroups）：只改变同阶段内「谁先谁后」，
+ *    不改变阶段划分；同组切片在阶段内按 splitPhaseByAffinity 切成串行轮次
  *
  * @param ids 要执行的切片 id
  * @param cliArgs 命令行参数（用于读 --depends-on 覆盖）
@@ -44,10 +55,36 @@ export async function buildExecutionPlan(
 
   const plan = planExecutionPhases(members, deps);
 
+  if (plan.cycle) {
+    return {
+      phases: [],
+      cycle: plan.cycle,
+      downgrades: [],
+      affinity: new Map(ids.map((id) => [id, null])),
+      affinityGroups: [],
+      affinityPrevious: new Map(ids.map((id) => [id, []])),
+    };
+  }
+
+  // 亲和分组：依赖链 → 写集前缀 → 设计模块（确定性，不调模型）
+  const moduleMap = await readModuleMap(ids);
+  const affinityPlan = planAffinityGroups(members, deps, moduleMap);
+
+  // 亲和只在同一执行阶段内排序：同组切片切成串行轮次，其余仍可并行。
+  // 阶段划分本身不变（ADR-019 §3.3 不变）。
+  const phases: string[][] = [];
+  for (const phase of plan.phases) {
+    const rounds = splitPhaseByAffinity(phase, affinityPlan.groups);
+    phases.push(...rounds);
+  }
+
   return {
-    phases: plan.phases,
-    cycle: plan.cycle,
+    phases,
+    cycle: null,
     downgrades: plan.downgrades,
+    affinity: affinityPlan.groups,
+    affinityGroups: affinityPlan.affinityGroups,
+    affinityPrevious: affinityPreviousOf(affinityPlan),
   };
 }
 
@@ -76,5 +113,18 @@ export function printExecutionPlan(plan: ExecutionPlan): void {
     console.log(
       `  ⚠️  ${d.sliceId} 与 ${d.conflictsWith.join(', ')} 写集重叠 —— 已降级为串行`,
     );
+  }
+
+  if (plan.affinityGroups.length > 0) {
+    const reasonLabel: Record<string, string> = {
+      dep: '依赖链',
+      'writes-prefix': '同写集前缀',
+      module: '同设计模块',
+    };
+    for (const g of plan.affinityGroups) {
+      console.log(
+        `  🧲 亲和组 ${g.groupId}（${reasonLabel[g.reason] ?? g.reason}）：${g.members.join(' → ')} —— 组内串行`,
+      );
+    }
   }
 }

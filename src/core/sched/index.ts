@@ -1,5 +1,19 @@
-export { type SchedResult, type SchedBlock, type SchedDecision, type ConstraintBundle } from './types.js';
+export { type SchedResult, type SchedBlock, type SchedDecision, type ConstraintBundle, type AffinityContext, type AffinitySummary } from './types.js';
 export { Scheduler } from './engine.js';
+export {
+  type BatchMember,
+  type BatchReview,
+  type BatchIssue,
+  type BatchPhasePlan,
+  type PhaseDowngrade,
+  type ExecutionPhasePlan,
+  type WriteSetMember,
+  type AffinityPlan,
+  affinityPrefixOf,
+  planAffinityGroups,
+  affinityPreviousOf,
+  splitPhaseByAffinity,
+} from './batch.js';
 export {
   pathMatches,
   pathsOverlap,
