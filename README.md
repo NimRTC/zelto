@@ -56,6 +56,18 @@ export ZELTO_LLM_API_KEY=sk-...   # or DEEPSEEK_API_KEY; falls back to llm.apiKe
 Only the key comes from the environment — `baseUrl`, `model` and `pricing` stay in
 `.zelto/config.yaml` so the project stays reproducible (ADR-022).
 
+You can also point at the environment from the config file itself (ADR-026):
+
+```yaml
+llm:
+  provider: deepseek
+  apiKey: "${NIMRTC_LLM_API_KEY}"
+```
+
+`${NIMRTC_LLM_API_KEY}` is replaced with the value of that environment variable.
+If the variable is not set, zelto treats it as "no key" and says so — it never
+sends the literal `${...}` text as a credential.
+
 Run `zelto help` for the full command list. Run `zelto help <cmd>` for one command's usage.
 
 ## How it works

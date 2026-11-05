@@ -358,6 +358,21 @@ llm:
   model: deepseek-chat
 ```
 
+也可以在配置文件里引用环境变量（ADR-026）——密钥彻底不落盘：
+
+```yaml
+llm:
+  provider: deepseek
+  apiKey: "${NIMRTC_LLM_API_KEY}"
+  baseUrl: https://api.deepseek.com/v1
+  model: deepseek-chat
+```
+
+`${NIMRTC_LLM_API_KEY}` 会被替换为同名环境变量的值。变量没设置时，
+zelto 视作「没有密钥」并给出警告 —— **绝不会把 `${...}` 字面量当密钥发出去**。
+
+只支持整值引用：`"${FOO}"` 可以，`"prefix-${FOO}"` 不展开（保持原样）。
+
 **密钥来源优先级**（ADR-022）：
 
 | 优先级 | 来源 | 说明 |
@@ -365,6 +380,9 @@ llm:
 | 1 | `ZELTO_LLM_API_KEY` | zelto 专用，不与其它工具抢 |
 | 2 | `DEEPSEEK_API_KEY` | 生态通用命名 |
 | 3 | `llm.apiKey`（配置文件） | 回退路径，存量用户不用改 |
+
+配置里的 `${VAR}` 引用展开后落在第 3 级 —— 环境变量里的
+`ZELTO_LLM_API_KEY` 仍然赢过它。
 
 `llm.baseUrl` / `llm.model` / `llm.pricing` 是配置不是密钥，**不读环境变量**，
 留在文件里才能保证项目可复现。

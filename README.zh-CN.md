@@ -117,6 +117,17 @@ export ZELTO_LLM_API_KEY=sk-...   # 或 DEEPSEEK_API_KEY；都没有时回退到
 只有密钥走环境变量；`baseUrl` / `model` / `pricing` 仍留在 `.zelto/config.yaml`，
 这样项目配置才是可复现的（ADR-022）。
 
+也可以在配置文件里直接引用环境变量，密钥彻底不落盘（ADR-026）：
+
+```yaml
+llm:
+  provider: deepseek
+  apiKey: "${NIMRTC_LLM_API_KEY}"
+```
+
+`${NIMRTC_LLM_API_KEY}` 会被替换为同名环境变量的值。变量没设置时，
+zelto 视作「没有密钥」并给出警告 —— 绝不会把 `${...}` 字面量当密钥发出去。
+
 ## 开发
 
 ```bash
