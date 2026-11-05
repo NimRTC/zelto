@@ -82,9 +82,9 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
 
   // ─── AI 流水线 ─────────────────────────────────────────────────────────
-  { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, confirm <id>, refine <id> <text>' },
-  { name: 'design', group: 'AI 流水线', args: '<req-id>', summary: '从需求生成与细化设计', detail: 'list, confirm <id>, refine <id> <text>' },
-  { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, confirm <id>, add-version <id> <d>' },
+  { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
+  { name: 'design', group: 'AI 流水线', args: '<req-id>', summary: '从需求生成与细化设计', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
+  { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, show <id>, confirm <id>, add-version <id> <d>' },
   { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>' },
   { name: 'pipeline', group: 'AI 流水线', args: 'status', summary: '需求→设计→计划→版本→切片 全链一览' },
 
@@ -98,7 +98,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'depgraph', group: '全景与依赖', args: '<id> [id ...]', summary: '查看切片之间的依赖图', detail: '--depends-on, --json' },
   { name: 'artifact', group: '全景与依赖', args: 'check <id> <id> ...', summary: '检测切片之间的工件级冲突', detail: '--json' },
   { name: 'batch', group: '全景与依赖', args: '<id> [id ...]', summary: '审核这批切片能否一起开工，并排出执行阶段', detail: '--depends-on, --json' },
-  { name: 'dashboard', group: '全景与依赖', args: '', summary: '生成项目看板 HTML', detail: '--watch, --open, --output, --json' },
+  { name: 'dashboard', group: '全景与依赖', args: '', summary: '生成项目看板 HTML', detail: '--watch, --open, --output, --tty, --json' },
 
   // ─── 其他 ──────────────────────────────────────────────────────────────
   { name: 'spec-md', group: '其他', args: '<validate|run> <slice-id>', summary: '校验切片规格文件结构 / 执行规格 checklist' },

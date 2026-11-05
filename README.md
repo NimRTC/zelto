@@ -21,9 +21,14 @@ the acceptance checks frozen alongside that spec.
 - **Gates you can't argue with.** The deterministic layer never calls a model. Acceptance
   checks are frozen with the spec, so an agent cannot make a gate pass by editing the test.
 - **Agent-agnostic by construction.** Policy and gate decisions live in zelto, not in the
-  harness. Claude Agent SDK is the executor today; others plug in as adapters.
+  harness. Two executors today: `claude-agent` (CLI spawn, default) and `claude-agent-sdk`
+  (opt in with `--adapter claude-agent-sdk`); others plug in as adapters.
 - **Everything is a file.** Slices, events, locks — no daemon, no database, no account.
   `grep` and `git log` are your audit tools.
+- **Planning you can review in one screen.** `zelto require|design|plan show <id>` prints
+  a summary, the decision points that actually need a human (marked added / removed /
+  changed) and the diff against the previous revision — no more reading a wall of
+  markdown before you approve a plan (ADR-023).
 
 ## Quick start
 
@@ -62,7 +67,7 @@ clarify (shape the spec) → draft + acceptance skeleton → check (gate 1) → 
 
 1. **Write a slice spec.** One unit of work: scope, write-set, acceptance criteria.
 2. **Freeze it.** Gate 1 checks traceability and contracts deterministically — no model involved.
-3. **Run unattended.** zelto launches the agent inside an isolated worktree with the write-set enforced at runtime.
+3. **Run unattended.** zelto launches the agent in an isolated git worktree when available (otherwise the current directory) with the write-set enforced at runtime.
 4. **Gate it.** Gate 2 runs the frozen acceptance checks. A red gate blocks the merge, with evidence on disk.
 5. **Sign and merge.** You approve in the inbox. Merging is always an explicit `zelto merge` step.
 
@@ -85,7 +90,7 @@ What the architecture constraints mean for you:
 - **No hidden state.** Everything lives in files under `.zelto/`. No daemon, no database.
 - **Deterministic verdicts.** Policy and gate decisions never call a model and never touch the network.
 - **Frozen acceptance.** The tests that decide the gate are frozen with the spec — the agent can't move the goalposts.
-- **Isolation by default.** Agents run in isolated worktrees; write-set reservations are enforced at runtime by a standalone hook process.
+- **Isolation when git is there.** Agents run in isolated git worktrees when the project is a git repo (otherwise they run in the current directory); write-set reservations are enforced at runtime by a standalone hook process. This is not an OS sandbox.
 - **Every action leaves a trace.** Append-only event logs back every state change, so failures can be attributed.
 - **Sign ≠ merge.** Approving a slice never touches the branch. Merging is always explicit.
 - **Hotfix is explicit.** Skipping gate 2 requires `zelto run --hotfix --yes`, and everything else (write-set, audit, protected paths) still applies.
@@ -95,8 +100,9 @@ Protected paths are hard-coded outside policy reach, and `core/` has zero third-
 ## Status
 
 - **Pre-1.0.** CLI flags, config schema, and event format may change without migration.
-- **One executor today.** Claude Agent SDK. The policy/gate layer is harness-agnostic,
-  but claiming multi-agent support before the adapters exist would be a lie.
+- **Two executors, default included.** `claude-agent` (CLI spawn) is the default; `claude-agent-sdk`
+  is opt-in via `--adapter claude-agent-sdk`. The policy/gate layer is harness-agnostic,
+  but claiming more harnesses before the adapters exist would be a lie.
 - **Install from source.** Not on npm yet (`private: true`). Planned for 0.5.
 
 ## CLI reference
@@ -182,14 +188,14 @@ Key invariants:
 zelto/
 ├── src/
 │   ├── core/           slice state machine · policy · gate · sched · stall
-│   │                    clarify · events · audit · metrics · halt · ports
+│   │                    clarify · events · audit · metrics · halt · ports · review
 │   │                    (+ artifacts/budget/contracts/design/project/question
 │   │                     report/requirements/route/spec/version/worktree)
 │   ├── cli/            CLI implementation (`zelto help` is the source of truth)
 │   │   ├── commands/   slice/pipeline/governance/panoramic command groups
 │   │   └── policy/     policy CLI entry
 │   ├── hook/           standalone verdict process (git hooks / CI gate)
-│   ├── adapters/       executor adapters (Claude Agent SDK today)
+│   ├── adapters/       executor adapters (`claude-agent` default, `claude-agent-sdk` opt-in)
 │   └── llm/            passage B only: drafts and suggestions, never verdicts
 ├── contracts/schemas/  JSON Schema source of truth
 ├── policy/             policy.yaml + lock.json

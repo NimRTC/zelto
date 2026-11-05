@@ -265,6 +265,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Requirements Store** | `src/core/requirements/store.ts` | 需求文档持久化与状态 |
 | **Design Store** | `src/core/design/store.ts` | 设计文档与模块划分持久化 |
 | **Version Store** | `src/core/version/store.ts` | 版本计划持久化与版本状态 |
+| **Draft Review** | `src/core/review/` | 草稿评审：摘要 + 行级 diff + 决策点抽取 + 修订快照（ADR-023） |
 | **Project Scanner** | `src/core/project/scanner.ts` | 既有项目扫描，生成项目地图 |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
@@ -348,6 +349,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto dashboard [--watch] [--open]` | 生成项目看板 HTML | 全景 |
 | `zelto tasks` / `zelto task-status <id>` / `zelto wait <id>` | 后台任务查看与等待 | 通用 |
 | `zelto suggest` | 项目全貌与建议动作 | 通用 |
+| `zelto require\|design\|plan show <id> [--diff] [--full]` | 草稿评审：摘要 + 决策点 + 与上一版的差异（ADR-023） | 规划 |
 
 ### 3.3 独立 Hook
 
@@ -407,9 +409,13 @@ worktree 与写集预约都保留，**现场交回给人**。
 | 协调 | `coord.dep_added`, `coord.phase_ready`, `coord.phase_complete`, `coord.cycle_detected` |
 | 工件 | `artifact.conflict_detected` |
 | 版本 | `version.accepted`, `version.delivered` |
+| 草稿 | `draft.created`, `draft.revised`, `draft.confirmed` |
 
 **版本级事件**用 `version-<label>` 作归属键（版本不是切片，事件流按切片分目录），
 见 `docs/adr-017-version-level-orchestration.md`。
+
+**草稿级事件**用 `draft-<kind>-<id>` 作归属键（需求 / 设计 / 版本计划都不是切片），
+见 `docs/adr-023-planning-review-experience.md`。
 
 ---
 

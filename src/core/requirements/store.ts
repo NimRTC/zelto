@@ -54,7 +54,8 @@ export class RequirementStore {
   }
 
   private markdownToDoc(content: string): RequirementDoc {
-    const match = content.match(FRONTMATTER_REGEX);
+    // Windows 编辑器常带 BOM —— 去掉，否则 frontmatter 匹配不上
+    const match = content.replace(/^\uFEFF/, '').match(FRONTMATTER_REGEX);
     if (!match) throw new Error('Invalid requirement document format');
 
     const fmLines = match[1].split('\n');

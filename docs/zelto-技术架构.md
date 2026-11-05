@@ -381,9 +381,16 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 | `core/requirements/` | `.zelto/requirements/<id>.json` | 需求文档、验收标准、`draft → confirmed` |
 | `core/design/` | `.zelto/designs/<id>.json` | 设计正文、**模块划分**（name / files / deps）、`draft → confirmed` |
 | `core/version/` | `.zelto/versions/<id>.json` | 版本计划（versions / slices / dependsOn）、版本状态 |
+| `core/review/` | `.zelto/revisions/<kind>/<id>/*.json` | 草稿修订快照——refine 之前留一份，diff 才有得可对（ADR-023） |
 
 **版本状态机**：`planned → in_progress → integrated → delivered`
 （ADR-017 新增 `integrated` 中间态：版本级验收通过但尚未交付）。
+
+**草稿评审**（ADR-023）：`core/review/` 是纯计算层——
+`diff.ts`（行级 LCS diff）、`decision-points.ts`（决策点抽取）、
+`review.ts`（`buildDraftReview`）、`revisions.ts`（快照存储）。
+决策点按稳定 id 跨版本对齐，标出新增 / 移除 / 变更。
+判定不调模型、不触网（C3），快照只落在文件里（C1）。
 
 模块划分（`DesignDoc.modules`）目前是**文档级的**——
 它描述了模块边界，但还没有被编译期或门禁期校验。这是

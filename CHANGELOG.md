@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- Planning confirmation is now a review view instead of a wall of markdown:
+  `zelto require|design|plan show <id>` prints a summary, the **decision points**
+  (acceptance criteria, modules, module dependencies, versions, slices — each
+  marked added / removed / changed) and, with `--diff`, the change against the
+  previous revision; `--full` appends the body (ADR-023).
+- Draft revisions are snapshotted before every refine, so "what changed" is
+  always visible. Snapshots live in `.zelto/revisions/<kind>/<id>/`.
+- New event types `draft.created` / `draft.revised` / `draft.confirmed` —
+  changes to a requirement, design or version plan are now traceable.
+- `zelto pipeline status` lists the drafts that still need confirmation and
+  the exact command to review them.
 - LLM credentials can come from the environment instead of a file:
   `ZELTO_LLM_API_KEY` > `DEEPSEEK_API_KEY` > `llm.apiKey` in `.zelto/config.yaml`
   (ADR-022). `baseUrl` / `model` / `pricing` stay in the config file so the
@@ -11,6 +22,9 @@
   credentials before a commit; wired into CI as a gate
 
 ### Fixed
+- Files written with a UTF-8 BOM (common on Windows) no longer break requirement
+  / design / plan / revision parsing; `show` reports a readable error instead
+  of throwing a stack trace.
 - The Claude Agent SDK adapter now passes its `AbortController` to the SDK, so
   `stop()` and the timeout actually terminate the spawned Claude Code process.
   Previously the controller was created but never wired up, which left the child
