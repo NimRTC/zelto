@@ -267,7 +267,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Version Store** | `src/core/version/store.ts` | 版本计划持久化与版本状态 |
 | **Draft Review** | `src/core/review/` | 草稿评审：摘要 + 行级 diff + 决策点抽取 + 修订快照（ADR-023） |
 | **Project Scanner** | `src/core/project/scanner.ts` | 既有项目扫描，生成项目地图 |
-| **Architecture Scan** | `src/core/arch/` | 架构偏离检查：设计模块图 vs 实际 import 图，只读报告（G-4/B） |
+| **Architecture Scan** | `src/core/arch/` | 架构偏离检查：设计模块图 vs 实际 import 图；只读报告（G-4/B）+ policy 可配置护栏 `arch:`（G-4/A，ADR-027） |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
 
 ### 3.2 CLI 命令
@@ -351,7 +351,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto tasks` / `zelto task-status <id>` / `zelto wait <id>` | 后台任务查看与等待 | 通用 |
 | `zelto suggest` | 项目全貌与建议动作 | 通用 |
 | `zelto require\|design\|plan show <id> [--diff] [--full]` | 草稿评审：摘要 + 决策点 + 与上一版的差异（ADR-023） | 规划 |
-| `zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]` | 架构偏离检查：设计模块图 vs 实际 import 图（只读报告，`--strict` 有偏离时退出码 1） | 治理 |
+| `zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]` | 架构偏离检查：设计模块图 vs 实际 import 图（纯报告；`--strict` 按 `policy.yaml` 的 `arch:` 段定级，`deny` 类偏离时退出码 1，ADR-027） | 治理 |
 
 ### 3.3 独立 Hook
 

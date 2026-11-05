@@ -394,8 +394,8 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 
 模块划分（`DesignDoc.modules`）过去是**文档级**的——
 它描述了模块边界，但没有被校验过。现在 `core/arch/` 会拿它跟代码里实际的
-import 图比一遍，出**只读偏离报告**（`zelto arch check`，见 §3.18）。
-做成硬护栏（门禁期拦截）仍待做，那是 G-4/A。
+import 图比一遍，出偏离报告（`zelto arch check`，见 §3.18），
+再按 `policy.yaml` 的 `arch:` 段定级成护栏结论（G-4/A，ADR-027）。
 
 ### 3.15 编排层 — `src/core/worktree/` / `question/` / `sched/`
 
@@ -445,7 +445,7 @@ import 图比一遍，出**只读偏离报告**（`zelto arch check`，见 §3.1
 ### 3.18 架构偏离检查 — `src/core/arch/`
 
 **文件**: `imports.ts`（import 解析）、`scan.ts`（扫描与归属）、`report.ts`（比对出偏离）、
-`types.ts`
+`guard.ts`（按 `arch:` 段定级，ADR-027）、`types.ts`
 
 **职责**：把「设计里画的模块图」和「代码里实际的 import 图」摆在一起比，
 差出来的东西就是**架构腐化的证据**。
@@ -495,11 +495,12 @@ scope(A) 与 scope(B) 有交集的边算**内部边**——它只是组与成员
 - 设计声明先归一化——反引号、「无」类占位词、`无（仅定义类型和接口）` 这类写法
   不该变成假偏离
 
-**只报告、不拦**（G-4/B）：偏离是给人看的证据，不是判定。
-要做成硬护栏是 G-4/A——要扩展 policy 契约，届时另写 ADR。
+**报告层**（G-4/B）：偏离是给人看的证据；**护栏层**（G-4/A，ADR-027）
+按 `policy.yaml` 的 `arch:` 段给六类硬偏离定级（`deny` / `ask` / `allow`）。
 
 CLI 入口：`zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]`。
-`--strict` 在有偏离时返回退出码 1（给 CI 用），默认只报告不拦人。
+不带 `--strict` 时纯报告（退出码恒 0，不读配置）；`--strict` 按护栏配置重算结论，
+有 `deny` 类偏离时返回退出码 1（给 CI 用）。
 
 ---
 
@@ -736,10 +737,13 @@ agent 写文件
 
 - `imports.ts` —— 正则抽 import 说明符，分相对 / 包 / 内置三类
 - `scan.ts` —— 扫源码、算文件归属、算模块间的实际依赖边
-- `report.ts` —— 拿设计与实际比，产出偏离列表与依赖环
+- `report.ts` —— 拿设计与实际比，产出偏离列表与依赖环（只报告，不定结论）
+- `guard.ts` —— 按 `policy.yaml` 的 `arch:` 段给六类硬偏离定级（G-4/A，ADR-027；
+  `deny` 拦、`ask` 只待确认、`allow` 不计入结论；缺段时全按 `deny`，与旧 `--strict` 一致）
 
-这一层**只报告、不拦**。要做成硬护栏是 G-4/A——
-那要扩展 policy 契约（让模块依赖方向成为可配置规则），需另写 ADR。
+报告层只出证据，护栏层只算结论：`arch check --strict`（整图结论定退出码）、
+`version deliver`（整图结论作交付门）、`batch` 准入与单片 `gate`
+（只看与本片写集相关的偏离）四处执行点共用 `cli/commands/arch-guard.ts` 的接线层。
 
 ### 8.2 版本内依赖分层（G-1）——已落地
 
