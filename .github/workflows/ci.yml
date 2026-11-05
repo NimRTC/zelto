@@ -44,7 +44,17 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Credential scan
-        run: pnpm check:credentials
+        env:
+          # 私有名单（公司域名、私有 token 前缀等）不入库，放在 GitHub Secret 里，
+          # 加密存储。仓库内只保留通用形态；这里在跑扫描前临时还原成本地名单文件，
+          # 让 CI 也能拦下「专有标识误入版本库」。
+          ZELTO_CREDENTIAL_PATTERNS: ${{ secrets.ZELTO_CREDENTIAL_PATTERNS }}
+        run: |
+          if [ -n "$ZELTO_CREDENTIAL_PATTERNS" ]; then
+            mkdir -p .zelto
+            printf '%s' "$ZELTO_CREDENTIAL_PATTERNS" > .zelto/credential-patterns.local.json
+          fi
+          pnpm check:credentials
 
       - run: pnpm build
 
