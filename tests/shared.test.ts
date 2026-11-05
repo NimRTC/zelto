@@ -12,6 +12,8 @@ import {
   generateSliceSpecContent,
   hashSpecFile,
   resolveApiKey,
+  parseEnvRef,
+  expandConfigEnvRefs,
 } from '../src/cli/commands/shared.js';
 
 // ─── parseConfigYaml ──────────────────────────────────────────────────────
@@ -419,5 +421,81 @@ gate:
     const result = parseConfigYaml(yaml);
     assert.ok(result !== null);
     assert.equal(result.llm, undefined);
+  });
+});
+
+// ─── `${VAR}` 环境变量引用（ADR-026） ─────────────────────────────────────
+
+describe('parseEnvRef', () => {
+  it('parses a whole-value reference', () => {
+    assert.equal(parseEnvRef('${NIMRTC_LLM_API_KEY}'), 'NIMRTC_LLM_API_KEY');
+    assert.equal(parseEnvRef('  ${FOO}  '), 'FOO');
+    assert.equal(parseEnvRef('${_private1}'), '_private1');
+  });
+
+  it('does not parse partial or malformed references', () => {
+    assert.equal(parseEnvRef('prefix-${FOO}'), null);
+    assert.equal(parseEnvRef('${FOO}-suffix'), null);
+    assert.equal(parseEnvRef('${1FOO}'), null);
+    assert.equal(parseEnvRef('${FOO BAR}'), null);
+    assert.equal(parseEnvRef('sk-plain-key'), null);
+  });
+});
+
+describe('expandConfigEnvRefs', () => {
+  const base = {
+    gate: { commands: [], timeoutSec: 120, retry: { max: 2 } },
+    agent: { command: 'npx claude-code' },
+  };
+
+  it('replaces a reference with the environment value', () => {
+    const cfg = {
+      ...base,
+      llm: { provider: 'deepseek', apiKey: '${NIMRTC_LLM_API_KEY}', model: 'm' },
+    };
+    const result = expandConfigEnvRefs(cfg, { NIMRTC_LLM_API_KEY: 'sk-from-env' });
+    assert.equal(result.llm?.apiKey, 'sk-from-env');
+  });
+
+  it('resolves an unset reference to "no key" rather than the literal text', () => {
+    const cfg = {
+      ...base,
+      llm: { provider: 'deepseek', apiKey: '${NIMRTC_LLM_API_KEY}', model: 'm' },
+    };
+    const result = expandConfigEnvRefs(cfg, {});
+    assert.equal(result.llm?.apiKey, '');
+    assert.notEqual(result.llm?.apiKey, '${NIMRTC_LLM_API_KEY}');
+  });
+
+  it('leaves a plaintext key untouched', () => {
+    const cfg = { ...base, llm: { provider: 'deepseek', apiKey: 'sk-plain' } };
+    const result = expandConfigEnvRefs(cfg, { NIMRTC_LLM_API_KEY: 'sk-from-env' });
+    assert.equal(result.llm?.apiKey, 'sk-plain');
+  });
+
+  it('leaves a partial reference untouched', () => {
+    const cfg = { ...base, llm: { provider: 'deepseek', apiKey: 'prefix-${FOO}' } };
+    const result = expandConfigEnvRefs(cfg, { FOO: 'bar' });
+    assert.equal(result.llm?.apiKey, 'prefix-${FOO}');
+  });
+
+  it('does not expand baseUrl or model', () => {
+    const cfg = {
+      ...base,
+      llm: { provider: 'deepseek', apiKey: 'sk-plain', baseUrl: '${HOST}', model: '${MODEL}' },
+    };
+    const result = expandConfigEnvRefs(cfg, { HOST: 'example.com', MODEL: 'm1' });
+    assert.equal(result.llm?.baseUrl, '${HOST}');
+    assert.equal(result.llm?.model, '${MODEL}');
+  });
+
+  it('does not expand gate commands (the shell does that)', () => {
+    const cfg = {
+      ...base,
+      gate: { commands: [{ name: 'test', run: 'pnpm ${PROFILE}' }], timeoutSec: 120, retry: { max: 2 } },
+      llm: { provider: 'deepseek', apiKey: 'sk-plain' },
+    };
+    const result = expandConfigEnvRefs(cfg, { PROFILE: 'fast' });
+    assert.equal(result.gate.commands[0].run, 'pnpm ${PROFILE}');
   });
 });

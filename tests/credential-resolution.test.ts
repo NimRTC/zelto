@@ -141,3 +141,82 @@ gate:
     assert.equal(cfg.llm!.apiKey, 'sk-from-env');
   });
 });
+
+// ─── `${VAR}` 环境变量引用（ADR-026） ─────────────────────────────────────
+
+describe('loadConfig — environment variable references (ADR-026)', () => {
+  const originalCwd = process.cwd();
+  const originalRef = process.env.NIMRTC_LLM_API_KEY;
+  const originalZelto = process.env.ZELTO_LLM_API_KEY;
+  const originalDeepseek = process.env.DEEPSEEK_API_KEY;
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'zelto-envref-'));
+    process.chdir(dir);
+    delete process.env.NIMRTC_LLM_API_KEY;
+    delete process.env.ZELTO_LLM_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    rmSync(dir, { recursive: true, force: true });
+    for (const [name, value] of [
+      ['NIMRTC_LLM_API_KEY', originalRef],
+      ['ZELTO_LLM_API_KEY', originalZelto],
+      ['DEEPSEEK_API_KEY', originalDeepseek],
+    ] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+
+  function writeConfig(content: string): void {
+    mkdirSync(join(dir, '.zelto'), { recursive: true });
+    writeFileSync(join(dir, '.zelto', 'config.yaml'), content, 'utf-8');
+  }
+
+  it('reads the key from the referenced environment variable', () => {
+    writeConfig(`
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  provider: "deepseek"
+  apiKey: "\${NIMRTC_LLM_API_KEY}"
+  baseUrl: "https://api.example.com"
+`);
+    process.env.NIMRTC_LLM_API_KEY = 'sk-from-nimrtc';
+    const cfg = loadConfig();
+    assert.equal(cfg.llm?.apiKey, 'sk-from-nimrtc');
+    // 非密钥字段不受影响
+    assert.equal(cfg.llm?.baseUrl, 'https://api.example.com');
+  });
+
+  it('treats an unset reference as no key, not as a literal token', () => {
+    writeConfig(`
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  provider: "deepseek"
+  apiKey: "\${NIMRTC_LLM_API_KEY}"
+`);
+    const cfg = loadConfig();
+    assert.equal(cfg.llm?.apiKey, '');
+    assert.notEqual(cfg.llm?.apiKey, '${NIMRTC_LLM_API_KEY}');
+  });
+
+  it('keeps the ADR-022 priority: ZELTO_LLM_API_KEY still wins over the reference', () => {
+    writeConfig(`
+gate:
+  - { name: test, run: "pnpm test" }
+llm:
+  provider: "deepseek"
+  apiKey: "\${NIMRTC_LLM_API_KEY}"
+`);
+    process.env.NIMRTC_LLM_API_KEY = 'sk-from-nimrtc';
+    process.env.ZELTO_LLM_API_KEY = 'sk-from-zelto';
+    const cfg = loadConfig();
+    assert.equal(cfg.llm?.apiKey, 'sk-from-zelto');
+  });
+});

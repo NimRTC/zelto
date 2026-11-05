@@ -170,6 +170,55 @@ export function resolveApiKey(
   return fromConfig ? fromConfig : undefined;
 }
 
+/**
+ * Parse an environment-variable reference of the form `${NAME}` (ADR-026).
+ *
+ * Only whole-value references count: `"${FOO}"` parses, `"prefix-${FOO}"`
+ * does not. Partial expansion would silently produce half a credential when
+ * the variable is unset — harder to diagnose than not expanding at all.
+ *
+ * Returns the variable name, or null when the value is not a reference.
+ */
+export function parseEnvRef(value: string): string | null {
+  const m = value.trim().match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Expand `${VAR}` references in `llm.apiKey` (ADR-026).
+ *
+ * Only the API key is expanded. `llm.baseUrl` / `llm.model` / `llm.pricing`
+ * are configuration, not secrets — they stay in the file so the project
+ * remains reproducible (ADR-022). `gate.commands[].run` is handed to the
+ * shell, which does its own variable substitution; expanding here would
+ * change the command's meaning.
+ *
+ * A reference to an unset variable resolves to "no key" rather than to the
+ * literal text — sending `${NIMRTC_LLM_API_KEY}` as a bearer token would
+ * fail with an opaque 401 that points at the wrong thing.
+ */
+export function expandConfigEnvRefs(
+  config: ZeltoConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): ZeltoConfig {
+  const llm = config.llm;
+  if (!llm?.apiKey) return config;
+
+  const name = parseEnvRef(llm.apiKey);
+  if (!name) return config;
+
+  const resolved = env[name]?.trim();
+  if (!resolved) {
+    console.warn(
+      `  ⚠️  Config: llm.apiKey references environment variable ${name}, but it is not set.`,
+    );
+    console.warn('      The LLM path (clarify / spec / stall) will be unavailable.');
+    return { ...config, llm: { ...llm, apiKey: '' } };
+  }
+
+  return { ...config, llm: { ...llm, apiKey: resolved } };
+}
+
 export function loadConfig(): ZeltoConfig {
   const configPath = join(ZELTO_DIR, 'config.yaml');
   const defaultConfig: ZeltoConfig = {
@@ -193,14 +242,18 @@ export function loadConfig(): ZeltoConfig {
     const content = readFileSync(configPath, 'utf-8');
     const parsed = parseConfigYaml(content);
     if (parsed) {
-      // Validate config and warn about common issues
-      validateConfig(parsed);
-      return withEnvApiKey({
+      const assembled: ZeltoConfig = {
         gate: parsed.gate,
         agent: parsed.agent ?? defaultConfig.agent,
         llm: parsed.llm,
         targetProject: parsed.targetProject,
-      });
+      };
+      // Expand `${VAR}` references before validating — the placeholder check
+      // has to see the real value (ADR-026).
+      const expanded = expandConfigEnvRefs(assembled);
+      // Validate config and warn about common issues
+      validateConfig(expanded);
+      return withEnvApiKey(expanded);
     }
     return withEnvApiKey(defaultConfig);
   } catch {
