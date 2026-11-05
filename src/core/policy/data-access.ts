@@ -10,8 +10,10 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { parsePolicyYaml } from './yaml.js';
 import { serializeRulesToYaml } from './yaml-writer.js';
 import type { RuleData } from './yaml-writer.js';
+import type { ArchGuardRule } from './types.js';
 
 export interface PolicyRuleEntry {
   id: string;
@@ -25,6 +27,7 @@ export interface PolicyRuleEntry {
 
 export interface PolicyData {
   rules: PolicyRuleEntry[];
+  arch?: ArchGuardRule[];
   path: string;
   version: string;
 }
@@ -32,6 +35,7 @@ export interface PolicyData {
 /**
  * Load policy rules from policy.yaml.
  * Returns null if the file doesn't exist or can't be parsed.
+ * Uses the single parser (core/policy/yaml.ts) so `arch:` survives.
  */
 export function loadPolicy(projectRoot?: string): PolicyData | null {
   const root = projectRoot ?? process.cwd();
@@ -43,9 +47,10 @@ export function loadPolicy(projectRoot?: string): PolicyData | null {
 
   try {
     const content = readFileSync(policyPath, 'utf-8');
-    const rules = parsePolicyYamlSimple(content);
+    const parsed = parsePolicyYaml(content);
     return {
-      rules,
+      rules: parsed.rules as unknown as PolicyRuleEntry[],
+      ...(parsed.arch ? { arch: parsed.arch } : {}),
       path: policyPath,
       version: `sha256:${hashContent(content)}`,
     };
@@ -89,11 +94,13 @@ export function addRule(
   const yamlContent = serializeRulesToYaml(
     current.rules as RuleData[],
     headerComment,
+    current.arch,
   );
   writeFileSync(policyPath, yamlContent, 'utf-8');
 
   return {
     rules: current.rules,
+    ...(current.arch ? { arch: current.arch } : {}),
     path: policyPath,
     version: `sha256:${hashContent(yamlContent)}`,
   };
@@ -133,100 +140,19 @@ export function removeRule(
   const yamlContent = serializeRulesToYaml(
     filtered as RuleData[],
     headerComment,
+    current.arch,
   );
   writeFileSync(policyPath, yamlContent, 'utf-8');
 
   return {
     rules: filtered,
+    ...(current.arch ? { arch: current.arch } : {}),
     path: policyPath,
     version: `sha256:${hashContent(yamlContent)}`,
   };
 }
 
-/**
- * Simple policy YAML parser — extracts rule entries.
- * Compatible with the format produced by `zelto init` and consumed by hook/.
- */
-function parsePolicyYamlSimple(content: string): PolicyRuleEntry[] {
-  const rules: PolicyRuleEntry[] = [];
-  let current: Partial<PolicyRuleEntry> | null = null;
-
-  const lines = content.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#') || trimmed === '') continue;
-
-    // Start of a rule
-    if (trimmed.startsWith('- id:')) {
-      if (current?.id) {
-        rules.push(current as PolicyRuleEntry);
-      }
-      current = { id: trimmed.slice(5).trim() };
-      continue;
-    }
-
-    if (!current) continue;
-
-    // match: { path: "...", operation: "..." }
-    const matchInline = trimmed.match(
-      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
-    );
-    if (matchInline) {
-      current.match = {
-        path: matchInline[1],
-        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('path:')) {
-      current.match = {
-        ...current.match,
-        path: trimmed.slice(5).trim().replace(/^"|"$/g, ''),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('operation:')) {
-      current.match = {
-        ...current.match,
-        operation: trimmed.slice(10).trim().replace(/^"|"$/g, ''),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('action:')) {
-      current.action = trimmed.slice(7).trim();
-      continue;
-    }
-
-    if (trimmed.startsWith('basis:')) {
-      current.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-
-    if (trimmed.startsWith('guidance:')) {
-      current.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-
-    if (trimmed.startsWith('description:')) {
-      current.description = trimmed.slice(12).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-
-    if (trimmed.startsWith('priority:')) {
-      current.priority = Number.parseInt(trimmed.slice(9).trim(), 10);
-      continue;
-    }
-  }
-
-  if (current?.id) {
-    rules.push(current as PolicyRuleEntry);
-  }
-
-  return rules;
-}
+/** 旧的独立解析器已删除 —— 统一用 core/policy/yaml.ts 的 parsePolicyYaml。 */
 
 function hashContent(content: string): string {
   // Simple hash for versioning — not cryptographic, just for change detection

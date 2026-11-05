@@ -33,6 +33,30 @@
       "type": "array",
       "items": { "type": "string" },
       "description": "Additional protected paths beyond the built-in defaults"
+    },
+    "arch": {
+      "type": "array",
+      "description": "Architecture guard rules (ADR-027): per hard-deviation-kind actions",
+      "items": {
+        "type": "object",
+        "required": ["kind", "action", "basis"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "missing_dependency",
+              "undeclared_dependency",
+              "ambiguous_module",
+              "unmapped_file",
+              "unknown_module",
+              "cycle"
+            ]
+          },
+          "action": { "type": "string", "enum": ["allow", "deny", "ask"] },
+          "basis": { "type": "string" },
+          "guidance": { "type": "string" }
+        }
+      }
     }
   }
 }

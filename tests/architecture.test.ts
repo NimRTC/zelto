@@ -309,6 +309,37 @@ function runCli(cwd: string, ...args: string[]): Promise<{ stdout: string; stder
 describe('zelto arch check', () => {
   let testDir: string;
 
+  /** 带 policy.yaml 的 CLI 沙盒（护栏配置行为用；设计与源码与 testDir 同构） */
+  async function makeGuardCliDir(policyYaml: string): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'zelto-arch-guard-cli-'));
+    await mkdir(join(dir, '.zelto', 'design'), { recursive: true });
+    await mkdir(join(dir, 'src', 'a'), { recursive: true });
+    await mkdir(join(dir, 'src', 'b'), { recursive: true });
+    await mkdir(join(dir, 'policy'), { recursive: true });
+    await writeFile(join(dir, 'src', 'a', 'index.ts'), "import { b } from '../b';\n", 'utf-8');
+    await writeFile(join(dir, 'src', 'b', 'index.ts'), 'export const b = 1;\n', 'utf-8');
+    await writeFile(
+      join(dir, '.zelto', 'design', 'dsg-test.json'),
+      JSON.stringify({
+        id: 'dsg-test',
+        requirementId: 'req-test',
+        title: '测试设计',
+        body: '',
+        modules: [
+          { name: 'a', description: '', filePatterns: ['src/a/**'], dependencies: [] },
+          { name: 'b', description: '', filePatterns: ['src/b/**'], dependencies: [] },
+        ],
+        status: 'confirmed',
+        supersedes: null,
+        createdAt: new Date().toISOString(),
+        confirmedAt: new Date().toISOString(),
+      }, null, 2),
+      'utf-8',
+    );
+    await writeFile(join(dir, 'policy', 'policy.yaml'), policyYaml, 'utf-8');
+    return dir;
+  }
+
   before(async () => {
     testDir = await mkdtemp(join(tmpdir(), 'zelto-arch-cli-'));
     await mkdir(join(testDir, '.zelto', 'design'), { recursive: true });
@@ -352,6 +383,56 @@ describe('zelto arch check', () => {
   it('--strict 时有偏离就返回 1', async () => {
     const { code } = await runCli(testDir, 'arch', 'check', '--strict');
     assert.equal(code, 1);
+  });
+
+  it('--strict 读 arch 段：ask 只待确认、不拦（退出码 0）', async () => {
+    const dir = await makeGuardCliDir(`rules:
+  - id: allow-src
+    match: { path: "src/**", operation: "write" }
+    action: allow
+    basis: "test"
+arch:
+  - kind: undeclared_dependency
+    action: ask
+    basis: "policy.yaml#test"
+`);
+    try {
+      const { stdout, code } = await runCli(dir, 'arch', 'check', '--strict');
+      assert.equal(code, 0);
+      assert.ok(stdout.includes('待人确认') || stdout.includes('待确认'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--strict 读 arch 段：allow 不计入结论但报告证据仍在', async () => {
+    const dir = await makeGuardCliDir(`rules:
+  - id: allow-src
+    match: { path: "src/**", operation: "write" }
+    action: allow
+    basis: "test"
+arch:
+  - kind: undeclared_dependency
+    action: allow
+    basis: "policy.yaml#test"
+`);
+    try {
+      const { stdout, code } = await runCli(dir, 'arch', 'check', '--strict');
+      assert.equal(code, 0);
+      assert.ok(stdout.includes('未声明依赖'));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--strict --json 带 guard 结论且原 report 保留', async () => {
+    const { stdout, code } = await runCli(testDir, 'arch', 'check', '--strict', '--json');
+    assert.equal(code, 1);
+    const parsed = JSON.parse(stdout);
+    assert.ok(Array.isArray(parsed.report.deviations));
+    assert.equal(typeof parsed.guard.blocked, 'boolean');
+    assert.equal(parsed.guard.blocked, true);
+    assert.ok(Array.isArray(parsed.guard.perKind));
   });
 
   it('--json 给出结构化结果', async () => {

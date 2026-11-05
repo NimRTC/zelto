@@ -28,6 +28,24 @@ export interface PolicyRule {
 export interface PolicyConfig {
   rules: PolicyRule[];
   protected: string[];
+  arch?: ArchGuardRule[];
+}
+
+/** 架构护栏可配的硬偏离种类（软偏离 unverifiable_dependency 不可配） */
+export type ArchDeviationKind =
+  | 'missing_dependency'
+  | 'undeclared_dependency'
+  | 'ambiguous_module'
+  | 'unmapped_file'
+  | 'unknown_module'
+  | 'cycle';
+
+/** policy.yaml `arch:` 段的一条护栏规则 */
+export interface ArchGuardRule {
+  kind: ArchDeviationKind;
+  action: Decision;
+  basis: string;
+  guidance?: string;
 }
 
 export interface Anchor {

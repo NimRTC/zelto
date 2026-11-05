@@ -575,14 +575,31 @@ function loadRules(projectRoot: string): { rules: PreToolContext['rules']; versi
   return { rules, version };
 }
 
-/** 解析 policy.yaml 的 rules 段（与 core/policy/yaml.ts 同一套行内语法）。 */
+/** 解析 policy.yaml 的 rules 段（与 core/policy/yaml.ts 同一套行内语法）。
+ * `arch:` 段直接忽略 —— 逐写判定只看写规则（ADR-027 §2.3），
+ * 不跳过的话里面的 `action:` 会贴到最后一条 rule 上造成污染。 */
 export function parsePolicyRules(content: string): NonNullable<PreToolContext['rules']> {
   const rules: NonNullable<PreToolContext['rules']> = [];
   let current: Record<string, unknown> | null = null;
+  let inArch = false;
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (trimmed.startsWith('#') || trimmed === '') continue;
+
+    if (trimmed === 'arch:') {
+      if (current?.id) {
+        rules.push(current as never);
+        current = null;
+      }
+      inArch = true;
+      continue;
+    }
+    if (trimmed === 'rules:') {
+      inArch = false;
+      continue;
+    }
+    if (inArch) continue;
 
     if (trimmed.startsWith('- id:')) {
       if (current?.id) rules.push(current as never);

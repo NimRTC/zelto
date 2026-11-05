@@ -2,14 +2,14 @@
  * yaml-writer.ts — Serialize policy rules to YAML format and write to disk
  *
  * Handles the YAML serialization side of policy data access.
- * Produces output compatible with parsePolicyYamlSimple() in data-access.ts
- * and parsePolicyYaml() in cli/commands/shared.ts.
+ * Produces output compatible with parsePolicyYaml() in core/policy/yaml.ts.
  *
  * C2: core/ does not depend on any SDK or adapters/
  * C3: deterministic — no model calls, no network
  */
 
 import { writeFileSync } from 'node:fs';
+import type { ArchGuardRule } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,9 +48,10 @@ export interface RuleData {
  *
  * @param rules - Rules to serialize
  * @param headerComment - Optional header comment block (lines starting with #)
+ * @param arch - Optional arch guard rules (ADR-027); appended as top-level `arch:` so round-trips preserve it
  * @returns YAML string with trailing newline
  */
-export function serializeRulesToYaml(rules: RuleData[], headerComment?: string): string {
+export function serializeRulesToYaml(rules: RuleData[], headerComment?: string, arch?: ArchGuardRule[]): string {
   const lines: string[] = [];
 
   if (headerComment) {
@@ -91,6 +92,20 @@ export function serializeRulesToYaml(rules: RuleData[], headerComment?: string):
     }
     if (rule.description !== undefined && rule.description !== null) {
       lines.push(`    description: "${rule.description}"`);
+    }
+  }
+
+  // ADR-027: preserve arch guard rules on round-trip (addRule/removeRule must not drop them)
+  if (arch && arch.length > 0) {
+    lines.push('');
+    lines.push('arch:');
+    for (const g of arch) {
+      lines.push(`  - kind: ${g.kind}`);
+      lines.push(`    action: ${g.action}`);
+      lines.push(`    basis: "${g.basis}"`);
+      if (g.guidance !== undefined && g.guidance !== null) {
+        lines.push(`    guidance: "${g.guidance}"`);
+      }
     }
   }
 

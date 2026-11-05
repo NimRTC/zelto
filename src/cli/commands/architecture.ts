@@ -1,4 +1,4 @@
-// 架构偏离检查（G-4/B）—— 只读报告
+// 架构偏离检查（G-4/B 报告 + ADR-027 护栏结论）
 //
 // `zelto arch check` 把两样东西摆在一起比：
 //   设计里的模块图（DesignDoc.modules 的依赖声明）
@@ -12,7 +12,9 @@
 //   文件无归属 —— 有文件没有任何模块认领
 //   依赖成环   —— 模块边界已经烂了
 //
-// 这一层**只报告、不拦**。要变成硬护栏是 G-4/A（要改 policy 契约，另写 ADR）。
+// 不带 `--strict` 时是纯报告（退出码恒 0，不读配置）。
+// 带 `--strict` 时按 policy.yaml 的 `arch:` 段重算结论（ADR-027）：
+// 缺段时全按 deny，与旧的 `!report.ok` 一致。
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -22,13 +24,17 @@ import { DesignStore } from '../../core/design/store.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import {
   buildArchitectureReport,
+  buildArchRelaxSnippet,
+  judgeArchGuard,
   scanArchitecture,
   type ArchitectureReport,
   type Deviation,
+  type GuardRule,
+  type GuardVerdict,
   type ModuleSpec,
 } from '../../core/arch/index.js';
 import { register } from './shared.js';
-import { ZELTO_DIR } from './shared.js';
+import { loadPolicyConfig, ZELTO_DIR } from './shared.js';
 
 interface ArchOptions {
   designId?: string;
@@ -118,7 +124,7 @@ function groupUnmapped(deviations: Deviation[]): Map<string, string[]> {
   return groups;
 }
 
-function renderReport(report: ArchitectureReport, design: DesignDoc): string {
+function renderReport(report: ArchitectureReport, design: DesignDoc, guard?: GuardVerdict, guardRules?: GuardRule[]): string {
   const out: string[] = [];
   out.push('');
   out.push(`  ${colors.bold(colors.cyan('架构偏离检查'))} ${colors.dim('（只读报告，不拦人）')}`);
@@ -187,6 +193,42 @@ function renderReport(report: ArchitectureReport, design: DesignDoc): string {
     }
   }
 
+  // ─── 护栏结论（仅 --strict 时传入）────────────────────────────────────
+  if (guard) {
+    out.push('');
+    const pending = guard.perKind.filter((k) => k.needsConfirm && k.count > 0);
+    const blocked = guard.perKind.filter((k) => k.blocked);
+    const ignored = guard.perKind.filter((k) => k.action === 'allow' && k.count > 0);
+    if (!guard.blocked && pending.length === 0) {
+      out.push(`  ${colors.green('✔ 护栏通过')} —— 按 policy.yaml 的 arch 段重算，无需拦截`);
+    } else {
+      if (blocked.length > 0) {
+        out.push(`  ${colors.red(colors.bold(`护栏拦截 (${blocked.reduce((s, k) => s + k.count, 0)})`))}`);
+        for (const k of blocked) {
+          out.push(`    ${colors.red('●')} ${(DEVIATION_LABEL[k.kind] ?? k.kind).padEnd(8)} ${k.count} 处 · deny`);
+        }
+      }
+      if (pending.length > 0) {
+        out.push(`  ${colors.yellow(colors.bold(`待人确认 (${pending.reduce((s, k) => s + k.count, 0)})`))} ${colors.dim('不拦，只标注')}`);
+        for (const k of pending) {
+          out.push(`    ${colors.yellow('●')} ${(DEVIATION_LABEL[k.kind] ?? k.kind).padEnd(8)} ${k.count} 处 · ask`);
+        }
+      }
+      if (ignored.length > 0) {
+        out.push(`  ${colors.dim(`已忽略 (${ignored.reduce((s, k) => s + k.count, 0)}) · allow，证据仍在报告里`)}`);
+      }
+    }
+    // Q1 省力放开：给出可复制的 arch 片段（按当前已配规则重算，只给还会被拦的种类）
+    const snippet = buildArchRelaxSnippet(report, guardRules);
+    if (snippet) {
+      out.push('');
+      out.push(`  ${colors.dim('原型期放开（复制进 policy.yaml，交付前收紧为 deny）：')}`);
+      for (const line of snippet.split('\n')) {
+        out.push(`  ${colors.dim(line)}`);
+      }
+    }
+  }
+
   out.push('');
   return out.join('\n');
 }
@@ -219,9 +261,15 @@ register('arch', async (args) => {
   const scan = scanArchitecture(options.root, specs);
   const report = buildArchitectureReport(specs, scan);
 
+  // ADR-027: --strict 才读护栏配置（纯报告模式不读，保证退出码恒 0）
+  // 策略读进程 cwd（项目根），与设计同根；--root 只影响源码扫描目录。
+  const guardRules = options.strict ? loadPolicyConfig().arch : undefined;
+  const guard = options.strict ? judgeArchGuard(report, guardRules) : undefined;
+
   const payload = {
     design: { id: design.id, title: design.title },
     report,
+    ...(guard ? { guard } : {}),
   };
 
   if (options.json || f.getFormat() === OutputFormat.JSON) {
@@ -230,8 +278,8 @@ register('arch', async (args) => {
   } else if (f.getFormat() === OutputFormat.YAML) {
     f.data(payload);
   } else {
-    process.stdout.write(renderReport(report, design) + '\n');
+    process.stdout.write(renderReport(report, design, guard, guardRules) + '\n');
   }
 
-  return options.strict && !report.ok ? 1 : 0;
+  return options.strict ? (guard && guard.blocked ? 1 : 0) : 0;
 });

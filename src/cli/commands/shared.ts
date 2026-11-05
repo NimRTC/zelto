@@ -44,8 +44,8 @@ export function register(name: string, fn: Command) {
 
 // ─── Policy Config ───────────────────────────────────────────────────────────
 
-export function loadPolicyConfig(): PolicyConfig {
-  const policyPath = join('policy', 'policy.yaml');
+export function loadPolicyConfig(root?: string): PolicyConfig {
+  const policyPath = join(root ?? process.cwd(), 'policy', 'policy.yaml');
   if (existsSync(policyPath)) {
     try {
       const content = readFileSync(policyPath, 'utf-8');
@@ -54,6 +54,7 @@ export function loadPolicyConfig(): PolicyConfig {
         return {
           rules: parsed.rules,
           protected: ['policy/**', '.zelto/**', 'AGENTS.md', '.cursor/rules/**'],
+          ...(parsed.arch ? { arch: parsed.arch } : {}),
         };
       }
     } catch {

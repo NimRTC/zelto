@@ -17,6 +17,7 @@ import type { GateConfig } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
+import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
 
 /**
  * Detect common source directories for default write-set.
@@ -140,6 +141,25 @@ export async function autoGateAfterRun(id: string): Promise<void> {
   // Gate runs inside the slice's worktree so it validates the agent's actual output
   const manager = worktreeManager();
   const gateRoot = manager.exists(id) ? manager.pathFor(id) : process.cwd();
+
+  // ── 架构护栏（切片级，ADR-027 Q2）────────────────────────────────
+  // 与 `zelto gate` 同一口径：只看与本片写集相关的偏离，无设计时跳过。
+  // 拦下时不进门禁、不改状态 —— 等人修好或改 policy 后重跑。
+  try {
+    const slice = await store.read(id);
+    const sliceGuard = await checkSliceGateGuard(slice.writes, { scanRoot: gateRoot });
+    if (sliceGuard?.verdict.blocked) {
+      console.log(`  Arch:     ❌ 架构护栏拦截：${describeGuardKinds(sliceGuard.verdict, 'blocked')}`);
+      console.log(`  Design:   ${sliceGuard.designId}`);
+      console.log('  修好偏离或改 policy.yaml 的 arch 段后重跑门禁。');
+      return;
+    }
+    if (sliceGuard?.verdict.needsConfirm) {
+      console.log(`  Arch:     ⚠️  待确认（不拦）：${describeGuardKinds(sliceGuard.verdict, 'pending')}`);
+    }
+  } catch {
+    // 读不到切片或扫不到图就不拦 —— 门禁自己的命令会给出结论
+  }
 
   const executor = new GateExecutor(store, events, gateConfig, gateRoot);
   console.log(`\n  Auto-running gate②...`);

@@ -17,6 +17,7 @@
 import { reviewBatch, planExecutionPhases, evaluateBatchConflicts, groupIssues } from '../../core/sched/batch.js';
 import type { BatchIssue, BatchMember } from '../../core/sched/batch.js';
 import { readDependencies, readEffectiveWriteSet, readSliceFacts } from './batch-facts.js';
+import { loadWholeGraphGuard, sliceGuardForWrites, sliceGuardIssue } from './arch-guard.js';
 import { register } from './shared.js';
 
 register('batch', async (args) => {
@@ -59,7 +60,21 @@ register('batch', async (args) => {
   const plan = planExecutionPhases(members, deps);
   const phases = plan.cycle ? [] : plan.phases;
   const conflicts = evaluateBatchConflicts(members, phases);
-  const allIssues: BatchIssue[] = [...review.issues, ...conflicts];
+
+  // ── 架构护栏（切片级：只看与本片写集相关的偏离，ADR-027 Q2）──────
+  // 整图只扫一次，逐片按写集过滤。无关模块的漂移不拦干净切片。
+  // 无确认设计时跳过（老项目无感）。batch 是只读命令，不写事件。
+  const archIssues: BatchIssue[] = [];
+  const archCtx = await loadWholeGraphGuard();
+  if (archCtx) {
+    for (const m of members) {
+      const { verdict } = sliceGuardForWrites(archCtx, m.writes);
+      const issue = sliceGuardIssue(m.id, verdict);
+      if (issue) archIssues.push(issue);
+    }
+  }
+
+  const allIssues: BatchIssue[] = [...review.issues, ...conflicts, ...archIssues];
   if (plan.cycle) {
     allIssues.push({
       sliceId: null,
@@ -99,7 +114,7 @@ register('batch', async (args) => {
 
   console.log('准入检查：');
   for (const m of members) {
-    const sliceIssues = review.issues.filter((i) => i.sliceId === m.id);
+    const sliceIssues = allIssues.filter((i) => i.sliceId === m.id);
     const errs = sliceIssues.filter((i) => i.severity === 'error');
     const warns = sliceIssues.filter((i) => i.severity === 'warning');
     const icon = errs.length > 0 ? '❌' : warns.length > 0 ? '⚠️ ' : '✅';

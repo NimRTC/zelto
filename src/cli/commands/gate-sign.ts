@@ -6,6 +6,7 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadConfig, resolveTargetDir, existingWorktreePath } from './shared.js';
+import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
 import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
 import { resolve } from 'node:path';
 import { readdir } from 'node:fs/promises';
@@ -141,6 +142,35 @@ register('gate', async (args) => {
 
     const worktreePath = existingWorktreePath(id);
     const gateRoot = worktreePath ?? targetDir ?? undefined;
+
+    // ── 架构护栏（切片级：只看与本片写集相关的偏离，ADR-027 Q2）────
+    // 设计与策略读主仓（设计不在 worktree 里），源码扫门禁实际跑的目录
+    // （worktree 有就验 worktree，没有就验主仓）。
+    // 无确认设计时跳过（老项目无感）；ask 只提示不拦，deny 才拦。
+    // --dry-run 不拦（只展示命令）；--only 只跑单个命令时不拦（不是完整门禁）。
+    if (!isDryRun && !onlyCommand) {
+      const sliceGuard = await checkSliceGateGuard(slice.writes, {
+        scanRoot: gateRoot ?? process.cwd(),
+      });
+      if (sliceGuard) {
+        if (sliceGuard.verdict.blocked) {
+          const msg = `架构护栏拦截：${describeGuardKinds(sliceGuard.verdict, 'blocked')} —— 修好或改 policy.yaml 的 arch 段后再跑门禁`;
+          if (isJson) {
+            console.log(JSON.stringify({
+              sliceId: id, passed: false, error: msg, code: 'arch_guard_blocked',
+            }));
+          } else {
+            console.log(`  Arch:     ❌ ${msg}`);
+            console.log(`  Design:   ${sliceGuard.designId}`);
+          }
+          return 1;
+        }
+        if (sliceGuard.verdict.needsConfirm && !isJson) {
+          console.log(`  Arch:     ⚠️  待确认（不拦）：${describeGuardKinds(sliceGuard.verdict, 'pending')}`);
+        }
+      }
+    }
+
     const executor = new GateExecutor(store, events, gateConfig, gateRoot);
     const report = await executor.execute(id);
     if (worktreePath && !isJson) {

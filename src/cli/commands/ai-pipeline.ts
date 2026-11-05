@@ -20,6 +20,7 @@ import { designFacts, planFacts, requirementFacts, showDraft } from './draft-rev
 import { executeSlicesByPhase, printParallelSummary } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { branchExists, isMergedIntoHead } from './merge-executor.js';
+import { describeGuardKinds, loadWholeGraphGuard } from './arch-guard.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 
 // ─── 版本级验收 ──────────────────────────────────────────────────────────────
@@ -767,7 +768,28 @@ register('version', async (args) => {
       return 1;
     }
 
-    // ── 第二步：版本级验收 —— 在主仓跑项目自己的门禁命令 ──────────
+    // ── 第二步：架构护栏（整图结论作为交付门，ADR-027 Q2）────────
+    // 判据是「合入主干之后的整体架构偏离」，扫主仓、读主仓的设计与 policy。
+    // 无确认设计时跳过（老项目无感）；ask 只提示不拦，deny 才拦。
+    const archGuard = await loadWholeGraphGuard();
+    if (archGuard) {
+      if (archGuard.guard.blocked) {
+        f.out('');
+        f.out(`❌ 版本 ${versionLabel} 的架构护栏未通过 —— 状态保持 in_progress`);
+        f.out(`   ${describeGuardKinds(archGuard.guard, 'blocked')}`);
+        f.out(`   设计：${archGuard.designId}「${archGuard.designTitle}」`);
+        f.out('');
+        f.out('👉 修好偏离，或改 policy.yaml 的 arch 段后重新验收：zelto version deliver ' + versionLabel);
+        return 1;
+      }
+      const pending = archGuard.guard.perKind.filter((k) => k.needsConfirm && k.count > 0);
+      if (pending.length > 0) {
+        f.out('');
+        f.out(`⚠️  架构护栏待确认（不拦）：${describeGuardKinds(archGuard.guard, 'pending')}`);
+      }
+    }
+
+    // ── 第三步：版本级验收 —— 在主仓跑项目自己的门禁命令 ──────────
     // 判据是「合入主干之后的整体能不能过验收」，所以跑在主仓、跑真实代码。
     const cfg = loadConfig();
     const acceptance = await runVersionAcceptance(versionLabel, cfg.gate.commands, cfg.gate.timeoutSec);

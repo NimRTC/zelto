@@ -28,6 +28,17 @@ export {
 
 export { buildArchitectureReport, findCycles } from './report.js';
 
+export {
+  buildArchRelaxSnippet,
+  filterRelevantDeviations,
+  HARD_DEVIATION_KINDS,
+  isDeviationRelevantToSlice,
+  judgeArchGuard,
+  judgeSliceArchGuard,
+  relevantModuleNames,
+} from './guard.js';
+export type { GuardKindResult, GuardRule, GuardVerdict } from './guard.js';
+
 export type {
   ArchitectureReport,
   Deviation,

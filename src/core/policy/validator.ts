@@ -9,7 +9,8 @@
  * C3: core/policy/ is deterministic — no model calls, no network
  */
 
-import type { PolicyConfig, PolicyRule, Decision } from './types.js';
+import type { ArchGuardRule, PolicyConfig, Decision } from './types.js';
+import { parsePolicyYaml } from './yaml.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,6 +37,16 @@ export interface ValidationResult {
 const VALID_ACTIONS: readonly Decision[] = ['allow', 'deny', 'ask'];
 
 const VALID_OPERATIONS: readonly string[] = ['read', 'write', 'execute'];
+
+/** ADR-027: 可配的六类硬偏离（软偏离 unverifiable_dependency 不可配） */
+const VALID_ARCH_KINDS: readonly string[] = [
+  'missing_dependency',
+  'undeclared_dependency',
+  'ambiguous_module',
+  'unmapped_file',
+  'unknown_module',
+  'cycle',
+];
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -110,7 +121,124 @@ export function validatePolicyConfig(data: unknown): ValidationResult {
     }
   }
 
+  // Validate arch (optional, ADR-027)
+  if (config.arch !== undefined) {
+    if (!Array.isArray(config.arch)) {
+      errors.push({
+        path: 'arch',
+        message: '"arch" must be an array of guard rules',
+        code: 'E_TYPE',
+      });
+    } else {
+      const seen = new Set<string>();
+      for (let i = 0; i < (config.arch as unknown[]).length; i++) {
+        const item = (config.arch as unknown[])[i];
+        const itemErrors = validateArchGuardRule(item);
+        for (const err of itemErrors) {
+          errors.push({
+            ...err,
+            path: `arch[${i}].${err.path}`,
+          });
+        }
+        // 去重：kind 重复即错误
+        if (
+          item !== null &&
+          typeof item === 'object' &&
+          typeof (item as Record<string, unknown>).kind === 'string'
+        ) {
+          const kind = (item as Record<string, unknown>).kind as string;
+          if (VALID_ARCH_KINDS.includes(kind)) {
+            if (seen.has(kind)) {
+              errors.push({
+                path: `arch[${i}].kind`,
+                message: `Duplicate arch kind "${kind}"`,
+                code: 'E_DUPLICATE',
+              });
+            } else {
+              seen.add(kind);
+            }
+          }
+        }
+      }
+    }
+  }
+
   return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Validate a single arch guard rule (ADR-027).
+ * Returns errors scoped to the rule's own fields (no "arch[N]." prefix).
+ */
+export function validateArchGuardRule(rule: unknown): ValidationError[] {
+  const errors: ValidationError[] = [];
+
+  if (rule === null || rule === undefined || typeof rule !== 'object') {
+    errors.push({
+      path: '',
+      message: 'Arch guard rule must be a non-null object',
+      code: 'E_TYPE',
+    });
+    return errors;
+  }
+
+  const r = rule as Record<string, unknown>;
+
+  // --- kind: required, must be one of the six hard kinds ---
+  if (r.kind === undefined || r.kind === null) {
+    errors.push({
+      path: 'kind',
+      message: 'Arch guard kind is required',
+      code: 'E_REQUIRED',
+    });
+  } else if (typeof r.kind !== 'string' || !VALID_ARCH_KINDS.includes(r.kind)) {
+    errors.push({
+      path: 'kind',
+      message: `Arch guard kind must be one of: ${VALID_ARCH_KINDS.join(', ')}`,
+      code: 'E_ENUM',
+    });
+  }
+
+  // --- action: required, valid enum ---
+  if (r.action === undefined || r.action === null) {
+    errors.push({
+      path: 'action',
+      message: 'Arch guard action is required',
+      code: 'E_REQUIRED',
+    });
+  } else if (typeof r.action !== 'string' || !VALID_ACTIONS.includes(r.action as Decision)) {
+    errors.push({
+      path: 'action',
+      message: `Arch guard action must be one of: ${VALID_ACTIONS.join(', ')}`,
+      code: 'E_ENUM',
+    });
+  }
+
+  // --- basis: required, non-empty ---
+  if (r.basis === undefined || r.basis === null) {
+    errors.push({
+      path: 'basis',
+      message: 'Arch guard basis is required',
+      code: 'E_REQUIRED',
+    });
+  } else if (typeof r.basis !== 'string' || (r.basis as string).trim() === '') {
+    errors.push({
+      path: 'basis',
+      message: 'Arch guard basis must be a non-empty string',
+      code: 'E_TYPE',
+    });
+  }
+
+  // --- guidance: optional, must be string if present ---
+  if (r.guidance !== undefined && r.guidance !== null && typeof r.guidance !== 'string') {
+    errors.push({
+      path: 'guidance',
+      message: 'Arch guard guidance must be a string',
+      code: 'E_TYPE',
+    });
+  }
+
+  return errors;
 }
 
 /**
@@ -299,8 +427,8 @@ export function validateMatch(match: unknown, basePath: string): ValidationError
  * Checks that the YAML-like content produces valid rules when parsed.
  *
  * This is a two-phase validator:
- * 1. Parse the raw content using the same logic as data-access.ts / shared.ts
- * 2. Validate the resulting rules against the schema
+ * 1. Structural checks (top-level keys, inline match syntax)
+ * 2. Parse with the single parser (core/policy/yaml.ts) and validate rules + arch
  */
 export function validatePolicyYaml(content: string): ValidationResult {
   const errors: ValidationError[] = [];
@@ -322,8 +450,8 @@ export function validatePolicyYaml(content: string): ValidationResult {
     return { valid: false, errors };
   }
 
-  // Phase 2: parse and validate rules
-  const parsed = parseYamlToRules(content);
+  // Phase 2: parse with the single parser and validate rules + arch
+  const parsed = parsePolicyYaml(content);
 
   if (parsed.rules.length === 0 && content.trim().length > 0) {
     // Content exists but no rules parsed — likely malformed
@@ -343,6 +471,30 @@ export function validatePolicyYaml(content: string): ValidationResult {
         ...err,
         path: `rules[${i}].${err.path}`,
       });
+    }
+  }
+
+  // Validate each parsed arch guard rule (incl. duplicate kind)
+  if (parsed.arch) {
+    const seen = new Set<string>();
+    for (let i = 0; i < parsed.arch.length; i++) {
+      const itemErrors = validateArchGuardRule(parsed.arch[i]);
+      for (const err of itemErrors) {
+        errors.push({
+          ...err,
+          path: `arch[${i}].${err.path}`,
+        });
+      }
+      const kind = (parsed.arch[i] as ArchGuardRule).kind;
+      if (seen.has(kind)) {
+        errors.push({
+          path: `arch[${i}].kind`,
+          message: `Duplicate arch kind "${kind}"`,
+          code: 'E_DUPLICATE',
+        });
+      } else {
+        seen.add(kind);
+      }
     }
   }
 
@@ -448,10 +600,10 @@ function validateYamlStructure(content: string): ValidationError[] {
       // Only check lines that have no leading whitespace (top-level keys)
       if (line.length > 0 && line[0] !== ' ' && line[0] !== '\t' && originalTrimmed !== '' && !originalTrimmed.startsWith('#') && !originalTrimmed.startsWith('-')) {
         const keyName = originalTrimmed.split(':')[0].trim();
-        if (keyName !== 'rules' && keyName !== 'protected') {
+        if (keyName !== 'rules' && keyName !== 'protected' && keyName !== 'arch') {
           errors.push({
             path: `line:${lineIdx + 1}`,
-            message: `Unknown top-level key "${keyName}". Only "rules" and "protected" are allowed`,
+            message: `Unknown top-level key "${keyName}". Only "rules", "protected" and "arch" are allowed`,
             code: 'E_UNKNOWN',
           });
         }
@@ -460,111 +612,4 @@ function validateYamlStructure(content: string): ValidationError[] {
   }
 
   return errors;
-}
-
-/**
- * Parse YAML content into PolicyRule objects using the same logic
- * as the existing parsers in shared.ts / data-access.ts.
- */
-function parseYamlToRules(content: string): { rules: PolicyRule[] } {
-  const rules: PolicyRule[] = [];
-  let currentRule: Record<string, unknown> | null = null;
-
-  const lines = content.split('\n');
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('#') || trimmed === '' || trimmed === 'rules:') continue;
-
-    // Start of a new rule
-    if (trimmed.startsWith('- id:')) {
-      if (currentRule) {
-        normalizeRule(currentRule);
-        rules.push(currentRule as unknown as PolicyRule);
-      }
-      currentRule = { id: trimmed.slice(5).trim().replace(/^"|"$/g, ''), match: {} };
-      continue;
-    }
-
-    if (!currentRule) continue;
-
-    // Inline match: { path: "...", operation: "..." }
-    const matchInline = trimmed.match(
-      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
-    );
-    if (matchInline) {
-      currentRule.match = {
-        path: matchInline[1],
-        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
-      };
-      continue;
-    }
-
-    // Individual match fields
-    if (trimmed.startsWith('path:')) {
-      currentRule.match = {
-        ...(currentRule.match as Record<string, unknown>),
-        path: trimmed.slice(5).trim().replace(/^"|"$/g, ''),
-      };
-      continue;
-    }
-
-    if (trimmed.startsWith('operation:')) {
-      currentRule.match = {
-        ...(currentRule.match as Record<string, unknown>),
-        operation: trimmed.slice(10).trim().replace(/^"|"$/g, ''),
-      };
-      continue;
-    }
-
-    // Action, basis, guidance, priority, description
-    if (trimmed.startsWith('action:')) {
-      currentRule.action = trimmed.slice(7).trim() as Decision;
-      continue;
-    }
-
-    if (trimmed.startsWith('basis:')) {
-      currentRule.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-
-    if (trimmed.startsWith('guidance:')) {
-      currentRule.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-
-    if (trimmed.startsWith('priority:')) {
-      currentRule.priority = Number.parseInt(trimmed.slice(9).trim(), 10);
-      continue;
-    }
-
-    if (trimmed.startsWith('description:')) {
-      currentRule.description = trimmed.slice(12).trim().replace(/^"|"$/g, '');
-      continue;
-    }
-  }
-
-  // Push the last rule
-  if (currentRule) {
-    normalizeRule(currentRule);
-    rules.push(currentRule as unknown as PolicyRule);
-  }
-
-  return { rules };
-}
-
-/**
- * Normalize a parsed rule: ensure match is always an object,
- * and remove undefined fields.
- */
-function normalizeRule(rule: Record<string, unknown>): void {
-  if (!rule.match || typeof rule.match !== 'object') {
-    rule.match = {};
-  }
-  // Remove undefined keys from match
-  const m = rule.match as Record<string, unknown>;
-  for (const key of Object.keys(m)) {
-    if (m[key] === undefined) {
-      delete m[key];
-    }
-  }
 }
