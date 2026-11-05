@@ -8,6 +8,7 @@ import { AuditTrail } from '../../core/audit/trail.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
+import { collectPlanningDrafts, draftConfirmCommand, draftShowCommand } from './planning-drafts.js';
 import { commandsByGroup, findCommand, usageOf } from './catalog.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
@@ -17,10 +18,10 @@ import { writeOutput } from '../output.js';
 
 register('next', async () => {
   const list = await store.list();
-  if (list.length === 0) {
-    console.log('No slices found. Create one to get started.');
-    return 0;
-  }
+
+  // 规划草稿只读收集：上游没确认，下游跑了也白跑，所以排在切片状态之前。
+  // 停机仍最高——那是执行中被交回控制权，眼下唯一该做的事。
+  const drafts = await collectPlanningDrafts(ZELTO_DIR);
 
   // 停机切片优先：人被交还控制权的那一刻，最该看见的就是「哪些切片等着他处理」。
   // 停机切片的状态通常还是 frozen（回退后的状态），按状态优先级排会被
@@ -46,6 +47,23 @@ register('next', async () => {
     if (stalled.length > 1) {
       console.log(`  (还有 ${stalled.length - 1} 个停机切片：${stalled.slice(1).map((s) => s.id).join('、')})`);
     }
+    return 0;
+  }
+
+  if (drafts.length > 0) {
+    const first = drafts[0];
+    console.log(`Next: ${first.kind} ${first.id} (draft)`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: ${draftShowCommand(first)}`);
+    console.log(`  Then:  ${draftConfirmCommand(first)}`);
+    if (drafts.length > 1) {
+      console.log(`  (还有 ${drafts.length - 1} 个待确认草稿：${drafts.slice(1).map((d) => `${d.kind} ${d.id}`).join('、')})`);
+    }
+    return 0;
+  }
+
+  if (list.length === 0) {
+    console.log('No slices found. Create one to get started.');
     return 0;
   }
 
@@ -82,8 +100,9 @@ register('next', async () => {
 
 register('suggest', async () => {
   const list = await store.list();
+  const drafts = await collectPlanningDrafts(ZELTO_DIR);
 
-  if (list.length === 0) {
+  if (list.length === 0 && drafts.length === 0) {
     console.log(formatSection('Welcome to zelto!'));
     console.log(`  ${colors.cyan('zelto init')}     Initialize a project`);
     console.log(`  ${colors.cyan('zelto help')}     Show all commands`);
@@ -93,72 +112,85 @@ register('suggest', async () => {
     return 0;
   }
 
+  // 规划草稿先行：上游没确认，下游切片跑了也白跑。
+  // 只读展示，不改状态，确认入口是 show → confirm（G-5 同一入口）。
+  if (drafts.length > 0) {
+    console.log(formatSection('Planning Drafts'));
+    for (const d of drafts) {
+      console.log(`  ${colors.bold(`${d.kind} ${d.id}`)}`);
+      console.log(`    ${colors.dim(d.title)}`);
+      console.log(`    ${colors.cyan(draftShowCommand(d))}   → 看完再 ${colors.cyan(draftConfirmCommand(d))}`);
+    }
+  }
+
   // Check overall project state
-  const stateCounts: Record<string, number> = {};
-  for (const id of list) {
-    try {
-      const s = await store.read(id);
-      stateCounts[s.state] = (stateCounts[s.state] ?? 0) + 1;
-    } catch { /* skip */ }
-  }
-
-  console.log(formatSection('Project Overview'));
-  console.log(`  ${colors.dim('Slices:')} ${list.length}`);
-  for (const [state, count] of Object.entries(stateCounts)) {
-    const colorFn: Record<string, (s: string) => string> = {
-      draft: colors.yellow,
-      clarifying: colors.blue,
-      frozen: colors.magenta,
-      running: colors.cyan,
-      completed: colors.green,
-      abandoned: colors.gray,
-    };
-    const fn = colorFn[state] ?? colors.dim;
-    console.log(`    ${fn(`${state}: ${count}`)}`);
-  }
-
-  // Check each slice and suggest next action
-  console.log(formatSection('Suggested Actions'));
-  const priority: Array<{ state: string; action: string; prepare: string }> = [
-    { state: 'draft', action: 'zelto check <id> && zelto freeze <id>', prepare: 'Check and freeze spec' },
-    { state: 'clarifying', action: 'zelto clarify <id>', prepare: 'Answer clarification questions' },
-    { state: 'frozen', action: 'zelto run <id> [--dry-run]', prepare: 'Execute slice' },
-    { state: 'running', action: 'zelto events <id>', prepare: 'Monitor execution' },
-    { state: 'completed', action: 'zelto sign <id> --approve', prepare: 'Review and sign off' },
-  ];
-
-  let suggested = false;
-  for (const p of priority) {
+  let suggested = drafts.length > 0;
+  if (list.length > 0) {
+    const stateCounts: Record<string, number> = {};
     for (const id of list) {
       try {
         const s = await store.read(id);
-        if (s.state === p.state) {
-          console.log(`  ${colors.bold(id)}`);
-          console.log(`    ${colors.dim(s.title)}`);
-          console.log(`    ${colors.cyan(p.prepare)}`);
-          console.log(`    ${colors.gray(p.action.replaceAll('<id>', id))}`);
-          suggested = true;
-        }
+        stateCounts[s.state] = (stateCounts[s.state] ?? 0) + 1;
       } catch { /* skip */ }
     }
-  }
 
-  if (!suggested) {
-    // Check stalled slices
-    const stalled: string[] = [];
-    for (const id of list) {
-      try {
-        const s = await store.read(id);
-        if (isSliceStalled(s)) stalled.push(id);
-      } catch { /* skip */ }
+    console.log(formatSection('Project Overview'));
+    console.log(`  ${colors.dim('Slices:')} ${list.length}`);
+    for (const [state, count] of Object.entries(stateCounts)) {
+      const colorFn: Record<string, (s: string) => string> = {
+        draft: colors.yellow,
+        clarifying: colors.blue,
+        frozen: colors.magenta,
+        running: colors.cyan,
+        completed: colors.green,
+        abandoned: colors.gray,
+      };
+      const fn = colorFn[state] ?? colors.dim;
+      console.log(`    ${fn(`${state}: ${count}`)}`);
     }
-    if (stalled.length > 0) {
-      console.log(`  ${colors.yellow(`${stalled.length} stalled slice(s):`)}`);
-      for (const id of stalled) {
-        console.log(`    ${colors.cyan(`zelto stall ${id}`)} — inspect and resolve`);
-        console.log(`    ${colors.cyan(`zelto resume ${id}`)} — resume after resolution`);
+
+    // Check each slice and suggest next action
+    console.log(formatSection('Suggested Actions'));
+    const priority: Array<{ state: string; action: string; prepare: string }> = [
+      { state: 'draft', action: 'zelto check <id> && zelto freeze <id>', prepare: 'Check and freeze spec' },
+      { state: 'clarifying', action: 'zelto clarify <id>', prepare: 'Answer clarification questions' },
+      { state: 'frozen', action: 'zelto run <id> [--dry-run]', prepare: 'Execute slice' },
+      { state: 'running', action: 'zelto events <id>', prepare: 'Monitor execution' },
+      { state: 'completed', action: 'zelto sign <id> --approve', prepare: 'Review and sign off' },
+    ];
+
+    for (const p of priority) {
+      for (const id of list) {
+        try {
+          const s = await store.read(id);
+          if (s.state === p.state) {
+            console.log(`  ${colors.bold(id)}`);
+            console.log(`    ${colors.dim(s.title)}`);
+            console.log(`    ${colors.cyan(p.prepare)}`);
+            console.log(`    ${colors.gray(p.action.replaceAll('<id>', id))}`);
+            suggested = true;
+          }
+        } catch { /* skip */ }
       }
-      suggested = true;
+    }
+
+    if (!suggested) {
+      // Check stalled slices
+      const stalled: string[] = [];
+      for (const id of list) {
+        try {
+          const s = await store.read(id);
+          if (isSliceStalled(s)) stalled.push(id);
+        } catch { /* skip */ }
+      }
+      if (stalled.length > 0) {
+        console.log(`  ${colors.yellow(`${stalled.length} stalled slice(s):`)}`);
+        for (const id of stalled) {
+          console.log(`    ${colors.cyan(`zelto stall ${id}`)} — inspect and resolve`);
+          console.log(`    ${colors.cyan(`zelto resume ${id}`)} — resume after resolution`);
+        }
+        suggested = true;
+      }
     }
   }
 
