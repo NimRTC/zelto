@@ -1,7 +1,8 @@
 // Project design generator — calls LLM to reverse-engineer design from project map
 
 import type { LlmAdapter } from '../../core/ports/llm.js';
-import type { DesignDoc, DesignModule } from '../../core/design/types.js';
+import { parseDesignModules } from '../../core/design/parse.js';
+import type { DesignDoc } from '../../core/design/types.js';
 import type { ProjectMap, ProjectModule } from '../../core/project/types.js';
 import { PROJECT_DESIGN_PROMPT } from '../prompts/project-design.js';
 
@@ -59,30 +60,8 @@ function parseProjectDesignResponse(
   const titleMatch = content.match(/^#\s+(.+)/m);
   const title = titleMatch ? titleMatch[1].trim() : 'Project Design';
 
-  // Extract modules using the "### 模块名" pattern
-  const modules: DesignModule[] = [];
-  const moduleRegex = /### (.+?)\n([\s\S]*?)(?=\n### |\n## |$)/g;
-  let match;
-
-  while ((match = moduleRegex.exec(content)) !== null) {
-    const name = match[1].trim();
-    const body = match[2].trim();
-
-    const descMatch = body.match(/\*\*职责\*\*[：:]\s*(.+)/);
-    const description = descMatch ? descMatch[1].trim() : '';
-
-    const filesMatch = body.match(/\*\*文件路径\*\*[：:]\s*(.+)/);
-    const filePatterns = filesMatch
-      ? filesMatch[1].split(/[,，、]/).map((f: string) => f.replace(/^\[|\]$/g, '').trim()).filter(Boolean)
-      : [];
-
-    const depsMatch = body.match(/\*\*依赖模块\*\*[：:]\s*(.+)/);
-    const dependencies = depsMatch
-      ? depsMatch[1].split(/[,，、]/).map((d: string) => d.replace(/^\[|\]$/g, '').trim()).filter(Boolean)
-      : [];
-
-    modules.push({ name, description, filePatterns, dependencies });
-  }
+  // 模块声明的解析口径与「设计」那条路径共用一份（core/design/parse.ts）
+  const modules = parseDesignModules(content);
 
   return {
     title,

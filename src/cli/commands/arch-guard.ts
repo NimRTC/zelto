@@ -10,6 +10,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import { pickDefaultDesign } from '../../core/design/selection.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import {
@@ -37,7 +38,8 @@ export interface WholeGraphGuard {
 }
 
 function toModuleSpecs(design: DesignDoc): ModuleSpec[] {
-  return design.modules.map((m) => ({
+  // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+  return deriveModules(design).map((m) => ({
     name: m.name,
     description: m.description,
     filePatterns: m.filePatterns,

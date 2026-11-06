@@ -15,60 +15,17 @@
 //   - 识别「无」类占位词（无 / 无依赖 / none / n/a / -）并当成空
 //   - 模块名与依赖名统一去空白
 //
+// 「什么算空」只有一份定义，放在中立的 core/text/normalize.ts：
+// 解析层（core/design/parse.ts）与判定层（本文件）用同一份，
+// 不会各说各话。这里只做 re-export，旧的 import 路径不用改。
+//
 // 判定仍然是纯字符串计算（C3），不调模型、不触网。
 // C6: core/ 内，不依赖 adapters/
 
+import { isEmptyToken, stripWrappingQuotes } from '../text/normalize.js';
 import type { ModuleSpec } from './types.js';
 
-/** 为空的占位词 */
-const EMPTY_TOKENS = new Set([
-  '无',
-  '无依赖',
-  '没有',
-  'none',
-  'n/a',
-  'na',
-  'null',
-  'nil',
-  '-',
-  '—',
-  '()',
-]);
-
-/** 可以包裹路径的引号字符 */
-const QUOTE_CHARS = ['`', '"', "'", '“', '”', '‘', '’', '（', '）', '(', ')'];
-
-/**
- * 剥掉包裹用的引号与前后空白。
- *
- * 只在**两端都配对**时才剥 —— 否则路径里合法的括号会被削掉。
- */
-export function stripWrappingQuotes(raw: string): string {
-  let value = (raw ?? '').trim();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const quote of QUOTE_CHARS) {
-      if (value.length >= 2 && value.startsWith(quote) && value.endsWith(quote)) {
-        value = value.slice(quote.length, -quote.length).trim();
-        changed = true;
-        break;
-      }
-    }
-  }
-  return value;
-}
-
-/**
- * 判断一个声明是不是「空」的占位写法。
- *
- * 依赖写成「无」、文件范围写成「无」都算空。
- */
-export function isEmptyToken(raw: string): boolean {
-  const value = stripWrappingQuotes(raw).toLowerCase();
-  if (!value) return true;
-  return EMPTY_TOKENS.has(value);
-}
+export { isEmptyToken, stripWrappingQuotes };
 
 /**
  * 归一化一组模块声明。

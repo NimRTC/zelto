@@ -3,6 +3,7 @@
 
 import { RequirementStore } from '../../../core/requirements/store.js';
 import { DesignStore } from '../../../core/design/store.js';
+import { deriveModules } from '../../../core/design/derive.js';
 import { VersionStore } from '../../../core/version/store.js';
 import { SliceStore } from '../../../core/slice/store.js';
 import type {
@@ -91,7 +92,8 @@ export async function fetchTraceData(
       id: design.id,
       title: design.title,
       status: design.status,
-      modules: design.modules.map((m) => ({
+      // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+      modules: deriveModules(design).map((m) => ({
         name: m.name,
         description: m.description,
         dependencies: m.dependencies ?? [],

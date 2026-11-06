@@ -14,6 +14,7 @@ import { getDefaultFormatter, OutputFormat } from '../output-formatter.js';
 import { colors } from '../color.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import { VersionStore } from '../../core/version/store.js';
 import {
   RevisionStore,
@@ -46,7 +47,8 @@ export function designFacts(doc: DesignDoc): DraftFacts {
   return {
     title: doc.title,
     body: doc.body,
-    modules: doc.modules.map((m) => ({
+    // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+    modules: deriveModules(doc).map((m) => ({
       name: m.name,
       description: m.description,
       filePatterns: m.filePatterns,

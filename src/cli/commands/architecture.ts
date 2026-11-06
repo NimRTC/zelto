@@ -1,7 +1,7 @@
 // 架构偏离检查（G-4/B 报告 + ADR-027 护栏结论）
 //
 // `zelto arch check` 把两样东西摆在一起比：
-//   设计里的模块图（DesignDoc.modules 的依赖声明）
+//   设计里的模块图（从设计正文推导出来的模块声明 —— ADR-029）
 //   代码里实际的 import 图（扫源码算出来的）
 //
 // 差出来的几类东西：
@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { getDefaultFormatter, OutputFormat } from '../output-formatter.js';
 import { colors } from '../color.js';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import { otherConfirmedDesigns, pickDefaultDesign } from '../../core/design/selection.js';
 import type { DesignDoc, DesignSummary } from '../../core/design/types.js';
 import {
@@ -85,7 +86,8 @@ async function resolveDesign(designId?: string): Promise<DesignDoc | null> {
 }
 
 function toModuleSpecs(design: DesignDoc): ModuleSpec[] {
-  return design.modules.map((m) => ({
+  // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+  return deriveModules(design).map((m) => ({
     name: m.name,
     description: m.description,
     filePatterns: m.filePatterns,

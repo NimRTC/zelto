@@ -21,6 +21,11 @@
 //     X ∈ scope(A)   （A 这一片里的谁 import 的）
 //     Y ∈ scope(B)   （import 的是 B，或 B 的成员）
 //
+// ─── 依赖名的解析 ───────────────────────────────────────────────────────
+// 设计里写的依赖名可能是模块名，也可能是路径（`src/core/ports`）。
+// 路径先按「该路径下的文件归谁」解析到模块，解析不出来才报未知模块。
+// 见 core/arch/resolve.ts。
+//
 // ─── 层级内部边 vs 跨模块边 ─────────────────────────────────────────────
 // scope(A) 与 scope(B) 有交集的边是**内部边**——它只是组与成员的关系，
 // 不是跨模块依赖。这类边：
@@ -33,6 +38,7 @@
 
 import { pathMatches } from '../sched/paths.js';
 import { normalizeModuleSpecs } from './normalize.js';
+import { resolveDependencyNames } from './resolve.js';
 import type {
   ArchitectureReport,
   Deviation,
@@ -88,10 +94,17 @@ export function buildArchitectureReport(
   };
 
   // ─── 设计里声明的依赖 ──────────────────────────────────────────────────
+  // 依赖名先按「归属」解析（core/arch/resolve.ts）：设计里写路径
+  // （`src/core/ports`）时，它指的是某个模块内部的一块。
+  // 解析不出来才报「未知模块」。
+  const allDeps = [...new Set(modules.flatMap((m) => m.dependencies))];
+  const resolved = resolveDependencyNames(allDeps, modules, scan);
+
   const declaredPairs: Array<[string, string]> = [];
   for (const mod of modules) {
     for (const dep of mod.dependencies) {
-      if (!moduleNames.includes(dep)) {
+      const target = resolved.get(dep) ?? dep;
+      if (!moduleNames.includes(target)) {
         deviations.push({
           kind: 'unknown_module',
           from: mod.name,
@@ -100,9 +113,14 @@ export function buildArchitectureReport(
         });
         continue;
       }
-      declaredPairs.push([mod.name, dep]);
+      declaredPairs.push([mod.name, target]);
     }
   }
+  // 解析后可能有重复边（两个依赖名指向同一个模块），去重再比对。
+  // 键用 JSON 编码，避免模块名里含分隔符时撞键。
+  const uniqueDeclaredPairs = [
+    ...new Map(declaredPairs.map((p) => [JSON.stringify(p), p])).values(),
+  ];
 
   // ─── 代码里实际的依赖 ──────────────────────────────────────────────────
   const actualEdges = scan.edges;
@@ -114,7 +132,7 @@ export function buildArchitectureReport(
     scopeOf(a).has(edge.from) && scopeOf(b).has(edge.to);
 
   // 声明了但代码里没有对应的实际边
-  for (const [from, to] of declaredPairs) {
+  for (const [from, to] of uniqueDeclaredPairs) {
     const hit = actualEdges.some((edge) => covers(from, to, edge));
     if (hit) continue;
 
@@ -131,7 +149,7 @@ export function buildArchitectureReport(
 
   // 代码里有但设计里没写（只看跨模块边：组依赖自己的成员不算偏离）
   for (const edge of crossEdges) {
-    const covered = declaredPairs.some(([a, b]) => covers(a, b, edge));
+    const covered = uniqueDeclaredPairs.some(([a, b]) => covers(a, b, edge));
     if (covered) continue;
     deviations.push({
       kind: 'undeclared_dependency',
@@ -180,7 +198,13 @@ export function buildArchitectureReport(
     name: mod.name,
     fileCount: (scan.moduleFiles.get(mod.name) ?? []).length,
     codeFileCount: (scan.moduleCodeFiles.get(mod.name) ?? []).length,
-    declaredDeps: mod.dependencies.filter((d) => moduleNames.includes(d)),
+    declaredDeps: [
+      ...new Set(
+        mod.dependencies
+          .map((d) => resolved.get(d) ?? d)
+          .filter((d) => moduleNames.includes(d)),
+      ),
+    ],
     // 实际依赖只看跨模块边：组依赖自己的成员不算对外依赖
     actualDeps: crossEdges
       .filter((e) => e.from === mod.name)

@@ -127,7 +127,7 @@ checkAnchor(currentHash, anchorHash): { valid, mismatch }
 
 ### 3.2 Slice State Machine — `src/core/slice/`
 
-**文件**: `state.ts`, `store.ts`
+**文件**: `state.ts`, `store.ts`, `kind.ts`
 
 **6 种状态**: `draft → clarifying → frozen → running → completed → abandoned`
 
@@ -397,6 +397,11 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 import 图比一遍，出偏离报告（`zelto arch check`，见 §3.18），
 再按 `policy.yaml` 的 `arch:` 段定级成护栏结论（G-4/A，ADR-027）。
 
+**模块声明以设计正文为真源**（ADR-029）：`DesignDoc.body` 是人读的 Markdown，
+`DesignDoc.modules` 只是给人看的快照；判定时一律经 `core/design/derive.ts`
+的 `deriveModules()` 从正文重新推导。解析口径只有一份
+（`core/design/parse.ts`），「什么算空」也只有一份（`core/text/normalize.ts`）。
+
 ### 3.15 编排层 — `src/core/worktree/` / `question/` / `sched/`
 
 | 模块 | 职责 |
@@ -445,10 +450,16 @@ import 图比一遍，出偏离报告（`zelto arch check`，见 §3.18），
 ### 3.18 架构偏离检查 — `src/core/arch/`
 
 **文件**: `imports.ts`（import 解析）、`scan.ts`（扫描与归属）、`report.ts`（比对出偏离）、
-`guard.ts`（按 `arch:` 段定级，ADR-027）、`types.ts`
+`guard.ts`（按 `arch:` 段定级，ADR-027）、`resolve.ts`（依赖名按归属解析，ADR-029）、
+`normalize.ts`（形状归一化）、`types.ts`
 
 **职责**：把「设计里画的模块图」和「代码里实际的 import 图」摆在一起比，
 差出来的东西就是**架构腐化的证据**。
+
+模块图从**设计正文**推导（ADR-029），不读存的结构化副本：
+`core/design/derive.ts` → `core/design/parse.ts`。
+依赖名先经 `resolve.ts` 按「该路径下的文件归谁」解析到模块，
+所以设计里写 `src/core/ports` 不会被误报成「未知模块」。
 
 ```typescript
 scanArchitecture(root: string, modules: ModuleSpec[]): ScanResult

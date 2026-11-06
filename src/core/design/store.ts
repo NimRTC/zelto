@@ -3,6 +3,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { deriveModules } from './derive.js';
 import type { DesignDoc, DesignStatus, DesignSummary } from './types.js';
 
 export class DesignStore {
@@ -47,7 +48,8 @@ export class DesignStore {
           title: doc.title,
           requirementId: doc.requirementId,
           status: doc.status,
-          moduleCount: doc.modules.length,
+          // 模块数从正文推导（正文是真源），存的 modules 只是缓存
+          moduleCount: deriveModules(doc).length,
           createdAt: doc.createdAt,
         });
       } catch {

@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import type { VersionPlan } from '../../core/version/types.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import { VersionStore } from '../../core/version/store.js';
 import { SliceStore } from '../../core/slice/store.js';
 import type { SliceData } from '../../core/slice/store.js';
@@ -356,7 +357,8 @@ register('design', async (args) => {
 
     doc.title = result.title;
     doc.body = result.body;
-    doc.modules = result.modules;
+    // 存的 modules 只是快照：判定时一律从正文重新推导（core/design/derive.ts）
+    doc.modules = deriveModules({ body: result.body, modules: result.modules });
     await designStore.save(doc);
 
     await events.append(draftEventKey('design', id), 'draft.revised', 'zelto', {
@@ -414,7 +416,8 @@ register('design', async (args) => {
     requirementId: reqId,
     title: result.title,
     body: result.body,
-    modules: result.modules,
+    // 存的 modules 只是快照：判定时一律从正文重新推导（core/design/derive.ts）
+    modules: deriveModules({ body: result.body, modules: result.modules }),
     status: 'draft',
     supersedes: null,
     createdAt: new Date().toISOString(),
@@ -615,7 +618,8 @@ register('plan', async (args) => {
   }
 
   f.out('Generating version plan...');
-  const result = await generateSlicePlan(llm, design.body, design.modules, '');
+  // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+  const result = await generateSlicePlan(llm, design.body, deriveModules(design), '');
 
   const id = `plan-${Date.now()}`;
   const plan: VersionPlan = {

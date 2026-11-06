@@ -17,6 +17,7 @@ import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { parsePrerequisites, parseScopePaths } from '../../core/spec/scope.js';
 import { BudgetCollector } from '../../core/budget/collector.js';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import { events, hashSpecFile, store, ZELTO_DIR } from './shared.js';
 import { resolveWriteSet } from './run-support.js';
 
@@ -125,7 +126,9 @@ export async function readModuleMap(ids: string[]): Promise<Map<string, string[]
     const confirmed = list.filter((d) => d.status === 'confirmed');
     if (confirmed.length === 0) return result;
     const doc = await designStore.read(confirmed[0].id);
-    if (!doc.modules || doc.modules.length === 0) return result;
+    // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+    const modules = deriveModules(doc);
+    if (modules.length === 0) return result;
 
     const writesOf = new Map<string, string[]>();
     for (const id of ids) {
@@ -139,7 +142,7 @@ export async function readModuleMap(ids: string[]): Promise<Map<string, string[]
     for (const id of ids) {
       const writes = writesOf.get(id) ?? [];
       const hits: string[] = [];
-      for (const mod of doc.modules) {
+      for (const mod of modules) {
         if (!mod.name || !mod.filePatterns) continue;
         const hit = (mod.filePatterns as string[]).some((pat) =>
           writes.some((w) => pathsOverlap(w, pat) || pathsOverlap(pat, w)),

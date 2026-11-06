@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
+import { deriveModules } from '../../core/design/derive.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
@@ -54,7 +55,7 @@ register('pipeline', async (args) => {
     for (const design of designs) {
       const designIcon = design.status === 'confirmed' ? '✅' : '📝';
       console.log(`   │`);
-      console.log(`   └── ${designIcon} ${design.id}  (${design.status})  "${design.title}"  [${design.modules.length} modules]`);
+      console.log(`   └── ${designIcon} ${design.id}  (${design.status})  "${design.title}"  [${deriveModules(design).length} modules]`);
 
       const plans = (await Promise.all(
         planList.map((p) => versionStore.read(p.id)),
@@ -378,7 +379,8 @@ register('project', async (args) => {
       requirementId: '(project-takeover)',
       title: design.title,
       body: design.body,
-      modules: design.modules,
+      // 存的 modules 只是快照：判定时一律从正文重新推导（core/design/derive.ts）
+      modules: deriveModules({ body: design.body, modules: design.modules }),
       status: 'confirmed',
       supersedes: null,
       createdAt: new Date().toISOString(),
@@ -406,14 +408,16 @@ register('project', async (args) => {
       return 1;
     }
     const design = await designStore.read(confirmedDesigns[0].id);
-    console.log(`📋 Using design: ${design.id} (${design.modules.length} modules)`);
+    // 模块声明从正文推导（正文是真源），存的 modules 只是缓存
+    const designModules = deriveModules(design);
+    console.log(`📋 Using design: ${design.id} (${designModules.length} modules)`);
 
     const sliceStore = new SliceStore(SLICES_DIR);
     const slicesDir = 'specs/slices';
     if (!existsSync(slicesDir)) mkdirSync(slicesDir, { recursive: true });
 
     let created = 0;
-    for (const mod of design.modules) {
+    for (const mod of designModules) {
       const sliceId = `v0-${mod.name.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
       if (await sliceStore.exists(sliceId)) {
         console.log(`  ℹ️  "${sliceId}" already exists, skipping`);
