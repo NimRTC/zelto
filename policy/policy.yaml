@@ -40,3 +40,18 @@ rules:
     action: ask
     basis: "policy.yaml#allow-config"
     guidance: "Changing project configuration requires human review."
+
+# 架构护栏（ADR-027）：给偏离定级。未列出的类别一律按 deny 处理（fail closed）。
+#
+# 本仓只放开一类 —— 依赖成环，且只这一条：
+#   src/core/gate ↔ src/core/slice 是**模块粒度**的成环，不是文件粒度：
+#   gate/executor.ts、gate/sign.ts import slice/store.ts；
+#   slice/store.ts、slice/types.ts import gate/types.ts（只为 SliceType 这个类型）；
+#   而 gate/types.ts 自己不 import 任何东西 —— 文件级没有环。
+#   先按「待人确认」处理：证据留在报告里，不拦人。
+#   收紧条件：SliceType 的归属定下来、slice 不再依赖 gate 之后，把这条改回 deny。
+arch:
+  - kind: cycle
+    action: ask
+    basis: "policy.yaml#arch-cycle"
+    guidance: "core/gate <-> core/slice 是类型级互引；SliceType 归属定下来后可收紧为 deny。"

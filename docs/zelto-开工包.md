@@ -410,18 +410,30 @@ rules:
     action: deny
     basis: "AGENTS.md#禁区-5"
     guidance: "Acceptance tests are frozen with the spec."
+
+# 架构护栏（可选，ADR-027）：给架构偏离定级。
+# 未列出的类别一律按 deny 处理（fail closed）。
+arch:
+  - kind: cycle
+    action: ask
+    basis: "policy.yaml#arch-cycle"
+    guidance: "……写清这条为什么先放开、什么条件下收紧"
 ```
 
 ### 5.3 `policy/lock.json`
 
 ```json
 {
-  "hash": "sha256:2a30463e9bd3f61d5269f91a07a5dc9ea31f261bb225f837d4d8db1d9c6f758e",
+  "hash": "sha256:0191547f9768d688faec3f09754f1f5716af7a4485f11d06ce1e5b1a45bee7b4",
   "commit": null,
-  "lockedAt": "2026-10-15T00:00:00.000Z",
-  "lockedBy": "system"
+  "lockedAt": "2026-11-06T13:08:31.533Z",
+  "lockedBy": "human"
 }
 ```
+
+锚点口径 = **`policy/policy.yaml` 全文的 sha256**（ADR-027 §4）。
+策略内容一改，锚点就得跟着重算——否则事后审计说不清「当时按什么标准拦的」。
+锚点在策略**之外**（C5）：策略本身改不了自己的锚点，只能由人显式重算。
 
 ---
 
