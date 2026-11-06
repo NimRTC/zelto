@@ -1,6 +1,6 @@
 // Project design generator — calls LLM to reverse-engineer design from project map
 
-import type { LlmAdapter } from '../../adapters/llm/types.js';
+import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { DesignDoc, DesignModule } from '../../core/design/types.js';
 import type { ProjectMap, ProjectModule } from '../../core/project/types.js';
 import { PROJECT_DESIGN_PROMPT } from '../prompts/project-design.js';

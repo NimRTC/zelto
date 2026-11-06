@@ -1,6 +1,6 @@
 // Slice plan generator — calls LLM to generate version + slice plan from design
 
-import type { LlmAdapter } from '../../adapters/llm/types.js';
+import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { DesignModule } from '../../core/design/types.js';
 import type { VersionPlan, Version, VersionSlice } from '../../core/version/types.js';
 import { SLICE_PLAN_PROMPT } from '../prompts/slice-plan.js';

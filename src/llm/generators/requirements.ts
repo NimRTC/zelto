@@ -1,6 +1,6 @@
 // Requirements generator — calls LLM to generate a requirement document from user input
 
-import type { LlmAdapter } from '../../adapters/llm/types.js';
+import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { RequirementDoc } from '../../core/requirements/types.js';
 import { REQUIREMENTS_PROMPT } from '../prompts/requirements.js';
 import { REFINE_REQUIREMENTS_PROMPT } from '../prompts/refine-requirements.js';

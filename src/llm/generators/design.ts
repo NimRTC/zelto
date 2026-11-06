@@ -1,6 +1,6 @@
 // Design generator — calls LLM to generate a design document from requirements
 
-import type { LlmAdapter } from '../../adapters/llm/types.js';
+import type { LlmAdapter } from '../../core/ports/llm.js';
 import type { DesignDoc, DesignModule } from '../../core/design/types.js';
 import { DESIGN_PROMPT } from '../prompts/design.js';
 import { REFINE_DESIGN_PROMPT } from '../prompts/refine-design.js';
