@@ -13,6 +13,10 @@ import { register } from './shared.js';
 import {
   store, events, ZELTO_DIR, loadConfig, createExecutorAdapter, existingWorktreePath,
 } from './shared.js';
+// 直接从 run-support 拿 autoGateAfterRun —— core-slice.ts 只是再导出它。
+// 经 core-slice 绕一圈会形成 question.ts → core-slice.ts → question.ts 的环，
+// 而 core-slice.ts 又 import 并行执行器，于是变成三条命令文件互相咬。
+import { autoGateAfterRun } from './run-support.js';
 
 const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
 
@@ -270,7 +274,6 @@ register('answer', async (args) => {
   }
   console.log(`✅ Agent completed after the answer.`);
 
-  const { autoGateAfterRun } = await import('./core-slice.js');
   await autoGateAfterRun(sliceId);
   return 0;
 });
