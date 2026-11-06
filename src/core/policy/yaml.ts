@@ -10,14 +10,57 @@
 import type { ArchGuardRule, Decision, PolicyRule } from './types.js';
 
 /**
- * 去掉包裹整个字符串的双引号，保留字符串内部的引号。
+ * 去掉包裹整个字符串的成对引号，保留字符串内部的引号。
  * '"npx claude-code"' → 'npx claude-code'
+ * "'secrets/**'"      → 'secrets/**'
+ *
+ * 单引号与双引号等价（ADR-028）：YAML 里两者都是字符串定界符，
+ * 只认双引号会让用单引号写的规则解析成带引号的字面量，
+ * glob 永不匹配 —— deny 规则因此被静默跳过，策略反而被绕过。
+ *
+ * 只剥成对包裹的引号；不成对（`'src/**`）原样保留。
  */
 export function stripSurroundingQuotes(s: string): string {
-  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
-    return s.slice(1, -1);
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return s.slice(1, -1);
+    }
   }
   return s;
+}
+
+/**
+ * 解析行内 `match: { ... }` 的内容。
+ *
+ * 按键值对解析，不依赖键的先后顺序（ADR-028）：
+ * `{ path: "src/**", operation: "write" }` 与
+ * `{ operation: "write", path: "src/**" }` 等价。
+ *
+ * 返回 `null` 表示这不是行内 match 写法，交给分行写法处理。
+ */
+function parseInlineMatch(body: string): { path?: string; operation?: string } | null {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+
+  const inner = trimmed.slice(1, -1).trim();
+  if (inner === '') return {};
+
+  const result: { path?: string; operation?: string } = {};
+  for (const part of inner.split(',')) {
+    const segment = part.trim();
+    if (segment === '') continue;
+
+    const sep = segment.indexOf(':');
+    if (sep < 0) continue;
+
+    const key = stripSurroundingQuotes(segment.slice(0, sep).trim());
+    const value = stripSurroundingQuotes(segment.slice(sep + 1).trim());
+    if (key === 'path') result.path = value;
+    else if (key === 'operation') result.operation = value;
+  }
+  return result;
 }
 
 /**
@@ -27,8 +70,8 @@ export function stripSurroundingQuotes(s: string): string {
  * - 行内：`match: { path: "src/**", operation: "write" }`
  * - 分行：`match:` 下面缩进写 `path:` / `operation:`
  *
- * `match` 必须把 `path` 写在前面 —— 行内写法靠正则按位置解析，
- * 写成 `{ operation: ..., path: ... }` 会被忽略。
+ * 两种写法都**引号风格无关**（单/双/无引号等价），
+ * 行内写法的**键序无关**（`path` 与 `operation` 谁在前都一样）——ADR-028。
  *
  * 顶层段跟踪：进入 `arch:` 后 `action:` / `basis:` 归护栏规则，
  * 不再往最后一条 `rules:` 上贴（否则最后一个 rule 会被污染）。
@@ -114,14 +157,14 @@ export function parsePolicyYaml(content: string): { rules: PolicyRule[]; arch?: 
 
     if (!currentRule) continue;
 
-    const matchInline = trimmed.match(
-      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
-    );
-    if (matchInline) {
-      currentRule.match = {
-        path: matchInline[1],
-        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
-      };
+    if (trimmed.startsWith('match:')) {
+      const inline = parseInlineMatch(trimmed.slice(6));
+      if (inline) {
+        currentRule.match = {
+          ...(currentRule.match as Record<string, unknown>),
+          ...inline,
+        };
+      }
       continue;
     }
 

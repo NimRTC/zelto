@@ -11,6 +11,8 @@ import { createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isProtectedPath, matchPath } from './protected.js';
+
 // ── Inline policy engine (self-contained, no import from core/) ──────────
 
 type Decision = 'allow' | 'deny' | 'ask';
@@ -34,30 +36,6 @@ interface PolicyDecision {
   basis: string;
   guidance: string | null;
   policyVersion: string;
-}
-
-const PROTECTED_PATTERNS: readonly string[] = [
-  'policy/**',
-  '.zelto/**',
-  'AGENTS.md',
-  '.cursor/rules/**',
-  'zelto-hook',
-  'zelto-hook.exe',
-];
-
-function matchPath(pattern: string, path: string): boolean {
-  const regexStr = pattern
-    .replace(/\*\*\//g, '<<<DS>>>/')   // **/ → sentinel (keeps trailing / for later)
-    .replace(/\*\*/g, '<<<DSB>>>')     // bare ** → different sentinel
-    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')  // escape all regex metacharacters
-    .replace(/\*/g, '[^/]*')
-    .replace(/<<<DS>>>\//g, '(.+/|)')  // **/ → zero-or-more dirs (with optional /)
-    .replace(/<<<DSB>>>/g, '.*');       // bare ** → any path
-  return new RegExp(`^${regexStr}$`).test(path);
-}
-
-function isProtectedPath(path: string): boolean {
-  return PROTECTED_PATTERNS.some((p) => matchPath(p, path));
 }
 
 function evaluatePolicy(
@@ -248,9 +226,47 @@ function main() {
   });
 }
 
+function stripSurroundingQuotes(s: string): string {
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return s.slice(1, -1);
+    }
+  }
+  return s;
+}
+
+/**
+ * 解析行内 `match: { ... }` —— 按键值对解析，键序无关、引号风格无关（ADR-028）。
+ */
+function parseInlineMatch(body: string): { path?: string; operation?: string } | null {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+
+  const inner = trimmed.slice(1, -1).trim();
+  if (inner === '') return {};
+
+  const result: { path?: string; operation?: string } = {};
+  for (const part of inner.split(',')) {
+    const segment = part.trim();
+    if (segment === '') continue;
+
+    const sep = segment.indexOf(':');
+    if (sep < 0) continue;
+
+    const key = stripSurroundingQuotes(segment.slice(0, sep).trim());
+    const value = stripSurroundingQuotes(segment.slice(sep + 1).trim());
+    if (key === 'path') result.path = value;
+    else if (key === 'operation') result.operation = value;
+  }
+  return result;
+}
+
 function parsePolicyYaml(content: string): PolicyConfig {
   const rules: PolicyRule[] = [];
   let currentRule: Partial<PolicyRule> | null = null;
+  let inArch = false;
 
   const lines = content.split('\n');
   for (const line of lines) {
@@ -258,35 +274,51 @@ function parsePolicyYaml(content: string): PolicyConfig {
 
     if (trimmed.startsWith('#') || trimmed === '') continue;
 
+    // 顶层段切换 —— `arch:` 段是护栏规则，逐写判定不消费它，
+    // 但必须跳过，否则它的 `action:` / `basis:` 会贴到最后一条 rules 规则上，
+    // 把一条 allow 规则改成 deny（ADR-027 §2.3、ADR-028）。
+    if (trimmed === 'arch:') {
+      if (currentRule?.id) {
+        rules.push(currentRule as PolicyRule);
+      }
+      currentRule = null;
+      inArch = true;
+      continue;
+    }
+    if (trimmed === 'rules:') {
+      inArch = false;
+      continue;
+    }
+    if (inArch) continue;
+
     // Start of a rule: "- id: <name>"
     if (trimmed.startsWith('- id:')) {
       if (currentRule?.id) {
         rules.push(currentRule as PolicyRule);
       }
-      currentRule = { id: trimmed.slice(5).trim() };
+      currentRule = { id: stripSurroundingQuotes(trimmed.slice(5).trim()) };
       continue;
     }
 
     if (!currentRule) continue;
 
     // Handle inline match: `match: { path: "...", operation: "..." }`
-    const matchInline = trimmed.match(/^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/);
-    if (matchInline) {
-      currentRule.match = {
-        path: matchInline[1],
-        ...(matchInline[2] ? { operation: matchInline[2] } : {}),
-      };
+    if (trimmed.startsWith('match:')) {
+      const inline = parseInlineMatch(trimmed.slice(6));
+      if (inline) {
+        currentRule.match = { ...currentRule.match, ...inline };
+      }
       continue;
     }
 
     // Handle indented match subfields: `  path: "..."`
     if (trimmed.startsWith('path:')) {
-      currentRule.match = { ...currentRule.match, path: trimmed.slice(5).trim().replace(/^"|"$/g, '') };
+      currentRule.match = { ...currentRule.match, path: stripSurroundingQuotes(trimmed.slice(5).trim()) };
       continue;
     }
 
     if (trimmed.startsWith('operation:')) {
-      currentRule.match = { ...currentRule.match, operation: trimmed.slice(10).trim().replace(/^"|"$/g, '') };
+      currentRule.match = { ...currentRule.match, operation: stripSurroundingQuotes(trimmed.slice(10).trim()) };
       continue;
     }
 
@@ -297,12 +329,12 @@ function parsePolicyYaml(content: string): PolicyConfig {
     }
 
     if (trimmed.startsWith('basis:')) {
-      currentRule.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
+      currentRule.basis = stripSurroundingQuotes(trimmed.slice(6).trim());
       continue;
     }
 
     if (trimmed.startsWith('guidance:')) {
-      currentRule.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
+      currentRule.guidance = stripSurroundingQuotes(trimmed.slice(9).trim());
       continue;
     }
 

@@ -69,39 +69,9 @@ export interface PreToolPayload {
 
 // ── 路径处理 ────────────────────────────────────────────────────────────────
 
-/** 把路径统一成正斜杠，便于跨平台比较。 */
-function toPosix(p: string): string {
-  return p.replace(/\\/g, '/');
-}
+import { isProtectedPath, matchPath, toPosix } from './protected.js';
 
-/** 受保护域：策略规则改不动它（C5 / C8）。 */
-const PROTECTED_PATTERNS: readonly string[] = [
-  'policy/**',
-  '.zelto/**',
-  'AGENTS.md',
-  '.cursor/rules/**',
-  'zelto-hook',
-  'zelto-hook.exe',
-];
-
-function globToRegExp(pattern: string): RegExp {
-  const regexStr = pattern
-    .replace(/\*\*\//g, '<<<DS>>>/')
-    .replace(/\*\*/g, '<<<DSB>>>')
-    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '[^/]*')
-    .replace(/<<<DS>>>\//g, '(.+/|)')
-    .replace(/<<<DSB>>>/g, '.*');
-  return new RegExp(`^${regexStr}$`);
-}
-
-export function matchPath(pattern: string, path: string): boolean {
-  return globToRegExp(pattern).test(path);
-}
-
-export function isProtectedPath(path: string): boolean {
-  return PROTECTED_PATTERNS.some((p) => matchPath(p, path));
-}
+export { isProtectedPath, matchPath } from './protected.js';
 
 /**
  * 把一次写入目标解析成「相对 worktree 的路径」。
@@ -575,6 +545,42 @@ function loadRules(projectRoot: string): { rules: PreToolContext['rules']; versi
   return { rules, version };
 }
 
+/** 去掉包裹整个字符串的成对引号（单引号与双引号等价）——ADR-028。 */
+function stripSurroundingQuotes(s: string): string {
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return s.slice(1, -1);
+    }
+  }
+  return s;
+}
+
+/** 解析行内 `match: { ... }` —— 按键值对解析，键序无关、引号风格无关（ADR-028）。 */
+function parseInlineMatch(body: string): { path?: string; operation?: string } | null {
+  const trimmed = body.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+
+  const inner = trimmed.slice(1, -1).trim();
+  if (inner === '') return {};
+
+  const result: { path?: string; operation?: string } = {};
+  for (const part of inner.split(',')) {
+    const segment = part.trim();
+    if (segment === '') continue;
+
+    const sep = segment.indexOf(':');
+    if (sep < 0) continue;
+
+    const key = stripSurroundingQuotes(segment.slice(0, sep).trim());
+    const value = stripSurroundingQuotes(segment.slice(sep + 1).trim());
+    if (key === 'path') result.path = value;
+    else if (key === 'operation') result.operation = value;
+  }
+  return result;
+}
+
 /** 解析 policy.yaml 的 rules 段（与 core/policy/yaml.ts 同一套行内语法）。
  * `arch:` 段直接忽略 —— 逐写判定只看写规则（ADR-027 §2.3），
  * 不跳过的话里面的 `action:` 会贴到最后一条 rule 上造成污染。 */
@@ -608,22 +614,17 @@ export function parsePolicyRules(content: string): NonNullable<PreToolContext['r
     }
     if (!current) continue;
 
-    const inline = trimmed.match(
-      /^match:\s*\{\s*path:\s*"([^"]*)"\s*(?:,\s*operation:\s*"([^"]*)")?\s*\}/,
-    );
+    const inline = parseInlineMatch(trimmed.slice(6));
     if (inline) {
-      current.match = {
-        path: inline[1],
-        ...(inline[2] ? { operation: inline[2] } : {}),
-      };
+      current.match = { ...(current.match as object), ...inline };
       continue;
     }
     if (trimmed.startsWith('path:')) {
-      current.match = { ...(current.match as object), path: trimmed.slice(5).trim().replace(/^"|"$/g, '') };
+      current.match = { ...(current.match as object), path: stripSurroundingQuotes(trimmed.slice(5).trim()) };
       continue;
     }
     if (trimmed.startsWith('operation:')) {
-      current.match = { ...(current.match as object), operation: trimmed.slice(10).trim().replace(/^"|"$/g, '') };
+      current.match = { ...(current.match as object), operation: stripSurroundingQuotes(trimmed.slice(10).trim()) };
       continue;
     }
     if (trimmed.startsWith('action:')) {
@@ -631,11 +632,11 @@ export function parsePolicyRules(content: string): NonNullable<PreToolContext['r
       continue;
     }
     if (trimmed.startsWith('basis:')) {
-      current.basis = trimmed.slice(6).trim().replace(/^"|"$/g, '');
+      current.basis = stripSurroundingQuotes(trimmed.slice(6).trim());
       continue;
     }
     if (trimmed.startsWith('guidance:')) {
-      current.guidance = trimmed.slice(9).trim().replace(/^"|"$/g, '');
+      current.guidance = stripSurroundingQuotes(trimmed.slice(9).trim());
       continue;
     }
     if (trimmed.startsWith('priority:')) {

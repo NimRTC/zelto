@@ -5,7 +5,16 @@ import { type PolicyConfig, type PolicyDecision, type PolicyRule, type Decision 
 import { createHash } from 'node:crypto';
 import { normalize } from 'node:path';
 
-const PROTECTED_PATTERNS: readonly string[] = [
+/**
+ * 保护域（C5 / C8）：硬编码，**不可被任何策略规则覆盖**。
+ *
+ * 这是保护域的唯一真源 —— 报告层、hook 判定层都从这里取，
+ * 不允许各自抄一份（抄一份就多一处漂移点，而漂移的后果是
+ * 「本该拦住的文件被放行」）。
+ *
+ * 变更保护域等于变更不变量，必须走 ADR。
+ */
+export const PROTECTED_PATTERNS: readonly string[] = [
   'policy/**',
   '.zelto/**',
   'AGENTS.md',
