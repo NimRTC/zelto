@@ -9,7 +9,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-> **Status: v0.4.0 — pre-1.0.** CLI flags, config schema, and event format may change
+> **Status: v0.5.0 — pre-1.0.** CLI flags, config schema, and event format may change
 > without migration. Pin a commit if you need stability.
 
 zelto is a local-first cockpit for AI coding agents. You write a slice spec, approve it,

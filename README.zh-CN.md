@@ -9,7 +9,7 @@
 [![TypeScript](https://img.shields.io/badge/typescript-7-blue)](https://www.typescriptlang.org)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> **Status: v0.4.0 — pre-1.0.** CLI flags, config schema, and event format may change
+> **Status: v0.5.0 — pre-1.0.** CLI flags, config schema, and event format may change
 > without migration. Pin a commit if you need stability.
 
 zelto 是一个 **AI 编程驾驶舱**（AI Programming Cockpit），不是 AI 编程助手。

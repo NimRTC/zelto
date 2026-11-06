@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-06
+
 ### Added
 - Planning confirmation is now a review view instead of a wall of markdown:
   `zelto require|design|plan show <id>` prints a summary, the **decision points**
@@ -25,8 +27,37 @@
   references are expanded; `"prefix-${FOO}"` is left as-is.
 - `pnpm check:credentials` — scans changed, untracked and tracked files for
   credentials before a commit; wired into CI as a gate
+- `zelto arch check` and the architecture guard now pick the **project baseline
+  design** (`zelto project design`, tagged `__project__`) by default instead of
+  "the most recently created confirmed design". Picking a local feature design
+  and comparing it against the whole repo marked every unrelated file as
+  unmapped — the report was misleading and the guard could block legitimate
+  write sets. Other confirmed designs are listed in the report so `--design
+  <id>` is discoverable.
 
 ### Fixed
+- **Policy YAML parsing now ignores quote style and inline key order**
+  (ADR-028). A `deny` rule written as `path: 'secrets/**'` was parsed into the
+  literal `'secrets/**'`, which never matches a real path — so the rule was
+  silently skipped and the write was allowed by a broader `allow` rule.
+  **Strategy written more strictly was easier to bypass.** Single quotes,
+  double quotes and unquoted values are now equivalent, and
+  `match: { operation: ..., path: ... }` parses the same as
+  `match: { path: ..., operation: ... }`. Fixed in all three parsers
+  (`core/policy/yaml.ts`, `hook/index.ts`, `hook/pretool.ts`); equivalence is
+  locked by `tests/policy-parser-parity.test.ts`.
+- The `arch:` section of `policy.yaml` no longer contaminates the last
+  `rules:` entry in the hook parser — its `action:` / `basis:` used to be
+  attached to the previous rule, which could turn an `allow` rule into a
+  `deny`.
+- The protected domain now has a single source of truth: `PROTECTED_PATTERNS`
+  is exported from `core/policy/engine.ts` and reused by the report layer; the
+  hook keeps its own copy (it must compile standalone) and
+  `tests/protected-domain-parity.test.ts` asserts the two copies and their glob
+  semantics stay identical.
+- Every event type now has a dedicated audit summary — `sign.revoked`,
+  `draft.created`, `draft.revised` and `draft.confirmed` previously fell back
+  to the generic `Event: <type>` text. A test covers all 52 event types.
 - `zelto config` with no subcommand now shows the configuration instead of
   printing usage text — the "show configuration" branch was unreachable.
 - `zelto config get llm.apiKey` masks the credential by default; the real
