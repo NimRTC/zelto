@@ -1,31 +1,25 @@
 // Stall classifier — 9 classes of stall
 // See docs/zelto-场景功能地图.md §4.1
+//
+// 类型定义的真源在 `./types.ts`，这里只做分类计算。
+// 以前 StallClass 定义在本文件而 StallInfo 在 types.ts，
+// 两边互相 import对方的类型，形成类型依赖环；
+// 环一旦形成，编译器的类型推断会在某些组合下退化成 any，
+// 也让「哪个文件是类型的真源」变得说不清。
+//
+// 现在方向单一：types.ts ← classifier.ts。
+//
+// C3: 纯计算，不调模型、不触网
+// C6: core/ 内，不依赖 adapters/
 
-import type { StallInfo } from './types.js';
-export type { StallInfo };
+import type { StallClass, StallInfo } from './types.js';
 
-export type StallClass =
-  | 'permission_prompt'   // ① 权限确认 — hook returned ask
-  | 'environment_failure' // ② 环境失败 — build/test repeatedly fail
-  | 'context_exhaustion'  // ③ 上下文耗尽 — max_turns reached
-  | 'cognitive_stuck'     // ④ 认知卡壳 — same thing fails repeatedly
-  | 'plan_gate'           // ⑤ 计划门禁 — agent requests plan approval
-  | 'budget_exhausted'   // ⑥ 预算耗尽 — max budget reached
-  | 'gate_retry'         // ⑦ 门禁重试 — gate executor retries exhausted
-  | 'agent_question'     // ⑧ agent 提问 — 等待人回答（ADR-013）
-  | 'human_halt';        // ⑨ 人工拉闸 — 人喊停，等人处理现场（ADR-020）
-
-export type StallResolution = 'auto_resolved' | 'needs_attention' | 'escalated';
-
-export interface StallEvent {
-  sliceId: string;
-  runId: string;
-  class: StallClass;
-  resolution: StallResolution;
-  summary: string;
-  attempts?: number;
-  details?: Record<string, unknown>;
-}
+export type {
+  StallClass,
+  StallEvent,
+  StallInfo,
+  StallResolution,
+} from './types.js';
 
 /**
  * Whether a stall class can be resolved without human input.
