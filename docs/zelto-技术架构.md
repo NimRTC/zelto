@@ -129,6 +129,9 @@ checkAnchor(currentHash, anchorHash): { valid, mismatch }
 
 **文件**: `state.ts`, `store.ts`, `kind.ts`
 
+`kind.ts` 是**切片的分类**（`SliceType`：code / docs / config / refactor）的定义处，零 import（ADR-031）。
+`core/gate` 侧保留 re-export 兼容旧路径，`detectSliceType` 仍住在 gate —— 它是门禁选 profile 的逻辑。
+
 **6 种状态**: `draft → clarifying → frozen → running → completed → abandoned`
 
 **9 种事件**:
@@ -193,6 +196,8 @@ interface EventEnvelope {
 ### 3.4 Gate Executor — `src/core/gate/`
 
 **文件**: `types.ts`, `executor.ts`, `sign.ts`
+
+`types.ts` 从 `core/slice/kind.ts` re-export `SliceType`（定义归 slice 域，ADR-031）。
 
 **GateExecutor**: 运行配置的命令序列（如 `pnpm test`、`pnpm lint`），支持重试。
 

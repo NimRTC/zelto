@@ -43,15 +43,12 @@ rules:
 
 # 架构护栏（ADR-027）：给偏离定级。未列出的类别一律按 deny 处理（fail closed）。
 #
-# 本仓只放开一类 —— 依赖成环，且只这一条：
-#   src/core/gate ↔ src/core/slice 是**模块粒度**的成环，不是文件粒度：
-#   gate/executor.ts、gate/sign.ts import slice/store.ts；
-#   slice/store.ts、slice/types.ts import gate/types.ts（只为 SliceType 这个类型）；
-#   而 gate/types.ts 自己不 import 任何东西 —— 文件级没有环。
-#   先按「待人确认」处理：证据留在报告里，不拦人。
-#   收紧条件：SliceType 的归属定下来、slice 不再依赖 gate 之后，把这条改回 deny。
-arch:
-  - kind: cycle
-    action: ask
-    basis: "policy.yaml#arch-cycle"
-    guidance: "core/gate <-> core/slice 是类型级互引；SliceType 归属定下来后可收紧为 deny。"
+# 本仓**不放任何豁免** —— 六类硬偏离全部走默认 deny。
+#
+# 曾经开过一条豁免：cycle -> ask，理由是 src/core/gate ↔ src/core/slice 的模块级成环。
+# ADR-031 把 SliceType 归位到 core/slice/kind.ts 之后，core/slice 不再依赖 core/gate，
+# 环已经消失、重建基线后偏离归零，这条豁免按 ADR-030 §3.3 写下的收紧条件撤销。
+#
+# 要放开某一类时，在这里显式写一条 kind + action + basis + guidance；
+# 写清楚「为什么开、什么时候收」，否则护栏就退化成「不配所以不拦」。
+# （ADR-031 §3.4）

@@ -20,8 +20,18 @@ export interface GateConfig {
   };
 }
 
-/** Slice type classification for gate profile selection */
-export type SliceType = 'code' | 'docs' | 'config' | 'refactor';
+import type { SliceType } from '../slice/kind.js';
+
+/**
+ * Slice type classification for gate profile selection.
+ *
+ * Re-exported for compatibility: the definition now lives in `core/slice/kind.ts`
+ * because it classifies a **slice**, not a gate. Gate consumes it to pick the
+ * profile; the vocabulary belongs to the slice domain.
+ *
+ * See docs/adr-031-slice-type-ownership.md.
+ */
+export type { SliceType };
 
 /**
  * Auto-detect slice type from write-set paths.

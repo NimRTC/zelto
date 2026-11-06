@@ -413,18 +413,16 @@ rules:
 
 # 架构护栏（可选，ADR-027）：给架构偏离定级。
 # 未列出的类别一律按 deny 处理（fail closed）。
-arch:
-  - kind: cycle
-    action: ask
-    basis: "policy.yaml#arch-cycle"
-    guidance: "……写清这条为什么先放开、什么条件下收紧"
+# 本仓当前**没有任何豁免** —— arch: 段为空，六类硬偏离全走默认 deny。
+# 要放开某一类时在这里显式写 kind + action + basis + guidance，
+# 并写清「为什么开、什么时候收」。
 ```
 
 ### 5.3 `policy/lock.json`
 
 ```json
 {
-  "hash": "sha256:0191547f9768d688faec3f09754f1f5716af7a4485f11d06ce1e5b1a45bee7b4",
+  "hash": "sha256:0e08432b1870064e46a696a0a2ac6b18b91f172021ff478eb3060494dc9ab201",
   "commit": null,
   "lockedAt": "2026-11-06T13:08:31.533Z",
   "lockedBy": "human"

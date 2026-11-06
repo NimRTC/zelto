@@ -4,7 +4,6 @@
 import type { SliceState } from './state.js';
 import type { SliceSpec, SliceAcceptance, SliceDrift, SliceTrace, SliceData } from './store.js';
 import type { StallInfo } from '../stall/types.js';
-import type { SliceType } from '../gate/types.js';
 
 // ─── V2-specific types ──────────────────────────────────────────────────────
 
