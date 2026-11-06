@@ -21,7 +21,8 @@ import { join } from 'node:path';
 import { getDefaultFormatter, OutputFormat } from '../output-formatter.js';
 import { colors } from '../color.js';
 import { DesignStore } from '../../core/design/store.js';
-import type { DesignDoc } from '../../core/design/types.js';
+import { otherConfirmedDesigns, pickDefaultDesign } from '../../core/design/selection.js';
+import type { DesignDoc, DesignSummary } from '../../core/design/types.js';
 import {
   buildArchitectureReport,
   buildArchRelaxSnippet,
@@ -62,7 +63,12 @@ function parseOptions(args: string[]): ArchOptions {
   return options;
 }
 
-/** 找设计：指定了就用指定的，否则取最近一份已确认的设计 */
+/**
+ * 找设计：指定了就用指定的，否则按 `pickDefaultDesign` 的规则挑。
+ *
+ * 默认挑项目基线设计（`zelto project design` 生成的 `__project__` 需求那一份），
+ * 没有基线才退到「最新的已确认设计」。理由见 `core/design/selection.ts`。
+ */
 async function resolveDesign(designId?: string): Promise<DesignDoc | null> {
   const store = new DesignStore(ZELTO_DIR);
   if (designId) {
@@ -73,9 +79,9 @@ async function resolveDesign(designId?: string): Promise<DesignDoc | null> {
   // 而这是一条只读报告命令，不该在别人的项目里留下痕迹
   if (!existsSync(join(ZELTO_DIR, 'design'))) return null;
   const list = await store.list();
-  const confirmed = list.filter((d) => d.status === 'confirmed');
-  if (confirmed.length === 0) return null;
-  return store.read(confirmed[0].id);
+  const picked = pickDefaultDesign(list);
+  if (!picked) return null;
+  return store.read(picked.id);
 }
 
 function toModuleSpecs(design: DesignDoc): ModuleSpec[] {
@@ -124,11 +130,22 @@ function groupUnmapped(deviations: Deviation[]): Map<string, string[]> {
   return groups;
 }
 
-function renderReport(report: ArchitectureReport, design: DesignDoc, guard?: GuardVerdict, guardRules?: GuardRule[]): string {
+function renderReport(
+  report: ArchitectureReport,
+  design: DesignDoc,
+  guard?: GuardVerdict,
+  guardRules?: GuardRule[],
+  alternatives?: DesignSummary[],
+): string {
   const out: string[] = [];
   out.push('');
   out.push(`  ${colors.bold(colors.cyan('架构偏离检查'))} ${colors.dim('（只读报告，不拦人）')}`);
   out.push(`  ${colors.dim('设计:')} ${design.id} "${design.title}"`);
+  if (alternatives && alternatives.length > 0) {
+    out.push(
+      `  ${colors.dim('其它已确认设计:')} ${alternatives.map((d) => d.id).join(', ')} ${colors.dim('（用 --design <id> 换）')}`,
+    );
+  }
   out.push(`  ${colors.dim('─'.repeat(56))}`);
 
   out.push('');
@@ -244,6 +261,10 @@ register('arch', async (args) => {
 
   const options = parseOptions(args.slice(1));
 
+  // 其它已确认设计 —— 用来在报告里提示「默认挑了哪份、还有哪些可换」
+  const allDesigns = existsSync(join(ZELTO_DIR, 'design'))
+    ? await new DesignStore(ZELTO_DIR).list()
+    : [];
   const design = await resolveDesign(options.designId);
   if (!design) {
     if (options.designId) {
@@ -256,6 +277,7 @@ register('arch', async (args) => {
     }
     return 1;
   }
+  const alternatives = options.designId ? [] : otherConfirmedDesigns(allDesigns, design.id);
 
   const specs = toModuleSpecs(design);
   const scan = scanArchitecture(options.root, specs);
@@ -268,6 +290,9 @@ register('arch', async (args) => {
 
   const payload = {
     design: { id: design.id, title: design.title },
+    ...(alternatives.length > 0
+      ? { otherDesigns: alternatives.map((d) => ({ id: d.id, title: d.title })) }
+      : {}),
     report,
     ...(guard ? { guard } : {}),
   };
@@ -278,7 +303,7 @@ register('arch', async (args) => {
   } else if (f.getFormat() === OutputFormat.YAML) {
     f.data(payload);
   } else {
-    process.stdout.write(renderReport(report, design, guard, guardRules) + '\n');
+    process.stdout.write(renderReport(report, design, guard, guardRules, alternatives) + '\n');
   }
 
   return options.strict ? (guard && guard.blocked ? 1 : 0) : 0;

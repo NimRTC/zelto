@@ -10,6 +10,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DesignStore } from '../../core/design/store.js';
+import { pickDefaultDesign } from '../../core/design/selection.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import {
   buildArchitectureReport,
@@ -70,9 +71,11 @@ export async function loadWholeGraphGuard(options?: {
   if (!existsSync(join(zeltoDir, 'design'))) return null;
   const store = new DesignStore(zeltoDir);
   const list = await store.list();
-  const confirmed = list.filter((d) => d.status === 'confirmed');
-  if (confirmed.length === 0) return null;
-  const design = await store.read(confirmed[0].id);
+  // 与 `zelto arch check` 同一口径：默认挑项目基线设计，
+  // 没有基线才退到最新的已确认设计（见 core/design/selection.ts）。
+  const picked = pickDefaultDesign(list);
+  if (!picked) return null;
+  const design = await store.read(picked.id);
 
   const specs = toModuleSpecs(design);
   const scan = scanArchitecture(scanRoot, specs);
