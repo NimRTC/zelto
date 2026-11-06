@@ -8,6 +8,7 @@ import type { DesignSummary } from '../design/types.js';
 import type { EventEnvelope } from '../events/stream.js';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { PROTECTED_PATTERNS } from '../policy/engine.js';
 
 export interface SliceStatusDistribution {
   draft: number;
@@ -214,11 +215,8 @@ export async function analyzeReport(
           totalRules++;
         }
       }
-      // Also read PROTECTED_PATTERNS from engine.ts comment or just hardcode
-      protectedPaths.push(
-        'policy/**', '.zelto/**', 'AGENTS.md',
-        '.cursor/rules/**', 'zelto-hook', 'zelto-hook.exe',
-      );
+      // 保护域从 policy engine 取（唯一真源，不在这里抄一份）
+      protectedPaths.push(...PROTECTED_PATTERNS);
     }
   } catch {
     // Policy file doesn't exist or unreadable

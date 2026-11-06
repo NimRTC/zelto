@@ -79,6 +79,8 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `Sign requested by ${String(e.payload?.requestedBy ?? '')}`,
   'sign.approved': () => 'Sign approved',
   'sign.rejected': () => 'Sign rejected',
+  'sign.revoked': (e) =>
+    `Sign revoked by ${String(e.payload?.revokedBy ?? '?')}: ${String(e.payload?.reason ?? '')}`,
   'batch.halted': (e) =>
     `Batch halted (${String(e.payload?.stage ?? 'running')}): ${String(e.payload?.reason ?? '')}`,
   'merge.completed': () => 'Merge completed',
@@ -118,6 +120,18 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
     `Version ${String(e.payload?.version ?? '?')} delivered — slices: ${String(
       Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '',
     )}`,
+  'draft.created': (e) =>
+    `Draft created: ${String(e.payload?.kind ?? '?')} "${String(e.payload?.title ?? '')}" (${String(e.payload?.id ?? '?')})`,
+  'draft.revised': (e) =>
+    `Draft revised: ${String(e.payload?.kind ?? '?')} "${String(e.payload?.title ?? '')}"${
+      e.payload?.addedVersion ? ` — added version ${String(e.payload.addedVersion)}` : ''
+    }${e.payload?.feedback ? ` — feedback: ${String(e.payload.feedback)}` : ''}`,
+  'draft.confirmed': (e) =>
+    `Draft confirmed by human: ${String(e.payload?.kind ?? '?')} "${String(e.payload?.title ?? '')}"${
+      Array.isArray(e.payload?.versions) && (e.payload.versions as string[]).length > 0
+        ? ` — versions: ${(e.payload.versions as string[]).join(', ')}`
+        : ''
+    }`,
 };
 
 export class AuditTrail {
