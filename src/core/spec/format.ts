@@ -31,6 +31,9 @@ export interface SectionSpec {
 export const SPEC_SECTIONS: SectionSpec[] = [
   { concept: 'Summary', aliases: ['Summary', 'Purpose', '目的'], required: true },
   { concept: 'Acceptance Criteria', aliases: ['Acceptance Criteria', 'Acceptance', '验收标准'], required: true },
+  // 「需求」章节是追溯引用的另一种出处写法：有些规格先列需求再列验收标准。
+  // 非必备——缺它只是拿不到这路出处，不构成规格缺陷（ADR-032 §3.3）。
+  { concept: 'Requirements', aliases: ['Requirements', 'Requirement', '需求'], required: false },
   { concept: 'Scope', aliases: ['Scope', 'Range', '范围'], required: false },
   { concept: 'Design', aliases: ['Design', '设计'], required: false },
   { concept: 'API / Interface Changes', aliases: ['API / Interface Changes', 'API Changes', 'API', '接口变更'], required: false },

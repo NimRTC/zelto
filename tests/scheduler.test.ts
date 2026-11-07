@@ -41,6 +41,7 @@ describe('Scheduler — admit', () => {
   it('admits a frozen slice with no conflicts', async () => {
     const slice = store.create('slice-a', 'Slice A', {
       writes: ['src/core/feature-a/**'],
+      trace: { requirements: ['R1: 切片 A 的需求出处'], contracts: [], tests: [] },
     });
     slice.state = 'frozen';
     slice.spec.frozenHash = 'abc';
@@ -65,6 +66,7 @@ describe('Scheduler — admit', () => {
   it('blocks a slice with write-set conflict', async () => {
     const sliceA = store.create('slice-conflict-a', 'Conflict A', {
       writes: ['src/shared/component.ts'],
+      trace: { requirements: ['R1: 切片 A 的需求出处'], contracts: [], tests: [] },
     });
     sliceA.state = 'frozen';
     sliceA.spec.frozenHash = 'abc';
@@ -76,6 +78,7 @@ describe('Scheduler — admit', () => {
 
     const sliceB = store.create('slice-conflict-b', 'Conflict B', {
       writes: ['src/shared/component.ts'],
+      trace: { requirements: ['R1: 切片 B 的需求出处'], contracts: [], tests: [] },
     });
     sliceB.state = 'frozen';
     sliceB.spec.frozenHash = 'def';
@@ -90,6 +93,7 @@ describe('Scheduler — admit', () => {
   it('admits slices with non-overlapping write-sets', async () => {
     const sliceA = store.create('slice-nonoverlap-a', 'Non-overlap A', {
       writes: ['src/feature-x/**'],
+      trace: { requirements: ['R1: 切片 A 的需求出处'], contracts: [], tests: [] },
     });
     sliceA.state = 'frozen';
     sliceA.spec.frozenHash = 'abc';
@@ -99,6 +103,7 @@ describe('Scheduler — admit', () => {
 
     const sliceB = store.create('slice-nonoverlap-b', 'Non-overlap B', {
       writes: ['src/feature-y/**'],
+      trace: { requirements: ['R1: 切片 B 的需求出处'], contracts: [], tests: [] },
     });
     sliceB.state = 'frozen';
     sliceB.spec.frozenHash = 'def';

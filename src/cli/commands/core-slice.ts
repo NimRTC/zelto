@@ -20,6 +20,27 @@ function extractFlagValue(args: string[], flag: string): string | undefined {
   }
   return parts.length > 0 ? parts.join(' ') : undefined;
 }
+
+/**
+ * Extract every occurrence of a repeatable flag.
+ * Each occurrence takes exactly one value (the next argument).
+ * E.g. extractFlagValues(['--requirement', 'R1', '--requirement', 'R2'], '--requirement')
+ * → ['R1', 'R2']
+ *
+ * 为什么需要它：需求追溯引用可以有多条（一片往往追溯到多条需求），
+ * 而 extractFlagValue 会把多条值拼成一个字符串——追溯引用要能一条一条列出来。
+ */
+function extractFlagValues(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== flag) continue;
+    const value = args[i + 1];
+    if (value === undefined || value.startsWith('--')) continue;
+    const trimmed = value.trim();
+    if (trimmed) values.push(trimmed);
+  }
+  return values;
+}
 import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
 import type { SliceData } from '../../core/slice/store.js';
@@ -152,11 +173,14 @@ register('create', async (args) => {
 
   // Show usage for --help
   if (id === '--help' || id === '-h') {
-    console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>] [--from-spec]');
+    console.error('Usage: zelto create <slice-id> [--title <title>] [--writes <path1,path2,...>] [--requirement <ref>]... [--from-spec]');
     console.error('');
     console.error('  --from-spec    Parse spec markdown (specs/slices/<id>.md) to auto-populate');
     console.error('                 writes, requirements, baseline, and acceptance test fields.');
     console.error('                 Also detects v0- prefix as baseline slice.');
+    console.error('  --requirement  Declare a requirement reference (repeatable). Required unless the');
+    console.error('                 spec has acceptance criteria — the freeze gate refuses slices');
+    console.error('                 with no traceable origin (ADR-032).');
     return 0;
   }
 
@@ -206,6 +230,9 @@ register('create', async (args) => {
 
   const isJson = args.includes('--json');
   const fromSpec = args.includes('--from-spec');
+  // 需求追溯引用（人批准的出处）：可以给多条。
+  // 没有规格可解析时，这是人唯一能声明「这段代码为什么存在」的入口（ADR-032 §3.3）。
+  const declaredRequirements = extractFlagValues(args, '--requirement');
 
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
     if (isJson) {
@@ -227,10 +254,13 @@ register('create', async (args) => {
 
   // If --from-spec, parse the spec markdown to populate slice fields
   if (fromSpec) {
-    return await createSliceFromSpec(id, title, writes, isJson);
+    return await createSliceFromSpec(id, title, writes, isJson, declaredRequirements);
   }
 
-  const slice = store.create(id, title, { writes });
+  const slice = store.create(id, title, {
+    writes,
+    trace: { requirements: declaredRequirements, contracts: [], tests: [] },
+  });
   await store.write(slice);
   await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title, specPath: slice.spec.path });
 
@@ -248,6 +278,7 @@ register('create', async (args) => {
   console.log(`  State:  ${slice.state}`);
   console.log(`  Writes: ${writes.length > 0 ? writes.join(', ') : '(none)'}`);
   console.log(`  Spec:   ${slice.spec.path}`);
+  console.log(`  Reqs:   ${declaredRequirements.length > 0 ? declaredRequirements.join('; ') : '(none — 没有规格章节可物化，冻结准入会拦住它)'}`);
   console.log(`  Next:   zelto check ${id} && zelto freeze ${id}`);
   return 0;
 });
@@ -264,6 +295,7 @@ async function createSliceFromSpec(
   title: string,
   cliWrites: string[],
   isJson: boolean,
+  declaredRequirements: string[] = [],
 ): Promise<number> {
   const specPath = `specs/slices/${id}.md`;
 
@@ -335,10 +367,13 @@ async function createSliceFromSpec(
   // Auto-detect slice type from write-set
   const sliceType = detectSliceType(finalWrites);
 
+  // 已声明的需求追溯优先于从规格里读出来的（ADR-032 §3.1：声明优先，规格是兜底）
+  const finalRequirements = declaredRequirements.length > 0 ? declaredRequirements : requirements;
+
   const slice = store.create(id, parsedTitle, {
     writes: finalWrites,
     type: sliceType,
-    trace: { requirements, contracts: [], tests: acceptanceTests },
+    trace: { requirements: finalRequirements, contracts: [], tests: acceptanceTests },
     traceWaiver,
     baseline: isBaseline,
   });
@@ -367,7 +402,7 @@ async function createSliceFromSpec(
   console.log(`  State:    ${slice.state}`);
   console.log(`  Baseline: ${isBaseline ? '✅ (v0- prefix detected)' : 'no'}`);
   console.log(`  Writes:   ${finalWrites.length > 0 ? finalWrites.join(', ') : '(none — add with --writes)'}`);
-  console.log(`  Reqs:     ${requirements.length} parsed from spec`);
+  console.log(`  Reqs:     ${finalRequirements.length} ${declaredRequirements.length > 0 ? 'declared' : 'parsed from spec'}`);
   if (hasAcceptanceTest) console.log(`  Accept:   ✅ ${acceptanceTestPath}`);
   if (traceWaiver) console.log(`  Waiver:   ${traceWaiver}`);
   console.log(`  Spec:     ${slice.spec.path}`);
@@ -430,16 +465,18 @@ register('check', async (args) => {
     }
 
     // Validate acceptance test path exists
+    // 提示级而不是阻断级：验收测试跑不跑得通是门禁②的事（ADR-032 §3.2），
+    // 门禁①只管「追溯到没追溯」与「规格写没写清楚」。
     if (slice.acceptance.dir && !slice.acceptance.dir.includes('*') && slice.state !== 'draft') {
       const acceptPath = slice.acceptance.dir.endsWith('/')
         ? slice.acceptance.dir.slice(0, -1)
         : slice.acceptance.dir;
       if (!existsSync(acceptPath) && !existsSync(`${acceptPath}.test.ts`)) {
-        issues.push(`Acceptance test path not found: ${slice.acceptance.dir}`);
+        advisories.push(`Acceptance test path not found: ${slice.acceptance.dir}`);
       }
     }
 
-    // 规格引擎接入（ADR-032 §3.4）：
+    // 规格引擎接线（ADR-032 §3.4）：
     //   - 确定性判据（validateDeterministic）：error 阻断、warning 提示
     //   - 语义启发式（analyzeSemantic）：只提示、不阻断（C7：语义分析不参与判定）
     // 「追溯」与「哈希」两类由上面的追溯判定与哈希比对负责，这里跳过避免重复报。
@@ -772,7 +809,8 @@ register('freeze', async (args) => {
       specContent = '';
     }
     const gate = evaluateFreezeTrace(slice, specContent);
-    if (gate.requirements.length !== slice.trace.requirements.length) {
+    const materialized = gate.requirements.length !== slice.trace.requirements.length;
+    if (materialized) {
       slice.trace.requirements = gate.requirements;
       await store.write(slice);
     }
@@ -783,7 +821,8 @@ register('freeze', async (args) => {
         sliceId: id, issues: gate.blocking.length, passed: false, details, phase: 'freeze',
       });
       const advice = [
-        `  声明需求追溯： zelto set ${id} --field trace.requirements --value "<需求引用>"`,
+        `  在规格里写「## 验收标准」（编号条目）→ zelto 会自动物化成需求追溯`,
+        `  或显式声明需求追溯： zelto set ${id} --field trace.requirements --value "<需求引用>"`,
         `  或写明豁免理由： zelto set ${id} --field traceWaiver --value "<理由>"`,
       ].join('\n');
       if (isJson) {
@@ -800,6 +839,8 @@ register('freeze', async (args) => {
       return 1;
     }
 
+    // 物化追溯也是一次状态变更（C4）：留痕挂在同一次冻结动作的事件上——
+    // 单独再写一条 spec.checked 会让「本片 check 过几次」这种统计失真。
     const specHash = hashSpecFile(slice.spec.path);
     slice.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
     slice.spec.frozenAt = new Date().toISOString();
@@ -808,6 +849,8 @@ register('freeze', async (args) => {
     await store.transit(id, 'FREEZE');
     await events.append(id, 'spec.frozen', 'cli', {
       sliceId: id, frozenHash: slice.spec.frozenHash, frozenAt: slice.spec.frozenAt,
+      materializedRequirements: gate.requirements.length,
+      traceSource: materialized ? 'spec' : 'declared',
     });
 
     if (isJson) {
@@ -1292,7 +1335,7 @@ register('admit', async (args) => {
 register('start', async (args) => {
   const [id] = args;
   if (!id || id.startsWith('--')) {
-    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--agent <name>] [--adapter <type>] [--yes]');
+    console.error('Usage: zelto start <slice-id> [--title <title>] [--writes <path1,path2,...>] [--requirement <ref>]... [--agent <name>] [--adapter <type>] [--yes]');
     return 1;
   }
 
@@ -1323,11 +1366,18 @@ register('start', async (args) => {
   const writesRaw = extractFlagValue(args, '--writes');
   const customWrites = writesRaw ? writesRaw.split(',').map((w: string) => w.trim()).filter(Boolean) : null;
 
+  // 需求追溯引用（人批准的出处）：start 常常没有规格可解析，
+  // 这时人必须显式声明，否则冻结准入会拦住（ADR-032 §3.1）。
+  const declaredRequirements = extractFlagValues(args, '--requirement');
+
   // Step 1: Create if not exists
   let isNew = false;
   if (!(await store.exists(id))) {
     const writes = customWrites ?? detectDefaultWrites();
-    const slice = store.create(id, title, { writes });
+    const slice = store.create(id, title, {
+      writes,
+      trace: { requirements: declaredRequirements, contracts: [], tests: [] },
+    });
     await store.write(slice);
     await events.append(id, 'spec.drafted', 'cli', { sliceId: id, title, specPath: slice.spec.path });
     console.log(`  ✅ Created: ${id}`);
@@ -1343,6 +1393,11 @@ register('start', async (args) => {
   try {
     const current = await store.read(id);
     if (current.state === 'draft' || current.state === 'clarifying') {
+      // 人显式声明的需求追溯：切片已有出处就不覆盖（声明优先，但不覆盖更完整的声明）
+      if (current.trace.requirements.length === 0 && declaredRequirements.length > 0) {
+        current.trace.requirements = declaredRequirements;
+        await store.write(current);
+      }
       // Write a default spec if none exists
       const { existsSync, mkdirSync, writeFileSync } = await import('node:fs');
       const specPath = current.spec.path;
@@ -1351,11 +1406,15 @@ register('start', async (args) => {
         if (!existsSync(specDir)) {
           mkdirSync(specDir, { recursive: true });
         }
-        // 占位规格：验收标准给一条能被人覆盖的默认条目（ADR-032 §3.3）。
-        // 这条默认条目会物化成本片的需求追溯——它是占位，不是替人批准的需求。
+        // 占位规格：只有骨架，**验收标准留空**。
+        //
+        // 为什么不给一条默认的验收标准：那一句话会物化成本片的需求追溯，
+        // 于是「追溯合格」变成 zelto 自己替人批准的需求——追溯链看着完整，
+        // 实际是空的。假引用比缺失更有毒（ADR-032 §3.3）。
+        // 所以这里写骨架，然后由冻结准入拦住人：先把验收标准写下来。
         writeFileSync(
           specPath,
-          `# ${current.title}\n\n## Summary\n\n${current.title}\n\n## Acceptance Criteria\n\n1. ${current.title} 完成并通过验收测试\n`,
+          `# ${current.title}\n\n## Summary\n\n${current.title}\n\n## Scope\n\n## Acceptance Criteria\n\n## Risks\n`,
           'utf-8',
         );
       }
@@ -1370,7 +1429,9 @@ register('start', async (args) => {
       if (gate.blocking.length > 0) {
         console.error(`  ❌ 追溯不合格，拒绝冻结：`);
         for (const v of gate.blocking) console.error(`     - ${v.message}`);
-        console.error(`     声明需求追溯： zelto set ${id} --field trace.requirements --value "<需求引用>"`);
+        console.error(`     在规格「${specPath}」里写「## 验收标准」（编号条目）→ 冻结准入会认它`);
+        console.error(`     或显式声明需求追溯： zelto start ${id} --requirement "<需求引用>"`);
+        console.error(`     或事后补声明： zelto set ${id} --field trace.requirements --value "<需求引用>"`);
         return 1;
       }
 
