@@ -247,3 +247,80 @@ export function displayPath(target: string, gateRoot: string): string {
   const rel = relative(gateRoot, target);
   return rel.startsWith('..') ? target : rel.split(sep).join('/');
 }
+
+// ─── 「有没有真跑用例」 ─────────────────────────────────────────────────────
+
+/**
+ * 测试运行器的统计（只认 TAP 汇总行里明确写出来的数字）。
+ *
+ * `known` 为 false 表示输出里没有可识别的汇总行 —— **未知不等于没跑**，
+ * 这种情况下不做任何判断（不同测试运行器的输出格式不一样，猜不得）。
+ */
+export interface AcceptanceRunStats {
+  /** 真正执行并通过的用例数 */
+  pass: number;
+  /** 失败的用例数 */
+  fail: number;
+  /** 标记为 todo 的用例数（骨架生成器写的就是它） */
+  todo: number;
+  /** 被跳过的用例数 */
+  skipped: number;
+  /** 是否读到了统计 */
+  known: boolean;
+}
+
+/**
+ * 从测试运行器的输出里读统计。
+ *
+ * 认 node 测试运行器的 TAP 汇总行（`# pass 3` / `# todo 2` / `# skipped 1`）。
+ * 认不出就返回 `known: false` —— 不猜、不用正则硬凑一个结论。
+ */
+export function parseTestRunnerStats(output: string): AcceptanceRunStats {
+  const stats: AcceptanceRunStats = { pass: 0, fail: 0, todo: 0, skipped: 0, known: false };
+
+  for (const line of output.split('\n')) {
+    const m = line.match(/^\s*#\s*(pass|fail|todo|skipped)\s+(\d+)\s*$/i);
+    if (!m) continue;
+    const count = Number.parseInt(m[2], 10);
+    if (Number.isNaN(count)) continue;
+    stats.known = true;
+    const key = m[1].toLowerCase() as 'pass' | 'fail' | 'todo' | 'skipped';
+    stats[key] = count;
+  }
+
+  return stats;
+}
+
+/**
+ * 判断验收是不是「真跑过了」。
+ *
+ * 为什么要多这一层（ADR-034）：验收测试骨架里的用例全是 `test.todo(...)`，
+ * 而 `node --test` 对全是 todo 的文件**退出码是 0** —— 门禁于是把
+ * 「一个用例都没跑」当成「验收通过」。骨架存在 ≠ 验收通过。
+ *
+ * 判定只有一条：**没有任何一条用例真正执行过** → 没验证。
+ */
+export function verifyAcceptanceRanTests(stats: AcceptanceRunStats): {
+  ok: boolean;
+  reason: string | null;
+} {
+  if (!stats.known) {
+    return { ok: true, reason: null }; // 读不出统计 → 不做判断
+  }
+
+  if (stats.pass > 0) {
+    return { ok: true, reason: null };
+  }
+
+  if (stats.todo > 0 || stats.skipped > 0) {
+    return {
+      ok: false,
+      reason: `验收文件里没有一条用例真正执行过（pass 0 / todo ${stats.todo} / skipped ${stats.skipped}）—— todo 与 skip 不算验证`,
+    };
+  }
+
+  return {
+    ok: false,
+    reason: '验收命令跑完了，但没有任何用例被执行（pass 0）—— 验收文件是空的或全被跳过',
+  };
+}

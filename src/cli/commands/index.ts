@@ -33,6 +33,7 @@ import './batch.js';
 import './halt.js';
 import './merge.js';
 import './architecture.js';
+import './slice-spec.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────

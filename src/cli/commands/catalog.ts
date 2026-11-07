@@ -87,6 +87,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'design', group: 'AI 流水线', args: '<req-id>', summary: '从需求生成与细化设计', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
   { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, show <id>, confirm <id>, add-version <id> <d>' },
   { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>' },
+  { name: 'spec', group: 'AI 流水线', args: '<subcommand> <slice-id>', summary: '切片规格的草稿与确认：生成草稿 → 人确认后写进正式规格', detail: 'draft, show, confirm' },
   { name: 'pipeline', group: 'AI 流水线', args: 'status', summary: '需求→设计→计划→版本→切片 全链一览' },
 
   // ─── 项目接管 ──────────────────────────────────────────────────────────

@@ -15,7 +15,8 @@ import { generateRequirements, refineRequirements } from '../../llm/generators/r
 import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
-import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, generateSliceSpecContent, hashSpecFile } from './shared.js';
+import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, hashSpecFile } from './shared.js';
+import { createSpecDraft } from './slice-spec.js';
 import { RevisionStore } from '../../core/review/index.js';
 import { designFacts, planFacts, requirementFacts, showDraft } from './draft-review.js';
 import { executeSlicesByPhase, printParallelSummary } from './parallel-executor.js';
@@ -503,18 +504,12 @@ register('plan', async (args) => {
     plan.confirmedAt = new Date().toISOString();
     await versionStore.save(plan);
 
-    const specsDir = 'specs/slices';
-    if (!existsSync(specsDir)) {
-      mkdirSync(specsDir, { recursive: true });
-    }
-
-    for (const v of plan.versions) {
-      for (const slice of v.slices) {
-        const specContent = generateSliceSpecContent(slice.id, slice.title, slice.module, slice.writes, v.version);
-        writeFileSync(slice.specPath, specContent, 'utf-8');
-        f.out(`  Created ${slice.specPath}`);
-      }
-    }
+    // 计划确认**不代填规格**（ADR-034）。
+    // 工具自动写的规格会物化成本片的需求追溯，于是「追溯合格」变成
+    // zelto 替人批准的需求（ADR-032 §4 方案四）。规格由人确认的草稿产生：
+    //   zelto spec draft <slice-id>   → 生成草稿 + 验收测试骨架
+    //   zelto spec confirm <slice-id> → 人确认后写进正式规格
+    const plannedSlices = plan.versions.flatMap((v) => v.slices.map((s) => s.id));
 
     f.success(`Plan "${id}" confirmed.`);
     for (const v of plan.versions) {
@@ -526,7 +521,11 @@ register('plan', async (args) => {
       title: plan.title,
       versions: plan.versions.map((v) => v.version),
     });
-    f.out('Run "zelto version start <version>" to begin execution.');
+    f.out('下一步：给每一片生成规格草稿并由你确认：');
+    for (const sliceId of plannedSlices) {
+      f.out(`   zelto spec draft ${sliceId}   →   zelto spec confirm ${sliceId}`);
+    }
+    f.out('确认完再跑 zelto version start —— 没有确认过的规格不会被冻结。');
     return 0;
   }
 
@@ -909,6 +908,7 @@ register('version', async (args) => {
     // ── Phase 1: 准备切片（建切片文件 → 写规格 → 冻结）──────────────
     f.out('\n── Phase 1: Prepare slices ──');
     const prepared: string[] = [];
+    const pendingConfirm: string[] = [];
 
     for (const sliceDef of version.slices) {
       const existing = await sliceStore.read(sliceDef.id).catch(() => null);
@@ -937,7 +937,12 @@ register('version', async (args) => {
       try {
         specContent = readFileSync(specPath, 'utf-8');
       } catch {
-        specContent = generateSliceSpecContent(sliceDef.id, sliceDef.title, sliceDef.module, sliceDef.writes, versionLabel);
+        // 正式规格不存在 → 生成**草稿**，等人确认（ADR-034）。
+        // 这一片不冻结：追溯的出处必须是人确认过的规格，而不是工具刚写的东西。
+        const draft = await createSpecDraft(sliceDef.id);
+        f.out(`  📝 "${sliceDef.id}" 还没有确认过的规格 —— 已生成草稿：${draft?.path ?? '(生成失败)'}`);
+        pendingConfirm.push(sliceDef.id);
+        continue;
       }
       const specDir = dirname(specPath);
       if (!existsSync(specDir)) mkdirSync(specDir, { recursive: true });
@@ -979,6 +984,21 @@ register('version', async (args) => {
       }
 
       prepared.push(sliceDef.id);
+    }
+
+    // 有片还没拿到「人确认过的规格」→ 这一轮不开跑。
+    // 追溯的出处必须是人批准的规格；工具刚生成的草稿不算（ADR-034 / ADR-032 §4）。
+    if (pendingConfirm.length > 0) {
+      f.out('');
+      f.error(
+        'BLOCKED',
+        `${pendingConfirm.length} 个切片还没有确认过的规格，本轮不启动执行：${pendingConfirm.join('、')}`,
+      );
+      f.out('   审阅草稿（.zelto/drafts/specs/）并确认后重跑：');
+      for (const id of pendingConfirm) {
+        f.out(`     zelto spec confirm ${id}`);
+      }
+      return 1;
     }
 
     if (prepared.length === 0) {

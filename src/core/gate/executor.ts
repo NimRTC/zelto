@@ -13,7 +13,9 @@ import {
   DEFAULT_ACCEPTANCE_COMMAND,
   buildAcceptanceCommand,
   missingTargetOutcome,
+  parseTestRunnerStats,
   resolveAcceptance,
+  verifyAcceptanceRanTests,
 } from './acceptance.js';
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
@@ -273,6 +275,17 @@ export class GateExecutor {
       durationMs: result.durationMs,
       files: target.files,
     };
+
+    // 退出码 0 不等于「验收通过」：全是 todo/skip 的验收文件也会退出 0
+    // （ADR-034 的验收骨架就是这么写的）。这里补一层「真跑过用例」的判定。
+    if (outcome.status === 'passed') {
+      const stats = parseTestRunnerStats(`${result.stdout}\n${result.stderr}`);
+      const verdict = verifyAcceptanceRanTests(stats);
+      if (!verdict.ok && verdict.reason) {
+        outcome.status = 'failed';
+        outcome.reason = verdict.reason;
+      }
+    }
 
     await this.appendEvent(slice.id, 'gate.result', actor, {
       sliceId: slice.id,

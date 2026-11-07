@@ -15,6 +15,7 @@ import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.
 import type { GateAcceptanceConfig } from '../../core/gate/types.js';
 import { SliceStore } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
+import { buildDeterministicSliceSpec } from '../../llm/generators/slice-spec.js';
 
 // 策略解析的唯一实现在 core/policy/yaml.ts（ADR-014 §4）。
 // 这里转出去是为了不破坏既有调用方。
@@ -907,6 +908,17 @@ export function createExecutorAdapter(
 
 // ─── Slice Spec Generator ────────────────────────────────────────────────────
 
+/**
+ * 生成一份切片规格正文（**确定性降级路径**）。
+ *
+ * 内容的唯一实现在 `src/llm/generators/slice-spec.ts`（ADR-034）。
+ * 这里的薄壳保留是为了兼容既有调用方与测试。
+ *
+ * 注意：这条路径产出的规格**不含任何自造的验收标准** —— 没有已批准的
+ * 需求条目时，验收标准章节只留占位说明（不写编号条目）。
+ * 写了编号条目就会被物化成本片的需求追溯，于是「追溯合格」变成
+ * zelto 替人批准的需求（ADR-032 §4 方案四）。
+ */
 export function generateSliceSpecContent(
   sliceId: string,
   title: string,
@@ -914,21 +926,13 @@ export function generateSliceSpecContent(
   writes: string[],
   version: string,
 ): string {
-  return [
-    `# Slice: ${sliceId}`,
-    '',
-    '## 目的',
-    `版本 ${version} — ${title}`,
-    '',
-    '## 范围',
-    ...writes.map((w) => `- \`${w}\``),
-    '',
-    '## 验收标准',
-    `1. 完成 ${title}`,
-    '2. 全部测试通过',
-    '',
-    '## 风险',
-    '- 无',
-    '',
-  ].join('\n');
+  return buildDeterministicSliceSpec({
+    sliceId,
+    title,
+    module,
+    writes,
+    version,
+    requirements: [],
+    prerequisites: [],
+  });
 }
