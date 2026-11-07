@@ -133,7 +133,7 @@ export async function autoGateAfterRun(id: string): Promise<void> {
   const gateConfig: GateConfig = {
     commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
     profiles: config.gate.profiles,
-    changedLineCoverage: 0.8,
+    ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
     timeoutSec: config.gate.timeoutSec,
     retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
   };

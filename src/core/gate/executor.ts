@@ -6,22 +6,49 @@ import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { GateConfig, GateCommand, GateResult, GateReport, SliceType } from './types.js';
+import type { GateConfig, GateCommand, GateResult, GateReport, SliceType, AcceptanceOutcome } from './types.js';
 import { detectSliceType } from './types.js';
+import {
+  DEFAULT_ACCEPTANCE_BUILD_DIR,
+  DEFAULT_ACCEPTANCE_COMMAND,
+  buildAcceptanceCommand,
+  missingTargetOutcome,
+  resolveAcceptance,
+} from './acceptance.js';
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 
-function runCommand(cmd: GateCommand, timeoutSec: number, cwd: string): Promise<GateResult> {
+/**
+ * 跑一条命令。
+ *
+ * `stripTestContext` 用来防止「假绿」：当这段代码自己跑在 `node --test`
+ * 里面时，`NODE_TEST_CONTEXT=child-v8` 会被子进程继承。子进程看到它就认为
+ * 「我已经是测试子进程了」，于是**跳过所有用例直接 exit 0** ——
+ * 门禁于是把「一个测试都没跑」当成「测试全过」（ADR-033）。
+ *
+ * 验收命令必须真跑，所以这个变量要摘掉。
+ */
+function runCommand(
+  cmd: GateCommand,
+  timeoutSec: number,
+  cwd: string,
+  options: { stripTestContext?: boolean } = {},
+): Promise<GateResult> {
   return new Promise((resolvePromise) => {
     const start = performance.now();
     // Use shell: true with the full command as a single string
     // to avoid the deprecation warning about args with shell
     const ac = new AbortController();
+    const env = { ...process.env };
+    if (options.stripTestContext) {
+      delete env.NODE_TEST_CONTEXT;
+    }
     const child = spawn(cmd.run || cmd.name, [], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: true,
       signal: ac.signal,
+      env,
     });
 
     const timer = setTimeout(() => {
@@ -140,6 +167,16 @@ export class GateExecutor {
       }
     }
 
+    // ── 切片级验收（ADR-033）────────────────────────────────────────
+    // 这一步回答的是「这片东西自己有没有被验证过」，与全项目命令是两件事。
+    // 没配 gate.acceptance 时显式记为 skipped（不是静默跳过）。
+    // 配了之后 fail closed：跑不起来就是 failed，不是 skipped
+    // （除非显式声明 required:false）。
+    const acceptance = await this.runAcceptance(slice, actor);
+    if (acceptance.status === 'failed') {
+      passed = false;
+    }
+
     const totalDurationMs = performance.now() - totalStart;
 
     await this.appendEvent(sliceId, 'gate.result', actor, {
@@ -155,6 +192,7 @@ export class GateExecutor {
       })),
       retryCount: totalRetries,
       totalDurationMs,
+      acceptance,
     });
 
     return {
@@ -163,7 +201,87 @@ export class GateExecutor {
       results,
       retryCount: totalRetries,
       totalDurationMs,
+      acceptance,
     };
+  }
+
+  /**
+   * 跑本片的验收测试（ADR-033）。
+   *
+   * 判定完全确定：只看「目标找没找到」「命令跑没跑成功」，不看内容语义。
+   *
+   * 三种结论：
+   * - `skipped`：没配 `gate.acceptance`（人还没决定要用切片级验收），
+   *   或者配了但声明 `required: false` 且本片没有验收目标；
+   * - `failed`：配了验收但没有验收目标、命令跑不起来、命令跑了但失败；
+   * - `passed`：命令跑成功。
+   *
+   * 「没配」不等于「没问题」—— 所以它会被显式记下来，不会静默跳过。
+   */
+  private async runAcceptance(slice: SliceData, actor: string): Promise<AcceptanceOutcome> {
+    const cfg = this.config.acceptance;
+
+    // 没配切片级验收：显式记 skipped，不影响门禁结论。
+    if (!cfg) {
+      return {
+        status: 'skipped',
+        path: null,
+        command: null,
+        reason: '未配置切片级验收（config.yaml 的 gate.acceptance 段）',
+        exitCode: null,
+        durationMs: 0,
+      };
+    }
+
+    const commandTemplate = cfg.command.trim() || DEFAULT_ACCEPTANCE_COMMAND;
+    const required = cfg.required ?? true;
+    const buildDir = cfg.buildDir ?? DEFAULT_ACCEPTANCE_BUILD_DIR;
+
+    const resolution = resolveAcceptance(slice.acceptance?.dir, this.projectRoot, buildDir);
+
+    if (!resolution.target) {
+      const reason = resolution.reason ?? '本片没有登记验收目标';
+      const outcome = missingTargetOutcome(required, reason, commandTemplate);
+      await this.appendEvent(slice.id, 'gate.result', actor, {
+        sliceId: slice.id,
+        passed: false,
+        acceptance: outcome,
+        note: '切片级验收未执行',
+      });
+      return outcome;
+    }
+
+    const target = resolution.target;
+    const command = buildAcceptanceCommand(commandTemplate, target.files);
+    const timeoutSec = cfg?.timeoutSec ?? this.config.timeoutSec;
+    const result = await runCommand(
+      { name: 'acceptance', run: command },
+      timeoutSec,
+      this.projectRoot,
+      // 验收命令必须是一个**真正跑测试**的进程，不能继承测试运行器的环境标记。
+      // `NODE_TEST_CONTEXT=child-v8` 会被 node --test 继承成「我是测试子进程」，
+      // 于是它跳过所有用例直接 exit 0 —— 门禁于是「假绿」（ADR-033）。
+      { stripTestContext: true },
+    );
+
+    const outcome: AcceptanceOutcome = {
+      status: result.passed ? 'passed' : 'failed',
+      path: target.path,
+      command,
+      ...(result.passed ? {} : { reason: result.stderr.slice(0, 2000) || result.stdout.slice(0, 2000) || '验收命令失败' }),
+      exitCode: result.exitCode,
+      durationMs: result.durationMs,
+      files: target.files,
+    };
+
+    await this.appendEvent(slice.id, 'gate.result', actor, {
+      sliceId: slice.id,
+      passed: outcome.status === 'passed',
+      acceptance: outcome,
+      ...(outcome.reason ? { stderr: outcome.reason.slice(0, 2000) } : {}),
+    });
+
+    return outcome;
   }
 
   /**

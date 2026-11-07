@@ -8,11 +8,48 @@ export interface GateCommand {
   timeoutSec?: number;
 }
 
+export interface GateAcceptanceConfig {
+  /**
+   * Command template for running the slice's own acceptance tests.
+   *
+   * The literal `{acceptance}` is replaced by the slice's acceptance path
+   * (`slice.acceptance.dir`, resolved against the gate root). When the
+   * template has no placeholder, the path is appended as a trailing argument.
+   */
+  command: string;
+  /**
+   * Whether the slice must have a runnable acceptance target.
+   *
+   * - `true` (default): a missing / empty acceptance target fails the gate.
+   * - `false`: a missing target is reported as `skipped` instead.
+   *
+   * This governs *presence*, not outcome — a target that runs and fails
+   * always fails the gate.
+   */
+  required?: boolean;
+  /** Per-acceptance timeout in seconds. Falls back to GateConfig.timeoutSec. */
+  timeoutSec?: number;
+  /**
+   * Compile-output directory, relative to the gate root.
+   *
+   * TypeScript sources cannot be executed by `node --test` directly, so the
+   * gate looks for the compiled counterpart here first (ADR-033).
+   * Defaults to `dist-test`.
+   */
+  buildDir?: string;
+}
+
 export interface GateConfig {
   commands: GateCommand[];
   /** Named gate profiles keyed by slice type (code, docs, config, refactor) */
   profiles?: Record<string, GateCommand[]>;
-  changedLineCoverage: number;
+  /**
+   * Optional slice-level acceptance gate.
+   *
+   * When absent, the gate only runs the project-wide `commands` and the
+   * acceptance step is reported as `skipped` (explicitly, never silently).
+   */
+  acceptance?: GateAcceptanceConfig;
   timeoutSec: number;
   retry: {
     max: number;
@@ -67,10 +104,33 @@ export interface GateResult {
   durationMs: number;
 }
 
+/**
+ * Outcome of the slice-level acceptance step.
+ *
+ * `skipped` means "there was nothing to run" (no acceptance configured, or
+ * the slice has no acceptance target and `required` is false). It is never
+ * used for a run that was attempted and failed — that is `failed`.
+ */
+export interface AcceptanceOutcome {
+  status: 'passed' | 'failed' | 'skipped';
+  /** The acceptance target that was run (or would have been run). */
+  path: string | null;
+  /** The command as actually executed (after `{acceptance}` substitution). */
+  command: string | null;
+  /** Why the step was skipped / failed, when there is something to say. */
+  reason?: string;
+  /** The concrete test files that were executed (relative to the gate root). */
+  files?: string[];
+  exitCode?: number | null;
+  durationMs?: number;
+}
+
 export interface GateReport {
   sliceId: string;
   passed: boolean;
   results: GateResult[];
   retryCount: number;
   totalDurationMs: number;
+  /** Result of the slice-level acceptance step, when one was configured. */
+  acceptance?: AcceptanceOutcome;
 }

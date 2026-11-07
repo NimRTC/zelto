@@ -12,6 +12,7 @@ import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js'
 import { EventStream } from '../../core/events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
+import type { GateAcceptanceConfig } from '../../core/gate/types.js';
 import { SliceStore } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 
@@ -124,6 +125,8 @@ export interface ZeltoConfig {
   gate: {
     commands: Array<{ name: string; run: string; timeoutSec?: number }>;
     profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
+    /** 切片级验收配置（ADR-033）。没配就退回到「跑该片的验收目录」。 */
+    acceptance?: GateAcceptanceConfig;
     timeoutSec: number;
     retry: { max: number };
   };
@@ -333,6 +336,13 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let inTargetProjectGateSection = false;
   let inProfileSection = false;
   let currentProfile: string | null = null;
+  // 切片级验收段（ADR-033）
+  let inAcceptanceSection = false;
+  let acceptanceIndent = 0;
+  let acceptanceCommand = '';
+  let acceptanceRequired = true;
+  let acceptanceTimeoutSec: number | undefined;
+  let acceptanceBuildDir: string | undefined;
   let llmProvider = '';
   let llmApiKey = '';
   let llmModel = '';
@@ -406,6 +416,23 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
+      // acceptance: 切片级验收段（ADR-033）。
+      // 它是 gate 的兄弟节点，不是 command —— 所以要在这里另开一个状态机，
+      // 不能借用 currentCommand 那套（那是给 `- name:` 列表用的）。
+      //
+      // 位置要紧：必须在「profile 名匹配」之前判。否则 `profiles:` 之后的
+      // `acceptance:` 会被当成一个叫 acceptance 的 profile 名吃掉，
+      // 验收配置就静默丢了 —— 门禁于是「配了却没跑」。
+      if (trimmed === 'acceptance:') {
+        inAcceptanceSection = true;
+        acceptanceIndent = indent;
+        acceptanceCommand = '';
+        acceptanceRequired = true;
+        acceptanceTimeoutSec = undefined;
+        acceptanceBuildDir = undefined;
+        continue;
+      }
+
       // Detect profile name (indented under profiles:, e.g. "  docs:")
       const profileMatch = trimmed.match(/^(\w+):$/);
       if (profileMatch && inProfileSection) {
@@ -422,6 +449,29 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         inProfileSection = false;
         currentProfile = null;
         continue;
+      }
+
+      if (inAcceptanceSection) {
+        // 只认比 acceptance: 更深缩进的键 —— 否则 gate 顶层的 timeoutSec: 会被误吞。
+        if (indent <= acceptanceIndent) {
+          inAcceptanceSection = false;
+        } else if (trimmed.startsWith('command:')) {
+          acceptanceCommand = stripSurroundingQuotes(trimmed.slice(8).trim());
+          continue;
+        } else if (trimmed.startsWith('required:')) {
+          const raw = trimmed.slice(9).trim().toLowerCase();
+          acceptanceRequired = raw !== 'false';
+          continue;
+        } else if (trimmed.startsWith('timeoutSec:')) {
+          acceptanceTimeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+          continue;
+        } else if (trimmed.startsWith('buildDir:')) {
+          acceptanceBuildDir = stripSurroundingQuotes(trimmed.slice(9).trim()) || undefined;
+          continue;
+        } else {
+          // 未知子键：结束这段，别把它当 gate 的键处理
+          inAcceptanceSection = false;
+        }
       }
 
       const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
@@ -650,14 +700,27 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
     : undefined;
 
+  // 切片级验收配置（ADR-033）：只有在 command 非空时才生效。
+  // 「配了 acceptance 段但没写 command」等于没配 —— 宁可退回默认行为，
+  // 也不要拿一个空命令去跑门禁（那必然失败，失败原因还会误导人）。
+  const acceptance: GateAcceptanceConfig | undefined = acceptanceCommand
+    ? {
+        command: acceptanceCommand,
+        required: acceptanceRequired,
+        ...(acceptanceTimeoutSec !== undefined ? { timeoutSec: acceptanceTimeoutSec } : {}),
+        ...(acceptanceBuildDir !== undefined ? { buildDir: acceptanceBuildDir } : {}),
+      }
+    : undefined;
+
   const gate = commands.length > 0
     ? {
         commands,
         ...(Object.keys(profiles).length > 0 ? { profiles } : {}),
+        ...(acceptance ? { acceptance } : {}),
         timeoutSec,
         retry: { max: retryMax },
       }
-    : { commands: [], timeoutSec: 120, retry: { max: 2 } };
+    : { commands: [], ...(acceptance ? { acceptance } : {}), timeoutSec: 120, retry: { max: 2 } };
 
   const targetProject = targetProjectPath
     ? {
@@ -674,7 +737,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
     : undefined;
 
-  return commands.length > 0 || Object.keys(profiles).length > 0 || llm || targetProject
+  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject
     ? {
         gate,
         agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}), ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}) },
