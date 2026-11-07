@@ -12,7 +12,7 @@
 import { detectArtifactConflicts } from './artifact.js';
 import { DependencyGraph } from './depgraph.js';
 import { writeSetsOverlap } from './paths.js';
-import { judgeTrace } from '../trace/index.js';
+import { judgeTrace, severityOf } from '../trace/index.js';
 
 /** 问题严重程度 */
 export type BatchSeverity = 'error' | 'warning';
@@ -87,12 +87,10 @@ const RUNNABLE_STATES = new Set(['frozen', 'completed']);
  * 1. 状态是 frozen（已审核冻结）或 completed
  * 2. 规格已冻结
  * 3. 规格未漂移
- * 4. 追溯到需求
- * 5. 追溯到契约（除非有豁免）
- * 6. 追溯到测试
- * 7. 验收测试目录存在
- * 8. 写集非空
- * 9. 预算未耗尽
+ * 4. 追溯到需求（缺需求 = 阻断；缺契约 / 缺测试 = 提示，ADR-032 §3.2）
+ * 5. 验收测试目录存在
+ * 6. 写集非空
+ * 7. 预算未耗尽
  */
 export function reviewBatch(members: BatchMember[]): BatchReview {
   const issues: BatchIssue[] = [];
@@ -116,8 +114,10 @@ export function reviewBatch(members: BatchMember[]): BatchReview {
     }
 
     // 追溯判据唯一真源：core/trace/judgment.ts —— 这里只做呈现翻译
+    // 严重级别同样取自 core/trace/severity.ts（ADR-032 §3.2）：
+    // 缺需求 = 阻断；缺契约 / 缺测试 = 提示。
     for (const v of judgeTrace({ trace: m.trace, waiver: m.traceWaiver }).violations) {
-      add('error', v.code, v.message);
+      add(severityOf(v.code) === 'blocking' ? 'error' : 'warning', v.code, v.message);
     }
 
     if (!m.acceptancePresent) {

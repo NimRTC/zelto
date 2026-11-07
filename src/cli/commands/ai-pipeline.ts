@@ -23,6 +23,7 @@ import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { branchExists, isMergedIntoHead } from './merge-executor.js';
 import { describeGuardKinds, loadWholeGraphGuard } from './arch-guard.js';
 import { getDefaultFormatter } from '../output-formatter.js';
+import { evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 
 // ─── 版本级验收 ──────────────────────────────────────────────────────────────
 
@@ -951,6 +952,18 @@ register('version', async (args) => {
 
       // 冻结：规格哈希 + 时间戳 + 事件 —— 与 `zelto freeze` 同一套判据
       if (sliceData.state !== 'frozen') {
+        // 追溯准入闸门（ADR-032 §3.1）：需求追溯为空 → 不许冻结。
+        // 规格里的「验收标准」会物化成本片的需求追溯（人批准的出处）。
+        const gate = evaluateFreezeTrace(sliceData, specContent);
+        if (gate.requirements.length !== sliceData.trace.requirements.length) {
+          sliceData.trace.requirements = gate.requirements;
+          await sliceStore.write(sliceData);
+        }
+        if (gate.blocking.length > 0) {
+          f.error('BLOCKED', `"${sliceDef.id}" 追溯不合格，拒绝冻结：${gate.blocking.map((v) => v.message).join('；')}`);
+          return 1;
+        }
+
         sliceData.spec.frozenHash = hashSpecFile(specPath) ?? `sha256:${Date.now()}`;
         sliceData.spec.frozenAt = new Date().toISOString();
         await sliceStore.write(sliceData);

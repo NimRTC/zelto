@@ -7,6 +7,7 @@ import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
 import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
+import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
 
 export class Scheduler {
@@ -43,6 +44,26 @@ export class Scheduler {
         sliceId,
         decision: 'blocked',
         reason: 'Slice has not been frozen (no frozenHash)',
+        blockedBy: [],
+      };
+    }
+
+    // 追溯准入（ADR-032 §3.1）：需求追溯为空 = 这段代码没有出处 → 不许开跑。
+    // 判据唯一真源在 core/trace/；这里只做呈现翻译。
+    // 基线切片不参与追溯链（它只描述现状、不改代码）。
+    const traceJudgment = judgeTrace({ trace: traceCountsOf(slice.trace), waiver: slice.traceWaiver });
+    const traceBlocking = slice.baseline ? [] : blockingViolations(traceJudgment);
+    if (traceBlocking.length > 0) {
+      const reason = `Trace incomplete: ${traceBlocking.map((v) => v.message).join('；')}`;
+      await this.appendEvent(sliceId, 'sched.blocked', actor, {
+        sliceId,
+        reason,
+        issues: traceBlocking.map((v) => v.code),
+      });
+      return {
+        sliceId,
+        decision: 'blocked',
+        reason,
         blockedBy: [],
       };
     }
