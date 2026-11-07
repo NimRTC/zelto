@@ -61,7 +61,7 @@ import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './p
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
-import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites } from './run-support.js';
+import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -1187,9 +1187,17 @@ register('run', async (args) => {
       }
 
       await store.transit(id, 'RUN_FINISH');
-      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
+      // 花费结算（ADR-035）：先记账，再复判预算。
+      // 超预算的切片**不进 gate、不发签字请求** —— 现场交回给人（与 ADR-020 一致）。
+      const cost = await settleRunCost(id, adapter, sessionId);
+      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0, costUsd: cost.costUsd });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
+
+      if (cost.exhausted) {
+        console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+        return 0;
+      }
 
       if (isHotfix) {
         // Hotfix: skip gate, auto-sign, write hotfix event
@@ -1570,9 +1578,16 @@ register('start', async (args) => {
       }
 
       await store.transit(id, 'RUN_FINISH');
-      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0 });
+      // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
+      const cost = await settleRunCost(id, adapter, sessionId);
+      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0, costUsd: cost.costUsd });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
+
+      if (cost.exhausted) {
+        console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+        return 0;
+      }
 
       // Auto-run gate and create sign request on pass
       await autoGateAfterRun(id);
@@ -1662,8 +1677,13 @@ async function monitorTaskInBackground(
     // Process result as if foreground (state transition, gate, etc.)
     if (exitCode === 0 && withinBounds) {
       await store.transit(sliceId, 'RUN_FINISH');
-      await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0 });
-      if (isHotfix) {
+      // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
+      const cost = await settleRunCost(sliceId, adapter, sessionId);
+      await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd });
+      if (cost.exhausted) {
+        // 超预算：停在 frozen 等人 —— 不进 gate、不发签字请求。
+        console.error(`\n⛔ Slice "${sliceId}" 预算耗尽（$${cost.spent.toFixed(2)}）—— 未进入 gate，等人处理。`);
+      } else if (isHotfix) {
         await store.transit(sliceId, 'GATE_PASS');
         await events.append(sliceId, 'slice.hotfix', 'zelto', {
           sliceId, elapsed, note: 'hotfix — gate skipped, auto-approved',

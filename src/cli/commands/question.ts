@@ -16,7 +16,7 @@ import {
 // 直接从 run-support 拿 autoGateAfterRun —— core-slice.ts 只是再导出它。
 // 经 core-slice 绕一圈会形成 question.ts → core-slice.ts → question.ts 的环，
 // 而 core-slice.ts 又 import 并行执行器，于是变成三条命令文件互相咬。
-import { autoGateAfterRun } from './run-support.js';
+import { autoGateAfterRun, settleRunCost } from './run-support.js';
 
 const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
 
@@ -261,9 +261,12 @@ register('answer', async (args) => {
   // RUN_FINISH 只在 `running` 状态合法。切片若已被人工改动过状态，
   // transitionSlice 会抛 Invalid transition —— 捕获后按可读信息报错，
   // 不让整个命令崩成未捕获异常。
+  // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
+  let cost: Awaited<ReturnType<typeof settleRunCost>>;
   try {
     await store.transit(sliceId, 'RUN_FINISH');
-    await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0 });
+    cost = await settleRunCost(sliceId, adapter, newSessionId);
+    await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`❌ Could not finish the run for slice "${sliceId}": ${msg}`);
@@ -273,6 +276,11 @@ register('answer', async (args) => {
     return 1;
   }
   console.log(`✅ Agent completed after the answer.`);
+
+  if (cost.exhausted) {
+    console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+    return 0;
+  }
 
   await autoGateAfterRun(sliceId);
   return 0;

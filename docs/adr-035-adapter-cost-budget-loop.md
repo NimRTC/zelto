@@ -9,6 +9,34 @@
 
 ---
 
+## 8. 实施记录
+
+ADR 定案后分三步落地：
+
+1. **端口契约**（`core/ports/executor.ts`）：`AdapterUsage` + 可选的 `getUsage?(sessionId)`。
+   事件类型 `budget.spent` 复用，不新增。
+2. **用量解析助手**（`adapters/usage-parse.ts`）：把 Claude 的两种上报形状
+   （Agent SDK 的 `result` 消息 / Claude Code CLI 的 json 输出）收敛成端口形状。
+   `costUsd === 0` 是有效数据，与 null（「没测到」）严格分开。
+3. **适配器与 CLI 接线**：
+   - `adapters/claude-agent-sdk`：消费消息流时从 `result` 消息记下用量；
+   - `adapters/claude-agent`：切到 `--output-format json`，`getOutput` 优先取
+     JSON 的 `result` 字段，解析不出则**退回原始 stdout**（不吞输出）；
+   - `cli/commands/run-support.ts`：`recordAdapterUsage()` 是写 `budget.spent`
+     事件的**唯一入口**（适配器不碰事件流）；`settleRunCost()` 负责
+     「先记账 → 再复判预算」并把判定与停机事件绑在一起；
+   - 四条执行路径（`run` / `start` / 后台任务监视器 / 提问续跑 / 并行执行器）
+     都在 agent 退出后记账，`run.finished` 带 `costUsd`（数字或 null）。
+
+判定语义（与 §3.5 一致）：花费达到上限 → **不进 gate、不发签字请求**，
+写 `stall.classified`（`class: 'budget_exhausted'`），切片停在 `frozen` 等人。
+适配器没报用量 → 按「未测到」处理，**不判定超支**，但 `costUsd = null` 让这件事可见。
+
+上限语义（§3.6）：`budgetLimitUsd: 0` 表示**不限**（用 `UNLIMITED_BUDGET = Infinity`
+作哨兵，而不是 `0` —— `0` 会被误读成「一分钱都不许花」），缺失配置回落默认 `1.0`。
+
+---
+
 ## 1. 摘要
 
 zelto 有一套预算机制：`.zelto/config.yaml` 里的 `budgetLimitUsd`、

@@ -139,8 +139,68 @@ export async function recordAdapterUsage(
   if (usage.inputTokens !== undefined) payload.inputTokens = usage.inputTokens;
   if (usage.outputTokens !== undefined) payload.outputTokens = usage.outputTokens;
 
-  await events.append(sliceId, 'budget.spent', 'zelto', payload);
+  try {
+    await events.append(sliceId, 'budget.spent', 'zelto', payload);
+  } catch (err) {
+    // 写事件失败不是致命的 —— 账单漏记不该让整个 run 崩掉。
+    // 但这件事必须让人看得见，所以打印一行警告。
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ⚠️  Could not record usage: ${msg}`);
+  }
   return usage.costUsd;
+}
+
+/** 一次运行的花费结算结果。 */
+export interface RunCostSettlement {
+  /** 本次会话花费（美元）；null = 没测到（不是零） */
+  costUsd: number | null;
+  /** 是否已超预算。超了就已经写下 `stall.classified` 停机事件 */
+  exhausted: boolean;
+  /** 累计已花费 */
+  spent: number;
+  /** 上限（Infinity = 不限） */
+  limit: number;
+}
+
+/**
+ * 一次 agent 会话结束后的花费结算（ADR-035 §3.4 / §3.5）。
+ *
+ * 做两件事，顺序不能换：
+ * 1. **先记账** —— 把本次会话的真实花费写成 `budget.spent` 事件；
+ * 2. **再复判预算** —— 记账之后才知道总额，超预算的切片不许进 gate。
+ *
+ * 「适配器没报用量」按「未测到」处理：**不判定超支**（没有数据不等于超支），
+ * 但 `costUsd = null` 让「没测到」这件事在事件流里可见 —— 否则又是一道假闸门。
+ *
+ * 上限为「不限」时永远不算超支（`limit` 是 Infinity）。
+ */
+export async function settleRunCost(
+  sliceId: string,
+  adapter: ExecutorAdapter,
+  sessionId: string,
+): Promise<RunCostSettlement> {
+  const costUsd = await recordAdapterUsage(sliceId, adapter, sessionId);
+
+  let spent = 0;
+  let limit = Number.POSITIVE_INFINITY;
+  try {
+    const budget = new BudgetCollector(events, ZELTO_DIR);
+    [spent, limit] = await Promise.all([budget.getSpent(sliceId), budget.getLimit(sliceId)]);
+  } catch {
+    // 读不到账本就不判定超支 —— 闸门打不开不该由一次读取失败决定
+    return { costUsd, exhausted: false, spent, limit };
+  }
+
+  const exhausted = Number.isFinite(limit) && spent >= limit;
+  if (exhausted) {
+    // 停机事件只在这里写一次 —— 判定与写事件绑在一起，
+    // 免得「判定」和「留痕」两处实现漂移。
+    await events.append(sliceId, 'stall.classified', 'zelto', {
+      sliceId, class: 'budget_exhausted', spent, limit,
+    });
+  }
+
+  return { costUsd, exhausted, spent, limit };
 }
 
 /**

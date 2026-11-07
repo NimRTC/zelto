@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+### Added
+- **Trace judgment is now a gate, not a suggestion** (ADR-032). `zelto freeze`,
+  `version start` and the scheduler's admission check all refuse to let a slice
+  through when its trace is incomplete — a slice with no requirement trace used
+  to freeze, run an agent, pass gate② and land in the sign queue. The spec's
+  「验收标准」section is materialised into the requirement trace, so the
+  "every line traces to an approved spec" promise is now enforced on the path
+  people actually use.
+- **Slice-level acceptance** (ADR-033). `zelto spec draft` generates an
+  acceptance-test skeleton (one `todo` per acceptance criterion), and gate②
+  now runs *this slice's* acceptance files instead of only the whole-project
+  commands. Not configured is recorded as `skipped`, never silently skipped;
+  configured but unrunnable is `failed`.
+- **Spec generation with human confirmation** (ADR-034).
+  `zelto spec draft <id>` produces a spec draft (via the LLM when one is
+  configured, deterministic fallback otherwise) plus an acceptance skeleton;
+  `zelto spec confirm <id>` is what makes it the "approved source" a trace can
+  point at. Drafts never participate in any judgment (C7).
+- **Agent spend is now metered, and the budget gate actually closes**
+  (ADR-035). Both executor adapters report their real cost via the optional
+  `getUsage(sessionId)` port; the CLI records it as a `budget.spent` event
+  (`source: 'agent'`) after the agent exits and re-checks the budget. A slice
+  that reaches its limit **does not enter gate② and gets no sign request** —
+  it stops at `frozen` and waits for a human to add budget or cut scope.
+  `run.finished` now carries `costUsd`; `null` means "not measured" and is
+  deliberately distinct from zero.
+
+### Fixed
+- **`zelto check` now exits non-zero on failure in text mode too** (ADR-032).
+  It always returned 0, so it could not be chained into a script or a hook.
+  The spec engine (`validateDeterministic` / `analyzeSemantic`) is now wired
+  into `check` instead of being reachable only from tests: deterministic
+  findings block, semantic heuristics only advise (C7).
+- **`budgetLimitUsd: 0` now means "unlimited"** (ADR-035). The config comment
+  said so, the implementation treated `0` as invalid and fell back to the
+  default `1.0` — comment and code disagreeing means the setting is a lie.
+
 ## [0.5.0] — 2026-11-06
 
 ### Added

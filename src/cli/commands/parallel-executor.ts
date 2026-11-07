@@ -30,7 +30,7 @@ import {
   store,
   worktreeManager,
 } from './shared.js';
-import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet } from './run-support.js';
+import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -693,8 +693,28 @@ export async function executeSlicesParallel(
 
     await store.transit(st.id, 'RUN_FINISH');
     const finishedAffinity = options.affinity?.get(st.id) ?? null;
-    await events.append(st.id, 'run.finished', 'zelto', { sliceId: st.id, exitCode: 0, affinityGroup: finishedAffinity });
+    // 花费结算（ADR-035）：先记账，再复判预算；超预算则该片不进 gate。
+    const cost = adapter && sessionId
+      ? await settleRunCost(st.id, adapter, sessionId)
+      : { costUsd: null, exhausted: false, spent: 0, limit: Number.POSITIVE_INFINITY };
+    await events.append(st.id, 'run.finished', 'zelto', {
+      sliceId: st.id, exitCode: 0, costUsd: cost.costUsd, affinityGroup: finishedAffinity,
+    });
     console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
+
+    if (cost.exhausted) {
+      // 超预算：停在 frozen 等人 —— 不进 gate、不发签字请求（ADR-035 §3.5）。
+      console.log(`⛔ ${st.id}: 预算耗尽（$${cost.spent.toFixed(2)}）— 未进入 gate，等人处理`);
+      outcomes.push({
+        id: st.id,
+        status: 'stalled',
+        exitCode: 0,
+        elapsedSec: st.elapsedSec,
+        gatePassed: null,
+        signRequested: false,
+      });
+      continue;
+    }
 
     let gatePassed: boolean | null = null;
     let signRequested = false;
