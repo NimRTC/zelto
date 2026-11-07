@@ -17,6 +17,24 @@ export interface AdapterMeta {
 }
 
 /**
+ * Token / cost usage of one agent session (ADR-035).
+ *
+ * The adapter is the only place that knows what the agent actually cost —
+ * the CLI shell spawn and the Agent SDK report it in completely different
+ * shapes, so the shape is normalised here, at the port.
+ */
+export interface AdapterUsage {
+  /** Cumulative cost of the session in USD. */
+  costUsd: number;
+  /** Prompt tokens consumed, when the adapter reports them. */
+  inputTokens?: number;
+  /** Completion tokens consumed, when the adapter reports them. */
+  outputTokens?: number;
+  /** Model id, when the adapter reports it. */
+  model?: string;
+}
+
+/**
  * ExecutorAdapter — abstract interface for spawning and managing agent sessions.
  *
  * This is a superset of SessionPort that adds adapter identity metadata.
@@ -67,6 +85,15 @@ export interface ExecutorAdapter {
    * recorded in the question record (ADR-013 §3.2).
    */
   getAgentSessionId(sessionId: string): string | null;
+
+  /**
+   * Report the token / cost usage of a session (ADR-035).
+   *
+   * Optional: an adapter that cannot report usage simply does not implement
+   * it, and the budget accounting then treats that slice as "no usage data"
+   * rather than "zero cost". Never returns a negative cost.
+   */
+  getUsage?(sessionId: string): AdapterUsage | null;
 
   /**
    * Stop/kill an agent session.
