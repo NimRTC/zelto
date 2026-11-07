@@ -1,1 +1,1 @@
-export { BudgetCollector } from './collector.js';
+export { BudgetCollector, UNLIMITED_BUDGET } from './collector.js';

@@ -16,6 +16,7 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
+import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
 import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
 
@@ -100,6 +101,49 @@ export async function resolveWriteSet(
 }
 
 /**
+ * 记一次 agent 会话的用量（ADR-035 §3.3 / §3.4）。
+ *
+ * 记账的唯一入口。适配器不知道切片 id、也不该知道事件流（C2：依赖单向向下），
+ * 所以由 CLI 在 agent 退出后调用 `adapter.getUsage()`，把结果写成事件。
+ *
+ * 返回本次会话记下的花费（美元），拿不到用量数据时返回 null ——
+ * **null 的含义是「没测到」，不是「零」**（两者必须能区分开，
+ * 否则又是一道假闸门）。
+ *
+ * 记不到用量不是错误：适配器可能压根不实现 `getUsage`。
+ * 那就什么都不写，让「没测到」这件事在 `run.finished.costUsd = null` 里可见。
+ */
+export async function recordAdapterUsage(
+  sliceId: string,
+  adapter: ExecutorAdapter,
+  sessionId: string,
+): Promise<number | null> {
+  if (typeof adapter.getUsage !== 'function') return null;
+
+  let usage;
+  try {
+    usage = adapter.getUsage(sessionId);
+  } catch {
+    // 适配器取数失败不是致命的 —— 记成「没测到」，不阻断流程
+    return null;
+  }
+  if (!usage) return null;
+
+  const payload: Record<string, unknown> = {
+    amount: usage.costUsd,
+    source: 'agent',
+    adapter: adapter.name,
+    sessionId,
+  };
+  if (usage.model !== undefined) payload.model = usage.model;
+  if (usage.inputTokens !== undefined) payload.inputTokens = usage.inputTokens;
+  if (usage.outputTokens !== undefined) payload.outputTokens = usage.outputTokens;
+
+  await events.append(sliceId, 'budget.spent', 'zelto', payload);
+  return usage.costUsd;
+}
+
+/**
  * Check if a slice has exceeded its budget limit.
  * Returns true if budget is OK, false if exhausted.
  */
@@ -109,7 +153,7 @@ export async function checkBudget(id: string): Promise<boolean> {
     const exhausted = await budget.isExhausted(id);
     if (exhausted) {
       const [spent, limit] = await Promise.all([budget.getSpent(id), budget.getLimit(id)]);
-      console.error(`  ⛔ Budget exhausted: $${spent.toFixed(2)} spent of $${limit.toFixed(2)} limit`);
+      console.error(`  ⛔ Budget exhausted: $${spent.toFixed(2)} spent of $${formatLimit(limit)} limit`);
       await events.append(id, 'stall.classified', 'zelto', {
         sliceId: id, class: 'budget_exhausted', spent, limit,
       });
@@ -120,6 +164,11 @@ export async function checkBudget(id: string): Promise<boolean> {
     // Budget check failure is non-fatal — proceed without enforcement
     return true;
   }
+}
+
+/** 上限的显示方式 —— 不限时不能显示成 `$0.00`（那看着像「一分钱都不许花」） */
+function formatLimit(limit: number): string {
+  return Number.isFinite(limit) ? `$${limit.toFixed(2)}` : 'unlimited';
 }
 
 /**
