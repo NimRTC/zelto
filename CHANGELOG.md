@@ -28,6 +28,19 @@
   it stops at `frozen` and waits for a human to add budget or cut scope.
   `run.finished` now carries `costUsd`; `null` means "not measured" and is
   deliberately distinct from zero.
+- **Contract evolution check and cross-version regression baseline**
+  (ADR-036). `zelto contract check` compares the contracts in
+  `contracts/schemas/` against a **human-confirmed baseline** and reports
+  which changes are breaking, split by direction: *writer* (the new contract
+  no longer accepts old data) and *reader* (the new data breaks old programs).
+  The baseline is only ever updated by an explicit `zelto contract baseline` —
+  accepting a break is a human's signature, never an automatic step.
+  `zelto version deliver` now runs the contract check as a precondition and
+  records a regression baseline from the acceptance output, comparing it with
+  the previous delivered version to catch the case where a slice deletes the
+  test that proved a behaviour (regressed / degraded / missing). A detected
+  regression blocks delivery; `--accept-regression` records an explicit
+  acceptance instead.
 
 ### Fixed
 - **`zelto check` now exits non-zero on failure in text mode too** (ADR-032).

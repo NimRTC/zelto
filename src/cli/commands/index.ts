@@ -34,6 +34,7 @@ import './halt.js';
 import './merge.js';
 import './architecture.js';
 import './slice-spec.js';
+import './contract.js';
 
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────

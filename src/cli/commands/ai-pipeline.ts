@@ -25,6 +25,15 @@ import { branchExists, isMergedIntoHead } from './merge-executor.js';
 import { describeGuardKinds, loadWholeGraphGuard } from './arch-guard.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
+import { ContractBaselineStore, ContractRegistry, diffSchemas } from '../../core/contracts/index.js';
+import {
+  RegressionBaselineStore,
+  compareRegression,
+  hasRegression,
+  mergeTapResults,
+  parseTapResults,
+  renderRegression,
+} from '../../core/regression/index.js';
 
 // ─── 版本级验收 ──────────────────────────────────────────────────────────────
 
@@ -98,6 +107,68 @@ async function runVersionAcceptance(
   }
 
   return { passed, results };
+}
+
+/**
+ * 契约演进检查（ADR-036）：当前契约 vs 人工确认过的基线。
+ *
+ * 没有基线时不判 —— 「还没确认过基线」不是「没有问题」，
+ * 但它也不该拦住一个从没用过这个功能的项目（老项目无感）。
+ *
+ * 判据是纯计算：读文件、算差集。不调模型、不触网（C3）。
+ */
+async function runContractEvolutionCheck(): Promise<{
+  hasBaseline: boolean;
+  breaking: number;
+  details: string[];
+}> {
+  const store = new ContractBaselineStore(ZELTO_DIR);
+  const baseline = await store.read();
+  if (!baseline) return { hasBaseline: false, breaking: 0, details: [] };
+
+  const dir = join(process.cwd(), 'contracts', 'schemas');
+  if (!existsSync(dir)) return { hasBaseline: true, breaking: 0, details: [] };
+
+  const registry = new ContractRegistry(dir);
+  const schemas = await registry.loadAll();
+  const current: Record<string, Record<string, unknown>> = {};
+  for (const contract of schemas) current[contract.name] = contract.schema;
+
+  const names = new Set([...Object.keys(baseline.contracts), ...Object.keys(current)]);
+  const details: string[] = [];
+  let breaking = 0;
+
+  for (const name of [...names].sort()) {
+    const changes = diffSchemas(baseline.contracts[name] ?? null, current[name] ?? {});
+    for (const change of changes) {
+      if (!change.breaking) continue;
+      breaking += 1;
+      const label = change.direction === 'writer' ? '写入方破坏' : '读取方破坏';
+      details.push(`${name}  ${change.path}  [${label}]  ${change.message}`);
+    }
+  }
+
+  return { hasBaseline: true, breaking, details };
+}
+
+/**
+ * 找「上一个已交付且有回归基线」的版本。
+ *
+ * 找不到就没有可比对象 —— 第一个版本没有上版本，回归无从谈起。
+ */
+function findPreviousDeliveredVersion(
+  plan: VersionPlan,
+  currentVersion: string,
+  store: RegressionBaselineStore,
+): string | null {
+  for (let i = plan.versions.length - 1; i >= 0; i -= 1) {
+    const candidate = plan.versions[i];
+    if (candidate.version === currentVersion) continue;
+    if (candidate.status !== 'delivered' && candidate.status !== 'integrated') continue;
+    if (!store.exists(plan.id, candidate.version)) continue;
+    return candidate.version;
+  }
+  return null;
 }
 
 // ─── require ─────────────────────────────────────────────────────────────────
@@ -793,6 +864,21 @@ register('version', async (args) => {
       }
     }
 
+    // ── 第二步之二：契约演进检查（ADR-036）────────────────────────
+    // 契约改坏了，别的程序读不懂 —— 这件事在「版本交付」这一层最该被拦住：
+    // 交付是版本对外生效的边界，契约破坏留到交付之后才发现，代价已经出去了。
+    // 没有基线时不判（老项目无感）；有基线且检出破坏 → 阻断交付。
+    const contractCheck = await runContractEvolutionCheck();
+    if (contractCheck.breaking > 0) {
+      f.out('');
+      f.out(`❌ 版本 ${versionLabel} 的契约演进检查未通过 —— 状态保持 in_progress`);
+      for (const line of contractCheck.details) f.out(`   ${line}`);
+      f.out('');
+      f.out('👉 确认这次契约变化可以接受后更新基线：zelto contract baseline');
+      f.out('   然后重新验收：zelto version deliver ' + versionLabel);
+      return 1;
+    }
+
     // ── 第三步：版本级验收 —— 在主仓跑项目自己的门禁命令 ──────────
     // 判据是「合入主干之后的整体能不能过验收」，所以跑在主仓、跑真实代码。
     const cfg = loadConfig();
@@ -807,6 +893,76 @@ register('version', async (args) => {
       f.out('');
       f.out('👉 修好之后重新验收：zelto version deliver ' + versionLabel);
       return 1;
+    }
+
+    // ── 第三步之二：跨版本回归基线（ADR-036）──────────────────────
+    // 版本级验收只给一个「过 / 不过」，看不出「上个版本验证过的东西，
+    // 这个版本还在不在」。这里把用例状态记下来，与上一个已交付版本对比：
+    // 用例消失、退化成空壳、或直接失败 —— 都是回归。
+    const regressionStore = new RegressionBaselineStore(ZELTO_DIR);
+    const tapResults = mergeTapResults(acceptance.results.map((r) => parseTapResults(r.output)));
+
+    if (!tapResults.known) {
+      f.out('');
+      f.out('ℹ️  验收输出里读不出 TAP 用例列表 —— 本次不记录回归基线（不猜别的运行器格式）');
+    } else {
+      const previousVersion = findPreviousDeliveredVersion(targetPlan, versionLabel, regressionStore);
+
+      if (previousVersion) {
+        const previousBaseline = await regressionStore.read(targetPlan.id, previousVersion);
+        const report = compareRegression(
+          previousBaseline?.tests ?? [],
+          tapResults.tests,
+          previousVersion,
+          versionLabel,
+        );
+
+        if (hasRegression(report)) {
+          await events.append(versionEventKey(versionLabel), 'version.regression_detected', 'zelto', {
+            version: versionLabel,
+            previousVersion,
+            regressed: report.regressed.length,
+            degraded: report.degraded.length,
+            missing: report.missing.length,
+            fixed: report.fixed.length,
+          });
+
+          if (!args.includes('--accept-regression')) {
+            f.out('');
+            f.out(`❌ 版本 ${versionLabel} 相对版本 ${previousVersion} 有回归 —— 状态保持 in_progress`);
+            f.out(renderRegression(report));
+            f.out('');
+            f.out('👉 修好回归，或显式接受这次回归：zelto version deliver ' + versionLabel + ' --accept-regression');
+            return 1;
+          }
+
+          f.out('');
+          f.out('⚠️  已显式接受本次回归：');
+          f.out(renderRegression(report));
+          await events.append(versionEventKey(versionLabel), 'version.regression_detected', 'zelto', {
+            version: versionLabel,
+            previousVersion,
+            regressed: report.regressed.length,
+            degraded: report.degraded.length,
+            missing: report.missing.length,
+            fixed: report.fixed.length,
+            accepted: true,
+          });
+        }
+      }
+
+      await regressionStore.write({
+        format: 1,
+        planId: targetPlan.id,
+        version: versionLabel,
+        capturedAt: new Date().toISOString(),
+        source: 'version-acceptance',
+        tests: tapResults.tests,
+      });
+      await events.append(versionEventKey(versionLabel), 'version.regression_recorded', 'zelto', {
+        version: versionLabel,
+        tests: tapResults.tests.length,
+      });
     }
 
     await events.append(versionEventKey(versionLabel), 'version.accepted', 'zelto', {

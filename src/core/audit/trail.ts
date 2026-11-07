@@ -132,6 +132,18 @@ const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
         ? ` — versions: ${(e.payload.versions as string[]).join(', ')}`
         : ''
     }`,
+  'contract.evolution_checked': (e) =>
+    `Contract evolution checked — ${String(e.payload?.contracts ?? 0)} contract(s), ${String(e.payload?.breaking ?? 0)} breaking`,
+  'contract.baseline_updated': (e) =>
+    `Contract baseline updated by human — ${String(
+      Array.isArray(e.payload?.contracts) ? (e.payload.contracts as string[]).join(', ') : '',
+    )}`,
+  'version.regression_recorded': (e) =>
+    `Regression baseline recorded for version ${String(e.payload?.version ?? '?')} — ${String(e.payload?.tests ?? 0)} test(s)`,
+  'version.regression_detected': (e) =>
+    `Regression detected in version ${String(e.payload?.version ?? '?')} — ${String(e.payload?.regressed ?? 0)} broken, ${String(
+      e.payload?.degraded ?? 0,
+    )} degraded, ${String(e.payload?.missing ?? 0)} missing`,
 };
 
 export class AuditTrail {

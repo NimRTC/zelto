@@ -352,6 +352,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto suggest` | 项目全貌与建议动作 | 通用 |
 | `zelto require\|design\|plan show <id> [--diff] [--full]` | 草稿评审：摘要 + 决策点 + 与上一版的差异（ADR-023） | 规划 |
 | `zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]` | 架构偏离检查：设计模块图 vs 实际 import 图（纯报告；`--strict` 按 `policy.yaml` 的 `arch:` 段定级，`deny` 类偏离时退出码 1，ADR-027） | 治理 |
+| `zelto contract [check\|baseline\|status] [--json]` | 契约演进检查：当前契约 vs 人工确认的基线，分清写入方 / 读取方破坏（ADR-036）；`baseline` 是人签字接受这次变化 | 治理 |
 
 ### 3.3 独立 Hook
 
@@ -463,7 +464,7 @@ zelto/
 │   │   ├── project/       既有项目扫描与治理初始化
 │   │   ├── arch/          架构偏离检查（设计模块图 vs 实际 import 图，只读报告）
 │   │   └── contracts/     契约注册表
-│   ├── cli/               CLI 命令实现（58 个命令）
+│   ├── cli/               CLI 命令实现（59 个命令）
 │   ├── hook/              独立可执行判定进程（+ PreToolUse 钩子）
 │   ├── llm/               AI 流水线草案生成（仅产出草稿，不参与判定）
 │   └── adapters/          执行器适配器（claude-agent / claude-agent-sdk）

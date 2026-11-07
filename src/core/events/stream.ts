@@ -53,7 +53,11 @@ export type EventType =
   | 'version.delivered'
   | 'draft.created'
   | 'draft.revised'
-  | 'draft.confirmed';
+  | 'draft.confirmed'
+  | 'contract.evolution_checked'
+  | 'contract.baseline_updated'
+  | 'version.regression_recorded'
+  | 'version.regression_detected';
 
 export interface EventEnvelope {
   ts: string;
