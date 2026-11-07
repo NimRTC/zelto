@@ -9,6 +9,7 @@ import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
 import { collectPlanningDrafts, draftConfirmCommand, draftShowCommand } from './planning-drafts.js';
+import { collectPendingActions, type PendingAction } from './pending-actions.js';
 import { commandsByGroup, findCommand, usageOf } from './catalog.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
@@ -62,12 +63,50 @@ register('next', async () => {
     return 0;
   }
 
+  // 待签字 / 待合并排在状态排序之前。
+  // 判据用签字请求的状态而不是切片状态 —— `completed` 同时表示「门禁过了」
+  // 与「已签字」（ADR-018），只看状态会把早已签过的切片也报成待签字。
+  const pendingActions = await collectPendingActions();
+
+  if (pendingActions.sign.length > 0) {
+    const first = pendingActions.sign[0];
+    console.log(`Next: ${first.sliceId} (awaiting signature)`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: ${first.action}`);
+    if (pendingActions.sign.length > 1) {
+      console.log(`  (还有 ${pendingActions.sign.length - 1} 个待签字：${pendingActions.sign.slice(1).map((a) => a.sliceId).join('、')})`);
+    }
+    return 0;
+  }
+
+  if (pendingActions.merge.length > 0) {
+    const first = pendingActions.merge[0];
+    console.log(`Next: ${first.sliceId} (signed, awaiting merge)`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: ${first.action}`);
+    if (pendingActions.merge.length > 1) {
+      console.log(`  (还有 ${pendingActions.merge.length - 1} 个待合并：${pendingActions.merge.slice(1).map((a) => a.sliceId).join('、')})`);
+    }
+    return 0;
+  }
+
+  if (pendingActions.requestSign.length > 0) {
+    const first = pendingActions.requestSign[0];
+    console.log(`Next: ${first.sliceId} (gate passed, needs signature request)`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: ${first.action}`);
+    if (pendingActions.requestSign.length > 1) {
+      console.log(`  (还有 ${pendingActions.requestSign.length - 1} 个待发起签字：${pendingActions.requestSign.slice(1).map((a) => a.sliceId).join('、')})`);
+    }
+    return 0;
+  }
+
   if (list.length === 0) {
     console.log('No slices found. Create one to get started.');
     return 0;
   }
 
-  const priority: Array<string> = ['draft', 'clarifying', 'frozen', 'running', 'completed', 'abandoned'];
+  const priority: Array<string> = ['draft', 'clarifying', 'frozen', 'running'];
   for (const state of priority) {
     for (const id of list) {
       try {
@@ -78,8 +117,6 @@ register('next', async () => {
             clarifying: 'Complete clarification',
             frozen: 'zelto run <id> --dry-run',
             running: 'Wait for execution (blocking other slices?)',
-            completed: 'zelto sign <id> --approve',
-            abandoned: 'Restart or archive',
           };
           console.log(`Next: ${id} (${s.state})`);
           console.log(`  ${s.title}`);
@@ -151,12 +188,39 @@ register('suggest', async () => {
 
     // Check each slice and suggest next action
     console.log(formatSection('Suggested Actions'));
+
+    // 待签字 / 待合并 / 待发起签字 —— 判据取自签字请求的状态，与 inbox、merge 同源。
+    // 切片状态 `completed` 同时表示「门禁过了」与「已签字」（ADR-018），
+    // 只按状态列会把早已签过的切片也报成待签字，所以 completed 不进状态分组。
+    const pendingActions = await collectPendingActions();
+    const printActions = (items: PendingAction[]) => {
+      for (const a of items) {
+        console.log(`  ${colors.bold(a.sliceId)}`);
+        console.log(`    ${colors.dim(a.title)}`);
+        console.log(`    ${colors.cyan(a.prepare)}`);
+        console.log(`    ${colors.gray(a.action)}`);
+        suggested = true;
+      }
+    };
+
+    if (pendingActions.sign.length > 0) {
+      console.log(formatSection('Awaiting Signature'));
+      printActions(pendingActions.sign);
+    }
+    if (pendingActions.merge.length > 0) {
+      console.log(formatSection('Awaiting Merge'));
+      printActions(pendingActions.merge);
+    }
+    if (pendingActions.requestSign.length > 0) {
+      console.log(formatSection('Needs Signature Request'));
+      printActions(pendingActions.requestSign);
+    }
+
     const priority: Array<{ state: string; action: string; prepare: string }> = [
       { state: 'draft', action: 'zelto check <id> && zelto freeze <id>', prepare: 'Check and freeze spec' },
       { state: 'clarifying', action: 'zelto clarify <id>', prepare: 'Answer clarification questions' },
       { state: 'frozen', action: 'zelto run <id> [--dry-run]', prepare: 'Execute slice' },
       { state: 'running', action: 'zelto events <id>', prepare: 'Monitor execution' },
-      { state: 'completed', action: 'zelto sign <id> --approve', prepare: 'Review and sign off' },
     ];
 
     for (const p of priority) {

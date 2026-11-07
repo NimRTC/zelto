@@ -165,8 +165,17 @@ export async function executeMergePlan(
   // ── 前置守卫：主仓库工作区必须干净，否则合并会污染未提交改动 ──
   const status = git(['status', '--porcelain'], repoRoot);
   if (status.ok && status.stdout.trim().length > 0) {
+    // 列出具体是什么挡着 —— 只说「有未提交改动」的话，人得自己去找。
+    const dirty = status.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(0, 10);
     log('  ⚠️  主仓库工作区有未提交改动，已跳过自动合并。');
-    log('     先提交或暂存这些改动，再重新签字合并。');
+    for (const d of dirty) log(`     ${d}`);
+    if (dirty.length >= 10) log('     …（只列前 10 条）');
+    log('     先提交（git commit）或暂存（git stash）这些改动，再重新跑 zelto merge。');
+    log('     签字已经过了，不用重新签。');
     return { merged, conflicts, staleBase, aborted: false };
   }
 

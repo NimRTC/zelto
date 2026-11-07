@@ -41,6 +41,16 @@
   test that proved a behaviour (regressed / degraded / missing). A detected
   regression blocks delivery; `--accept-regression` records an explicit
   acceptance instead.
+- **The dashboard now reports token usage, not just money.** `zelto dashboard`
+  (TTY / JSON / HTML) sums the `budget.spent` and `llm.called` events into one
+  set of numbers: agent execution and planning-time LLM drafts are kept apart,
+  and input/output tokens are broken out on each side — so "is the agent
+  expensive because it re-reads the codebase, or because it keeps rewriting?"
+  has an answer. The dashboard also shows the per-slice budget ceiling next to
+  the most expensive slice, and a **Token 消耗 Top** table. Cost and token
+  collection lives in one module (`src/cli/commands/dashboard-cost.ts`) so the
+  three renderings cannot drift apart; "measured as zero" stays strictly
+  separate from "not measured" (ADR-035).
 
 ### Fixed
 - **`zelto check` now exits non-zero on failure in text mode too** (ADR-032).
@@ -51,6 +61,18 @@
 - **`budgetLimitUsd: 0` now means "unlimited"** (ADR-035). The config comment
   said so, the implementation treated `0` as invalid and fell back to the
   default `1.0` — comment and code disagreeing means the setting is a lie.
+- **The dashboard's "pending approval" hint never appeared.** It looked for
+  `.zelto/inbox`, a directory that does not exist — sign requests live in
+  `.zelto/locks/sign-*.json`. The hint now reads the same source as
+  `zelto inbox` / `zelto next` / `zelto merge` and points at `zelto inbox`
+  (the suggested `zelto sign --list` was not a command that exists).
+- **The dashboard's HTML output now escapes dynamic text.** Slice titles and
+  event actors come from files any process can append to; they were
+  interpolated raw, so a title could inject markup into the generated page.
+- **A slice whose measured cost is zero no longer disappears from the
+  dashboard's cost view.** The old filter kept only slices with non-zero cost
+  or at least one LLM call, which silently dropped "measured, and it was
+  free" — the same distinction ADR-035 draws between `null` and `0`.
 
 ## [0.5.0] — 2026-11-06
 

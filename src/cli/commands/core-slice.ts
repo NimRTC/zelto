@@ -443,14 +443,33 @@ register('check', async (args) => {
     console.log(`  State:   ${slice.state}`);
     console.log(`  Spec:    ${slice.spec.path}`);
     const waiverNote = slice.traceWaiver ? ` (waived: ${slice.traceWaiver})` : '';
-    console.log(`  Traces:  ${slice.trace.requirements.length} reqs, ${slice.trace.contracts.length} contracts${waiverNote}, ${slice.trace.tests.length} tests`);
+
+    // 追溯判据要与 `freeze` 同源（ADR-032 §3.3）。
+    // freeze 会先从规格的「验收标准」/「需求」物化需求追溯再判定；check 若
+    // 直接拿未物化的 slice.trace 判，就会报出 freeze 根本不拦的假阻断
+    // （规格里明明写了编号验收标准，check 仍说「No requirements traced」）。
+    let specContent = '';
+    try {
+      specContent = await readFile(slice.spec.path, 'utf-8');
+    } catch {
+      specContent = '';
+    }
+    const freezeGate = evaluateFreezeTrace(slice, specContent);
+
+    console.log(`  Traces:  ${freezeGate.requirements.length} reqs, ${slice.trace.contracts.length} contracts${waiverNote}, ${slice.trace.tests.length} tests`);
+    if (freezeGate.requirements.length > slice.trace.requirements.length) {
+      console.log(`          (${freezeGate.requirements.length} reqs materialized from spec — written on freeze)`);
+    }
 
     const issues: string[] = [];
     const advisories: string[] = [];
     // 追溯判据唯一真源：core/trace/judgment.ts —— 这里只做呈现翻译
     // 阻断项（blocking）决定退出码；提示项（advisory）只提示，不阻断（ADR-032 §3.2）
-    const traceJudgment = judgeTrace({ trace: traceCountsOf(slice.trace), waiver: slice.traceWaiver });
-    for (const v of blockingViolations(traceJudgment)) issues.push(v.short);
+    const traceJudgment = judgeTrace({
+      trace: traceCountsOf({ ...slice.trace, requirements: freezeGate.requirements }),
+      waiver: slice.traceWaiver,
+    });
+    for (const v of freezeGate.blocking) issues.push(v.short);
     for (const v of advisoryViolations(traceJudgment)) advisories.push(v.short);
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 
@@ -480,12 +499,7 @@ register('check', async (args) => {
     //   - 确定性判据（validateDeterministic）：error 阻断、warning 提示
     //   - 语义启发式（analyzeSemantic）：只提示、不阻断（C7：语义分析不参与判定）
     // 「追溯」与「哈希」两类由上面的追溯判定与哈希比对负责，这里跳过避免重复报。
-    let specContent = '';
-    try {
-      specContent = await readFile(slice.spec.path, 'utf-8');
-    } catch {
-      specContent = '';
-    }
+    // specContent 已在上面读过（追溯物化要用它）。
     if (specContent) {
       for (const issue of validateDeterministic(slice, specContent).issues) {
         if (issue.category === 'trace' || issue.category === 'hash') continue;

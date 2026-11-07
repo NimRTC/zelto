@@ -128,12 +128,44 @@ export async function commitPendingWorktrees(ids: string[]): Promise<void> {
 }
 
 /**
+ * worktree 里有没有未提交的改动。
+ *
+ * agent 的产物先落在 worktree 的工作区里，签字不提交它 —— 提交发生在合并前
+ * （`commitPendingWorktrees`）。所以「分支是否已合入 HEAD」这个判据不足以
+ * 回答「该不该合」：
+ *
+ *   切片冻结在基点 C，agent 改完文件但还没提交 → 分支指针仍停在 C，
+ *   而 C 通常就是 HEAD。`isMergedIntoHead` 于是说「已合入」，这个切片
+ *   从待合并清单里消失 —— 人跑到 `zelto merge` 才看见「没有待合并的切片」。
+ *
+ * 判据是 git 的真实工作区状态（确定性，C3）。
+ */
+export function worktreeHasChanges(sliceId: string): boolean {
+  const manager = worktreeManager();
+  const path = manager.pathFor(sliceId);
+  if (!existsSync(path)) return false;
+  try {
+    const out = execFileSync('git', ['status', '--porcelain'], {
+      cwd: path,
+      encoding: 'utf-8',
+      timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return out.trim().length > 0;
+  } catch {
+    // 读不到状态就不算有改动 —— 宁可漏报也不误报
+    return false;
+  }
+}
+
+/**
  * 收集所有「已签字但尚未合入主分支」的切片。
  *
  * 判据（全部来自文件与 git，不含内存状态）：
  * - 存在已批准的签字请求（`.zelto/locks/sign-*.json`，status=approved）
  * - 对应的 `slice/<id>` 分支存在
- * - 该分支尚未合入当前 HEAD
+ * - 该分支尚未合入当前 HEAD，**或者** worktree 里还有未提交的产物
+ *   （产物在合并前才提交，见 `worktreeHasChanges`）
  */
 export async function collectMergeCandidates(): Promise<MergeSliceInfo[]> {
   const signManager = new SignManager(ZELTO_DIR, events, store);
@@ -145,7 +177,9 @@ export async function collectMergeCandidates(): Promise<MergeSliceInfo[]> {
     const manager = worktreeManager();
     const branch = manager.branchFor(req.sliceId);
     if (!branchExists(branch, repoRoot)) continue;
-    if (isMergedIntoHead(branch, repoRoot)) continue;
+    // 分支已合入 HEAD 且 worktree 干净 —— 确实合完了。
+    // 分支已合入但 worktree 还有改动 —— 产物没提交，得合。
+    if (isMergedIntoHead(branch, repoRoot) && !worktreeHasChanges(req.sliceId)) continue;
 
     let baseCommit: string | null = null;
     try {

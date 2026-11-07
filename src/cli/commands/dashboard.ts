@@ -2,16 +2,24 @@
 // Layers: ① Abnormalities ② Releases ③ Version Plans ④ Code Areas (collapsed)
 // Usage: zelto dashboard [--watch] [--open] [--output <path>] [--tty] [--json]
 
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, watch } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, watch } from 'node:fs';
 import { join } from 'node:path';
 import { register, ZELTO_DIR } from './shared.js';
 import { loadReleases, type ReleaseDef } from './releases.js';
 import { detectSliceType, type SliceType } from '../../core/gate/types.js';
 import { colors } from '../color.js';
-
-// ─── Cost Cache (avoids re-reading unchanged event files) ───────────────────
-
-const costCache = new Map<string, { mtimeMs: number; cost: SliceCost }>();
+import {
+  collectCosts,
+  fmtCost,
+  fmtLimit,
+  fmtTokens,
+  readBudgetLimit,
+  readPendingSigns,
+  sumCosts,
+  topSlicesByTokens,
+  type CostTotals,
+  type SliceCost,
+} from './dashboard-cost.js';
 
 // ─── Area Mapping ────────────────────────────────────────────────────────────
 
@@ -162,77 +170,22 @@ function collectRecentEvents(limit = 50): EventInfo[] {
   return all.slice(0, limit);
 }
 
-// ─── Cost Collection ────────────────────────────────────────────────────────────
-
-interface SliceCost {
-  totalCost: number;
-  totalTokens: number;
-  promptTokens: number;
-  completionTokens: number;
-  llmCalls: number;
-}
-
-function collectCosts(): Map<string, SliceCost> {
-  const dir = join(ZELTO_DIR, 'events');
-  const costMap = new Map<string, SliceCost>();
-  if (!existsSync(dir)) return costMap;
-
-  for (const sd of readdirSync(dir, { withFileTypes: true })) {
-    if (!sd.isDirectory()) continue;
-    const sliceId = sd.name;
-    const f = join(dir, sliceId, 'events.jsonl');
-    if (!existsSync(f)) continue;
-
-    let totalCost = 0;
-    let totalTokens = 0;
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let llmCalls = 0;
-
-    // Cache check: skip if file mtime unchanged
-    try {
-      const st = statSync(f);
-      const cached = costCache.get(sliceId);
-      if (cached && cached.mtimeMs === st.mtimeMs) {
-        if (cached.cost.totalCost > 0 || cached.cost.llmCalls > 0) {
-          costMap.set(sliceId, cached.cost);
-        }
-        continue;
-      }
-    } catch { /* stat failed — re-read */ }
-
-    try {
-      for (const line of readFileSync(f, 'utf-8').split('\n').filter(Boolean)) {
-        try {
-          const e = JSON.parse(line);
-          if (e.type === 'llm.called') {
-            llmCalls++;
-            totalTokens += e.payload?.totalTokens ?? 0;
-            promptTokens += e.payload?.promptTokens ?? 0;
-            completionTokens += e.payload?.completionTokens ?? 0;
-          } else if (e.type === 'budget.spent') {
-            totalCost += e.payload?.amount ?? 0;
-          }
-        } catch { /* skip malformed lines */ }
-      }
-    } catch { /* skip unreadable files */ }
-
-    if (llmCalls > 0 || totalCost > 0) {
-      const cost = { totalCost, totalTokens, promptTokens, completionTokens, llmCalls };
-      costMap.set(sliceId, cost);
-      // Update cache
-      try { const st = statSync(f); costCache.set(sliceId, { mtimeMs: st.mtimeMs, cost }); }
-      catch { /* skip */ }
-    }
+/**
+ * 把时长说成人话。
+ *
+ * 「1016m」没人读得懂 —— 看板上的每个数字都要能被扫一眼读出来。
+ */
+function fmtAge(minutes: number): string {
+  if (!Number.isFinite(minutes) || minutes < 1) return '刚刚';
+  if (minutes < 60) return `${Math.floor(minutes)}m`;
+  if (minutes < 60 * 24) {
+    const h = Math.floor(minutes / 60);
+    const m = Math.floor(minutes % 60);
+    return m > 0 ? `${h}h${m}m` : `${h}h`;
   }
-  return costMap;
-}
-
-function fmtCost(cost: number): string {
-  if (cost === 0) return '$0';
-  if (cost < 0.01) return '$' + cost.toFixed(4);
-  if (cost < 1) return '$' + cost.toFixed(3);
-  return '$' + cost.toFixed(2);
+  const d = Math.floor(minutes / (60 * 24));
+  const h = Math.floor((minutes % (60 * 24)) / 60);
+  return h > 0 ? `${d}d${h}h` : `${d}d`;
 }
 
 // ─── Action Recommendations ──────────────────────────────────────────────────
@@ -252,7 +205,7 @@ function computeActions(
   for (const s of slices) {
     if (s.stallClass) {
       const stallAge = s.updatedAt ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000) : 0;
-      const ageStr = stallAge > 0 ? ` (${stallAge}m)` : '';
+      const ageStr = stallAge > 0 ? ` (${fmtAge(stallAge)})` : '';
       actions.push({ priority: 1, command: `zelto resume ${s.id}`, reason: `⚠️ Stalled: ${s.stallClass}${ageStr}` });
     }
   }
@@ -273,18 +226,22 @@ function computeActions(
     }
   }
 
-  // Check sign inbox for pending approvals
-  const inboxDir = join(ZELTO_DIR, 'inbox');
-  if (existsSync(inboxDir)) {
-    let pendingCount = 0;
-    try {
-      for (const f of readdirSync(inboxDir)) {
-        if (f.endsWith('.json')) pendingCount++;
-      }
-    } catch { /* skip */ }
-    if (pendingCount > 0) {
-      actions.push({ priority: 3, command: 'zelto sign --list', reason: `📝 ${pendingCount} pending approval(s)` });
-    }
+  // 待签字队列 —— 真源是 `.zelto/locks/sign-*.json`（与 zelto inbox / next / merge 同源）。
+  //
+  // 这里原来读的是 `.zelto/inbox`：那个目录根本不存在（签字请求落在 locks 下），
+  // 于是「有待签字」这条提示永远不会出现 —— 一道永远敞开的门。
+  const pendingSigns = readPendingSigns();
+  if (pendingSigns.length > 0) {
+    const oldest = pendingSigns[0];
+    const ageMin = oldest.requestedAt
+      ? Math.floor((Date.now() - new Date(oldest.requestedAt).getTime()) / 60000)
+      : 0;
+    const ageStr = ageMin > 0 ? ` (最久一条等 ${fmtAge(ageMin)})` : '';
+    actions.push({
+      priority: 3,
+      command: 'zelto inbox',
+      reason: `📝 ${pendingSigns.length} pending approval(s)${ageStr}`,
+    });
   }
 
   // Auto-resolved stalls that haven't been resumed
@@ -311,16 +268,14 @@ function computeActions(
 
 function renderTty(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
-  events: EventInfo[], costMap: Map<string, SliceCost>,
+  events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
   const stateCnt: Record<string, number> = {};
   for (const s of slices) { stateCnt[s.state] = (stateCnt[s.state] ?? 0) + 1; }
 
-  let totalCost = 0;
-  let totalLlmCalls = 0;
-  for (const c of costMap.values()) { totalCost += c.totalCost; totalLlmCalls += c.llmCalls; }
+  const totals = sumCosts(costMap, slices.length);
 
   const lines: string[] = [];
   const h = (s: string) => colors.bold(colors.cyan(s));
@@ -335,7 +290,8 @@ function renderTty(
     `Running: ${colors.blue(String(stateCnt['running'] ?? 0))}`,
     `Stalled: ${colors.red(String(stalled.length))}`,
     `Completed: ${colors.green(String(stateCnt['completed'] ?? 0))}`,
-    `Cost: ${colors.magenta(fmtCost(totalCost))}${totalLlmCalls > 0 ? colors.dim(` (${totalLlmCalls} calls)`) : ''}`,
+    `Cost: ${colors.magenta(fmtCost(totals.totalCost))}`,
+    `Tokens: ${colors.magenta(fmtTokens(totals.totalTokens))}`,
   ];
   lines.push(`  ${summaryParts.join('  ·  ')}`);
   lines.push('');
@@ -401,6 +357,41 @@ function renderTty(
     lines.push('');
   }
 
+  // Cost & tokens —— agent 干活 vs 规划期草稿，两笔账分开看（ADR-035）
+  if (totals.measuredSlices > 0) {
+    lines.push(`  ${h('💰 成本与 Token')}`);
+    lines.push(`    ${colors.dim('Agent 执行')}  ${colors.bold(fmtCost(totals.agentCost))}  ${colors.cyan(`${fmtTokens(totals.agentTokens)} tokens`)}  ${colors.dim(`(in ${fmtTokens(totals.agentInputTokens)} / out ${fmtTokens(totals.agentOutputTokens)}) · ${totals.agentCalls} 次会话`)}`);
+    lines.push(`    ${colors.dim('规划期 LLM')}  ${colors.bold(fmtCost(totals.llmCost))}  ${colors.cyan(`${fmtTokens(totals.llmTokens)} tokens`)}  ${colors.dim(`(in ${fmtTokens(totals.llmPromptTokens)} / out ${fmtTokens(totals.llmCompletionTokens)}) · ${totals.llmCalls} 次调用`)}`);
+    const measured = `测到用量 ${totals.measuredSlices}/${slices.length} 片`;
+    const unmeasured = totals.unmeasuredSlices > 0 ? ` · ${totals.unmeasuredSlices} 片未测到` : '';
+    lines.push(`    ${colors.dim('Token 合计')}  ${colors.bold(fmtTokens(totals.totalTokens))}  ${colors.dim(measured + unmeasured)}`);
+
+    // 最贵的一片 vs 每片上限 —— 预算闸门离合闸还有多远
+    let priciest: { id: string; cost: number } | null = null;
+    for (const [id, c] of costMap) {
+      if (!priciest || c.totalCost > priciest.cost) priciest = { id, cost: c.totalCost };
+    }
+    if (priciest) {
+      const pct = Number.isFinite(budgetLimit) && budgetLimit > 0
+        ? Math.round((priciest.cost / budgetLimit) * 100)
+        : null;
+      const color = pct === null ? colors.dim : pct >= 100 ? colors.red : pct >= 70 ? colors.yellow : colors.green;
+      const pctStr = pct === null ? '' : ` (${pct}%)`;
+      lines.push(`    ${colors.dim('每片上限')}  ${colors.bold(fmtLimit(budgetLimit))}  ${colors.dim('最贵一片')} ${colors.bold(priciest.id)} ${color(fmtCost(priciest.cost) + pctStr)}`);
+    }
+    lines.push('');
+  }
+
+  // Recent events —— 事件流是追溯的底座，TTY 视图里不能缺席
+  if (events.length > 0) {
+    lines.push(`  ${h('📜 最近事件')}`);
+    for (const e of events.slice(0, 8)) {
+      const ts = e.ts ? e.ts.replace('T', ' ').slice(5, 16) : '';
+      lines.push(`    ${colors.dim(ts)}  ${colors.magenta(e.type)}  ${colors.dim(e.slice)}`);
+    }
+    lines.push('');
+  }
+
   // Summary line
   lines.push(`  ${colors.dim('Generated by zelto dashboard')}  ${colors.dim('Run zelto dashboard --tty for this view')}`);
   lines.push('');
@@ -412,7 +403,7 @@ function renderTty(
 
 function renderJson(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
-  events: EventInfo[], costMap: Map<string, SliceCost>,
+  events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
@@ -420,9 +411,7 @@ function renderJson(
   const typeCnt: Record<string, number> = {};
   for (const s of slices) { stateCnt[s.state] = (stateCnt[s.state] ?? 0) + 1; typeCnt[s.type] = (typeCnt[s.type] ?? 0) + 1; }
 
-  let totalCost = 0;
-  let totalLlmCalls = 0;
-  for (const c of costMap.values()) { totalCost += c.totalCost; totalLlmCalls += c.llmCalls; }
+  const totals = sumCosts(costMap, slices.length);
 
   const data = {
     generatedAt: new Date().toISOString(),
@@ -432,16 +421,62 @@ function renderJson(
       typeCounts: typeCnt,
       stalledCount: stalled.length,
       runningCount: running.length,
-      totalCost,
-      totalLlmCalls,
       releaseCount: releases.length,
       planCount: plans.length,
     },
+    cost: {
+      totalCostUsd: totals.totalCost,
+      agentCostUsd: totals.agentCost,
+      llmCostUsd: totals.llmCost,
+      agentCalls: totals.agentCalls,
+      llmCalls: totals.llmCalls,
+      totalTokens: totals.totalTokens,
+      agentTokens: totals.agentTokens,
+      agentInputTokens: totals.agentInputTokens,
+      agentOutputTokens: totals.agentOutputTokens,
+      llmTokens: totals.llmTokens,
+      llmPromptTokens: totals.llmPromptTokens,
+      llmCompletionTokens: totals.llmCompletionTokens,
+      budgetLimitUsdPerSlice: Number.isFinite(budgetLimit) ? budgetLimit : null,
+      budgetUnlimited: !Number.isFinite(budgetLimit),
+      slicesWithUsage: totals.measuredSlices,
+      slicesWithoutUsage: totals.unmeasuredSlices,
+    },
+    slices: slices.map((s) => {
+      const c = costMap.get(s.id);
+      return {
+        id: s.id,
+        title: s.title,
+        state: s.state,
+        type: s.type,
+        area: s.area,
+        version: s.version,
+        module: s.module,
+        updatedAt: s.updatedAt,
+        costUsd: c ? c.totalCost : null,
+        tokens: c ? c.totalTokens : null,
+        agentTokens: c ? c.agentTokens : null,
+        llmTokens: c ? c.llmTokens : null,
+        agentCalls: c ? c.agentCalls : 0,
+        llmCalls: c ? c.llmCalls : 0,
+      };
+    }),
+    topByTokens: topSlicesByTokens(costMap, 10).map(({ sliceId, cost }) => ({
+      sliceId,
+      tokens: cost.totalTokens,
+      agentTokens: cost.agentTokens,
+      llmTokens: cost.llmTokens,
+      costUsd: cost.totalCost,
+    })),
+    recentEvents: events.slice(0, 50),
     stalled: stalled.map((s) => ({
       id: s.id, title: s.title, stallClass: s.stallClass,
       autoResolved: s.autoResolved, area: s.area,
       plan: s.planTitle, version: s.version, module: s.module,
       updatedAt: s.updatedAt,
+      stalledMinutes: s.updatedAt
+        ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000)
+        : null,
     })),
     running: running.map((s) => ({
       id: s.id, title: s.title, area: s.area, updatedAt: s.updatedAt,
@@ -475,6 +510,22 @@ function renderJson(
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/**
+ * HTML 文本转义。
+ *
+ * 看板里的切片标题、事件 actor、事件类型都来自外部写入的文件（事件流是
+ * append-only 的，任何进程都能往里追加）。直接拼进 HTML 就会被浏览器当成
+ * 标记解析 —— 这是真的注入面，不是什么理论风险。
+ */
+function esc(s: unknown): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 const ST_ICON: Record<string, string> = {
   draft: '📝', clarifying: '❓', frozen: '❄️', running: '🔄', completed: '✅', abandoned: '🗑️',
 };
@@ -507,6 +558,7 @@ function statusLabel(st: string): string {
 function renderHtml(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], watchMode: boolean, costMap: Map<string, SliceCost>,
+  budgetLimit: number,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const stateCnt: Record<string, number> = {};
@@ -516,13 +568,9 @@ function renderHtml(
   // Build lookup: planId → plan
   const planMap = new Map(plans.map((p) => [p.planId, p]));
 
-  // Cost calculations
-  let totalCostAll = 0;
-  let totalLlmCalls = 0;
-  for (const c of costMap.values()) {
-    totalCostAll += c.totalCost;
-    totalLlmCalls += c.llmCalls;
-  }
+  // Cost calculations —— 与 TTY / JSON 共用同一份口径（dashboard-cost.ts）
+  const totals = sumCosts(costMap, slices.length);
+  const actions = computeActions(slices, plans, releases);
 
   // ── Summary ──────────────────────────────────────────────────────────────────
   const summary = `
@@ -531,7 +579,8 @@ function renderHtml(
   <div class="c"><div class="n">${releases.length}</div><div class="l">Releases</div></div>
   <div class="c"><div class="n">${stateCnt['running'] ?? 0}</div><div class="l">🔄 Running</div></div>
   <div class="c st"><div class="n">${stalled.length}</div><div class="l">⚠️ Stalled</div></div>
-  <div class="c" style="border-color:#58a6ff66"><div class="n">${fmtCost(totalCostAll)}</div><div class="l">💰 Total ${totalLlmCalls > 0 ? `(${totalLlmCalls} calls)` : ''}</div></div>
+  <div class="c" style="border-color:#58a6ff66"><div class="n">${fmtCost(totals.totalCost)}</div><div class="l">💰 Total cost</div></div>
+  <div class="c" style="border-color:#d2a8ff66"><div class="n">${fmtTokens(totals.totalTokens)}</div><div class="l">🧮 Total tokens</div></div>
 </div>`;
 
   const stateOrder = ['running','frozen','completed','draft','clarifying','abandoned'];
@@ -555,9 +604,71 @@ function renderHtml(
   <h2>⚠️ Stalled <span class="hc">${stalled.length}</span></h2>
   ${stalled.map((s) => {
     const loc = [s.planTitle, s.version, s.module].filter(Boolean).join(' / ') || areaDef(s.area).label;
-    return `<div class="li"><span class="ld" style="background:${stallColor(s.stallClass)}"></span><span class="lid">${s.id}</span><span class="lcls">${s.stallClass}</span><span class="lloc">${loc}</span><code>zelto resume ${s.id}</code></div>`;
+    const age = s.updatedAt ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000) : 0;
+    const ageStr = age > 0 ? ` · ${fmtAge(age)}` : '';
+    return `<div class="li"><span class="ld" style="background:${stallColor(s.stallClass)}"></span><span class="lid">${esc(s.id)}</span><span class="lcls">${esc(s.stallClass)}</span><span class="lloc">${esc(loc + ageStr)}</span><code>zelto resume ${esc(s.id)}</code></div>`;
   }).join('')}
 </div>` : '';
+
+  // ══════════════════════════════════════════════════════════════════════════════
+  // LAYER 1.5 — Cost & tokens
+  // ══════════════════════════════════════════════════════════════════════════════
+  // 两笔账分开摆：agent 干活的钱 vs 规划期草稿的钱。混在一起看，
+  // 就分不清「是 agent 太贵」还是「是规划层反复重写规格」（ADR-035 §3.3）。
+  let priciest: { id: string; cost: number } | null = null;
+  for (const [id, c] of costMap) {
+    if (!priciest || c.totalCost > priciest.cost) priciest = { id, cost: c.totalCost };
+  }
+  const limitPct = (cost: number): number | null =>
+    Number.isFinite(budgetLimit) && budgetLimit > 0 ? Math.round((cost / budgetLimit) * 100) : null;
+  const pctColor = (pct: number | null): string =>
+    pct === null ? '#8b949e' : pct >= 100 ? '#ff7b72' : pct >= 70 ? '#d29922' : '#3fb950';
+
+  const topTokens = topSlicesByTokens(costMap, 8);
+  const topRows = topTokens
+    .map(({ sliceId, cost }) => {
+      const pct = limitPct(cost.totalCost);
+      return `<tr><td class="eet">${esc(sliceId)}</td><td>${fmtTokens(cost.totalTokens)}</td><td class="etm">${fmtTokens(cost.agentInputTokens)}</td><td class="etm">${fmtTokens(cost.agentOutputTokens)}</td><td>${fmtCost(cost.totalCost)}</td><td style="color:${pctColor(pct)}">${pct === null ? '—' : `${pct}%`}</td></tr>`;
+    })
+    .join('');
+
+  const costLayer =
+    totals.measuredSlices > 0
+      ? `
+<h2 class="sh">💰 成本与 Token <span class="hc">agent 执行 vs 规划期草稿</span></h2>
+<div class="cost">
+  <div class="cost-card">
+    <div class="cl">Agent 执行</div>
+    <div class="cv">${fmtCost(totals.agentCost)}</div>
+    <div class="cs">${fmtTokens(totals.agentTokens)} tokens</div>
+    <div class="cs">in ${fmtTokens(totals.agentInputTokens)} / out ${fmtTokens(totals.agentOutputTokens)}</div>
+    <div class="cs">${totals.agentCalls} 次 agent 会话</div>
+  </div>
+  <div class="cost-card">
+    <div class="cl">规划期 LLM</div>
+    <div class="cv">${fmtCost(totals.llmCost)}</div>
+    <div class="cs">${fmtTokens(totals.llmTokens)} tokens</div>
+    <div class="cs">in ${fmtTokens(totals.llmPromptTokens)} / out ${fmtTokens(totals.llmCompletionTokens)}</div>
+    <div class="cs">${totals.llmCalls} 次 LLM 调用</div>
+  </div>
+  <div class="cost-card">
+    <div class="cl">Token 合计</div>
+    <div class="cv">${fmtTokens(totals.totalTokens)}</div>
+    <div class="cs">${totals.measuredSlices}/${slices.length} 片测到用量</div>
+    ${totals.unmeasuredSlices > 0 ? `<div class="cs warn">${totals.unmeasuredSlices} 片未测到用量</div>` : ''}
+  </div>
+  <div class="cost-card">
+    <div class="cl">每片预算上限</div>
+    <div class="cv">${fmtLimit(budgetLimit)}</div>
+    ${priciest ? `<div class="cs">最贵一片 ${esc(priciest.id)} ${fmtCost(priciest.cost)}${limitPct(priciest.cost) === null ? '' : ` · ${limitPct(priciest.cost)}%`}</div>` : '<div class="cs">—</div>'}
+  </div>
+</div>
+${topRows ? `<h2 class="sh">🔥 Token 消耗 Top <span class="hc">${topTokens.length} 片</span></h2>
+<table>
+<thead><tr><th>Slice</th><th>Tokens</th><th>Agent in</th><th>Agent out</th><th>Cost</th><th>占上限</th></tr></thead>
+<tbody>${topRows}</tbody>
+</table>` : ''}`
+      : '';
 
   // ══════════════════════════════════════════════════════════════════════════════
   // LAYER 2 — Releases
@@ -604,7 +715,7 @@ ${releases.map((r) => {
       const mpct = Math.round((d / t) * 100);
       const icon = mpct === 100 ? '✅' : mpct > 0 ? '🔄' : '⏳';
       const costStr = c > 0 ? ` · ${fmtCost(c)}` : '';
-      return `<span class="rl-mod">${icon} ${mod} <span class="rl-mod-stat">${d}/${t}${costStr}</span></span>`;
+      return `<span class="rl-mod">${icon} ${esc(mod)} <span class="rl-mod-stat">${d}/${t}${costStr}</span></span>`;
     }).join('');
 
   const bg = r.status === 'completed' ? '#1a2e1a' : r.status === 'in_progress' ? '#1a1f2e' : '#161b22';
@@ -612,15 +723,15 @@ ${releases.map((r) => {
 
   return `<div class="rl-card" style="background:${bg};border:${border}">
     <div class="rl-head">
-      <span class="rl-ver">${r.version}</span>
-      <span class="rl-title">${r.title}</span>
+      <span class="rl-ver">${esc(r.version)}</span>
+      <span class="rl-title">${esc(r.title)}</span>
       <span class="rl-status" style="color:${statusColor(r.status)}">${statusLabel(r.status)}</span>
     </div>
-    <div class="rl-desc">${r.description}</div>
+    <div class="rl-desc">${esc(r.description)}</div>
     <div class="rl-bar-wrap"><span class="rl-bar" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></div>
     <div class="rl-bar-label">${done}/${total} slices${sCnt ? ` · ⚠ ${sCnt} stalled` : ''}${total > 0 ? ` · ${pct}%` : ''}${relCost > 0 ? ` · ${fmtCost(relCost)}` : ''}</div>
     <div class="rl-mods">${moduleLines || '<span class="rl-mod-stat">(no slices assigned)</span>'}</div>
-    ${unresolvedPlans.length > 0 ? `<div class="rl-warn">⚠ ${unresolvedPlans.join(', ')} not found</div>` : ''}
+    ${unresolvedPlans.length > 0 ? `<div class="rl-warn">⚠ ${esc(unresolvedPlans.join(', '))} not found</div>` : ''}
   </div>`;
 }).join('')}
 </div>` : '';
@@ -647,22 +758,22 @@ ${plans.map((plan) => {
     const moduleHtml = [...modMap.entries()].map(([modName, modSlices]) => {
       const rows = modSlices.sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1))
         .map((s) => {
-          const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${s.stallClass}</span>` : '';
+          const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${esc(s.stallClass)}</span>` : '';
           const sc = costMap.get(s.id);
           const costTag = sc && sc.totalCost > 0 ? `<span class="ct">${fmtCost(sc.totalCost)}</span>` : '';
-          return `<div class="vr"><span class="vtic">${tIcon(s.type)}</span><span class="vsic">${sIcon(s.state)}</span><span class="vid">${s.id}</span><span class="vtl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${costTag}${stallTag}</div>`;
+          return `<div class="vr"><span class="vtic">${tIcon(s.type)}</span><span class="vsic">${sIcon(s.state)}</span><span class="vid">${esc(s.id)}</span><span class="vtl">${esc(s.title)}</span><span class="badge badge-${s.state}">${s.state}</span>${costTag}${stallTag}</div>`;
         }).join('');
       if (!modName) return rows;
-      return `<div class="vm"><div class="vmt">${modName} <span class="vmc">${modSlices.length}</span></div>${rows}</div>`;
+      return `<div class="vm"><div class="vmt">${esc(modName)} <span class="vmc">${modSlices.length}</span></div>${rows}</div>`;
     }).join('');
 
     return `<details class="vd" ${v.status === 'active' ? 'open' : ''}>
-      <summary class="vs"><span class="vv">${v.name}</span><span class="vtg" style="background:${statusColor(v.status)}">${v.status}</span><span class="vpb"><span class="vpf" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></span><span class="vpct">${done}/${total}${sCnt ? ` ⚠${sCnt}` : ''}</span></summary>
+      <summary class="vs"><span class="vv">${esc(v.name)}</span><span class="vtg" style="background:${statusColor(v.status)}">${esc(v.status)}</span><span class="vpb"><span class="vpf" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></span><span class="vpct">${done}/${total}${sCnt ? ` ⚠${sCnt}` : ''}</span></summary>
       <div class="vb">${moduleHtml}</div>
     </details>`;
   }).join('');
 
-  return `<div class="pc"><div class="pch"><span class="pctt">${plan.title}</span><span class="pcm">${plan.versions.length} versions · ${plan.versions.reduce((a, v) => a + v.slices.length, 0)} slices</span></div>${versionsHtml}</div>`;
+  return `<div class="pc"><div class="pch"><span class="pctt">${esc(plan.title)}</span><span class="pcm">${plan.versions.length} versions · ${plan.versions.reduce((a, v) => a + v.slices.length, 0)} slices</span></div>${versionsHtml}</div>`;
 }).join('')}` : '';
 
   // ══════════════════════════════════════════════════════════════════════════════
@@ -690,14 +801,14 @@ ${sortedAreas.map(([areaKey, modMap]) => {
   const modBlocks = [...modMap.entries()].map(([modName, modSlices]) => {
     const sorted = [...modSlices].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
     const rows = sorted.map((s) => {
-      const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${s.stallClass}</span>` : '';
-      const verTag = s.version ? `<span class="vt">${s.version}</span>` : '';
+      const stallTag = s.stallClass ? `<span class="st" style="background:${stallColor(s.stallClass)}">⚠ ${esc(s.stallClass)}</span>` : '';
+      const verTag = s.version ? `<span class="vt">${esc(s.version)}</span>` : '';
       const sc = costMap.get(s.id);
       const costTag = sc && sc.totalCost > 0 ? `<span class="ct">${fmtCost(sc.totalCost)}</span>` : '';
-      return `<div class="ar"><span class="atic">${tIcon(s.type)}</span><span class="asic">${sIcon(s.state)}</span><span class="aid">${s.id}</span><span class="atl">${s.title}</span><span class="badge badge-${s.state}">${s.state}</span>${verTag}${costTag}${stallTag}</div>`;
+      return `<div class="ar"><span class="atic">${tIcon(s.type)}</span><span class="asic">${sIcon(s.state)}</span><span class="aid">${esc(s.id)}</span><span class="atl">${esc(s.title)}</span><span class="badge badge-${s.state}">${s.state}</span>${verTag}${costTag}${stallTag}</div>`;
     }).join('');
     if (!modName) return rows;
-    return `<div class="am"><div class="amt">${modName} <span class="amc">${modSlices.length}</span></div>${rows}</div>`;
+    return `<div class="am"><div class="amt">${esc(modName)} <span class="amc">${modSlices.length}</span></div>${rows}</div>`;
   }).join('');
 
   return `<details class="ad"><summary class="as"><span class="ai">${ad.icon}</span><span class="al">${ad.label}</span><span class="asc">${allSlices.length}</span><span class="apb"><span class="apf" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></span><span class="apc">${done}/${allSlices.length}${sCnt ? ` ⚠${sCnt}` : ''}</span></summary><div class="abd">${modBlocks}</div></details>`;
@@ -707,7 +818,7 @@ ${sortedAreas.map(([areaKey, modMap]) => {
   // LAYER 5 — Events
   // ══════════════════════════════════════════════════════════════════════════════
   const eventRows = events.map((e) =>
-    `<tr><td class="etm">${new Date(e.ts).toLocaleString()}</td><td><span class="eet">${e.type}</span></td><td>${e.slice}</td><td>${e.actor}</td></tr>`
+    `<tr><td class="etm">${esc(new Date(e.ts).toLocaleString())}</td><td><span class="eet">${esc(e.type)}</span></td><td>${esc(e.slice)}</td><td>${esc(e.actor)}</td></tr>`
   ).join('');
 
   return `<!DOCTYPE html>
@@ -730,6 +841,13 @@ ${watchMode ? '<meta http-equiv="refresh" content="3">' : ''}
   .c .n{font-size:24px;font-weight:700}
   .c .l{font-size:11px;color:#8b949e;margin-top:2px}
   .c.st .n{color:#ff7b72}
+  /* Cost & tokens */
+  .cost{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:14px}
+  .cost-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 14px}
+  .cl{font-size:11px;color:#8b949e}
+  .cv{font-size:22px;font-weight:700;margin:2px 0 6px;color:#e6edf3}
+  .cs{font-size:10px;color:#8b949e;line-height:1.6}
+  .cs.warn{color:#d29922}
   .br{display:flex;height:24px;border-radius:5px;overflow:hidden;margin-bottom:12px}
   .brs{display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;color:#fff;gap:2px}
   .b-running,.brs.b-running{background:#1f6feb}.b-frozen,.brs.b-frozen{background:#58a6ff}.b-completed,.brs.b-completed{background:#238636}
@@ -853,20 +971,18 @@ ${summary}
 <div class="br">${typeBar || ''}</div>
 
 ${stalledLayer}
+${costLayer}
 ${releaseLayer}
 ${planLayer}
 ${areaLayer}
 
 <!-- Action Items -->
-${(() => {
-  const actions = computeActions(slices, plans, releases);
-  if (actions.length === 0) return '';
-  return `
+${actions.length === 0 ? '' : `
 <h2 class="sh">📋 Next Actions <span class="hc">${actions.length} items</span></h2>
 <div class="ax">${actions.map((a) => {
   const icon = a.priority === 1 ? '🔴' : a.priority === 2 ? '🔵' : '⚪';
-  return `<div class="ax-row"><span class="ax-icon">${icon}</span><code class="ax-cmd">${a.command}</code><span class="ax-why">${a.reason}</span></div>`;
-}).join('')}</div>`;})()}
+  return `<div class="ax-row"><span class="ax-icon">${icon}</span><code class="ax-cmd">${esc(a.command)}</code><span class="ax-why">${esc(a.reason)}</span></div>`;
+}).join('')}</div>`}
 
 <h2 class="sh">📜 Recent Events</h2>
 <table>
@@ -894,28 +1010,31 @@ register('dashboard', async (args) => {
   const outputIdx = args.indexOf('--output');
   const outputPath = outputIdx >= 0 ? args[outputIdx + 1] : join(process.cwd(), 'zelto-dashboard.html');
 
-  const gather = () => {
+  const gather = async () => {
     const sliceMap = collectSlices();
     const plans = buildPlans(sliceMap);
     const releases = loadReleases();
     const slices = [...sliceMap.values()].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
     const events = collectRecentEvents();
     const costMap = collectCosts();
-    return { slices, plans, releases, events, costMap };
+    const budgetLimit = await readBudgetLimit();
+    return { slices, plans, releases, events, costMap, budgetLimit };
   };
 
   // ── TTY mode ────────────────────────────────────────────────────────────
   if (ttyMode) {
-    const { slices, plans, releases, events, costMap } = gather();
-    process.stdout.write(renderTty(slices, plans, releases, events, costMap));
+    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
+    process.stdout.write(renderTty(slices, plans, releases, events, costMap, budgetLimit));
 
     if (watchMode) {
       console.log(colors.dim('  👀 Watching... (Ctrl+C to stop)'));
-      const regen = () => {
+      const regen = async () => {
         try {
-          const d = gather();
+          const d = await gather();
           process.stdout.write('\x1b[2J\x1b[H'); // clear screen
-          process.stdout.write(renderTty(d.slices, d.plans, d.releases, d.events, d.costMap));
+          process.stdout.write(
+            renderTty(d.slices, d.plans, d.releases, d.events, d.costMap, d.budgetLimit),
+          );
         } catch { /* ignore */ }
       };
       for (const sub of ['slices', 'versions', 'events']) {
@@ -929,18 +1048,18 @@ register('dashboard', async (args) => {
 
   // ── JSON mode ───────────────────────────────────────────────────────────
   if (jsonMode) {
-    const { slices, plans, releases, events, costMap } = gather();
-    console.log(renderJson(slices, plans, releases, events, costMap));
+    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
+    console.log(renderJson(slices, plans, releases, events, costMap, budgetLimit));
     return 0;
   }
 
   // ── HTML mode (default) ─────────────────────────────────────────────────
-  const generate = () => {
-    const { slices, plans, releases, events, costMap } = gather();
-    return renderHtml(slices, plans, releases, events, watchMode, costMap);
+  const generate = async () => {
+    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
+    return renderHtml(slices, plans, releases, events, watchMode, costMap, budgetLimit);
   };
 
-  writeFileSync(outputPath, generate(), 'utf-8');
+  writeFileSync(outputPath, await generate(), 'utf-8');
   console.log(`📊 Dashboard generated: ${outputPath}`);
 
   if (openBrowser) {
@@ -955,7 +1074,11 @@ register('dashboard', async (args) => {
 
   if (watchMode) {
     console.log('  👀 Watching... (Ctrl+C to stop)');
-    const regen = () => { try { writeFileSync(outputPath, generate(), 'utf-8'); } catch { /* ignore */ } };
+    const regen = async () => {
+      try {
+        writeFileSync(outputPath, await generate(), 'utf-8');
+      } catch { /* ignore */ }
+    };
     for (const sub of ['slices', 'versions', 'events']) {
       const d = join(ZELTO_DIR, sub);
       if (existsSync(d)) watch(d, { recursive: sub === 'events' }, regen);
