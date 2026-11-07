@@ -17,8 +17,9 @@
 //   - @anthropic-ai/claude-agent-sdk installed
 
 import { startup } from '@anthropic-ai/claude-agent-sdk';
-import { type ExecutorAdapter, type AdapterMeta } from '../../core/ports/executor.js';
+import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../../core/ports/executor.js';
 import type { EventEnvelope, EventType } from '../../core/events/index.js';
+import { parseClaudeUsage } from '../usage-parse.js';
 
 export interface ClaudeAgentSdkAdapterOptions {
   /** Working directory for the agent session (default: process.cwd()) */
@@ -126,6 +127,13 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   private readonly sessionEvents = new Map<string, EventEnvelope[]>();
   /** Accumulated agent text output per session */
   private readonly sessionText = new Map<string, string>();
+  /**
+   * 本次会话的用量（ADR-035）。
+   *
+   * 单独存一份而不是靠事件缓冲反推：`sessionEvents` 只保留最近 100 条，
+   * 长会话里 `result` 消息早就被 shift 掉了。
+   */
+  private readonly sessionUsage = new Map<string, AdapterUsage>();
   /** Resolve functions for waitForExit promises, keyed by sessionId */
   private readonly exitResolvers = new Map<string, (code: number | null) => void>();
   /** Resolvers for "the generator loop has fully unwound", keyed by sessionId */
@@ -287,6 +295,13 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
         };
 
         eventBuffer.push(envelope);
+
+        // 用量上报（ADR-035 §3.2）：SDK 的 `result` 消息自带 `total_cost_usd`
+        // 与 `usage`。记到会话上，`getUsage` 直接返回。
+        if (msgType === 'result' || 'total_cost_usd' in msg) {
+          const usage = parseClaudeUsage(msg);
+          if (usage) this.sessionUsage.set(sessionId, usage);
+        }
 
         // Keep only the last 100 events in memory
         if (eventBuffer.length > 100) {
@@ -464,6 +479,16 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
    */
   getAgentSessionId(_sessionId: string): string | null {
     return null;
+  }
+
+  /**
+   * 本次会话花了多少钱（ADR-035）。
+   *
+   * SDK 只在 `result` 消息里报花费；没收到就返回 null ——
+   * 意味着「没测到」，而不是「零」。把两者混同会让预算闸门变成一道假闸门。
+   */
+  getUsage(sessionId: string): AdapterUsage | null {
+    return this.sessionUsage.get(sessionId) ?? null;
   }
 
   async stop(sessionId: string): Promise<void> {

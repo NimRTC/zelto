@@ -9,6 +9,18 @@ import type { EventStream, EventEnvelope } from '../events/stream.js';
 
 const DEFAULT_BUDGET_LIMIT = 1.0; // USD
 
+/**
+ * 「不限」的哨兵值。
+ *
+ * `budgetLimitUsd: 0` 在 config.yaml 的注释里写的是「unlimited」，但实现
+ * 一直把它当成无效值回落到默认 1.0 —— 注释与实现不符 = 假的（ADR-035 §3.6）。
+ *
+ * 用 `Infinity` 而不是 `0` 表示不限：上限在别处要做比较
+ * （`spent >= limit`），`Infinity` 让比较天然正确，而 `0` 会让
+ * 「不限」被误读成「一分钱都不许花」。
+ */
+export const UNLIMITED_BUDGET = Number.POSITIVE_INFINITY;
+
 export class BudgetCollector {
   private readonly events: EventStream;
   private readonly zeltoDir: string;
@@ -37,7 +49,11 @@ export class BudgetCollector {
 
   /**
    * Read budget limit from .zelto/config.yaml.
-   * Falls back to DEFAULT_BUDGET_LIMIT if not configured.
+   *
+   * 语义（ADR-035 §3.6）：
+   * - `budgetLimitUsd > 0` → 这个数就是上限
+   * - `budgetLimitUsd: 0` → 不限（返回 `UNLIMITED_BUDGET`）
+   * - 没有这一项 / 解析不出数 → 默认 `1.0`
    */
   async getLimit(_sliceId: string): Promise<number> {
     const configPath = join(this.zeltoDir, 'config.yaml');
@@ -52,8 +68,8 @@ export class BudgetCollector {
         const trimmed = line.trim();
         if (trimmed.startsWith('budgetLimitUsd:')) {
           const val = Number.parseFloat(trimmed.slice(15).trim());
-          if (!Number.isNaN(val) && val > 0) {
-            return val;
+          if (!Number.isNaN(val) && val >= 0) {
+            return val === 0 ? UNLIMITED_BUDGET : val;
           }
         }
       }
@@ -66,12 +82,15 @@ export class BudgetCollector {
 
   /**
    * Check if a slice has exhausted its budget.
+   *
+   * 上限为「不限」时永远不算超支 —— 没有上限就没有闸门。
    */
   async isExhausted(sliceId: string): Promise<boolean> {
     const [spent, limit] = await Promise.all([
       this.getSpent(sliceId),
       this.getLimit(sliceId),
     ]);
+    if (!Number.isFinite(limit)) return false;
     return spent >= limit;
   }
 

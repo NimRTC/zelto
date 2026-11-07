@@ -110,6 +110,66 @@ describe('ADR-035 · 适配器 getUsage', () => {
   });
 });
 
+// ─── SDK 适配器：从 result 消息记下用量 ────────────────────────────────────
+
+describe('ADR-035 · SDK 适配器记用量', () => {
+  /**
+   * 消费消息流是适配器的内部方法（SDK 的 query() 需要真实 SDK 环境，
+   * 测试里造不出来），所以用结构化断言调用它，喂一条假的消息流。
+   */
+  type SdkInternals = {
+    consumeGenerator(
+      sessionId: string,
+      spec: { sliceId: string; prompt: string; model?: string },
+      gen: AsyncGenerator<unknown, void>,
+      retryCount: number,
+    ): Promise<void>;
+  };
+
+  /** 造一个只会 yield 指定消息的假消息流。 */
+  async function* fakeMessages(messages: unknown[]): AsyncGenerator<unknown, void> {
+    for (const msg of messages) yield msg;
+  }
+
+  it('从 result 消息记下花费与 token', async () => {
+    const adapter = new ClaudeAgentSdkAdapter();
+    const internals = adapter as unknown as SdkInternals;
+
+    await internals.consumeGenerator(
+      'claude-agent-sdk-adr035-result',
+      { sliceId: 'adr035', prompt: 'bundle' },
+      fakeMessages([
+        {
+          type: 'result',
+          total_cost_usd: 0.42,
+          usage: { input_tokens: 1200, output_tokens: 340 },
+        },
+      ]),
+      0,
+    );
+
+    const usage = adapter.getUsage('claude-agent-sdk-adr035-result');
+    assert.ok(usage, '收到 result 消息就该记下用量');
+    assert.equal(usage.costUsd, 0.42);
+    assert.equal(usage.inputTokens, 1200);
+    assert.equal(usage.outputTokens, 340);
+  });
+
+  it('没有 result 消息时用量为 null（没测到，不是零）', async () => {
+    const adapter = new ClaudeAgentSdkAdapter();
+    const internals = adapter as unknown as SdkInternals;
+
+    await internals.consumeGenerator(
+      'claude-agent-sdk-adr035-noresult',
+      { sliceId: 'adr035', prompt: 'bundle' },
+      fakeMessages([{ type: 'text', text: 'hello' }]),
+      0,
+    );
+
+    assert.equal(adapter.getUsage('claude-agent-sdk-adr035-noresult'), null);
+  });
+});
+
 // ─── CLI 适配器：json 输出模式的 getOutput / getUsage ──────────────────────
 
 describe('ADR-035 · CLI 适配器的 json 输出', () => {

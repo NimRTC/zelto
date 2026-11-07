@@ -18,8 +18,9 @@ import {
   existsSync, mkdirSync, readdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { type ExecutorAdapter, type AdapterMeta } from '../../core/ports/executor.js';
+import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../../core/ports/executor.js';
 import type { EventEnvelope } from '../../core/events/index.js';
+import { extractClaudeJson, parseClaudeUsage } from '../usage-parse.js';
 
 // ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -118,9 +119,23 @@ interface SessionState {
   exitCode: number | null;
 }
 
-/** Flags appended when the agent command is Claude Code. */
+/**
+ * Flags appended when the agent command is Claude Code.
+ *
+ * `--output-format json` 让 Claude Code 把本次运行汇报成一个 JSON 对象
+ * （其中含 `result` / `total_cost_usd` / `usage`），适配器才能上报真实花费
+ * （ADR-035 §3.2）。代价是 stdout 一次性到达，不再逐块流式回调 ——
+ * ADR 已把这条记为「不是缺陷」。
+ */
 function claudeCodeFlags(extra: string[] = []): string {
-  return ['--print', '--permission-mode', 'bypassPermissions', ...extra].join(' ');
+  return [
+    '--print',
+    '--permission-mode',
+    'bypassPermissions',
+    '--output-format',
+    'json',
+    ...extra,
+  ].join(' ');
 }
 
 export class ClaudeAgentAdapter implements ExecutorAdapter {
@@ -485,17 +500,45 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
    *
    * Prefers the in-memory record (complete) and falls back to the persisted
    * file (survives a restart).
+   *
+   * Claude Code 的 json 输出模式下，stdout 整个是一个 JSON 对象，回答在
+   * `result` 字段 —— 问答回路依赖这段文本，所以优先取它。
+   * 解析不出 JSON（CLI 报错、非 Claude Code 命令）时**退回原始 stdout 文本**，
+   * 不吞输出（ADR-035 §3.2）。
    */
   getOutput(sessionId: string): string {
-    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
-    if (!data) return '';
-    return data.output.join('');
+    const raw = this.getRawOutput(sessionId);
+    const json = extractClaudeJson(raw);
+    if (json) {
+      const result = json.result;
+      if (typeof result === 'string') return result;
+    }
+    return raw;
   }
 
   /** The agent-side conversation id (the Claude Code session uuid). */
   getAgentSessionId(sessionId: string): string | null {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     return data?.agentSessionId ?? null;
+  }
+
+  /**
+   * 本次会话花了多少钱（ADR-035）。
+   *
+   * 只在 Claude Code 的 json 输出里报得出 —— 拿不到就返回 null，
+   * 意思是「没测到」，而不是「零」。把两者混同会让预算闸门变成一道假闸门。
+   */
+  getUsage(sessionId: string): AdapterUsage | null {
+    const json = extractClaudeJson(this.getRawOutput(sessionId));
+    if (!json) return null;
+    return parseClaudeUsage(json);
+  }
+
+  /** 会话的原始 stdout 文本（内存优先，回落到持久化文件） */
+  private getRawOutput(sessionId: string): string {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    if (!data) return '';
+    return data.output.join('');
   }
 
   // ─── Stop ──────────────────────────────────────────────────────────────────
