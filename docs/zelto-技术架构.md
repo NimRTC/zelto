@@ -134,12 +134,13 @@ checkAnchor(currentHash, anchorHash): { valid, mismatch }
 
 **6 种状态**: `draft → clarifying → frozen → running → completed → abandoned`
 
-**9 种事件**:
+**10 种事件**:
 - `CLARIFY_START` (draft → clarifying)
 - `CLARIFY_CONVERGED` (clarifying → draft)
 - `FREEZE` (draft → frozen)
+- `REFREEZE` (frozen → draft) — 人确认新规格后重新冻结（ADR-037）
 - `RUN_START` (frozen/completed → running)
-- `RUN_FINISH` (running → frozen)
+- `RUN_FINISH` (running → frozen) — 也用于**写集越界后退回 frozen**（ADR-037）
 - `GATE_PASS` (frozen → completed)
 - `SIGN_APPROVE` (completed → completed)
 - `SIGN_REJECT` (completed → abandoned)
