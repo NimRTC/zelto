@@ -117,6 +117,7 @@ describe('Scheduler — admit', () => {
   it('records sched.admitted and sched.blocked events', async () => {
     const slice = store.create('slice-events', 'Events test', {
       writes: ['src/events-test/**'],
+      trace: { requirements: ['R1: 准入要留下 sched.admitted 事件'], contracts: [], tests: [] },
     });
     slice.state = 'frozen';
     slice.spec.frozenHash = 'abc';

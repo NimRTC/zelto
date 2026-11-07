@@ -46,7 +46,7 @@ describe('event emission', () => {
   }
 
   it('emits spec.frozen on freeze', async () => {
-    await runCommand('create', 'event-freeze-test', '--title', 'Freeze Event');
+    await runCommand('create', 'event-freeze-test', '--title', 'Freeze Event', '--requirement', 'REQ-1: 冻结要留下 spec.frozen 事件');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'event-freeze-test.md'), '# freeze event', 'utf-8');
     await runCommand('freeze', 'event-freeze-test');
 
@@ -58,7 +58,7 @@ describe('event emission', () => {
   });
 
   it('emits spec.checked on check', async () => {
-    await runCommand('create', 'event-check-test', '--title', 'Check Event');
+    await runCommand('create', 'event-check-test', '--title', 'Check Event', '--requirement', 'REQ-2: 门禁①检查要留下 spec.checked 事件');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'event-check-test.md'), '# check event', 'utf-8');
     await runCommand('freeze', 'event-check-test');
     await runCommand('check', 'event-check-test');
@@ -78,7 +78,7 @@ describe('event emission', () => {
   });
 
   it('emits slice.drift_detected on hash mismatch', async () => {
-    await runCommand('create', 'event-drift-test', '--title', 'Drift Event');
+    await runCommand('create', 'event-drift-test', '--title', 'Drift Event', '--requirement', 'REQ-3: 规格漂移要留下 slice.drift_detected 事件');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'event-drift-test.md'), '# original', 'utf-8');
     await runCommand('freeze', 'event-drift-test');
 

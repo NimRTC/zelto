@@ -49,7 +49,7 @@ rules:
 `, 'utf-8');
 
     // Create a slice
-    await runCommand('create', 'policy-test', '--title', 'Policy Test');
+    await runCommand('create', 'policy-test', '--title', 'Policy Test', '--requirement', 'REQ-1: 策略判定要读 policy.yaml');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'policy-test.md'), '# test', 'utf-8');
     await runCommand('freeze', 'policy-test');
 
@@ -72,7 +72,7 @@ gate:
 `, 'utf-8');
 
     // Create and freeze a slice, then run gate
-    await runCommand('create', 'gate-config-test', '--title', 'Gate Config Test');
+    await runCommand('create', 'gate-config-test', '--title', 'Gate Config Test', '--requirement', 'REQ-2: 门禁命令要读 config.yaml');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'gate-config-test.md'), '# test gate config', 'utf-8');
     await runCommand('freeze', 'gate-config-test');
 
@@ -86,7 +86,7 @@ gate:
     await rm(join(TEST_DIR, 'policy'), { recursive: true, force: true });
 
     // Create a slice and freeze — should use default policy
-    await runCommand('create', 'no-policy-test', '--title', 'No Policy');
+    await runCommand('create', 'no-policy-test', '--title', 'No Policy', '--requirement', 'REQ-3: 缺 policy.yaml 时冻结仍按默认规则工作');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'no-policy-test.md'), '# test', 'utf-8');
     const { stdout, code } = await runCommand('freeze', 'no-policy-test');
     assert.equal(code, 0, `Freeze failed: ${stdout}`);
@@ -97,7 +97,7 @@ gate:
     await rm(join(TEST_DIR, '.zelto', 'config.yaml'), { recursive: true, force: true });
 
     // Gate should work with defaults
-    await runCommand('create', 'no-config-test', '--title', 'No Config');
+    await runCommand('create', 'no-config-test', '--title', 'No Config', '--requirement', 'REQ-4: 缺 config.yaml 时门禁回退到默认命令');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'no-config-test.md'), '# test', 'utf-8');
     await runCommand('freeze', 'no-config-test');
     const { stdout, code } = await runCommand('gate', 'no-config-test');
@@ -105,7 +105,7 @@ gate:
   });
 
   it('check detects spec hash mismatch after freeze', async () => {
-    await runCommand('create', 'drift-test', '--title', 'Drift Test');
+    await runCommand('create', 'drift-test', '--title', 'Drift Test', '--requirement', 'REQ-5: 规格被改动后要能检出漂移');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'drift-test.md'), '# original content', 'utf-8');
     await runCommand('freeze', 'drift-test');
 
@@ -113,7 +113,9 @@ gate:
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'drift-test.md'), '# modified content', 'utf-8');
 
     const { stdout, code } = await runCommand('check', 'drift-test');
-    assert.equal(code, 0);
+    // ADR-032 §3.4：check 的退出码与 --json 对齐——有问题返回 1。
+    // 规格漂移就是问题，所以这里期望 1（改动前文本模式恒为 0）。
+    assert.equal(code, 1, `check should exit 1 when drift detected: ${stdout}`);
     assert.ok(stdout.includes('hash mismatch') || stdout.includes('changed'), `Should detect drift: ${stdout}`);
   });
 });

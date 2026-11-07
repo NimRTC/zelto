@@ -79,7 +79,7 @@ describe('acceptance: sign-state-event', () => {
 
   it('zelto sign --approve emits slice.state.changed event', async () => {
     // Create a slice, freeze it, run gate to create sign request, then approve
-    await zelto('create', 'sign-approve-test');
+    await zelto('create', 'sign-approve-test', '--requirement', 'REQ-1: 签字通过要推进切片状态');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'sign-approve-test.md'), '# Sign approve test spec', 'utf-8');
     await zelto('freeze', 'sign-approve-test');
     const gateResult = await zelto('gate', 'sign-approve-test');
@@ -107,7 +107,7 @@ describe('acceptance: sign-state-event', () => {
 
   it('zelto sign --reject emits slice.state.changed event', async () => {
     // Create a slice, freeze it, run gate, then reject
-    await zelto('create', 'sign-reject-test');
+    await zelto('create', 'sign-reject-test', '--requirement', 'REQ-2: 签字否决要把切片置为已放弃');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'sign-reject-test.md'), '# Sign reject test spec', 'utf-8');
     await zelto('freeze', 'sign-reject-test');
     const gateResult = await zelto('gate', 'sign-reject-test');

@@ -48,6 +48,7 @@ describe('admit command', () => {
   it('admits a frozen slice with no conflicts', async () => {
     const slice = store.create('admit-test-1', 'Test 1', {
       writes: ['src/**/*.ts'],
+      trace: { requirements: ['R1: 无冲突的冻结切片应被准入'], contracts: [], tests: [] },
     });
     slice.state = 'frozen';
     slice.spec.frozenHash = 'sha256:test';
@@ -62,6 +63,7 @@ describe('admit command', () => {
   it('admits a completed slice with no conflicts', async () => {
     const slice = store.create('admit-test-2', 'Test 2', {
       writes: ['src/**/*.ts'],
+      trace: { requirements: ['R2: 已完成的切片应被准入'], contracts: [], tests: [] },
     });
     slice.state = 'completed';
     slice.spec.frozenHash = 'sha256:test';
@@ -74,7 +76,9 @@ describe('admit command', () => {
   });
 
   it('rejects admit for draft slice', async () => {
-    const slice = store.create('admit-test-3', 'Test 3');
+    const slice = store.create('admit-test-3', 'Test 3', {
+      trace: { requirements: ['R3: 草稿切片不该被准入'], contracts: [], tests: [] },
+    });
     await store.write(slice);
 
     const result = await scheduler.admit('admit-test-3');
@@ -85,6 +89,7 @@ describe('admit command', () => {
   it('detects write-set conflicts between concurrent slices', async () => {
     const running = store.create('running-slice', 'Running', {
       writes: ['src/**/*.ts'],
+      trace: { requirements: ['R4: 运行中的切片要参与写集冲突判定'], contracts: [], tests: [] },
     });
     running.state = 'frozen';
     running.spec.frozenHash = 'sha256:r1';
@@ -94,6 +99,7 @@ describe('admit command', () => {
 
     const candidate = store.create('conflict-slice', 'Conflict', {
       writes: ['src/**/*.ts'],
+      trace: { requirements: ['R5: 写集重叠的切片应被挡住'], contracts: [], tests: [] },
     });
     candidate.state = 'frozen';
     candidate.spec.frozenHash = 'sha256:c1';
@@ -108,6 +114,7 @@ describe('admit command', () => {
   it('allows admit with non-overlapping writes', async () => {
     const running = store.create('running-slice-2', 'Running 2', {
       writes: ['src/core/**/*.ts'],
+      trace: { requirements: ['R6: 写集不重叠的切片应被准入'], contracts: [], tests: [] },
     });
     running.state = 'frozen';
     running.spec.frozenHash = 'sha256:r2';
@@ -117,6 +124,7 @@ describe('admit command', () => {
 
     const candidate = store.create('no-conflict-slice', 'No Conflict', {
       writes: ['src/cli/**/*.ts'],
+      trace: { requirements: ['R7: 写集不重叠的切片应被准入'], contracts: [], tests: [] },
     });
     candidate.state = 'frozen';
     candidate.spec.frozenHash = 'sha256:nc1';

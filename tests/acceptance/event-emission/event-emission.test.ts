@@ -78,7 +78,7 @@ describe('acceptance: event-emission', () => {
 
   it('zelto freeze emits spec.frozen event', async () => {
     // Create a slice and freeze it
-    await zelto('create', 'freeze-event-test');
+    await zelto('create', 'freeze-event-test', '--requirement', 'REQ-1: 冻结要留下 spec.frozen 事件');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'freeze-event-test.md'), '# Freeze event test spec', 'utf-8');
     await zelto('freeze', 'freeze-event-test');
 
@@ -94,7 +94,7 @@ describe('acceptance: event-emission', () => {
 
   it('zelto check emits spec.checked event', async () => {
     // Create a slice, freeze it, then check it
-    await zelto('create', 'check-event-test');
+    await zelto('create', 'check-event-test', '--requirement', 'REQ-2: 门禁①要留下 spec.checked 事件');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'check-event-test.md'), '# Check event test spec', 'utf-8');
     await zelto('freeze', 'check-event-test');
     await zelto('check', 'check-event-test');
@@ -111,7 +111,7 @@ describe('acceptance: event-emission', () => {
 
   it('zelto check emits slice.drift_detected on hash mismatch', async () => {
     // Create a slice and freeze it
-    await zelto('create', 'drift-event-test');
+    await zelto('create', 'drift-event-test', '--requirement', 'REQ-3: 规格漂移要留下 slice.drift_detected 事件');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'drift-event-test.md'), '# Original spec for drift test', 'utf-8');
     await zelto('freeze', 'drift-event-test');
 
@@ -132,7 +132,7 @@ describe('acceptance: event-emission', () => {
 
   it('zelto start auto-freeze emits spec.frozen event', async () => {
     // zelto start on a new slice should auto-freeze and emit spec.frozen
-    const { stdout, code } = await zelto('start', 'start-freeze-event', '--title', 'Start Freeze Event');
+    const { stdout, code } = await zelto('start', 'start-freeze-event', '--title', 'Start Freeze Event', '--requirement', 'REQ-4: start 自动冻结也要留下 spec.frozen 事件');
     assert.equal(code, 0, `start should exit 0: ${stdout}`);
 
     const events = await readEvents('start-freeze-event');

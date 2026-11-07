@@ -79,7 +79,7 @@ describe('acceptance: gate-state-event', () => {
 
   it('zelto gate emits slice.state.changed event on GATE_PASS', async () => {
     // Create a slice, freeze it, then run gate
-    await zelto('create', 'gate-event-test');
+    await zelto('create', 'gate-event-test', '--requirement', 'REQ-1: 门禁通过要推进切片状态');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'gate-event-test.md'), '# Gate event test spec', 'utf-8');
     await zelto('freeze', 'gate-event-test');
 

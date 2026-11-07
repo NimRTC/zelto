@@ -217,7 +217,8 @@ describe('acceptance: config-loading', () => {
 
     // Re-check should detect drift
     const { stdout, code } = await runZelto(['check', sliceId]);
-    assert.equal(code, 0, 'check should exit 0 even when drift detected');
+    // ADR-032 §3.4：check 有问题时返回 1，漂移算问题（改动前文本模式恒为 0）。
+    assert.equal(code, 1, 'check should exit 1 when drift detected');
     assert.ok(stdout.includes('drift') || stdout.includes('mismatch') || stdout.includes('hash'),
       'output should indicate drift or hash mismatch');
   });

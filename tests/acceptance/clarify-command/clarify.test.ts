@@ -82,7 +82,7 @@ describe('acceptance: zelto clarify', () => {
 
   it('rejects non-draft slices', async () => {
     // Create and freeze a slice first
-    await zelto('create', 'frozen-slice');
+    await zelto('create', 'frozen-slice', '--requirement', 'REQ-1: 已冻结的切片不该再澄清');
     await zelto('freeze', 'frozen-slice');
 
     const { stdout, code } = await zelto('clarify', 'frozen-slice', '--auto');

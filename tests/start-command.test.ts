@@ -35,7 +35,7 @@ describe('zelto start', () => {
   }
 
   it('starts a new slice from scratch', async () => {
-    const { stdout, code } = await runCommand('start', 'fresh-slice', '--title', 'New slice');
+    const { stdout, code } = await runCommand('start', 'fresh-slice', '--title', 'New slice', '--requirement', 'REQ-1: 开发者从零启动一个切片并交给 agent 执行');
 
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
     assert.ok(stdout.includes('fresh-slice'));
@@ -48,7 +48,7 @@ describe('zelto start', () => {
 
   it('starts an existing draft slice', async () => {
     // Create a slice first
-    await runCommand('create', 'existing-slice', '--title', 'Existing');
+    await runCommand('create', 'existing-slice', '--title', 'Existing', '--requirement', 'REQ-2: 已存在的草稿切片可以再次启动');
 
     // Then start it
     const { stdout, code } = await runCommand('start', 'existing-slice');
@@ -59,7 +59,7 @@ describe('zelto start', () => {
 
   it('rejects a running slice', async () => {
     // Create a slice and manually set it to frozen first
-    await runCommand('create', 'running-slice');
+    await runCommand('create', 'running-slice', '--requirement', 'REQ-3: 已存在的切片重复启动时状态判定要稳');
     // We can't easily test the running state without mocking,
     // but at minimum we test that start doesn't crash on frozen
     const { stdout, code } = await runCommand('start', 'running-slice');

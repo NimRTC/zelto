@@ -49,7 +49,7 @@ describe('acceptance: zelto start', () => {
   });
 
   it('runs full start flow on a new slice', async () => {
-    const { stdout, code } = await zelto('start', 'new-slice', '--title', 'New Slice');
+    const { stdout, code } = await zelto('start', 'new-slice', '--title', 'New Slice', '--requirement', 'REQ-1: 从零启动切片要走完创建到门禁的全流程');
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
     assert.ok(/created/i.test(stdout), 'should show created');
     assert.ok(/frozen/i.test(stdout), 'should mention frozen');
@@ -58,7 +58,7 @@ describe('acceptance: zelto start', () => {
   });
 
   it('skips create for existing draft slice', async () => {
-    await zelto('create', 'existing-draft');
+    await zelto('create', 'existing-draft', '--requirement', 'REQ-2: 已存在的草稿切片启动时不该被重复创建');
     const { stdout, code } = await zelto('start', 'existing-draft');
     assert.equal(code, 0, `Expected 0, got ${code}: ${stdout}`);
     assert.ok(/already exists/i.test(stdout), 'should mention existing');
@@ -66,7 +66,7 @@ describe('acceptance: zelto start', () => {
   });
 
   it('produces a valid bundle file', async () => {
-    await zelto('start', 'bundle-check');
+    await zelto('start', 'bundle-check', '--requirement', 'REQ-3: 启动切片要产出约束包');
     const bundlePath = join(BASE_DIR, '.zelto', 'bundle-check-bundle.json');
     assert.ok(existsSync(bundlePath), 'bundle file should exist');
     const bundle = JSON.parse(await readFile(bundlePath, 'utf-8'));

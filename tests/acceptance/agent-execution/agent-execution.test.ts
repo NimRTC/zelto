@@ -75,7 +75,7 @@ describe('acceptance: agent-execution', () => {
 
   it('zelto run spawns agent and transitions to running state', async () => {
     // Use start to create + freeze + run in one go
-    const { stdout, code } = await zelto('start', 'run-test-1', '--title', 'Agent Run Test', '--yes');
+    const { stdout, code } = await zelto('start', 'run-test-1', '--title', 'Agent Run Test', '--yes', '--requirement', 'REQ-1: start 要真的拉起 agent 并留下运行记录');
     assert.equal(code, 0, `start should exit 0: ${stdout}`);
 
     // After start with echo agent, the slice should eventually be in frozen state
@@ -95,7 +95,7 @@ describe('acceptance: agent-execution', () => {
 
   it('zelto run with already-running slice is rejected', async () => {
     // Create a frozen slice first
-    await zelto('create', 'conflict-test');
+    await zelto('create', 'conflict-test', '--requirement', 'REQ-2: 已冻结的切片重复运行时要被挡住');
     await mkdir(join(BASE_DIR, 'specs', 'slices'), { recursive: true });
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'conflict-test.md'), '# conflict test', 'utf-8');
     await zelto('freeze', 'conflict-test');
@@ -106,7 +106,7 @@ describe('acceptance: agent-execution', () => {
   });
 
   it('zelto run --dry-run simulates without executing agent', async () => {
-    await zelto('create', 'dry-run-test');
+    await zelto('create', 'dry-run-test', '--requirement', 'REQ-3: dry-run 只模拟不真跑');
     await mkdir(join(BASE_DIR, 'specs', 'slices'), { recursive: true });
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'dry-run-test.md'), '# dry run test', 'utf-8');
     await zelto('freeze', 'dry-run-test');
@@ -122,7 +122,7 @@ describe('acceptance: agent-execution', () => {
   });
 
   it('zelto run rejects non-frozen slices', async () => {
-    await zelto('create', 'draft-run-test');
+    await zelto('create', 'draft-run-test', '--requirement', 'REQ-4: 草稿切片不允许直接 run');
 
     const { stdout, stderr, code } = await zelto('run', 'draft-run-test');
     assert.notEqual(code, 0, 'run on draft should fail');

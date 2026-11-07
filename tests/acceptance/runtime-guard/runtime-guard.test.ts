@@ -212,7 +212,7 @@ describe('acceptance: runtime-guard', { concurrency: false }, () => {
   });
 
   it('the runtime guard enforces the write-set at run time', async () => {
-    const created = await zelto('create', SLICE_ID, '--title', 'Runtime Guard Test', '--writes', 'src/core/**');
+    const created = await zelto('create', SLICE_ID, '--title', 'Runtime Guard Test', '--writes', 'src/core/**', '--requirement', 'REQ-1: 运行期写集守卫要拦住越界写入');
     assert.equal(created.code, 0, `create should exit 0: ${created.stderr}`);
 
     const frozen = await zelto('freeze', SLICE_ID);

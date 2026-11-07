@@ -31,7 +31,7 @@ describe('zelto events (acceptance)', { concurrency: false }, () => {
     assert.equal(initResult.status, 0, `init failed: ${initResult.stderr}`);
 
     // Create a slice and generate events
-    const createResult = zelto('create', 'events-test-slice', '--title', 'Events Acceptance Test');
+    const createResult = zelto('create', 'events-test-slice', '--title', 'Events Acceptance Test', '--requirement', 'REQ-1: 事件流要能按切片查出来');
     assert.equal(createResult.status, 0, `create failed: ${createResult.stderr}`);
 
     // Write a spec file so freeze works

@@ -80,6 +80,7 @@ agent:
     const { stdout, code } = await runCommand(
       'start', 'mock-agent-test',
       '--title', 'Mock Agent',
+      '--requirement', 'REQ-1: 用 echo 当 agent 跑通 start 全流程',
       '--agent', 'echo',
     );
 
@@ -98,7 +99,7 @@ agent:
   it('runs a mock agent via run command', async () => {
     // Create a fresh slice, freeze it first
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'mock-run-test.md'), '# Mock Run Test', 'utf-8');
-    await runCommand('create', 'mock-run-test');
+    await runCommand('create', 'mock-run-test', '--requirement', 'REQ-2: 冻结后用 run 单独执行切片');
     await runCommand('freeze', 'mock-run-test');
 
     // Run with echo as agent
@@ -112,7 +113,7 @@ agent:
 
   it('handles agent non-zero exit', async () => {
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'fail-agent-test.md'), '# Fail Agent', 'utf-8');
-    await runCommand('create', 'fail-agent-test');
+    await runCommand('create', 'fail-agent-test', '--requirement', 'REQ-3: agent 非零退出时要被如实报告');
     await runCommand('freeze', 'fail-agent-test');
 
     // Run with a command that exits non-zero.

@@ -72,7 +72,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
 
   it('gate command failure emits gate.retry events and updates stall info', async () => {
     // Create a slice, freeze it
-    const { stdout: createOut, code: createCode } = await zelto('create', 'gate-retry-test', '--title', 'Gate Retry Test');
+    const { stdout: createOut, code: createCode } = await zelto('create', 'gate-retry-test', '--title', 'Gate Retry Test', '--requirement', 'REQ-1: 门禁命令失败要重试并留下事件');
     assert.equal(createCode, 0, `create failed: ${createOut}`);
 
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'gate-retry-test.md'), '# Gate retry test spec', 'utf-8');
@@ -112,7 +112,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
 
   it('passing gate does not create gate.retry events or stall', async () => {
     // Create a slice with passing gate commands
-    await zelto('create', 'gate-pass-test', '--title', 'Gate Pass Test');
+    await zelto('create', 'gate-pass-test', '--title', 'Gate Pass Test', '--requirement', 'REQ-2: 门禁通过时不该留下重试事件');
     await writeFile(join(BASE_DIR, 'specs', 'slices', 'gate-pass-test.md'), '# Gate pass test spec', 'utf-8');
     await zelto('freeze', 'gate-pass-test');
 
@@ -163,7 +163,7 @@ describe('acceptance: gate-retry', { concurrency: false }, () => {
     ].join('\n'), 'utf-8');
 
     // Use spawn directly for this test to use cleanDir
-    const child = spawn('node', [CLI_SCRIPT, 'create', 'gate-max-retry-test'], { cwd: cleanDir, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn('node', [CLI_SCRIPT, 'create', 'gate-max-retry-test', '--requirement', 'REQ-3: 重试次数要有上限'], { cwd: cleanDir, stdio: ['pipe', 'pipe', 'pipe'] });
     await new Promise<void>((resolve) => { child.on('close', () => resolve()); });
     await writeFile(join(cleanDir, 'specs', 'slices', 'gate-max-retry-test.md'), '# Gate max retry test spec', 'utf-8');
     const child2 = spawn('node', [CLI_SCRIPT, 'freeze', 'gate-max-retry-test'], { cwd: cleanDir, stdio: ['pipe', 'pipe', 'pipe'] });

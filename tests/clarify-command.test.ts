@@ -49,7 +49,7 @@ describe('zelto clarify', () => {
   });
 
   it('rejects frozen slice', async () => {
-    await runCommand('create', 'already-frozen', '--title', 'Frozen');
+    await runCommand('create', 'already-frozen', '--title', 'Frozen', '--requirement', 'REQ-1: 已冻结的切片不允许再澄清');
     await writeFile(join(TEST_DIR, 'specs', 'slices', 'already-frozen.md'), '# frozen', 'utf-8');
     await runCommand('freeze', 'already-frozen');
 
