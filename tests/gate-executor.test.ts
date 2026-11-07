@@ -17,7 +17,6 @@ const sampleGateConfig: GateConfig = {
   commands: [
     { name: 'echo', run: 'echo hello' },
   ],
-  changedLineCoverage: 0.8,
   timeoutSec: 30,
   retry: { max: 1, budgetStepUsd: 0.05 },
 };
@@ -74,7 +73,6 @@ describe('GateExecutor — failure handling', () => {
       commands: [
         { name: 'false', run: '' }, // exit code 1
       ],
-      changedLineCoverage: 0.8,
       timeoutSec: 10,
       retry: { max: 1, budgetStepUsd: 0.05 },
     }, TEST_DIR);

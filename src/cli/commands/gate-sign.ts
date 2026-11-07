@@ -106,7 +106,7 @@ register('gate', async (args) => {
         .filter((c) => !onlyCommand || c.name === onlyCommand)
         .map((c) => ({ name: c.name, run: c.run })),
       profiles: gateProfiles,
-      changedLineCoverage: 0.8,
+      ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
       timeoutSec: config.gate.timeoutSec,
       retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
@@ -183,6 +183,7 @@ register('gate', async (args) => {
         commands: report.results.map((r) => ({
           command: r.command, passed: r.passed, exitCode: r.exitCode, durationMs: r.durationMs,
         })),
+        ...(report.acceptance ? { acceptance: report.acceptance } : {}),
         retryCount: report.retryCount,
         totalDurationMs: report.totalDurationMs,
       }));
@@ -199,6 +200,23 @@ register('gate', async (args) => {
         for (const line of stderrLines) {
           console.log(`       ${line.slice(0, 200)}`);
         }
+      }
+    }
+
+    // 切片级验收（ADR-033）：跑没跑、跑没跑过、结论是什么，都要说清楚。
+    // skipped 也要显式说 —— 静默跳过等于骗人。
+    const acceptance = report.acceptance;
+    if (acceptance) {
+      const icon = acceptance.status === 'passed' ? '✅'
+        : acceptance.status === 'failed' ? '❌'
+        : '⏭️';
+      const target = acceptance.path ? ` ${acceptance.path}` : '';
+      console.log(`  Acceptance: ${icon} ${acceptance.status}${target}`);
+      if (acceptance.command) {
+        console.log(`    Command: ${acceptance.command}`);
+      }
+      if (acceptance.reason) {
+        console.log(`    Reason:  ${acceptance.reason}`);
       }
     }
 
