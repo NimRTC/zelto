@@ -674,12 +674,12 @@ export async function executeSlicesParallel(
     }
 
     // 写集审计（ADR-014 §5）—— 越界就不进 gate
+    //
+    // `enforceWriteSet` 已经把切片退回 frozen 并写了 `run.aborted` 事件，
+    // 这里不再重复写事件（append-only 事件流里重复条目只会让人误以为发生了两次）。
     const withinBounds = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
     if (!withinBounds) {
-      console.log(`❌ ${st.id}: 写集越界 — 未进入 gate，等人处理`);
-      await events.append(st.id, 'run.aborted', 'zelto', {
-        sliceId: st.id, exitCode: 0, reason: 'write-set violation',
-      });
+      console.log(`❌ ${st.id}: 写集越界 — 未进入 gate，切片已退回 frozen，等人处理`);
       outcomes.push({
         id: st.id,
         status: 'stalled',

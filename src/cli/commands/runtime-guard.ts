@@ -26,6 +26,7 @@ import {
   LOCKS_DIR,
 } from '../../core/sched/index.js';
 import { events } from './shared.js';
+import { handleWriteSetViolation } from './run-support.js';
 import {
   CLAUDE_SETTINGS_RELATIVE,
   type ClaudeHookOptions,
@@ -286,5 +287,14 @@ export async function enforceWriteSet(
     console.error(`   - ${p}（zelto 托管的文件被改动了 —— 门禁可能已被绕过）`);
   }
   console.error(`   事件流：.zelto/events/${sliceId}/events.jsonl`);
+
+  // 退回 frozen，让切片可以重跑 —— 否则它会永远卡在 running（见
+  // `handleWriteSetViolation` 的注释）。人扩完写集就能直接重跑。
+  await handleWriteSetViolation(sliceId, {
+    violations: result.violations,
+    tampered: result.tampered,
+  });
+  console.error(`   切片已退回 frozen：扩写集后重跑 zelto run ${sliceId}`);
+
   return false;
 }

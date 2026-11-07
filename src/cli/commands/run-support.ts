@@ -383,3 +383,49 @@ export async function handleAgentFailure(
 
   return { action: 'stall' };
 }
+
+/**
+ * 处置「写集越界」的切片：退回 `frozen` 并留痕。
+ *
+ * 为什么必须退回 `frozen`（而不是把切片留在 `running`）：
+ *
+ * 越界之后 agent 已经跑完了，但这一轮**不算数** —— 门禁没跑、签字没发。
+ * 如果状态留在 `running`，人就再也动不了这个切片：
+ *   - `zelto run` 拒绝跑（状态必须是 frozen 或 completed）
+ *   - `zelto merge` 不收它（没签字）
+ *   - `zelto resume` 说它没停机
+ *   - 唯一出路是 `zelto abandon` —— 整个切片作废，规格得重写
+ *
+ * 也就是「越界一次，切片就废了」。这不是设计意图：越界通常意味着**写集
+ * 划窄了**（agent 需要动一个没写进写集的文件），人扩一下写集重跑就行。
+ *
+ * 状态机里 `running --RUN_FINISH--> frozen` 正是这条退路（frozen 可再次
+ * RUN_START）。所以这里用 `RUN_FINISH` 事件退回 frozen：
+ *   - 可重跑：人扩写集后 `zelto run` 直接能跑
+ *   - 不自动重试：越界不是 agent 的错，是边界划错了，重试还是越界
+ *   - 不进 gate、不发签字请求 —— 与 ADR-014 §5 一致
+ *
+ * C1: 状态只落在文件里；C4: 留痕写 append-only 事件
+ */
+export async function handleWriteSetViolation(
+  id: string,
+  options?: { violations?: string[]; tampered?: string[] },
+): Promise<void> {
+  const violations = options?.violations ?? [];
+  const tampered = options?.tampered ?? [];
+
+  try {
+    // 退回 frozen，让切片可以重跑。状态机不认这个转换时也不阻断后续留痕。
+    await store.transit(id, 'RUN_FINISH');
+  } catch {
+    // 状态已经在 frozen 或别的态 —— 留痕照样要写。
+  }
+
+  await events.append(id, 'run.aborted', 'zelto', {
+    sliceId: id,
+    exitCode: null,
+    reason: 'write-set violation',
+    violations,
+    tampered,
+  });
+}

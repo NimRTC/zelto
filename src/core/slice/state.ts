@@ -13,6 +13,7 @@ export type SliceEvent =
   | 'CLARIFY_START'
   | 'CLARIFY_CONVERGED'
   | 'FREEZE'
+  | 'REFREEZE'
   | 'RUN_START'
   | 'RUN_FINISH'
   | 'GATE_PASS'
@@ -34,6 +35,9 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
     RUN_START: 'running',
     GATE_PASS: 'completed',
     SIGN_APPROVE: 'completed',
+    // 重新冻结：人改了规格（最常见是扩写集），确认后重新走一次冻结。
+    // 回到 draft 而不是直接回 frozen —— 中间要重新过门禁①与追溯物化。
+    REFREEZE: 'draft',
     ABANDON: 'abandoned',
   },
   running: {

@@ -794,21 +794,60 @@ register('abandon', async (args) => {
 register('freeze', async (args) => {
   const [id] = args;
   if (!id) {
-    console.error('Usage: zelto freeze <slice-id>');
+    console.error('Usage: zelto freeze <slice-id> [--refreeze]');
     return 1;
   }
 
   const isJson = args.includes('--json');
+  // --refreeze：允许对已冻结的切片重新冻结。
+  //
+  // 为什么需要：规格冻结之后人可能还要改它——最常见的是**写集越界之后
+  // 扩写集**（写集写在规格的「范围」章节里，改规格 = 改哈希）。
+  // 没有这条路径，那个切片就永久卡住：check 报 hash mismatch，
+  // freeze 又说「已经是 frozen，不能 freeze」。
+  const isRefreeze = args.includes('--refreeze');
 
   try {
-    const slice = await store.read(id);
+    // `let` 而非 `const`：--refreeze 分支会把 slice 换成刷新后的对象
+    // （transit 会覆写盘上的状态，局部变量必须跟着换）。
+    let slice = await store.read(id);
     if (slice.state !== 'draft' && slice.state !== 'clarifying') {
-      if (isJson) {
-        console.log(JSON.stringify({ sliceId: id, success: false, error: `Cannot freeze slice in state "${slice.state}"` }));
-      } else {
-        console.error(`Slice "${id}" is in state "${slice.state}", cannot freeze.`);
+      // 只有 frozen 能重新冻结。running / completed / abandoned 的规格
+      // 变了要另走流程 —— 那些状态里可能已经有 agent 的产物了。
+      const canRefreeze = isRefreeze && slice.state === 'frozen';
+      if (!canRefreeze) {
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, success: false, error: `Cannot freeze slice in state "${slice.state}"` }));
+        } else {
+          console.error(`Slice "${id}" is in state "${slice.state}", cannot freeze.`);
+          if (slice.state === 'frozen') {
+            console.error(`        规格已改？用 zelto freeze ${id} --refreeze 重新冻结。`);
+          }
+        }
+        return 1;
       }
-      return 1;
+
+      // 重新冻结 = 人确认了新规格。退回 draft 让 FREEZE 转换合法可用。
+      //
+      // 顺序要紧：`store.transit` 会重新读盘并整份覆写，所以字段修改
+      // 必须在 transit **之后**再做（否则刚改的字段会被冲掉）。
+      await store.transit(id, 'REFREEZE');
+
+      const refreshed = await store.read(id);
+      refreshed.spec.frozenHash = null;
+      refreshed.spec.frozenAt = null;
+      // 追溯重新物化：规格改了，需求条目也可能变了
+      refreshed.trace.requirements = [];
+      await store.write(refreshed);
+      // 后面的追溯物化与 FREEZE 转换都基于这个对象继续 —— 不换掉的话
+      // 局部变量还停在旧状态（frozen），FREEZE 转换会直接抛 Invalid transition。
+      slice = refreshed;
+
+      // 事件留痕：规格变更是人做的，必须能在事件流里看到（C4）。
+      await events.append(id, 'slice.state.changed', 'cli', {
+        sliceId: id, from: 'frozen', to: 'draft', event: 'REFREEZE',
+      });
+      console.log(`  ↻ 重新冻结：${id} 已退回 draft（规格哈希已重置，追溯待重新物化）`);
     }
 
     // 追溯物化 + 准入闸门（ADR-032 §3.1 / §3.3）：
@@ -1195,8 +1234,10 @@ register('run', async (args) => {
       }
 
       if (!withinBounds) {
-        // 越界：不进 gate、不自动签字 —— 等人处理
-        console.log(`\n❌ Slice "${id}" 写集越界 —— 未进入 gate，等人处理。`);
+        // 越界：不进 gate、不自动签字 —— 等人处理。
+        // `enforceWriteSet` 已经把切片退回 frozen（可重跑）并写了 run.aborted 事件。
+        console.log(`\n❌ Slice "${id}" 写集越界 —— 未进入 gate。`);
+        console.log(`   切片已退回 frozen：扩写集后重跑 zelto run ${id}`);
         return 1;
       }
 
