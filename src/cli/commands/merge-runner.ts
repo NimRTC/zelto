@@ -205,7 +205,12 @@ export async function cleanupMergedSlices(ids: string[]): Promise<void> {
   for (const id of ids) {
     try {
       if (manager.exists(id)) {
-        await removeWorktree(id);
+        // 强制删除：到这一步这个切片已经合进主干了，worktree 里剩下的
+        // 未跟踪文件是 zelto 自己放的托管文件（规格副本、约束包镜像），
+        // 不是 agent 的产物 —— agent 的产物在合并前已经提交并合入。
+        // 不带 force 的话 `git worktree remove` 会拒绝删，worktree 与
+        // 分支双双残留（分支还因为被 worktree 占用而删不掉）。
+        await removeWorktree(id, { force: true });
         console.log(`  ✅ Removed worktree ${manager.relativePathFor(id)}`);
       }
     } catch (err) {
@@ -216,6 +221,8 @@ export async function cleanupMergedSlices(ids: string[]): Promise<void> {
 
     try {
       const { execSync } = await import('node:child_process');
+      // worktree 删掉之后 git 才肯放分支；再 prune 一次清掉残留登记。
+      execSync('git worktree prune', { cwd: process.cwd(), timeout: 5000, stdio: 'ignore' });
       execSync(`git branch -d ${manager.branchFor(id)}`, { cwd: process.cwd(), timeout: 5000 });
       console.log(`  ✅ Deleted branch "${manager.branchFor(id)}"`);
     } catch {
