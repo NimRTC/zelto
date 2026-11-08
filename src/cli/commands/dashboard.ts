@@ -22,6 +22,12 @@ import {
   type ModelCost,
   type SliceCost,
 } from './dashboard-cost.js';
+import {
+  collectCompletedSummary,
+  deliveryLabel,
+  DELIVERY_ORDER,
+  type CompletedSummary,
+} from './completed-slices.js';
 
 // ─── Area Mapping ────────────────────────────────────────────────────────────
 
@@ -309,6 +315,7 @@ function computeActions(
 function renderTty(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
+  delivery: CompletedSummary,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
@@ -342,6 +349,22 @@ function renderTty(
     .map((st) => { const c = stateCnt[st] ?? 0; return c > 0 ? `${ST_ICON[st] ?? '❔'} ${c}` : ''; })
     .filter(Boolean);
   if (barParts.length > 0) lines.push(`  ${colors.dim('States:')}  ${barParts.join('  ')}`);
+
+  // 交付状态 —— `Completed: 12` 说不清这 12 个里有多少真的进了主干。
+  // 「做完了」和「交付了」是两回事，看板上必须分开摆。
+  //
+  // 措辞取自 `deliveryLabel` —— 与 suggest 命令同一份标签，不在这里另写一套，
+  // 否则两处会各说各话（「待签字」vs「门禁通过 · 待签字」）。
+  if (delivery.total > 0) {
+    const parts: string[] = [];
+    for (const status of DELIVERY_ORDER) {
+      const count = delivery.counts[status];
+      if (count === 0) continue;
+      const painted = status === 'merged' ? colors.green(`${count}`) : colors.yellow(`${count}`);
+      parts.push(`${painted} ${colors.dim(deliveryLabel(status))}`);
+    }
+    lines.push(`  ${colors.dim('Delivered:')}  ${parts.join('  ')}`);
+  }
   lines.push('');
 
   // Stalled list
@@ -463,6 +486,7 @@ function renderTty(
 function renderJson(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
+  delivery: CompletedSummary,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
@@ -482,6 +506,20 @@ function renderJson(
       runningCount: running.length,
       releaseCount: releases.length,
       planCount: plans.length,
+    },
+    // 交付状态 —— 「做完了」与「交付了」分开摆。
+    // completed 同时表示门禁过了与人签了字（ADR-018），单看状态数说不清
+    // 有多少切片真的进了主干。
+    delivery: {
+      total: delivery.total,
+      counts: delivery.counts,
+      slices: delivery.slices.map((s) => ({
+        id: s.id,
+        title: s.title,
+        status: s.status,
+        branchExists: s.branchExists,
+        updatedAt: s.updatedAt,
+      })),
     },
     cost: {
       totalCostUsd: totals.totalCost,
@@ -619,7 +657,7 @@ function statusLabel(st: string): string {
 function renderHtml(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], watchMode: boolean, costMap: Map<string, SliceCost>,
-  budgetLimit: number,
+  budgetLimit: number, delivery: CompletedSummary,
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const stateCnt: Record<string, number> = {};
@@ -642,6 +680,7 @@ function renderHtml(
   <div class="c st"><div class="n">${stalled.length}</div><div class="l">⚠️ Stalled</div></div>
   <div class="c" style="border-color:#58a6ff66"><div class="n">${fmtCost(totals.totalCost)}</div><div class="l">💰 Total cost</div></div>
   <div class="c" style="border-color:#d2a8ff66"><div class="n">${fmtTokens(totals.totalTokens)}</div><div class="l">🧮 Total tokens</div></div>
+  ${delivery.total > 0 ? `<div class="c" style="border-color:#3fb95066"><div class="n">${delivery.counts.merged}<span style="font-size:14px;color:#8b949e">/${delivery.total}</span></div><div class="l">📦 已交付主干</div></div>` : ''}
 </div>`;
 
   const stateOrder = ['running','frozen','completed','draft','clarifying','abandoned'];
@@ -656,6 +695,20 @@ function renderHtml(
     if (c === 0) return '';
     return `<div class="brs b-${t}" style="width:${((c/slices.length)*100).toFixed(0)}%">${tIcon(t)} ${c}</div>`;
   }).filter(Boolean).join('');
+
+  // 交付状态 —— 「做完了」与「交付了」是两回事。
+  // completed 同时表示门禁过了与人签了字（ADR-018），单看状态数说不清
+  // 有多少切片真的进了主干。这里把每一环的切片摊开给人看。
+  const deliveryRows = delivery.slices
+    .filter((s) => s.status !== 'merged' && s.status !== 'no-branch')
+    .map((s) => `<tr><td class="eet">${esc(s.id)}</td><td>${esc(deliveryLabel(s.status))}</td><td class="etm">${esc(s.title)}</td></tr>`)
+    .join('');
+  const deliveryLayer = delivery.total > 0 ? `
+<h2 class="sh">📦 交付状态 <span class="hc">${delivery.counts.merged}/${delivery.total} 已合入主干</span></h2>
+<table>
+<thead><tr><th>Slice</th><th>状态</th><th>标题</th></tr></thead>
+<tbody>${deliveryRows || '<tr><td colspan="3" class="empty">全部已合入主干</td></tr>'}</tbody>
+</table>` : '';
 
   // ══════════════════════════════════════════════════════════════════════════════
   // LAYER 1 — Stalled
@@ -1049,6 +1102,7 @@ ${summary}
 <div class="br">${stateBar || '<div style="color:#484f58;padding:8px;font-size:12px">No slices</div>'}</div>
 <div class="br">${typeBar || ''}</div>
 
+${deliveryLayer}
 ${stalledLayer}
 ${costLayer}
 ${releaseLayer}
@@ -1097,13 +1151,14 @@ register('dashboard', async (args) => {
     const events = collectRecentEvents();
     const costMap = collectCosts();
     const budgetLimit = await readBudgetLimit();
-    return { slices, plans, releases, events, costMap, budgetLimit };
+    const delivery = await collectCompletedSummary();
+    return { slices, plans, releases, events, costMap, budgetLimit, delivery };
   };
 
   // ── TTY mode ────────────────────────────────────────────────────────────
   if (ttyMode) {
-    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
-    process.stdout.write(renderTty(slices, plans, releases, events, costMap, budgetLimit));
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
+    process.stdout.write(renderTty(slices, plans, releases, events, costMap, budgetLimit, delivery));
 
     if (watchMode) {
       console.log(colors.dim('  👀 Watching... (Ctrl+C to stop)'));
@@ -1112,7 +1167,7 @@ register('dashboard', async (args) => {
           const d = await gather();
           process.stdout.write('\x1b[2J\x1b[H'); // clear screen
           process.stdout.write(
-            renderTty(d.slices, d.plans, d.releases, d.events, d.costMap, d.budgetLimit),
+            renderTty(d.slices, d.plans, d.releases, d.events, d.costMap, d.budgetLimit, d.delivery),
           );
         } catch { /* ignore */ }
       };
@@ -1129,15 +1184,15 @@ register('dashboard', async (args) => {
 
   // ── JSON mode ───────────────────────────────────────────────────────────
   if (jsonMode) {
-    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
-    console.log(renderJson(slices, plans, releases, events, costMap, budgetLimit));
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
+    console.log(renderJson(slices, plans, releases, events, costMap, budgetLimit, delivery));
     return 0;
   }
 
   // ── HTML mode (default) ─────────────────────────────────────────────────
   const generate = async () => {
-    const { slices, plans, releases, events, costMap, budgetLimit } = await gather();
-    return renderHtml(slices, plans, releases, events, watchMode, costMap, budgetLimit);
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
+    return renderHtml(slices, plans, releases, events, watchMode, costMap, budgetLimit, delivery);
   };
 
   writeFileSync(outputPath, await generate(), 'utf-8');

@@ -95,6 +95,44 @@ export function isMergedIntoHead(branch: string, repoRoot: string): boolean {
 }
 
 /**
+ * 一次性列出仓库里所有本地分支。
+ *
+ * 为什么要批量版：逐个分支跑 `git rev-parse` 是 N 次子进程调用，
+ * 切片一多（几十个完成切片）光审计就要几秒。`for-each-ref` 一次拿全。
+ */
+export function listLocalBranches(repoRoot: string): Set<string> {
+  const res = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/'], repoRoot);
+  if (!res.ok) return new Set();
+  return new Set(
+    res.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * 一次性列出已经合入当前 HEAD 的本地分支。
+ *
+ * 与逐个跑 `git merge-base --is-ancestor <branch> HEAD` 等价
+ * （`--merged=HEAD` 筛的就是「tip 是 HEAD 的祖先」的引用），
+ * 但只需要一次子进程调用。
+ */
+export function listMergedIntoHead(repoRoot: string): Set<string> {
+  const res = git(
+    ['for-each-ref', '--merged=HEAD', '--format=%(refname:short)', 'refs/heads/'],
+    repoRoot,
+  );
+  if (!res.ok) return new Set();
+  return new Set(
+    res.stdout
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean),
+  );
+}
+
+/**
  * 基点是否已漂移：切片冻结之后主分支已经前进。
  *
  * 判据是「基点是否仍等于当前 HEAD」——主分支前进后 HEAD 与基点不再相同，

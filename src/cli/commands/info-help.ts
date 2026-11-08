@@ -10,6 +10,12 @@ import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
 import { collectPlanningDrafts, draftConfirmCommand, draftShowCommand } from './planning-drafts.js';
 import { collectPendingActions, type PendingAction } from './pending-actions.js';
+import {
+  collectCompletedSummary,
+  deliveryLabel,
+  deliverySummaryLine,
+  DELIVERY_ORDER,
+} from './completed-slices.js';
 import { commandsByGroup, findCommand, usageOf } from './catalog.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
@@ -184,6 +190,18 @@ register('suggest', async () => {
       };
       const fn = colorFn[state] ?? colors.dim;
       console.log(`    ${fn(`${state}: ${count}`)}`);
+    }
+
+    // 交付状态 —— `completed: 12` 说不清这 12 个里有多少真的进了主干。
+    // 这里只给计数；具体是哪些切片、该敲哪条命令，归下面的待办段。
+    const delivery = await collectCompletedSummary();
+    if (delivery.total > 0) {
+      console.log(formatSection('Delivery Status'));
+      for (const status of DELIVERY_ORDER) {
+        const count = delivery.counts[status];
+        if (count === 0) continue;
+        console.log(`    ${colors.dim(deliveryLabel(status))}  ${colors.bold(String(count))}`);
+      }
     }
 
     // Check each slice and suggest next action
@@ -461,6 +479,12 @@ register('summary', async () => {
   f.out(`  Slices:     ${sliceList.length}`);
   for (const [state, count] of Object.entries(sliceStates)) {
     f.out(`    ${state}: ${count}`);
+  }
+
+  // 交付状态 —— 状态计数说不清「有多少真的进了主干」，这里补一行人话汇总。
+  const delivery = await collectCompletedSummary();
+  if (delivery.total > 0) {
+    f.out(`  Delivery:   ${deliverySummaryLine(delivery)}`);
   }
 
   let reworkLine = '';
