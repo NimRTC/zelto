@@ -104,6 +104,27 @@
   dashboard's cost view.** The old filter kept only slices with non-zero cost
   or at least one LLM call, which silently dropped "measured, and it was
   free" — the same distinction ADR-035 draws between `null` and `0`.
+- **An agent failure no longer hides a write-set violation that happened in the
+  same round.** When the agent exited non-zero *and* had written outside its
+  write set, the single-slice and background paths printed only "agent exited
+  with code N" — the list of offending files was computed, written to the event
+  stream, and then never shown to a human. The violation message is now printed
+  alongside the failure message on both paths, so the file list that decides
+  "widen the write set or redo the spec" is not lost.
+- **The parallel path now audits slices whose agent failed.** `zelto run
+  --parallel` skipped the post-run write-set audit entirely when the agent
+  exited non-zero, so on that path the C9 audit fallback simply did not exist:
+  a slice that failed *and* wrote outside its write set was reported as a
+  plain failure, with no violation event and no rollback to `frozen`. Failed
+  slices are now audited like successful ones; the violation is reported and
+  the slice goes back to `frozen` so it can be re-run after the write set is
+  widened.
+- **The background path writes `run.aborted` once, not twice.** The
+  de-duplication added with the unified run messages only covered the
+  `exitCode === 0` branch; an agent failure combined with a violation still
+  produced two `run.aborted` entries, which reads as "this happened twice" in
+  an append-only stream. The second entry is now written only when the audit
+  did not already write one.
 
 ## [0.5.0] — 2026-11-06
 

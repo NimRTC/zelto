@@ -63,10 +63,9 @@ import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
 import {
   agentFailedMessage,
-  auditFailedMessage,
   budgetExhaustedMessage,
   printOutcome,
-  writeSetViolationMessage,
+  writeSetOutcomeLines,
 } from './run-messages.js';
 import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost } from './run-support.js';
 import {
@@ -1247,11 +1246,7 @@ register('run', async (args) => {
         // 审计失败与越界分开说 —— 前者是「边界未知」，下一步是修环境；
         // 后者是「越界已证实」，下一步是扩写集。混着说会让人白跑一轮。
         console.log('');
-        if (withinBounds.error) {
-          printOutcome(auditFailedMessage({ sliceId: id }, withinBounds.error));
-        } else {
-          printOutcome(writeSetViolationMessage({ sliceId: id }, withinBounds));
-        }
+        printOutcome(writeSetOutcomeLines({ sliceId: id }, withinBounds));
         return 1;
       }
 
@@ -1287,6 +1282,13 @@ register('run', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log('');
       printOutcome(agentFailedMessage({ sliceId: id }, finalExitCode, attempt + 1, elapsed));
+      // agent 失败 ≠ 没有越界 —— 失败的那一轮同样可能写了越界的文件。
+      // 越界文件清单是人决定「扩写集还是重做规格」的唯一依据；
+      // 只报 agent 失败，人会以为「只是没写完」，白跑一轮。
+      const outcomeLines = writeSetOutcomeLines({ sliceId: id }, withinBounds);
+      if (outcomeLines.length > 0) {
+        printOutcome(outcomeLines);
+      }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1744,17 +1746,6 @@ async function monitorTaskInBackground(
     // 写集审计（ADR-014 §5）
     const verdict = await enforceWriteSet(sliceId, guard ?? null);
 
-    if (!verdict.ok && verdict.error) {
-      // 审计本身失败：边界无法确认 —— 不放行，但要说的是「审计失败」
-      // 而不是「越界」，两者的下一步不一样。
-      // 只有 agent 自己也失败时才在这里说（下面的 else 分支还会处理 agent 失败）；
-      // agent 成功但审计失败时，由下面的分支说，避免同一件事说两遍。
-      if (exitCode !== 0) {
-        console.error('');
-        printOutcome(auditFailedMessage({ sliceId }, verdict.error));
-      }
-    }
-
     // Process result as if foreground (state transition, gate, etc.)
     if (exitCode === 0 && verdict.ok) {
       await store.transit(sliceId, 'RUN_FINISH');
@@ -1780,13 +1771,20 @@ async function monitorTaskInBackground(
       // 越界 / 审计失败：不进 gate、不自动签字 —— 等人处理。
       // `enforceWriteSet` 已经退回 frozen 并写了 run.aborted 事件，这里不重复写。
       console.error('');
-      if (verdict.error) {
-        printOutcome(auditFailedMessage({ sliceId }, verdict.error));
-      } else {
-        printOutcome(writeSetViolationMessage({ sliceId }, verdict));
-      }
+      printOutcome(writeSetOutcomeLines({ sliceId }, verdict));
     } else {
-      await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+      // agent 失败。若同一轮还发生了越界 / 审计失败，两件事都要说 ——
+      // 只说 agent 失败，人会以为「只是没写完」，越界文件清单就丢了。
+      const outcomeLines = writeSetOutcomeLines({ sliceId }, verdict);
+      if (outcomeLines.length > 0) {
+        console.error('');
+        printOutcome(outcomeLines);
+      } else {
+        // 只有「没有越界」时才由这里写 run.aborted。
+        // 有越界时 `enforceWriteSet` 已经写过一条（reason: write-set violation），
+        // 再写一条只会让人误以为发生了两次。
+        await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+      }
       // Background tasks: write stall info without auto-retry (adapter already finished)
       const stallClass = classifyStall({
         type: exitCode === null ? 'build_failure' : 'test_failure',

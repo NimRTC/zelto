@@ -39,10 +39,10 @@ import {
 } from './runtime-guard.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
 import {
-  auditFailedMessage,
+  agentFailedMessage,
   budgetExhaustedMessage,
   printOutcome,
-  writeSetViolationMessage,
+  writeSetOutcomeLines,
 } from './run-messages.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -644,6 +644,13 @@ export async function executeSlicesParallel(
     }
 
     if (st.exitCode !== 0) {
+      // agent 失败也要审计 —— 失败的那一轮同样可能写了越界的文件。
+      // 不审计就等于并行路径上没有兜底：C9 的「运行后 git 审计兜底」在这里是空的。
+      const failedVerdict = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
+      const failedLines = writeSetOutcomeLines({ sliceId: st.id, compact: true }, failedVerdict);
+      if (failedLines.length > 0) {
+        printOutcome(failedLines);
+      }
       outcomes.push({
         id: st.id,
         status: 'failed',
@@ -652,7 +659,7 @@ export async function executeSlicesParallel(
         gatePassed: null,
         signRequested: false,
       });
-      console.log(`❌ ${st.id}: agent failed (exit ${st.exitCode})`);
+      printOutcome(agentFailedMessage({ sliceId: st.id, compact: true }, st.exitCode, 1, st.elapsedSec ?? 0));
       continue;
     }
 
@@ -685,12 +692,7 @@ export async function executeSlicesParallel(
     // 这里不再重复写事件（append-only 事件流里重复条目只会让人误以为发生了两次）。
     const verdict = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
     if (!verdict.ok) {
-      if (verdict.error) {
-        // 审计失败 ≠ 越界 —— 边界未知，下一步是修审计环境。
-        printOutcome(auditFailedMessage({ sliceId: st.id, compact: true }, verdict.error));
-      } else {
-        printOutcome(writeSetViolationMessage({ sliceId: st.id, compact: true }, verdict));
-      }
+      printOutcome(writeSetOutcomeLines({ sliceId: st.id, compact: true }, verdict));
       outcomes.push({
         id: st.id,
         status: 'stalled',

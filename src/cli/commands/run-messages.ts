@@ -152,6 +152,48 @@ export function agentFailedMessage(
 }
 
 /**
+ * 写集审计结论 —— 与 `runtime-guard.ts` 的 `WriteSetVerdict` 对齐。
+ *
+ * 这里只声明用得到的字段，不 import 运行时模块 —— 提示层不依赖判定层，
+ * 免得两条依赖方向搅在一起（措辞归 run-messages，判定归 runtime-guard）。
+ */
+export interface WriteSetOutcome {
+  /** 边界守住了吗 */
+  ok: boolean;
+  /** 越界写入的文件 */
+  violations?: string[];
+  /** 被篡改的托管文件 */
+  tampered?: string[];
+  /** 审计本身失败（读不到 git 状态之类） */
+  error?: string;
+}
+
+/**
+ * 把审计结论排成提示行。
+ *
+ * 结论只有三种，走向只有两条：
+ *   - 通过（ok）→ 没有提示行（返回空数组）
+ *   - 越界 → 扩写集重跑
+ *   - 审计失败 → 先修审计环境
+ *
+ * 「越界」与「审计失败」必须分开说：两者的下一步完全不同，
+ * 混着说会让人白跑一轮。
+ *
+ * 三条执行路径（单片 / 并行 / 后台）在同一种结局下必须说同一句话，
+ * 所以排版只在这里做一次 —— 调用方只管把结论丢进来。
+ */
+export function writeSetOutcomeLines(ctx: MessageContext, outcome: WriteSetOutcome): string[] {
+  if (outcome.ok) return [];
+  if (outcome.error) {
+    return auditFailedMessage(ctx, outcome.error);
+  }
+  return writeSetViolationMessage(ctx, {
+    violations: outcome.violations ?? [],
+    tampered: outcome.tampered ?? [],
+  });
+}
+
+/**
  * 把一组提示行打印出来。
  *
  * 单片路径用 `console.log`（与既有的运行输出混在一条流里），

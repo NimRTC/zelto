@@ -16,6 +16,7 @@ import {
   auditFailedMessage,
   budgetExhaustedMessage,
   printOutcome,
+  writeSetOutcomeLines,
   writeSetViolationMessage,
 } from '../src/cli/commands/run-messages.js';
 
@@ -111,6 +112,40 @@ describe('agent 失败的提示', () => {
     const text = agentFailedMessage({ sliceId: 'slice-a' }, null, 1, 5).join('\n');
     assert.ok(text.includes('signal'));
     assert.ok(!text.includes('null'));
+  });
+});
+
+describe('审计结论 → 提示行', () => {
+  it('通过时没有提示行 —— 调用方不必自己判断 ok', () => {
+    assert.deepEqual(writeSetOutcomeLines({ sliceId: 'slice-a' }, { ok: true }), []);
+  });
+
+  it('越界 → 说扩写集重跑，并列出越界文件', () => {
+    const text = writeSetOutcomeLines(
+      { sliceId: 'slice-a' },
+      { ok: false, violations: ['src/policy/bad.ts'], tampered: [] },
+    ).join('\n');
+    assert.ok(text.includes('写集越界'));
+    assert.ok(text.includes('src/policy/bad.ts（不在写集内）'));
+    assert.ok(text.includes('zelto run slice-a'));
+  });
+
+  it('审计失败 → 说修审计环境，不与越界混淆', () => {
+    const text = writeSetOutcomeLines(
+      { sliceId: 'slice-a' },
+      { ok: false, violations: [], tampered: [], error: 'git 状态读不到' },
+    ).join('\n');
+    assert.ok(text.includes('写集审计失败'));
+    assert.ok(text.includes('git 状态读不到'));
+    assert.ok(!text.includes('写集越界'));
+  });
+
+  it('agent 失败的那一轮若同时越界，两件事都会说到 —— 越界清单不能被吞掉', () => {
+    const text = writeSetOutcomeLines(
+      { sliceId: 'slice-a' },
+      { ok: false, violations: ['src/evil.js'], tampered: [] },
+    ).join('\n');
+    assert.ok(text.includes('src/evil.js'), '越界文件必须出现在提示里');
   });
 });
 
