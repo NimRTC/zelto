@@ -252,6 +252,23 @@ export async function reportAuditResult(
 }
 
 /**
+ * 写集审计的结论。
+ *
+ * 返回结论而不是直接打印 —— 打印的措辞按路径不同（单片 / 并行 / 后台），
+ * 判定只有这一处。措辞集中在 `run-messages.ts`，三条路径共用。
+ */
+export interface WriteSetVerdict {
+  /** 边界守住了吗 */
+  ok: boolean;
+  /** 越界写入的文件 */
+  violations: string[];
+  /** 被篡改的托管文件 */
+  tampered: string[];
+  /** 审计本身失败（读不到 git 状态之类） */
+  error?: string;
+}
+
+/**
  * 运行结束后对写集做一次审计，并决定放不放行。
  *
  * 放行 = 可以进 gate②、可以自动生成签字请求。
@@ -263,30 +280,30 @@ export async function reportAuditResult(
 export async function enforceWriteSet(
   sliceId: string,
   guard: RuntimeGuard | null,
-): Promise<boolean> {
-  if (!guard) return true;
+): Promise<WriteSetVerdict> {
+  const pass: WriteSetVerdict = { ok: true, violations: [], tampered: [] };
+  if (!guard) return pass;
 
   const result = guard.audit();
   // 没有 worktree —— 无从审计，不假装审计过
-  if (!result) return true;
+  if (!result) return pass;
 
   if (result.error) {
     await reportAuditResult(sliceId, result);
-    console.error(`\n⚠️  写集审计失败，无法确认边界: ${result.error}`);
-    return false;
+    // 审计失败 = 边界无法确认 —— 这一轮同样不算数。
+    // 不退回 frozen 的话切片会卡在 running（run/merge/resume 全堵死），
+    // 人只能 abandon —— 那等于「审计读不到 git 状态就把切片废了」，不合理。
+    await handleWriteSetViolation(sliceId, {
+      violations: [],
+      tampered: [],
+      reason: 'write-set audit failed',
+    });
+    return { ok: false, violations: [], tampered: [], error: result.error };
   }
 
-  if (result.violations.length === 0 && result.tampered.length === 0) return true;
+  if (result.violations.length === 0 && result.tampered.length === 0) return pass;
 
   await reportAuditResult(sliceId, result);
-  console.error(`\n❌ 写集越界（${sliceId}）—— 不进 gate，需要人来处理:`);
-  for (const p of result.violations) {
-    console.error(`   - ${p}（不在写集内）`);
-  }
-  for (const p of result.tampered) {
-    console.error(`   - ${p}（zelto 托管的文件被改动了 —— 门禁可能已被绕过）`);
-  }
-  console.error(`   事件流：.zelto/events/${sliceId}/events.jsonl`);
 
   // 退回 frozen，让切片可以重跑 —— 否则它会永远卡在 running（见
   // `handleWriteSetViolation` 的注释）。人扩完写集就能直接重跑。
@@ -294,7 +311,10 @@ export async function enforceWriteSet(
     violations: result.violations,
     tampered: result.tampered,
   });
-  console.error(`   切片已退回 frozen：扩写集后重跑 zelto run ${sliceId}`);
 
-  return false;
+  return {
+    ok: false,
+    violations: result.violations,
+    tampered: result.tampered,
+  };
 }

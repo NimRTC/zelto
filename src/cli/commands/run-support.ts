@@ -19,6 +19,7 @@ import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
 import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
+import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
 
 /**
  * Detect common source directories for default write-set.
@@ -213,7 +214,9 @@ export async function checkBudget(id: string): Promise<boolean> {
     const exhausted = await budget.isExhausted(id);
     if (exhausted) {
       const [spent, limit] = await Promise.all([budget.getSpent(id), budget.getLimit(id)]);
-      console.error(`  ⛔ Budget exhausted: $${spent.toFixed(2)} spent of $${formatLimit(limit)} limit`);
+      // 措辞与 run-messages 共用 —— 起跑前超预算与跑完超预算是同一件事，
+      // 只是发生时机不同，不该让人以为是两种错误。
+      printOutcome(budgetExhaustedMessage({ sliceId: id }, spent, limit));
       await events.append(id, 'stall.classified', 'zelto', {
         sliceId: id, class: 'budget_exhausted', spent, limit,
       });
@@ -224,11 +227,6 @@ export async function checkBudget(id: string): Promise<boolean> {
     // Budget check failure is non-fatal — proceed without enforcement
     return true;
   }
-}
-
-/** 上限的显示方式 —— 不限时不能显示成 `$0.00`（那看着像「一分钱都不许花」） */
-function formatLimit(limit: number): string {
-  return Number.isFinite(limit) ? `$${limit.toFixed(2)}` : 'unlimited';
 }
 
 /**
@@ -409,10 +407,11 @@ export async function handleAgentFailure(
  */
 export async function handleWriteSetViolation(
   id: string,
-  options?: { violations?: string[]; tampered?: string[] },
+  options?: { violations?: string[]; tampered?: string[]; reason?: string },
 ): Promise<void> {
   const violations = options?.violations ?? [];
   const tampered = options?.tampered ?? [];
+  const reason = options?.reason ?? 'write-set violation';
 
   try {
     // 退回 frozen，让切片可以重跑。状态机不认这个转换时也不阻断后续留痕。
@@ -424,7 +423,7 @@ export async function handleWriteSetViolation(
   await events.append(id, 'run.aborted', 'zelto', {
     sliceId: id,
     exitCode: null,
-    reason: 'write-set violation',
+    reason,
     violations,
     tampered,
   });

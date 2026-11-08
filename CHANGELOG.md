@@ -51,8 +51,39 @@
   collection lives in one module (`src/cli/commands/dashboard-cost.ts`) so the
   three renderings cannot drift apart; "measured as zero" stays strictly
   separate from "not measured" (ADR-035).
+- **"Completed" and "delivered" are now two separate things on the dashboard.**
+  `completed` means both "gate② passed" and "a human signed off" (ADR-018:
+  signing does not change the state), so a project overview could show
+  `completed: 12` while three of those slices were still sitting outside the
+  main branch and two had never been sent for signature at all. The new
+  delivery view sorts every finished slice into one of six states —
+  **已合入主干 / 已签字·待合并 / 门禁通过·待签字 / 门禁通过·未发起签字 /
+  基线切片·无分支 / 已作废** — and shows them on `zelto dashboard` (TTY, JSON,
+  HTML), `zelto suggest` and `zelto summary`. The classification reads the same
+  sources as `zelto inbox` / `zelto merge` (sign requests, merge candidates),
+  so the dashboard cannot disagree with the commands that do the work; the
+  verdict itself is a pure function (`classifyDelivery`) locked by unit tests.
+- **One wording for a run outcome, whichever path produced it.** The same
+  ending — write-set violation, audit failure, budget exhausted, agent
+  failure — used to be announced differently by `zelto run`, `zelto run
+  --parallel` and `zelto run --background`. People then acted on the wrong
+  path's advice. The wording now lives in one module (`run-messages.ts`) and
+  every path says the same thing: this round does not count, the slice is
+  back at `frozen` (not dead), and here is the exact command to run next.
 
 ### Fixed
+- **A write-set audit failure no longer leaves the slice stuck in `running`.**
+  When the post-run audit could not read git state, the slice was neither
+  advanced nor rolled back — `run` / `merge` / `resume` were all blocked and
+  the only way out was `abandon`, i.e. "the audit environment is broken" threw
+  the work away. The slice now returns to `frozen` like a real violation does,
+  with a `run.aborted` event whose reason is `write-set audit failed`. The
+  message distinguishes it from an actual violation, because the next step
+  differs: fix the audit environment vs. widen the write set.
+- **A write-set violation is no longer announced twice on the background
+  path.** `enforceWriteSet` already writes the `run.aborted` event and rolls
+  the slice back; the caller wrote a second `run.aborted` on top of it. In an
+  append-only event stream a duplicate entry reads as "this happened twice".
 - **`zelto check` now exits non-zero on failure in text mode too** (ADR-032).
   It always returned 0, so it could not be chained into a script or a hook.
   The spec engine (`validateDeterministic` / `analyzeSemantic`) is now wired

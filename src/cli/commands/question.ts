@@ -17,6 +17,7 @@ import {
 // 经 core-slice 绕一圈会形成 question.ts → core-slice.ts → question.ts 的环，
 // 而 core-slice.ts 又 import 并行执行器，于是变成三条命令文件互相咬。
 import { autoGateAfterRun, settleRunCost } from './run-support.js';
+import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
 
 const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
 
@@ -278,7 +279,7 @@ register('answer', async (args) => {
   console.log(`✅ Agent completed after the answer.`);
 
   if (cost.exhausted) {
-    console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+    printOutcome(budgetExhaustedMessage({ sliceId }, cost.spent, cost.limit));
     return 0;
   }
 

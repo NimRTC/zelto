@@ -38,6 +38,12 @@ import {
   releaseGuards,
 } from './runtime-guard.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
+import {
+  auditFailedMessage,
+  budgetExhaustedMessage,
+  printOutcome,
+  writeSetViolationMessage,
+} from './run-messages.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -677,9 +683,14 @@ export async function executeSlicesParallel(
     //
     // `enforceWriteSet` 已经把切片退回 frozen 并写了 `run.aborted` 事件，
     // 这里不再重复写事件（append-only 事件流里重复条目只会让人误以为发生了两次）。
-    const withinBounds = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
-    if (!withinBounds) {
-      console.log(`❌ ${st.id}: 写集越界 — 未进入 gate，切片已退回 frozen，等人处理`);
+    const verdict = await enforceWriteSet(st.id, guards.get(st.id) ?? null);
+    if (!verdict.ok) {
+      if (verdict.error) {
+        // 审计失败 ≠ 越界 —— 边界未知，下一步是修审计环境。
+        printOutcome(auditFailedMessage({ sliceId: st.id, compact: true }, verdict.error));
+      } else {
+        printOutcome(writeSetViolationMessage({ sliceId: st.id, compact: true }, verdict));
+      }
       outcomes.push({
         id: st.id,
         status: 'stalled',
@@ -704,7 +715,7 @@ export async function executeSlicesParallel(
 
     if (cost.exhausted) {
       // 超预算：停在 frozen 等人 —— 不进 gate、不发签字请求（ADR-035 §3.5）。
-      console.log(`⛔ ${st.id}: 预算耗尽（$${cost.spent.toFixed(2)}）— 未进入 gate，等人处理`);
+      printOutcome(budgetExhaustedMessage({ sliceId: st.id, compact: true }, cost.spent, cost.limit));
       outcomes.push({
         id: st.id,
         status: 'stalled',

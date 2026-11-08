@@ -26,6 +26,8 @@ stderr.txt
 stdout.txt
 test_out.txt
 test_err.txt
+test-out.txt
+test-err.txt
 run*.txt
 unmapped.txt
 arch-dump.json

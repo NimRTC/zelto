@@ -61,6 +61,13 @@ import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './p
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
+import {
+  agentFailedMessage,
+  auditFailedMessage,
+  budgetExhaustedMessage,
+  printOutcome,
+  writeSetViolationMessage,
+} from './run-messages.js';
 import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost } from './run-support.js';
 import {
   type RuntimeGuard,
@@ -1002,9 +1009,9 @@ register('run', async (args) => {
     const slice = await store.read(id);
 
     // Check budget before starting run
+    // `checkBudget` 内部已经打印统一措辞（并写 stall.classified 事件）
     const budgetOk = await checkBudget(id);
     if (!budgetOk) {
-      console.error(`zelto run ${id} — ❌ Budget exhausted`);
       return 1;
     }
 
@@ -1233,11 +1240,18 @@ register('run', async (args) => {
         return 0;
       }
 
-      if (!withinBounds) {
+      if (!withinBounds.ok) {
         // 越界：不进 gate、不自动签字 —— 等人处理。
         // `enforceWriteSet` 已经把切片退回 frozen（可重跑）并写了 run.aborted 事件。
-        console.log(`\n❌ Slice "${id}" 写集越界 —— 未进入 gate。`);
-        console.log(`   切片已退回 frozen：扩写集后重跑 zelto run ${id}`);
+        //
+        // 审计失败与越界分开说 —— 前者是「边界未知」，下一步是修环境；
+        // 后者是「越界已证实」，下一步是扩写集。混着说会让人白跑一轮。
+        console.log('');
+        if (withinBounds.error) {
+          printOutcome(auditFailedMessage({ sliceId: id }, withinBounds.error));
+        } else {
+          printOutcome(writeSetViolationMessage({ sliceId: id }, withinBounds));
+        }
         return 1;
       }
 
@@ -1250,7 +1264,7 @@ register('run', async (args) => {
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
       if (cost.exhausted) {
-        console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+        printOutcome(budgetExhaustedMessage({ sliceId: id }, cost.spent, cost.limit));
         return 0;
       }
 
@@ -1271,7 +1285,8 @@ register('run', async (args) => {
     } else {
       // All retries exhausted or non-resolvable — already handled by handleAgentFailure
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`\n❌ Slice "${id}" failed after ${attempt + 1} attempt(s) (${elapsed}s)`);
+      console.log('');
+      printOutcome(agentFailedMessage({ sliceId: id }, finalExitCode, attempt + 1, elapsed));
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1528,9 +1543,9 @@ register('start', async (args) => {
     }
 
     // Check budget before starting run
+    // `checkBudget` 内部已经打印统一措辞（并写 stall.classified 事件）
     const budgetOk = await checkBudget(id);
     if (!budgetOk) {
-      console.error(`  ❌ Budget exhausted`);
       return 1;
     }
 
@@ -1640,7 +1655,7 @@ register('start', async (args) => {
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
       if (cost.exhausted) {
-        console.log(`  ⛔ Budget exhausted: $${cost.spent.toFixed(2)} spent — 未进入 gate，等人处理`);
+        printOutcome(budgetExhaustedMessage({ sliceId: id }, cost.spent, cost.limit));
         return 0;
       }
 
@@ -1648,7 +1663,7 @@ register('start', async (args) => {
       await autoGateAfterRun(id);
     } else {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`  ❌ Slice "${id}" failed after ${attempt + 1} attempt(s) (${elapsed}s)`);
+      printOutcome(agentFailedMessage({ sliceId: id }, finalExitCode, attempt + 1, elapsed));
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1727,17 +1742,29 @@ async function monitorTaskInBackground(
     }
 
     // 写集审计（ADR-014 §5）
-    const withinBounds = await enforceWriteSet(sliceId, guard ?? null);
+    const verdict = await enforceWriteSet(sliceId, guard ?? null);
+
+    if (!verdict.ok && verdict.error) {
+      // 审计本身失败：边界无法确认 —— 不放行，但要说的是「审计失败」
+      // 而不是「越界」，两者的下一步不一样。
+      // 只有 agent 自己也失败时才在这里说（下面的 else 分支还会处理 agent 失败）；
+      // agent 成功但审计失败时，由下面的分支说，避免同一件事说两遍。
+      if (exitCode !== 0) {
+        console.error('');
+        printOutcome(auditFailedMessage({ sliceId }, verdict.error));
+      }
+    }
 
     // Process result as if foreground (state transition, gate, etc.)
-    if (exitCode === 0 && withinBounds) {
+    if (exitCode === 0 && verdict.ok) {
       await store.transit(sliceId, 'RUN_FINISH');
       // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
       const cost = await settleRunCost(sliceId, adapter, sessionId);
       await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd });
       if (cost.exhausted) {
         // 超预算：停在 frozen 等人 —— 不进 gate、不发签字请求。
-        console.error(`\n⛔ Slice "${sliceId}" 预算耗尽（$${cost.spent.toFixed(2)}）—— 未进入 gate，等人处理。`);
+        console.error('');
+        printOutcome(budgetExhaustedMessage({ sliceId }, cost.spent, cost.limit));
       } else if (isHotfix) {
         await store.transit(sliceId, 'GATE_PASS');
         await events.append(sliceId, 'slice.hotfix', 'zelto', {
@@ -1750,11 +1777,14 @@ async function monitorTaskInBackground(
         await autoGateAfterRun(sliceId);
       }
     } else if (exitCode === 0) {
-      // 越界：不进 gate、不自动签字 —— 等人处理
-      console.error(`\n❌ Slice "${sliceId}" 写集越界 —— 未进入 gate，等人处理。`);
-      await events.append(sliceId, 'run.aborted', 'zelto', {
-        sliceId, exitCode: 0, reason: 'write-set violation',
-      });
+      // 越界 / 审计失败：不进 gate、不自动签字 —— 等人处理。
+      // `enforceWriteSet` 已经退回 frozen 并写了 run.aborted 事件，这里不重复写。
+      console.error('');
+      if (verdict.error) {
+        printOutcome(auditFailedMessage({ sliceId }, verdict.error));
+      } else {
+        printOutcome(writeSetViolationMessage({ sliceId }, verdict));
+      }
     } else {
       await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
       // Background tasks: write stall info without auto-retry (adapter already finished)
