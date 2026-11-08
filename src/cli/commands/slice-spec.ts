@@ -252,6 +252,46 @@ async function handleConfirm(args: string[]): Promise<number> {
 
   const slice = await store.read(id);
   const specPath = slice.spec.path;
+
+  // ── 确认前预演追溯物化 ──
+  //
+  // 为什么要在确认时拦：草稿里可能没有可物化的需求条目（`spec draft`
+  // 在没有已批准需求时写的是占位符「（待人确认：…）」）。这种草稿确认
+  // 之后，写进正式规格、然后 `freeze` 被追溯闸门拒掉 —— 人被引导确认了
+  // 一份注定不能用的规格，然后卡在下一步，不知道问题出在哪。
+  //
+  // 拦住它的时机应该在「确认」：确认是「人批准这份规格」的瞬间，
+  // 也是最后一道能改内容的瞬间。过了这道门，规格就是「人批准的出处」，
+  // 不该再拒。
+  //
+  // 判据复用冻结准入的同一个函数（`evaluateFreezeTrace`）——
+  // 两处各判一套的话，人会遇到「confirm 说行、freeze 说不行」。
+  const { evaluateFreezeTrace } = await import('../../core/spec/trace-extract.js');
+  const gate = evaluateFreezeTrace(
+    {
+      trace: slice.trace,
+      traceWaiver: slice.traceWaiver,
+      baseline: slice.baseline,
+    },
+    draft,
+  );
+
+  if (gate.blocking.length > 0) {
+    f.error('TRACE', `切片 "${id}" 的规格无法物化需求追溯 —— 拒绝确认。`);
+    f.out('');
+    for (const v of gate.blocking) {
+      f.out(`  - ${v.message}`);
+    }
+    f.out('');
+    f.out('规格里要有可物化的需求条目，任选一种：');
+    f.out('  1) 在「## 验收标准」下写编号条目（如 "1. 用户能登录"）→ 自动物化成需求追溯');
+    f.out('  2) 显式声明需求引用：zelto set ' + id + ' --field trace.requirements --value "<需求引用>"');
+    f.out('  3) 写明豁免理由：zelto set ' + id + ' --field traceWaiver --value "<理由>"');
+    f.out('');
+    f.out('改完草稿后再确认：zelto spec confirm ' + id);
+    return 1;
+  }
+
   mkdirSync(dirname(specPath), { recursive: true });
   writeFileSync(specPath, draft, 'utf-8');
 

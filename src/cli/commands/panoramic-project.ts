@@ -337,17 +337,76 @@ register('project', async (args) => {
     const { initializeProject } = await import('../../core/project/initializer.js');
     const result = initializeProject(projectMap, { autoDetect: true, policyTemplate: 'default' });
 
-    if (result.created.length === 0) {
+    if (result.created.length === 0 && result.updated.length === 0) {
       console.log('   ✅ Already initialized.');
     } else {
-      console.log('   Created:');
-      for (const item of result.created) {
-        console.log(`     ✅ ${item}`);
+      if (result.created.length > 0) {
+        console.log('   Created:');
+        for (const item of result.created) {
+          console.log(`     ✅ ${item}`);
+        }
+      }
+      if (result.updated.length > 0) {
+        console.log('   Updated:');
+        for (const item of result.updated) {
+          console.log(`     🔄 ${item}`);
+        }
       }
     }
 
+    // 人手写的文件没动 —— 说清楚，否则人以为接管成了，其实门禁命令
+    // 还是他自己写的那套（或 zelto 最初写的通用那套）。
+    for (const item of result.skipped) {
+      console.log(`   ⚠️  ${item}`);
+    }
+    if (result.skipped.length > 0) {
+      console.log('   （手写文件不覆盖 —— 门禁命令与写集规则请自行核对）');
+    }
+
     console.log(`\n✅ Project "${projectMap.projectName}" is now under zelto governance.`);
-    console.log(`\n👉 Next: zelto project design`);
+
+    // ── 基线切片 ──
+    //
+    // 接管既有项目的第一步不是「写新代码」，而是「把现有代码登记进来」——
+    // 否则追溯链没有起点，后面的切片无从对齐写集。
+    //
+    // 这一步刻意**不依赖 LLM**：它表达的是「这个模块现在有哪些文件」，
+    // 那是 `project scan` 已经拿到的确定性事实。让它依赖模型，
+    // 只会让「接管既有项目」在没配 LLM 的机器上直接走不通。
+    const { planBaselineSlices, baselineSpecContent, baselineSliceTitle } = await import('../../core/project/baseline.js');
+    const sliceStore = new SliceStore(SLICES_DIR);
+    const slicesDir = 'specs/slices';
+    if (!existsSync(slicesDir)) mkdirSync(slicesDir, { recursive: true });
+
+    const plans = planBaselineSlices(projectMap);
+    let createdSlices = 0;
+    for (const plan of plans) {
+      if (await sliceStore.exists(plan.id)) continue;
+
+      const slice = sliceStore.create(plan.id, baselineSliceTitle(plan.moduleName), {
+        writes: plan.writes,
+        baseline: true,
+      });
+      // 基线切片是既成事实，不是待办的活 —— 直接落在 completed。
+      slice.state = 'completed';
+      slice.trace.requirements = ['(v0 baseline)'];
+      slice.traceWaiver = '基线切片 — 描述现状，不改代码，无需契约追踪';
+      slice.spec.frozenHash = 'sha256:v0-baseline';
+      slice.spec.frozenAt = new Date().toISOString();
+      await sliceStore.write(slice);
+
+      writeFileSync(join(slicesDir, `${plan.id}.md`), baselineSpecContent(plan), 'utf-8');
+      createdSlices++;
+      console.log(`  ✅ "${plan.id}" — ${plan.moduleName === '.' ? '项目根目录' : plan.moduleName} (${plan.writes.length} 个文件)`);
+    }
+    if (createdSlices > 0) {
+      console.log(`\n✅ Created ${createdSlices} baseline slice(s) — 现有代码已登记为追溯链的起点。`);
+    } else if (plans.length > 0) {
+      console.log(`\n✅ Baseline slices already present (${plans.length} modules).`);
+    }
+
+    console.log(`\n👉 Next: zelto project design （可选 — 生成更细的模块划分）`);
+    console.log(`   或直接开始新工作：zelto require "<需求>"`);
     return 0;
   }
 

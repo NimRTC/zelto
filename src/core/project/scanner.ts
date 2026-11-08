@@ -12,6 +12,22 @@ const IGNORE_DIRS = new Set([
   '.cache', 'tmp', 'out', '.claude',
 ]);
 
+/**
+ * zelto 自己的治理目录 —— 不是被接管的业务代码，不能算作「模块」。
+ *
+ * 为什么：`policy/` 与 `specs/` 是 zelto 运行时产物（策略真源、切片规格）。
+ * 接管既有项目时它们可能已经存在（人先跑过一次 `zelto init`），
+ * 若把它们扫成模块：
+ *   - 基线切片会给它们开一片 `v0-policy`，把**保护域登记成可写模块** ——
+ *     追溯链从此说「policy/policy.yaml 是某片的写集」，与 C5 直接冲突；
+ *   - policy.yaml 会给它们生成一条 `allow-write policy/**` 规则，
+ *     与同一文件里的 `protect-policy`（deny）自相矛盾。
+ *
+ * 所以这里在**根层**排除它们。根层之外的同名目录（`src/core/policy/` 之类）
+ * 不受影响 —— 那是业务代码，确实该被扫。
+ */
+const ZELTO_GOVERNANCE_DIRS = new Set(['policy', 'specs']);
+
 const TEST_FILE_PATTERNS = [
   /\.test\./, /\.spec\./, /_test\./, /test_/, /\.test\./, /__tests__\//,
 ];
@@ -238,6 +254,8 @@ export function scanProject(rootDir: string): ProjectMap {
     const entries = readdirSync(rootDir);
     for (const entry of entries) {
       if (IGNORE_DIRS.has(entry) || entry.startsWith('.')) continue;
+      // 根层的 zelto 治理目录不是业务模块 —— 见 ZELTO_GOVERNANCE_DIRS 的说明
+      if (ZELTO_GOVERNANCE_DIRS.has(entry)) continue;
       const fullPath = join(rootDir, entry);
       try {
         if (statSync(fullPath).isDirectory()) {
@@ -265,6 +283,45 @@ export function scanProject(rootDir: string): ProjectMap {
     const fullPath = join(rootDir, srcDir);
     const moduleList = buildModuleTree(fullPath, rootDir, projectType);
     modules.push(...moduleList);
+  }
+
+  // 根目录下的源码文件也算一个模块。
+  //
+  // 为什么：扁平结构的项目（文件直接放在仓库根下，没有 src/ 目录）
+  // 扫出来的 modules 会是空的 —— 上面那圈只遍历**子目录**，
+  // `buildModuleTree` 里的 self-module 分支又明确排除了根目录
+  // （`selfRelPath !== ''`）。结果是：这种项目接管后一片基线切片都没有，
+  // 追溯链没有起点，后续切片无从对齐写集。
+  //
+  // 所以这里把根目录自己当作一个模块补上。名字用 `.` 会被后面的
+  // id 生成压成 `v0-`，所以给个明确的名字。
+  if (modules.length === 0) {
+    const { files, testFiles } = collectFiles(rootDir, rootDir, 0);
+    // 根目录的「文件」要排除配置文件与元文件 —— package.json、
+    // README、.gitignore 这些不是「模块」，算进去基线切片的写集
+    // 就太宽了，后面谁都能改这些文件。
+    const rootSource = files.filter((f) => {
+      const base = f.split('/').pop() ?? f;
+      if (base.startsWith('.')) return false;
+      if (CONFIG_FILES[base]) return false;
+      if (/^(package|tsconfig|Cargo|go|pyproject|setup|Makefile|CMakeLists)/i.test(base)) return false;
+      if (/\.(md|txt|json|ya?ml|toml|lock)$/i.test(base)) return false;
+      return true;
+    });
+    const rootTests = testFiles.filter((f) => {
+      const base = f.split('/').pop() ?? f;
+      return !base.startsWith('.');
+    });
+
+    if (rootSource.length > 0 || rootTests.length > 0) {
+      modules.push({
+        name: '.',
+        files: rootSource,
+        testFiles: rootTests,
+        entryPoint: detectEntryPoint(rootDir, rootDir, projectType),
+        submodules: [],
+      });
+    }
   }
 
   const testCommand = detectTestCommand(rootDir);
