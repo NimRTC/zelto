@@ -46,6 +46,8 @@ export interface SliceCost {
   llmCalls: number;
   /** 是否测到过用量 —— false 是「没测到」，与 0 严格分开 */
   measured: boolean;
+  /** 逐模型明细 —— 钱花在哪个模型上 */
+  models: ModelCost[];
 }
 
 export interface CostTotals {
@@ -74,6 +76,25 @@ export interface PendingSign {
   requestedAt: string;
 }
 
+/**
+ * 某个模型上的花费与 token。
+ *
+ * 为什么要按模型分：单价差一个数量级是常事，同样一万 token，
+ * 用一个模型和用另一个模型不是同一笔账。混在一起看总额，
+ * 就分不清「是模型贵」还是「是跑得多」。
+ */
+export interface ModelCost {
+  model: string;
+  costUsd: number;
+  inputTokens: number;
+  outputTokens: number;
+  tokens: number;
+  /** 用这个模型跑了几次 agent 会话 */
+  calls: number;
+  /** 用这个模型发了几次规划期 LLM 调用 */
+  llmCalls: number;
+}
+
 // ─── Cost Cache ──────────────────────────────────────────────────────────────
 // 事件流是 append-only 的，文件 mtime 没变就说明没有新记录 —— 缓存按 mtime 失效。
 
@@ -94,6 +115,7 @@ function emptyCost(): SliceCost {
     agentCalls: 0,
     llmCalls: 0,
     measured: false,
+    models: [],
   };
 }
 
@@ -132,6 +154,16 @@ export function collectCosts(): Map<string, SliceCost> {
     }
 
     const cost = emptyCost();
+    const modelMap = new Map<string, ModelCost>();
+    const modelOf = (name: string): ModelCost => {
+      let m = modelMap.get(name);
+      if (!m) {
+        m = { model: name, costUsd: 0, inputTokens: 0, outputTokens: 0, tokens: 0, calls: 0, llmCalls: 0 };
+        modelMap.set(name, m);
+      }
+      return m;
+    };
+
     try {
       for (const line of readFileSync(f, 'utf-8').split('\n').filter(Boolean)) {
         try {
@@ -144,17 +176,46 @@ export function collectCosts(): Map<string, SliceCost> {
             cost.llmPromptTokens += p;
             cost.llmCompletionTokens += c;
             cost.llmTokens += num(e.payload?.totalTokens) || p + c;
+
+            const model = typeof e.payload?.model === 'string' && e.payload.model.trim()
+              ? e.payload.model
+              : '未标注模型';
+            const m = modelOf(model);
+            m.llmCalls++;
+            m.inputTokens += p;
+            m.outputTokens += c;
+            m.tokens += num(e.payload?.totalTokens) || p + c;
           } else if (e.type === 'budget.spent') {
             cost.measured = true;
             const amount = num(e.payload?.amount);
             if (e.payload?.source === 'agent') {
               cost.agentCalls++;
               cost.agentCost += amount;
-              cost.agentInputTokens += num(e.payload?.inputTokens);
-              cost.agentOutputTokens += num(e.payload?.outputTokens);
+              const inTok = num(e.payload?.inputTokens);
+              const outTok = num(e.payload?.outputTokens);
+              cost.agentInputTokens += inTok;
+              cost.agentOutputTokens += outTok;
+
+              const model = typeof e.payload?.model === 'string' && e.payload.model.trim()
+                ? e.payload.model
+                : '未标注模型';
+              const m = modelOf(model);
+              m.calls++;
+              m.costUsd += amount;
+              m.inputTokens += inTok;
+              m.outputTokens += outTok;
+              m.tokens += inTok + outTok;
             } else {
               // 规划期 LLM：老的 llm 侧事件不带 source，靠 reason 区分的那批也落这里
               cost.llmCost += amount;
+
+              // 规划期的模型名在 reason 里（`llm:<model>`）——
+              // 拿它跟 llm.called 的模型对上，两笔账才能合到一行
+              const reason = typeof e.payload?.reason === 'string' ? e.payload.reason : '';
+              const model = reason.startsWith('llm:') && reason.slice(4).trim()
+                ? reason.slice(4).trim()
+                : '未标注模型';
+              modelOf(model).costUsd += amount;
             }
           }
         } catch {
@@ -171,10 +232,37 @@ export function collectCosts(): Map<string, SliceCost> {
     cost.agentTokens = cost.agentInputTokens + cost.agentOutputTokens;
     cost.totalCost = cost.agentCost + cost.llmCost;
     cost.totalTokens = cost.agentTokens + cost.llmTokens;
+    cost.models = [...modelMap.values()].sort((a, b) => b.tokens - a.tokens);
     costMap.set(sliceId, cost);
     costCache.set(sliceId, { mtimeMs, cost });
   }
   return costMap;
+}
+
+/**
+ * 把各片的逐模型明细合并成一份全局视图。
+ *
+ * 按 token 从多到少排 —— 想知道「钱主要花在哪个模型上」时，
+ * 第一眼看到的应该是消耗最大的那个。
+ */
+export function aggregateByModel(costMap: Map<string, SliceCost>): ModelCost[] {
+  const merged = new Map<string, ModelCost>();
+  for (const c of costMap.values()) {
+    for (const m of c.models) {
+      let agg = merged.get(m.model);
+      if (!agg) {
+        agg = { model: m.model, costUsd: 0, inputTokens: 0, outputTokens: 0, tokens: 0, calls: 0, llmCalls: 0 };
+        merged.set(m.model, agg);
+      }
+      agg.costUsd += m.costUsd;
+      agg.inputTokens += m.inputTokens;
+      agg.outputTokens += m.outputTokens;
+      agg.tokens += m.tokens;
+      agg.calls += m.calls;
+      agg.llmCalls += m.llmCalls;
+    }
+  }
+  return [...merged.values()].sort((a, b) => b.tokens - a.tokens || b.costUsd - a.costUsd);
 }
 
 /**

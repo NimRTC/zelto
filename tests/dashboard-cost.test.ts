@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  aggregateByModel,
   collectCosts,
   fmtCost,
   fmtLimit,
@@ -165,6 +166,80 @@ describe('成本与 token 汇总', () => {
     assert.equal(top.length, 2);
     assert.equal(top[0].sliceId, 'big');
     assert.equal(top[0].cost.totalTokens, 9900);
+  });
+});
+
+describe('按模型聚合', () => {
+  it('同一个模型的花费与 token 合到一行', () => {
+    writeEvents('m1', [
+      {
+        type: 'budget.spent',
+        payload: { amount: 0.5, source: 'agent', model: 'claude-sonnet', inputTokens: 1000, outputTokens: 200 },
+      },
+      {
+        type: 'budget.spent',
+        payload: { amount: 0.25, source: 'agent', model: 'claude-sonnet', inputTokens: 300, outputTokens: 50 },
+      },
+    ]);
+
+    const byModel = aggregateByModel(collectCosts());
+    assert.equal(byModel.length, 1);
+    assert.equal(byModel[0].model, 'claude-sonnet');
+    assert.equal(byModel[0].costUsd, 0.75);
+    assert.equal(byModel[0].inputTokens, 1300);
+    assert.equal(byModel[0].outputTokens, 250);
+    assert.equal(byModel[0].tokens, 1550);
+    assert.equal(byModel[0].calls, 2);
+    assert.equal(byModel[0].llmCalls, 0);
+  });
+
+  it('规划期 LLM 的模型名从 reason 里取，与 llm.called 对上', () => {
+    writeEvents('m2', [
+      { type: 'budget.spent', payload: { amount: 0.02, reason: 'llm:deepseek-chat' } },
+      {
+        type: 'llm.called',
+        payload: { model: 'deepseek-chat', promptTokens: 500, completionTokens: 100, totalTokens: 600 },
+      },
+    ]);
+
+    const byModel = aggregateByModel(collectCosts());
+    assert.equal(byModel.length, 1);
+    assert.equal(byModel[0].model, 'deepseek-chat');
+    // 钱来自 budget.spent，token 来自 llm.called —— 两笔账合到同一行
+    assert.equal(byModel[0].costUsd, 0.02);
+    assert.equal(byModel[0].tokens, 600);
+    assert.equal(byModel[0].llmCalls, 1);
+  });
+
+  it('没标模型的归到「未标注模型」，不丢账', () => {
+    writeEvents('m3', [
+      { type: 'budget.spent', payload: { amount: 0.1, source: 'agent', inputTokens: 10, outputTokens: 1 } },
+    ]);
+
+    const byModel = aggregateByModel(collectCosts());
+    assert.equal(byModel.length, 1);
+    assert.equal(byModel[0].model, '未标注模型');
+    assert.equal(byModel[0].costUsd, 0.1);
+  });
+
+  it('按 token 从多到少排 —— 先看到消耗最大的那个模型', () => {
+    writeEvents('small-model', [
+      {
+        type: 'budget.spent',
+        payload: { amount: 0.01, source: 'agent', model: 'cheap', inputTokens: 10, outputTokens: 1 },
+      },
+    ]);
+    writeEvents('big-model', [
+      {
+        type: 'budget.spent',
+        payload: { amount: 0.9, source: 'agent', model: 'pricey', inputTokens: 9000, outputTokens: 900 },
+      },
+    ]);
+
+    const byModel = aggregateByModel(collectCosts());
+    assert.equal(byModel.length, 2);
+    assert.equal(byModel[0].model, 'pricey');
+    assert.equal(byModel[1].model, 'cheap');
   });
 });
 

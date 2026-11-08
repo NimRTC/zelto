@@ -9,6 +9,7 @@ import { loadReleases, type ReleaseDef } from './releases.js';
 import { detectSliceType, type SliceType } from '../../core/gate/types.js';
 import { colors } from '../color.js';
 import {
+  aggregateByModel,
   collectCosts,
   fmtCost,
   fmtLimit,
@@ -18,6 +19,7 @@ import {
   sumCosts,
   topSlicesByTokens,
   type CostTotals,
+  type ModelCost,
   type SliceCost,
 } from './dashboard-cost.js';
 
@@ -84,7 +86,7 @@ function areaDef(key: string) {
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-interface SliceData {
+export interface SliceData {
   id: string; title: string; state: string;
   stallClass: string | null; autoResolved: number;
   writes: string[]; type: SliceType; area: string;
@@ -186,6 +188,44 @@ function fmtAge(minutes: number): string {
   const d = Math.floor(minutes / (60 * 24));
   const h = Math.floor((minutes % (60 * 24)) / 60);
   return h > 0 ? `${d}d${h}h` : `${d}d`;
+}
+
+// ─── Area Aggregation ────────────────────────────────────────────────────────
+
+export interface AreaCost {
+  key: string;
+  label: string;
+  icon: string;
+  tokens: number;
+  cost: number;
+  slices: number;
+  measuredSlices: number;
+}
+
+/**
+ * 按代码区域聚合 token 与花费。
+ *
+ * 回答的是「哪个模块最烧钱」——比「哪一片最烧钱」更可执行：
+ * 片是偶然的，模块是长期的。
+ */
+export function aggregateByArea(slices: SliceData[], costMap: Map<string, SliceCost>): AreaCost[] {
+  const map = new Map<string, AreaCost>();
+  for (const s of slices) {
+    const def = areaDef(s.area);
+    let a = map.get(s.area);
+    if (!a) {
+      a = { key: s.area, label: def.label, icon: def.icon, tokens: 0, cost: 0, slices: 0, measuredSlices: 0 };
+      map.set(s.area, a);
+    }
+    a.slices++;
+    const c = costMap.get(s.id);
+    if (c) {
+      a.tokens += c.totalTokens;
+      a.cost += c.totalCost;
+      a.measuredSlices++;
+    }
+  }
+  return [...map.values()].sort((x, y) => y.tokens - x.tokens || y.cost - x.cost);
 }
 
 // ─── Action Recommendations ──────────────────────────────────────────────────
@@ -379,6 +419,25 @@ function renderTty(
       const pctStr = pct === null ? '' : ` (${pct}%)`;
       lines.push(`    ${colors.dim('每片上限')}  ${colors.bold(fmtLimit(budgetLimit))}  ${colors.dim('最贵一片')} ${colors.bold(priciest.id)} ${color(fmtCost(priciest.cost) + pctStr)}`);
     }
+
+    // 按模型 —— 同样一万 token，用哪个模型不是同一笔账
+    const byModel = aggregateByModel(costMap);
+    if (byModel.length > 0) {
+      lines.push(`    ${colors.dim('按模型')}`);
+      for (const m of byModel.slice(0, 5)) {
+        const calls = m.calls > 0 ? `${m.calls} 次会话` : `${m.llmCalls} 次调用`;
+        lines.push(`      ${colors.dim(m.model)}  ${colors.bold(fmtCost(m.costUsd))}  ${colors.cyan(`${fmtTokens(m.tokens)} tokens`)}  ${colors.dim(calls)}`);
+      }
+    }
+
+    // 按区域 —— 哪个模块最烧，比哪一片最烧更可执行
+    const byArea = aggregateByArea(slices, costMap).filter((a) => a.tokens > 0).slice(0, 3);
+    if (byArea.length > 0) {
+      lines.push(`    ${colors.dim('按区域')}`);
+      for (const a of byArea) {
+        lines.push(`      ${a.icon} ${colors.dim(a.label)}  ${colors.cyan(`${fmtTokens(a.tokens)} tokens`)}  ${colors.bold(fmtCost(a.cost))}  ${colors.dim(`${a.measuredSlices}/${a.slices} 片`)}`);
+      }
+    }
     lines.push('');
   }
 
@@ -468,6 +527,8 @@ function renderJson(
       llmTokens: cost.llmTokens,
       costUsd: cost.totalCost,
     })),
+    byModel: aggregateByModel(costMap),
+    byArea: aggregateByArea(slices, costMap),
     recentEvents: events.slice(0, 50),
     stalled: stalled.map((s) => ({
       id: s.id, title: s.title, stallClass: s.stallClass,
@@ -632,6 +693,15 @@ function renderHtml(
     })
     .join('');
 
+  // 按模型 —— 同样一万 token，用哪个模型不是同一笔账
+  const byModel = aggregateByModel(costMap);
+  const byModelRows = byModel
+    .map((m) => {
+      const calls = m.calls > 0 ? `${m.calls} 会话` : `${m.llmCalls} 调用`;
+      return `<tr><td class="eet">${esc(m.model)}</td><td>${fmtTokens(m.tokens)}</td><td class="etm">${fmtTokens(m.inputTokens)}</td><td class="etm">${fmtTokens(m.outputTokens)}</td><td>${fmtCost(m.costUsd)}</td><td class="etm">${calls}</td></tr>`;
+    })
+    .join('');
+
   const costLayer =
     totals.measuredSlices > 0
       ? `
@@ -667,6 +737,11 @@ ${topRows ? `<h2 class="sh">🔥 Token 消耗 Top <span class="hc">${topTokens.l
 <table>
 <thead><tr><th>Slice</th><th>Tokens</th><th>Agent in</th><th>Agent out</th><th>Cost</th><th>占上限</th></tr></thead>
 <tbody>${topRows}</tbody>
+</table>` : ''}
+${byModelRows ? `<h2 class="sh">🧠 按模型 <span class="hc">钱花在哪个模型上</span></h2>
+<table>
+<thead><tr><th>模型</th><th>Tokens</th><th>in</th><th>out</th><th>Cost</th><th>调用</th></tr></thead>
+<tbody>${byModelRows}</tbody>
 </table>` : ''}`
       : '';
 
@@ -797,6 +872,9 @@ ${sortedAreas.map(([areaKey, modMap]) => {
   const done = allSlices.filter((s) => s.state === 'completed').length;
   const sCnt = allSlices.filter((s) => s.stallClass).length;
   const pct = Math.round((done / allSlices.length) * 100);
+  // 区域级 token / 花费 —— 哪个模块最烧，比哪一片最烧更可执行
+  const areaTokens = allSlices.reduce((sum, s) => sum + (costMap.get(s.id)?.totalTokens ?? 0), 0);
+  const areaCost = allSlices.reduce((sum, s) => sum + (costMap.get(s.id)?.totalCost ?? 0), 0);
 
   const modBlocks = [...modMap.entries()].map(([modName, modSlices]) => {
     const sorted = [...modSlices].sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
@@ -811,7 +889,7 @@ ${sortedAreas.map(([areaKey, modMap]) => {
     return `<div class="am"><div class="amt">${esc(modName)} <span class="amc">${modSlices.length}</span></div>${rows}</div>`;
   }).join('');
 
-  return `<details class="ad"><summary class="as"><span class="ai">${ad.icon}</span><span class="al">${ad.label}</span><span class="asc">${allSlices.length}</span><span class="apb"><span class="apf" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></span><span class="apc">${done}/${allSlices.length}${sCnt ? ` ⚠${sCnt}` : ''}</span></summary><div class="abd">${modBlocks}</div></details>`;
+  return `<details class="ad"><summary class="as"><span class="ai">${ad.icon}</span><span class="al">${ad.label}</span><span class="asc">${allSlices.length}</span><span class="apb"><span class="apf" style="width:${pct}%;background:${pct===100?'#3fb950':sCnt>0?'#ff7b72':'#58a6ff'}"></span></span><span class="apc">${done}/${allSlices.length}${sCnt ? ` ⚠${sCnt}` : ''}</span><span class="apt">${areaTokens > 0 ? `${fmtTokens(areaTokens)} tokens · ${fmtCost(areaCost)}` : ''}</span></summary><div class="abd">${modBlocks}</div></details>`;
 }).join('')}` : '';
 
   // ══════════════════════════════════════════════════════════════════════════════
@@ -928,6 +1006,7 @@ ${watchMode ? '<meta http-equiv="refresh" content="3">' : ''}
   .apb{flex:1;height:6px;background:#21262d;border-radius:3px;overflow:hidden;max-width:120px}
   .apf{display:block;height:100%;border-radius:3px;transition:width .3s}
   .apc{font-size:10px;color:#8b949e;white-space:nowrap;min-width:50px}
+  .apt{font-size:10px;color:#d2a8ff;white-space:nowrap}
   .abd{padding:6px 12px 10px;border-top:1px solid #21262d}
   .am{margin-bottom:4px}
   .amt{font-size:11px;font-weight:600;color:#8b949e;padding:5px 0 3px;display:flex;align-items:center;gap:5px}
@@ -1037,7 +1116,9 @@ register('dashboard', async (args) => {
           );
         } catch { /* ignore */ }
       };
-      for (const sub of ['slices', 'versions', 'events']) {
+      // locks 也要监听：签字请求落在那里，不监听的话待签字队列在
+      // watch 模式下永远不变 —— 刚签完字看板还提示待办
+      for (const sub of ['slices', 'versions', 'events', 'locks']) {
         const d = join(ZELTO_DIR, sub);
         if (existsSync(d)) watch(d, { recursive: sub === 'events' }, regen);
       }
@@ -1079,7 +1160,8 @@ register('dashboard', async (args) => {
         writeFileSync(outputPath, await generate(), 'utf-8');
       } catch { /* ignore */ }
     };
-    for (const sub of ['slices', 'versions', 'events']) {
+    // locks 也要监听：签字请求落在那里（见上方 TTY 分支的说明）
+    for (const sub of ['slices', 'versions', 'events', 'locks']) {
       const d = join(ZELTO_DIR, sub);
       if (existsSync(d)) watch(d, { recursive: sub === 'events' }, regen);
     }
