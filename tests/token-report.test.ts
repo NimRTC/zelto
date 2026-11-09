@@ -3,8 +3,12 @@
 // 这个脚本是「钱和 token 花在哪了」的分析入口，它的输出会被人直接拿去
 // 判断 zelto 值不值。所以口径必须锁死：
 //
+//   - 基线是「直接用 agent」：每片 1 次成功会话、规格同样要读、无规划期 LLM、无手动重试
+//   - 规格上下文两边都要吃（zelto 读 bundle，人把规格贴进去），所以 bundle token
+//     不从基线里扣，只是单列 —— 这是最容易算错的一处
 //   - 失败重试烧的 token 不在事件流里，只能估算，且必须在输出里标成估算
-//   - 旧格式切片（只有 run.finished.costUsd、没有 budget.spent）不能被当成「零花费」
+//   - 「成功但没记账」的老格式切片既不是零花费，也不是失败会话
+//   - 完全没有记账样本时，基线与差额报「无法计算」，不报 0
 //   - BOM 文件（Windows PowerShell 写出来的 UTF-8）必须能解析
 //   - 规划期 LLM 的 token 只算一次（llm.called 与 budget.spent 是同一笔账的两面）
 
@@ -55,30 +59,35 @@ interface Report {
   eventLines: number;
   malformed: number;
   agent: {
-    sessions: number;
-    tokens: number;
-    costUsd: number;
-    runsStarted: number;
+    measuredSessions: number;
+    measuredTokens: number;
+    measuredCostUsd: number;
+    unmeasuredSessions: number;
+    unmeasuredCostUsd: number;
+    sessionsStarted: number;
+    sessionsSucceeded: number;
     failedSessions: number;
-    failedTokensEst: number;
-    failedCostEst: number;
-    costOnlySessions: number;
-    costOnlyUsd: number;
+    failedTokensEst: number | null;
+    failedCostEst: number | null;
   };
   planningLlm: { calls: number; tokens: number; costUsd: number };
-  bundleOverhead: { tokens: number; slices: number };
+  bundleInjection: { tokens: number; slices: number };
   comparison: {
-    zeltoTotalTokens: number;
-    directTokens: number;
-    deltaTokens: number;
-    deltaPct: number | null;
+    zeltoTotalTokens: number | null;
+    zeltoTotalCost: number | null;
+    directTokens: number | null;
+    directCost: number | null;
+    directTokensEstimated: boolean;
+    deltaTokens: number | null;
+    deltaCost: number | null;
   };
   perSlice: Array<{
     id: string;
-    agentSessions: number;
-    agentTokens: number;
-    agentCost: number;
-    costOnlySessions: number;
+    sessionsStarted: number;
+    sessionsSucceeded: number;
+    measuredSessions: number;
+    measuredTokens: number;
+    unmeasuredSessions: number;
     llmTokens: number;
   }>;
 }
@@ -89,6 +98,12 @@ function run(extraArgs: string[] = []): Report {
   });
   return JSON.parse(out) as Report;
 }
+
+/** 记账的一次成功会话：12 万 token，5 毛钱 */
+const AGENT_SPENT = {
+  type: 'budget.spent',
+  payload: { amount: 0.5, source: 'agent', inputTokens: 100000, outputTokens: 20000 },
+};
 
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'zelto-token-report-'));
@@ -101,10 +116,7 @@ afterEach(() => {
 describe('token-report 口径', () => {
   it('agent 会话与规划期 LLM 的 token 分得开', () => {
     writeEvents('s1', [
-      {
-        type: 'budget.spent',
-        payload: { amount: 0.5, source: 'agent', inputTokens: 100000, outputTokens: 20000 },
-      },
+      AGENT_SPENT,
       {
         type: 'llm.called',
         payload: { model: 'deepseek', promptTokens: 5000, completionTokens: 1000, totalTokens: 6000 },
@@ -113,67 +125,109 @@ describe('token-report 口径', () => {
     ]);
 
     const r = run();
-    assert.equal(r.agent.sessions, 1);
-    assert.equal(r.agent.tokens, 120000);
-    assert.equal(r.agent.costUsd, 0.5);
+    assert.equal(r.agent.measuredSessions, 1);
+    assert.equal(r.agent.measuredTokens, 120000);
+    assert.equal(r.agent.measuredCostUsd, 0.5);
     assert.equal(r.planningLlm.calls, 1);
     assert.equal(r.planningLlm.tokens, 6000);
     assert.equal(r.planningLlm.costUsd, 0.002);
   });
 
-  it('失败会话不在账上，按成功会话均值估算并单列', () => {
+  it('基线是「每片 1 次成功会话」，差额来自重试与规划期 LLM', () => {
     writeEvents('s1', [
       { type: 'run.started', payload: { sliceId: 's1' } },
       { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
       { type: 'run.started', payload: { sliceId: 's1' } },
       { type: 'run.finished', payload: { sliceId: 's1', exitCode: 0 } },
+      AGENT_SPENT,
       {
-        type: 'budget.spent',
-        payload: { amount: 0.5, source: 'agent', inputTokens: 100000, outputTokens: 20000 },
+        type: 'llm.called',
+        payload: { model: 'deepseek', promptTokens: 5000, completionTokens: 1000, totalTokens: 6000 },
       },
     ]);
 
     const r = run();
-    assert.equal(r.agent.runsStarted, 2);
-    assert.equal(r.agent.sessions, 1);
+    // 基线 = 这片 1 次成功会话 = 120000 tokens
+    assert.equal(r.comparison.directTokens, 120000);
+    // 用 zelto = 成功会话 120000 + 失败会话估算 120000 + 规划期 6000
+    assert.equal(r.comparison.zeltoTotalTokens, 246000);
+    assert.equal(r.comparison.deltaTokens, 126000);
+    assert.equal(r.planningLlm.tokens, 6000);
+  });
+
+  it('失败会话不在账上，按记账会话均值估算并单列', () => {
+    writeEvents('s1', [
+      { type: 'run.started', payload: { sliceId: 's1' } },
+      { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
+      { type: 'run.started', payload: { sliceId: 's1' } },
+      { type: 'run.finished', payload: { sliceId: 's1', exitCode: 0 } },
+      AGENT_SPENT,
+    ]);
+
+    const r = run();
+    assert.equal(r.agent.sessionsStarted, 2);
+    assert.equal(r.agent.sessionsSucceeded, 1);
     assert.equal(r.agent.failedSessions, 1);
     assert.equal(r.agent.failedTokensEst, 120000);
     assert.equal(r.agent.failedCostEst, 0.5);
   });
 
-  it('旧格式切片（无 budget.spent）算「花了钱但没测到」，不算零', () => {
+  it('run.aborted 重复写不会把失败次数数两遍', () => {
+    // core-slice 与 handleAgentFailure 会各写一条 run.aborted
+    writeEvents('s1', [
+      { type: 'run.started', payload: { sliceId: 's1' } },
+      { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
+      { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
+      { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
+    ]);
+
+    const r = run();
+    assert.equal(r.agent.sessionsStarted, 1);
+    assert.equal(r.agent.sessionsSucceeded, 0);
+    assert.equal(r.agent.failedSessions, 1);
+  });
+
+  it('老格式切片（成功但没记账）既不算零花费，也不算失败会话', () => {
     writeEvents('s2', [
       { type: 'run.started', payload: { sliceId: 's2' } },
       { type: 'run.finished', payload: { sliceId: 's2', exitCode: 0, costUsd: 0.25 } },
     ]);
 
     const r = run();
-    assert.equal(r.agent.costOnlySessions, 1);
-    assert.equal(r.agent.costOnlyUsd, 0.25);
-    assert.equal(r.agent.tokens, 0);
-    assert.equal(r.perSlice[0].costOnlySessions, 1);
+    assert.equal(r.agent.unmeasuredSessions, 1);
+    assert.equal(r.agent.unmeasuredCostUsd, 0.25);
+    assert.equal(r.agent.measuredTokens, 0);
+    // 成功的会话不算失败会话
+    assert.equal(r.agent.sessionsSucceeded, 1);
+    assert.equal(r.agent.failedSessions, 0);
+    assert.equal(r.perSlice[0].unmeasuredSessions, 1);
+  });
+
+  it('bundle token 只单列，不从基线里扣（两边都要读规格）', () => {
+    writeEvents('s1', [
+      { type: 'run.started', payload: { sliceId: 's1' } },
+      { type: 'run.finished', payload: { sliceId: 's1', exitCode: 0 } },
+      AGENT_SPENT,
+    ]);
+    writeBundle('s1', 'x'.repeat(400));
+
+    const r = run();
+    // 400 个 ASCII 字符 ≈ 100 token，每次会话读一遍
+    assert.equal(r.bundleInjection.tokens, 100);
+    assert.equal(r.bundleInjection.slices, 1);
+    // 基线仍然是这片的 1 次成功会话全额 —— bundle 不扣
+    assert.equal(r.comparison.directTokens, 120000);
   });
 
   it('带 BOM 的事件流与 bundle 都能解析', () => {
-    writeEvents(
-      's1',
-      [
-        {
-          type: 'budget.spent',
-          payload: { amount: 0.5, source: 'agent', inputTokens: 100000, outputTokens: 20000 },
-        },
-      ],
-      { bom: true },
-    );
+    writeEvents('s1', [AGENT_SPENT], { bom: true });
     writeBundle('s1', 'x'.repeat(400));
 
     const r = run();
     assert.equal(r.malformed, 0);
     assert.equal(r.eventLines, 1);
-    assert.equal(r.agent.tokens, 120000);
-    // 400 个 ASCII 字符 ≈ 100 token，每次会话读一遍
-    assert.equal(r.bundleOverhead.tokens, 100);
-    assert.equal(r.bundleOverhead.slices, 1);
+    assert.equal(r.agent.measuredTokens, 120000);
+    assert.equal(r.bundleInjection.tokens, 100);
   });
 
   it('--no-estimate 时不估算账外支出', () => {
@@ -182,16 +236,28 @@ describe('token-report 口径', () => {
       { type: 'run.aborted', payload: { sliceId: 's1', exitCode: 1 } },
       { type: 'run.started', payload: { sliceId: 's1' } },
       { type: 'run.finished', payload: { sliceId: 's1', exitCode: 0 } },
-      {
-        type: 'budget.spent',
-        payload: { amount: 0.5, source: 'agent', inputTokens: 100000, outputTokens: 20000 },
-      },
+      AGENT_SPENT,
     ]);
 
     const r = run(['--no-estimate']);
     assert.equal(r.agent.failedSessions, 1);
     assert.equal(r.agent.failedTokensEst, 0);
     assert.equal(r.agent.failedCostEst, 0);
+    // 基线不受影响
+    assert.equal(r.comparison.directTokens, 120000);
+  });
+
+  it('没有任何记账样本时，基线与差额报「无法计算」而不是 0', () => {
+    writeEvents('s1', [
+      { type: 'run.started', payload: { sliceId: 's1' } },
+      { type: 'run.finished', payload: { sliceId: 's1', exitCode: 0 } },
+    ]);
+
+    const r = run();
+    assert.equal(r.agent.measuredSessions, 0);
+    assert.equal(r.comparison.directTokens, null);
+    assert.equal(r.comparison.deltaTokens, null);
+    assert.equal(r.agent.failedTokensEst, null);
   });
 
   it('没有事件目录时报错退出，不静默给出 0', () => {

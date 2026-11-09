@@ -12,8 +12,15 @@
   estimated and labelled as estimates; slices written before per-session
   metering existed are reported as 「spent money, tokens unmeasured」 rather
   than as zero; and the "direct use" baseline is stated as an assumption
-  (one successful session per slice, no bundle, no planning LLM, no manual
-  retries) rather than presented as a measurement.
+  (one successful session per slice, no planning LLM, no manual retries)
+  rather than presented as a measurement. The spec context is charged to both
+  sides — zelto's bundle carries the spec text, and a person handing the spec
+  to an agent directly pays for the same context — so the bundle is reported
+  on its own instead of being deducted from the baseline, and the difference
+  comes from what zelto actually adds: retry amplification and the planning
+  LLM. When the project has no metered agent usage at all, the baseline and
+  the difference are reported as 「cannot be computed」 rather than as 0 —
+  a zero would read as "spent nothing", which is a different claim.
 - **Five follow-ups to taking over an existing project** (ADR-039). The
   remaining gaps on the path a person actually walks: registering the current
   code as baseline slices now writes a `slice.baseline_registered` event (C4 —
