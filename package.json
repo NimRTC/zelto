@@ -34,6 +34,17 @@
   },
   "packageManager": "pnpm@9.12.0",
   "private": true,
+  "files": [
+    "dist/",
+    "contracts/",
+    "policy/",
+    "bin/",
+    "misc/",
+    "syntax/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^26.6.5",

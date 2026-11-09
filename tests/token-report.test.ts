@@ -16,7 +16,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -273,5 +273,63 @@ describe('token-report 口径', () => {
 
   it('没有事件目录时报错退出，不静默给出 0', () => {
     assert.throws(() => run(), /找不到事件目录/);
+  });
+});
+
+// ─── 发布边界 ─────────────────────────────────────────────────────────────
+//
+// 这个脚本留在仓库里供内部自查，但它**不能随产品发布**。原因不是"太大"，
+// 而是「用 zelto 比直接用 agent 多花多少」这个对比一旦出现在用户能拿到的地方，
+// 就成了一句对外承诺 —— 而基线是个假设，假设一变结论就翻。
+//
+// 闸门在 package.json 的 files 白名单：白名单里没有 scripts/，npm pack 就不会
+// 把它打进去。下面这组用例守的是这条边界 —— 有人往 files 里加 "scripts/" 时
+// 会在这里失败。
+
+describe('开销对比不随产品发布', () => {
+  const pkg = JSON.parse(
+    readFileSync(join(process.cwd(), 'package.json'), 'utf-8'),
+  ) as { files?: string[]; scripts?: Record<string, string> };
+  const files = pkg.files ?? [];
+
+  it('package.json 声明了 files 白名单', () => {
+    assert.ok(Array.isArray(pkg.files), '没有 files 白名单 = 整个仓库都会被发布');
+    assert.ok(files.length > 0);
+  });
+
+  it('白名单里没有 scripts / tests / docs / specs —— 内部材料与开销对比脚本都不外发', () => {
+    const leaked = files.filter((f) => /^(scripts|tests|docs|specs|src)\//.test(f));
+    assert.deepEqual(leaked, [], `这些目录不该进发布包：${leaked.join(', ')}`);
+  });
+
+  it('白名单里没有 .cursor / AGENTS.md / CLAUDE.md 等内部协作材料', () => {
+    const leaked = files.filter(
+      (f) => f.startsWith('.') || /^(AGENTS|CLAUDE|CONTRIBUTING|GIT-STATE-NOTICE)/.test(f),
+    );
+    assert.deepEqual(leaked, [], `这些不该进发布包：${leaked.join(', ')}`);
+  });
+
+  it('npm scripts 里没有开销对比的入口', () => {
+    const scripts = Object.keys(pkg.scripts ?? {});
+    assert.equal(
+      scripts.some((s) => /token-report|cost-report/i.test(s)),
+      false,
+      'npm script 是用户看得见的入口，不该暴露内部自查工具',
+    );
+  });
+
+  it('npm pack 的实际产物里不含开销对比脚本', () => {
+    const out = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      shell: process.platform === 'win32',
+    });
+    const pack = JSON.parse(out) as Array<{ files: Array<{ path: string }> }>;
+    const paths = pack[0].files.map((f) => f.path);
+    const leaked = paths.filter((p) => /token-report/i.test(p));
+    assert.deepEqual(leaked, [], `发布包里混进了：${leaked.join(', ')}`);
+    // 顺带守住另一头：产物里也不该有 docs / specs
+    assert.equal(paths.some((p) => p.startsWith('docs/')), false);
+    assert.equal(paths.some((p) => p.startsWith('specs/')), false);
   });
 });
