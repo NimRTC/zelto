@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **A read-only cost comparison: what does zelto itself cost you**
+  (`npm run report:cost`, `node scripts/token-report.mjs <project>`). It reads
+  the event stream and answers the question the changelog of features never
+  answers: how many tokens does running *through* zelto cost compared to
+  handing the same spec to an agent directly. The script refuses to flatter
+  itself — failed sessions are not billed by the runtime, so their tokens are
+  estimated and labelled as estimates; slices written before per-session
+  metering existed are reported as 「spent money, tokens unmeasured」 rather
+  than as zero; and the "direct use" baseline is stated as an assumption
+  (one successful session per slice, no bundle, no planning LLM, no manual
+  retries) rather than presented as a measurement.
 - **Five follow-ups to taking over an existing project** (ADR-039). The
   remaining gaps on the path a person actually walks: registering the current
   code as baseline slices now writes a `slice.baseline_registered` event (C4 —
