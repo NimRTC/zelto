@@ -84,6 +84,20 @@
   back at `frozen` (not dead), and here is the exact command to run next.
 
 ### Fixed
+- **The installed package was never actually exercised.** The `files`
+  whitelist decided *which* files ship, but nothing checked that the files
+  that shipped *worked*. Three real defects were hiding in the gap:
+  `bin/zelto.sh` pointed at `bin/dist/cli/index.js` while `dist/` sits next to
+  `bin/`, so the wrapper had never run successfully since it landed; the
+  package shipped `policy/` — zelto's own write-set rules, which the user's
+  project never reads (`zelto init` generates a policy from the modules it
+  detects) and which are actively misleading once they land in someone else's
+  repository; and this repository's own `policy/lock.json` was still in the
+  pre-ADR-039 format, so the anchor reader could not parse it and zelto
+  reported itself as *unanchored* — C5's protection was silently inert on the
+  one repository where it mattered most. `tests/package-availability.test.ts`
+  now packs, installs and runs the real CLI in a clean directory, so these
+  cannot come back.
 - **Four event types could be emitted but were not in the contract.**
   ADR-036 added `contract.evolution_checked`, `contract.baseline_updated`,
   `version.regression_recorded` and `version.regression_detected`, but the

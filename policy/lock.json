@@ -1,6 +1,6 @@
 {
-  "hash": "sha256:0e08432b1870064e46a696a0a2ac6b18b91f172021ff478eb3060494dc9ab201",
-  "commit": null,
-  "lockedAt": "2026-11-06T13:08:31.533Z",
-  "lockedBy": "human"
+  "version": 1,
+  "policy": "sha256:0e08432b1870064e46a696a0a2ac6b18b91f172021ff478eb3060494dc9ab201",
+  "lockedAt": "2026-11-09T08:57:29.541Z",
+  "source": "manual"
 }

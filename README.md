@@ -115,7 +115,10 @@ Protected paths are hard-coded outside policy reach, and `core/` has zero third-
 - **Two executors, default included.** `claude-agent` (CLI spawn) is the default; `claude-agent-sdk`
   is opt-in via `--adapter claude-agent-sdk`. The policy/gate layer is harness-agnostic,
   but claiming more harnesses before the adapters exist would be a lie.
-- **Install from source.** Not on npm yet (`private: true`). Planned for 0.5.
+- **Install from source.** Not published to npm yet (`private: true` still set).
+  The package is packable and verified installable — `npm pack` produces a
+  self-contained tarball that runs `zelto init` on a fresh project — but
+  publishing is a separate, explicit step.
 
 ## CLI reference
 

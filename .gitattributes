@@ -4,3 +4,7 @@
 *.md text
 *.yaml text
 *.yml text
+
+# Shell 脚本必须保持 LF：core.autocrlf=true 会把它们检出成 CRLF，
+# 而 bash 读到行尾的 \r 会把它当成命令的一部分（`cd "$1"\r` 找不到目录）。
+*.sh text eol=lf

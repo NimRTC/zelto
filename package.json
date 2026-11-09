@@ -37,7 +37,6 @@
   "files": [
     "dist/",
     "contracts/",
-    "policy/",
     "bin/",
     "misc/",
     "syntax/",
