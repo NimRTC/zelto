@@ -26,7 +26,6 @@
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
-    "report:cost": "node scripts/token-report.mjs",
     "clean": "rm -rf dist dist-test",
     "prepublishOnly": "pnpm clean && pnpm build && pnpm test"
   },

@@ -1,7 +1,8 @@
 // token-report 脚本的口径测试 —— 开销对比的结论必须可复算。
 //
-// 这个脚本是「钱和 token 花在哪了」的分析入口，它的输出会被人直接拿去
-// 判断 zelto 值不值。所以口径必须锁死：
+// 这个脚本是内部自查工具，不进产品、不进 CHANGELOG —— 基线是个假设，一旦写进产品
+// 文档就成了一句对外承诺。但它跑出来的数字会被人直接拿去判断 zelto 值不值，
+// 所以口径必须锁死：
 //
 //   - 基线是「直接用 agent」：每片 1 次成功会话、规格同样要读、无规划期 LLM、无手动重试
 //   - 规格上下文两边都要吃（zelto 读 bundle，人把规格贴进去），所以 bundle token
@@ -56,6 +57,8 @@ function writeBundle(sliceId: string, instructions: string): void {
 }
 
 interface Report {
+  tool: string;
+  internal: boolean;
   eventLines: number;
   malformed: number;
   agent: {
@@ -258,6 +261,14 @@ describe('token-report 口径', () => {
     assert.equal(r.comparison.directTokens, null);
     assert.equal(r.comparison.deltaTokens, null);
     assert.equal(r.agent.failedTokensEst, null);
+  });
+
+  it('输出标明了它是内部工具，不是对外承诺', () => {
+    writeEvents('s1', [AGENT_SPENT]);
+
+    const r = run();
+    assert.equal(r.internal, true);
+    assert.equal(r.tool, 'zelto-internal-cost-report');
   });
 
   it('没有事件目录时报错退出，不静默给出 0', () => {

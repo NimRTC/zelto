@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // zelto 开销对比 —— 「用 zelto 做」比「直接用 agent 做」多花多少 token。
 //
-// 用途：只读的分析工具。它读事件流，不写任何文件、不调模型、不触网，
-// 所以放在 `scripts/` 里随仓库走，但不属于产品运行时的一部分。
+// 用途：**内部自查工具**，不是产品对外承诺的功能。它读事件流，不写任何文件、
+// 不调模型、不触网，所以放在 `scripts/` 里随仓库走，但不属于产品运行时的一部分。
+//
+// 为什么不给它对外入口（不进 package.json 的 scripts、不进 CHANGELOG）：
+// 「用 zelto 比直接用 agent 多花多少」这个问题一旦写进产品文档，就成了对外的一句
+// 承诺 —— 而基线本身是个假设，假设一变结论就翻。与其让人拿一个假设当定论，
+// 不如留在内部：需要的时候自己跑一遍，跑出的数字也要连着假设一起看。
 //
 // ── 读的账 ────────────────────────────────────────────────────────────────
 // `<root>/.zelto/events/<sliceId>/events.jsonl`：
@@ -78,7 +83,8 @@ const estimate = !args.includes('--no-estimate');
 if (args.includes('--help') || args.includes('-h')) {
   console.log(
     [
-      'zelto 开销对比 —— 只读事件流，算「用 zelto」相对「直接用 agent」的额外开销。',
+      'zelto 开销对比（内部自查工具）—— 只读事件流，算「用 zelto」相对「直接用 agent」的额外开销。',
+      '这不是产品对外承诺的功能：基线是个假设，换一套假设结论就变。',
       '',
       '用法：node scripts/token-report.mjs [项目根目录] [选项]',
       '',
@@ -440,6 +446,10 @@ if (asJson) {
   console.log(
     JSON.stringify(
       {
+        tool: "zelto-internal-cost-report",
+        internal: true,
+        note:
+          "内部自查工具，不是产品对外承诺的功能。基线是个假设，换一套假设结论就变。",
         root,
         eventLines,
         malformed,
@@ -502,7 +512,7 @@ if (asJson) {
 }
 
 console.log('');
-console.log(`zelto 开销对比 —— ${root}`);
+console.log(`zelto 开销对比（内部自查工具）—— ${root}`);
 console.log('='.repeat(72));
 console.log(`事件行 ${eventLines} 条（坏行 ${malformed}）｜参与统计的切片 ${slices.length} 片`);
 
