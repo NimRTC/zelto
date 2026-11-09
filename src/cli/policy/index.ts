@@ -14,6 +14,7 @@ import { addPolicyRule } from './commands/add.command.js';
 import { removePolicyRule } from './commands/remove.command.js';
 import { editPolicyRule } from './commands/edit.command.js';
 import { showPolicyRuleCommand } from './commands/show.command.js';
+import { lockPolicy } from './commands/lock.command.js';
 
 // ─── Subcommand dispatch ─────────────────────────────────────────────────────
 
@@ -29,6 +30,7 @@ ${'Usage:'}
   zelto policy add <rule-id> --path <path> [--operation <op>] --action <action> --basis <basis> [options]
   zelto policy remove <rule-id> [--json]
   zelto policy edit <rule-id> [--path <path>] [--operation <op>] [--action <action>] [--basis <basis>] [options]
+  zelto policy lock [--update] [--json]
 
 ${'Subcommands:'}
   list      List all policy rules
@@ -37,6 +39,7 @@ ${'Subcommands:'}
   add       Add a new rule to policy.yaml
   remove    Remove a rule from policy.yaml
   edit      Edit an existing rule in policy.yaml
+  lock      Show the policy hash anchor (policy/lock.json); --update re-anchors explicitly
 
 ${'Options:'}
   --json        Output in JSON format
@@ -47,6 +50,7 @@ ${'Options:'}
   --guidance    Guidance message for the rule (add/edit)
   --description Human-readable description (add/edit)
   --priority    Rule priority, lower = higher precedence (add/edit)
+  --update      Re-anchor the policy hash explicitly (policy lock)
     `);
     return 0;
   }
@@ -177,6 +181,12 @@ ${'Options:'}
       priority: priority !== undefined && !Number.isNaN(priority) ? priority : undefined,
       json: isJson,
     });
+  }
+
+  if (subcmd === 'lock') {
+    const rest = args.slice(1);
+    const isJson = rest.includes('--json');
+    return lockPolicy({ update: rest.includes('--update'), json: isJson });
   }
 
   console.error(`Unknown policy subcommand: "${subcmd}"`);

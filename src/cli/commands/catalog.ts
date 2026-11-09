@@ -73,7 +73,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'wait', group: '项目管理', args: '<task-id>', summary: '等待后台任务结束' },
 
   // ─── 治理与运行时 ──────────────────────────────────────────────────────
-  { name: 'policy', group: '治理与运行时', args: '<subcommand>', summary: '策略规则的增删查改与校验', detail: 'list, show, check, validate, add, remove, edit' },
+  { name: 'policy', group: '治理与运行时', args: '<subcommand>', summary: '策略规则的增删查改与校验', detail: 'list, show, check, validate, add, remove, edit, lock（查看/更新策略哈希锚点）' },
   { name: 'reservation', group: '治理与运行时', args: '<subcommand> [slice-id]', summary: '写集预约的查看与释放', detail: 'list, active, show, release, reap' },
   { name: 'drift', group: '治理与运行时', args: '<slice-id>', summary: '检查切片与冻结基线之间的漂移', detail: '--json' },
   { name: 'merge', group: '治理与运行时', args: '[id ...]', summary: '合并已签字的切片（不带 id 则合并全部待合切片；子命令 plan 只出计划）', detail: '--strategy, --dry-run, --push, --json' },

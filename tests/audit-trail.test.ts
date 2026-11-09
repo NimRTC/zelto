@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { AuditTrail } from '../src/core/audit/trail.js';
-import { EventStream, type EventType } from '../src/core/events/stream.js';
+import { EventStream, EVENT_TYPES, type EventType } from '../src/core/events/stream.js';
 
 const TEST_DIR = join(tmpdir(), `zelto-audit-test-${Date.now()}`);
 const EVENTS_DIR = join(TEST_DIR, 'events');
@@ -77,30 +77,14 @@ describe('AuditTrail', () => {
 
   // 每种事件类型都要有专属摘要 —— 否则审计报告会退化成
   // 泛泛的「Event: <type>」，可读性下降、事后追责困难。
-  // 这个不变式随事件类型增减自动生效（EventType 是联合类型，编译期会检查）。
+  //
+  // 清单从 `EVENT_TYPES` 取，不手写：手写的那份曾经漏掉了 5 种事件
+  // （ADR-036 加的 4 种 + 基线登记 1 种），于是「每种事件都有摘要」
+  // 这条不变式在测试里也是假的。现在它由三层保证 ——
+  // 运行时数组（可枚举）、`Record<EventType, ...>`（少一种编译不过）、
+  // 以及 `tests/event-contract-parity.test.ts` 的三方对账。
   it('every event type has a dedicated summary', async () => {
-    const eventTypes: EventType[] = [
-      'slice.state.changed', 'slice.drift_detected', 'slice.hotfix',
-      'spec.drafted', 'spec.checked', 'spec.frozen',
-      'clarify.question', 'clarify.answer',
-      'run.started', 'run.resumed', 'run.stalled', 'run.finished', 'run.aborted',
-      'policy.decision', 'policy.anchor_mismatch', 'policy.violation',
-      'reservation.acquired', 'reservation.released',
-      'gate.executed', 'gate.result', 'gate.retry',
-      'stall.classified',
-      'question.raised', 'question.answered',
-      'budget.spent', 'llm.called',
-      'queue.enqueued', 'queue.dequeued',
-      'sign.requested', 'sign.approved', 'sign.rejected', 'sign.revoked',
-      'batch.halted',
-      'merge.completed', 'merge.planned', 'merge.phase_complete', 'merge.conflict', 'merge.stale_base',
-      'sched.admitted', 'sched.blocked',
-      'worktree.created', 'worktree.removed',
-      'coord.dep_added', 'coord.phase_ready', 'coord.phase_complete', 'coord.cycle_detected',
-      'artifact.conflict_detected',
-      'version.accepted', 'version.delivered',
-      'draft.created', 'draft.revised', 'draft.confirmed',
-    ];
+    const eventTypes: EventType[] = [...EVENT_TYPES];
 
     // 逐个写入并检查摘要不是泛用的兜底文本
     for (const type of eventTypes) {
@@ -153,6 +137,16 @@ describe('AuditTrail', () => {
         tampered: [],
         violations: [],
         error: '',
+        // 基线登记 / 契约演进 / 版本回归这几类事件用到的字段
+        module: 'src/core',
+        fileCount: 3,
+        writes: ['src/core/**'],
+        contracts: ['a.json'],
+        breaking: 0,
+        tests: 1,
+        regressed: 0,
+        degraded: 0,
+        missing: 0,
       });
 
       const report = await audit.forSlice(sliceId);

@@ -1,7 +1,7 @@
 ﻿import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { executeMergePlan, type MergeSliceInfo } from '../src/cli/commands/merge-executor.js';
@@ -238,6 +238,75 @@ describe('merge orchestration — acceptance', () => {
 
       assert.ok(log.some((e) => e.type === 'merge.planned'));
       assert.ok(log.some((e) => e.type === 'merge.phase_complete'));
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('uncommitted zelto-managed spec files do not block a merge (ADR-039 §3)', async () => {
+    const repo = makeRepo();
+    try {
+      const epsilon = makeBranch(repo, 'slice/epsilon', 'epsilon.txt', 'epsilon\n');
+      const slices = new Map<string, SliceData>([['epsilon', makeSlice('epsilon', ['epsilon.txt'])]]);
+      const plan = await buildMergePlan({
+        ids: ['epsilon'],
+        slices,
+        specDir: join(repo, 'specs', 'slices'),
+      });
+      plan.strategy = 'sequential_ff';
+      for (const phase of plan.phases) phase.strategy = 'sequential_ff';
+
+      // 规格文件未提交 —— 它是追溯链的出处，不是代码改动，合并不该被它挡住
+      mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+      writeFileSync(join(repo, 'specs', 'slices', 'epsilon.md'), '# spec\n');
+
+      const events = new EventStream(mkdtempSync(join(tmpdir(), 'zelto-merge-ev5-')));
+      const logs: string[] = [];
+      const result = await executeMergePlan(
+        plan,
+        [{ id: 'epsilon', branch: epsilon, baseCommit: null }],
+        { events, repoRoot: repo, log: (m: string) => logs.push(m) },
+      );
+
+      assert.deepEqual(result.merged, ['epsilon'], 'uncommitted spec files must not block the merge');
+      assert.ok(
+        logs.some((l) => l.includes('zelto 管理的规格文件')),
+        `应说明规格文件不影响合并，实际日志：${logs.join(' | ')}`,
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('uncommitted source changes still block a merge', async () => {
+    const repo = makeRepo();
+    try {
+      const zeta = makeBranch(repo, 'slice/zeta', 'zeta.txt', 'zeta\n');
+      const slices = new Map<string, SliceData>([['zeta', makeSlice('zeta', ['zeta.txt'])]]);
+      const plan = await buildMergePlan({
+        ids: ['zeta'],
+        slices,
+        specDir: join(repo, 'specs', 'slices'),
+      });
+      plan.strategy = 'sequential_ff';
+      for (const phase of plan.phases) phase.strategy = 'sequential_ff';
+
+      // 人改了代码没提交 —— 这正是守卫要拦的
+      writeFileSync(join(repo, 'README.md'), '# base, edited\n');
+
+      const events = new EventStream(mkdtempSync(join(tmpdir(), 'zelto-merge-ev6-')));
+      const logs: string[] = [];
+      const result = await executeMergePlan(
+        plan,
+        [{ id: 'zeta', branch: zeta, baseCommit: null }],
+        { events, repoRoot: repo, log: (m: string) => logs.push(m) },
+      );
+
+      assert.deepEqual(result.merged, [], 'uncommitted code changes must block the merge');
+      assert.ok(
+        logs.some((l) => l.includes('已跳过自动合并')),
+        `应说明为什么跳过合并，实际日志：${logs.join(' | ')}`,
+      );
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

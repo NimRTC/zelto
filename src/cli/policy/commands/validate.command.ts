@@ -10,6 +10,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { loadPolicyConfig } from '../../commands/shared.js';
 import { validatePolicyConfig, validatePolicyYaml } from '../../../core/policy/validator.js';
+import { checkPolicyAnchor } from '../../../core/policy/lock.js';
 import { colors } from '../../color.js';
 import { writeOutput } from '../../output.js';
 
@@ -135,6 +136,25 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
     return 1;
   }
 
+  // 策略锚点（C5）
+  //
+  // 锚点独立存放在 policy/lock.json。策略文件自己声明自己的哈希是自证 ——
+  // 改策略的人顺手把哈希也改掉，事后就看不出「当时按什么标准拦的」被换过。
+  // 锚点独立之后，「策略被改过而没人改锚」就是一件可检出的事。
+  //
+  // **这里只警告，不失败。** 职责边界：`validate` 判的是「策略文件本身是否合法」，
+  // 退出码只反映这一件事；锚点失配由 `zelto policy lock` 判（退出码 1，可当门禁）。
+  //
+  // 为什么要分开：接管既有项目时，人换掉自己的策略是常态（zelto 生成的策略
+  // 未必是这个人想要的）。若 validate 因失配就红，人每次换策略都得先改锚 ——
+  // 「失配 = 可检出的改动」就退化成「每次改策略先走一遍仪式」，人只会绕过它。
+  // 判与报分开：validate 照样把失配说出来（不藏），lock 才是那个当门禁用的判据。
+  const anchor = checkPolicyAnchor(process.cwd());
+  const anchorWarning = anchor.mismatch
+    ? `策略锚点失配：锚点记的是 ${anchor.locked}，当前 policy.yaml 是 ${anchor.current}。` +
+      `策略被改过而锚点没动 —— 确认改动是有意的，跑 zelto policy lock --update 改锚。`
+    : null;
+
   // All valid
   if (options.json) {
     writeOutput(
@@ -145,6 +165,15 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
           rules: config.rules.length,
           protected: config.protected.length,
         },
+        // 锚点状态随输出一起给：不藏，但也不改变 valid（valid 只说策略本身）
+        anchor: {
+          status: anchor.mismatch ? 'mismatch' : anchor.hasLock ? 'matched' : 'unanchored',
+          locked: anchor.locked,
+          current: anchor.current,
+          mismatch: anchor.mismatch,
+          source: anchor.source,
+        },
+        ...(anchorWarning ? { warnings: [anchorWarning] } : {}),
       },
       undefined,
       { json: true },
@@ -153,6 +182,11 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
     console.log(`${colors.green('✓')} ${colors.bold('Validation: PASSED')}`);
     console.log(`  ${colors.dim(`Rules: ${config.rules.length}, Protected paths: ${config.protected.length}`)}`);
     console.log(`  ${colors.dim(`Source: ${policyPath}`)}`);
+    if (anchorWarning) {
+      console.log('');
+      console.log(`${colors.yellow('⚠')} ${colors.bold('锚点失配')} ${colors.dim('（不影响 validate 的退出码 —— 判锚点用 zelto policy lock）')}`);
+      console.log(`  ${colors.dim(anchorWarning)}`);
+    }
   }
 
   return 0;

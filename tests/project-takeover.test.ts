@@ -170,9 +170,16 @@ describe('接管既有项目 · 基线切片是追溯链的起点', () => {
     assert.ok(plans.length > 0, '接管既有项目必须能推出基线切片，否则追溯链没有起点');
     const srcCore = plans.find((p) => p.moduleName === 'src/core');
     assert.ok(srcCore, 'src/core 应成为一片基线切片');
+    // 写集口径是**目录通配**（ADR-039 §4）：基线标的是「这一片涵盖哪些既有代码」，
+    // 用具体文件的话，模块里此后新增的文件就落在基线范围之外。
     assert.ok(
-      srcCore!.writes.some((w) => w.endsWith('a.ts')) && srcCore!.writes.some((w) => w.endsWith('b.ts')),
-      `基线切片的写集应覆盖该模块的文件，实际：${JSON.stringify(srcCore!.writes)}`,
+      srcCore!.writes.includes('src/core/**'),
+      `基线切片的写集应覆盖该模块目录，实际：${JSON.stringify(srcCore!.writes)}`,
+    );
+    // 登记时点的文件清单单独留在 plan 里，供人核对
+    assert.ok(
+      srcCore!.files.some((f) => f.endsWith('a.ts')) && srcCore!.files.some((f) => f.endsWith('b.ts')),
+      `基线切片应记下该模块现有文件，实际：${JSON.stringify(srcCore!.files)}`,
     );
   });
 

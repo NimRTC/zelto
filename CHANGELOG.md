@@ -3,6 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- **Five follow-ups to taking over an existing project** (ADR-039). The
+  remaining gaps on the path a person actually walks: registering the current
+  code as baseline slices now writes a `slice.baseline_registered` event (C4 —
+  the event stream is the only carrier of evidence, so a registration with no
+  event did not happen); the policy hash anchor moved **out of the policy file**
+  into `policy/lock.json`, because a file that declares its own hash proves
+  nothing — changing the policy no longer silently changes the standard it was
+  judged by (C5); the pre-merge guard now tells zelto's own spec files apart
+  from code changes, so uncommitted `specs/slices/**` no longer blocks a merge
+  forever; `zelto init` and `zelto project init` now register the *same*
+  baseline through one function; and baseline write sets are directory
+  globs, so files added to a module later still fall inside the baseline.
 - **Trace judgment is now a gate, not a suggestion** (ADR-032). `zelto freeze`,
   `version start` and the scheduler's admission check all refuse to let a slice
   through when its trace is incomplete — a slice with no requirement trace used
@@ -72,6 +84,18 @@
   back at `frozen` (not dead), and here is the exact command to run next.
 
 ### Fixed
+- **Four event types could be emitted but were not in the contract.**
+  ADR-036 added `contract.evolution_checked`, `contract.baseline_updated`,
+  `version.regression_recorded` and `version.regression_detected`, but the
+  enum in `contracts/schemas/event-envelope.json` — the declared source of
+  truth — was never updated, so the code could write events the contract did
+  not recognise. The enum now lists all 57 event types, and the gap is
+  closed for good: the event list is a runtime array (`EVENT_TYPES`) that the
+  `EventType` union is derived from, the audit summary map is typed
+  `Record<EventType, ...>` (so a missing summary is a **compile error**, not a
+  runtime degradation to `Event: <type>`), and `tests/event-contract-parity.test.ts`
+  reconciles contract ↔ code ↔ audit summaries ↔ documentation on every test
+  run.
 - **A write-set audit failure no longer leaves the slice stuck in `running`.**
   When the post-run audit could not read git state, the slice was neither
   advanced nor rolled back — `run` / `merge` / `resume` were all blocked and

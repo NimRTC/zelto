@@ -9,6 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import type { EventStream } from '../../core/events/stream.js';
 import type { MergePhase, MergePlan } from '../../core/sched/merge.js';
+import { isZeltoManagedSpecPath } from '../../core/project/managed-paths.js';
 
 /** 参与合并的切片信息 */
 export interface MergeSliceInfo {
@@ -201,20 +202,45 @@ export async function executeMergePlan(
   const staleBase: string[] = [];
 
   // ── 前置守卫：主仓库工作区必须干净，否则合并会污染未提交改动 ──
+  //
+  // 例外：zelto 自己管理的规格文件（`specs/slices/**`）。
+  // 守卫要拦的是「人改了代码还没提交」—— 合并会把分支上的改动带进主干，
+  // 未提交的本地改动会被盖掉。规格文件不是代码：合并不会碰它，
+  // 它是追溯链的出处，该入库但不该挡路。接管既有项目时基线规格是新建文件，
+  // 人还没来得及提交 —— 把它算成「工作区不干净」，合并就永远过不去。
   const status = git(['status', '--porcelain'], repoRoot);
   if (status.ok && status.stdout.trim().length > 0) {
-    // 列出具体是什么挡着 —— 只说「有未提交改动」的话，人得自己去找。
-    const dirty = status.stdout
+    const entries = status.stdout
       .split('\n')
       .map((l) => l.trim())
-      .filter(Boolean)
-      .slice(0, 10);
-    log('  ⚠️  主仓库工作区有未提交改动，已跳过自动合并。');
-    for (const d of dirty) log(`     ${d}`);
-    if (dirty.length >= 10) log('     …（只列前 10 条）');
-    log('     先提交（git commit）或暂存（git stash）这些改动，再重新跑 zelto merge。');
-    log('     签字已经过了，不用重新签。');
-    return { merged, conflicts, staleBase, aborted: false };
+      .filter(Boolean);
+
+    const dirty: string[] = [];
+    const managedSpecs: string[] = [];
+    for (const entry of entries) {
+      // porcelain 格式：`XY <path>`（重命名时是 `XY <old> -> <new>`）
+      const rawPath = entry.slice(3).trim();
+      const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop()! : rawPath;
+      if (isZeltoManagedSpecPath(path)) managedSpecs.push(entry);
+      else dirty.push(entry);
+    }
+
+    if (managedSpecs.length > 0) {
+      log(`  ℹ️  ${managedSpecs.length} 个 zelto 管理的规格文件未提交（不影响合并）：`);
+      for (const m of managedSpecs.slice(0, 5)) log(`     ${m}`);
+      if (managedSpecs.length > 5) log('     …');
+    }
+
+    if (dirty.length > 0) {
+      // 列出具体是什么挡着 —— 只说「有未提交改动」的话，人得自己去找。
+      const shown = dirty.slice(0, 10);
+      log('  ⚠️  主仓库工作区有未提交改动，已跳过自动合并。');
+      for (const d of shown) log(`     ${d}`);
+      if (dirty.length > 10) log('     …（只列前 10 条）');
+      log('     先提交（git commit）或暂存（git stash）这些改动，再重新跑 zelto merge。');
+      log('     签字已经过了，不用重新签。');
+      return { merged, conflicts, staleBase, aborted: false };
+    }
   }
 
   // ── 记录计划 ──

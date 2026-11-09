@@ -1,7 +1,7 @@
 // Audit trail — generates human-readable audit from event streams
 // C4: every action writes append-only events — audit reads them
 
-import type { EventStream, EventEnvelope } from '../events/stream.js';
+import type { EventStream, EventEnvelope, EventType } from '../events/stream.js';
 
 export interface AuditEntry {
   seq: number;
@@ -20,9 +20,22 @@ export interface AuditReport {
   totalEvents: number;
 }
 
-const EVENT_SUMMARIES: Record<string, (e: EventEnvelope) => string> = {
+/**
+ * 每种事件类型的专属摘要。
+ *
+ * 键类型是 `Record<EventType, ...>` 而不是 `Record<string, ...>` ——
+ * 这让「每种事件都要有人话摘要」成为**编译期**约束：
+ * `EVENT_TYPES` 里加一个事件而这里没写摘要，`tsc` 直接报错。
+ * 以前这里是 `Record<string, ...>`，摘要表与事件集合之间没有任何强制关系，
+ * 于是新事件会静默退化成 `Event: <type>` —— 审计报告读起来像日志而不像审计。
+ */
+const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
   'slice.state.changed': (e) =>
     `State changed: ${String(e.payload?.from ?? '?')} → ${String(e.payload?.to ?? '?')}`,
+  'slice.baseline_registered': (e) =>
+    `Baseline registered: ${String(e.payload?.module ?? '?')} (${String(
+      e.payload?.fileCount ?? 0,
+    )} file(s)) — ${String(e.payload?.reason ?? '现状登记')}`,
   'slice.drift_detected': (e) =>
     `Drift detected: ${String(e.payload?.reason ?? 'unknown reason')}`,
   'slice.hotfix': (e) =>
@@ -161,7 +174,13 @@ export class AuditTrail {
     const entries: AuditEntry[] = [];
 
     for (const evt of raw) {
-      const summarizer = EVENT_SUMMARIES[evt.type];
+      // 兜底仍要留：事件文件是落盘的历史，可能由**别的版本**的 zelto 写的
+      // （本仓降级、或者文件被外部工具追加过）。类型上 evt.type 一定是
+      // EventType，但运行时不能假设 —— 读不懂就照实说「读不懂」，
+      // 而不是崩掉或假装无事发生。
+      const summarizer = (EVENT_SUMMARIES as Partial<Record<EventType, (e: EventEnvelope) => string>>)[
+        evt.type
+      ];
       const summary = summarizer ? summarizer(evt) : `Event: ${evt.type}`;
 
       entries.push({

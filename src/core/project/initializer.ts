@@ -5,6 +5,12 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { join } from 'node:path';
 import { execSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import {
+  POLICY_LOCK_PATH,
+  computePolicyHash,
+  readPolicyLock,
+  writePolicyLock,
+} from '../policy/lock.js';
 import type { ProjectMap, ProjectInitOptions } from './types.js';
 
 /**
@@ -152,10 +158,63 @@ function detectCppTestCommand(): string {
   return `mkdir -p build && cd build && cmake .. ${genFlag} && ${buildCmd} && ctest`;
 }
 
+/** 策略锚点同步的结果 */
+export interface PolicyAnchorOutcome {
+  /** `anchored` = 已锚定（新建或重建）；`unchanged` = 锚点与策略一致；`mismatch` = 策略被人改过而锚点没动 */
+  status: 'anchored' | 'unchanged' | 'mismatch' | 'no-policy';
+  /** 锚点记的哈希 */
+  locked: string | null;
+  /** 当前策略内容的哈希 */
+  current: string | null;
+}
+
+/**
+ * 同步策略锚点（C5）。
+ *
+ * 锚点存 `policy/lock.json`，独立于策略本身 —— 策略自己声明自己的哈希是
+ * 自证，改策略的人顺手把哈希也改掉就看不出「当时按什么标准拦的」被换过。
+ *
+ * 口径：
+ * - 策略是 zelto 生成的 → 锚点跟着重建（策略变了，锚点必须跟着变；
+ *   否则每次接管都会被自己判成「策略被人改过」）；
+ * - 策略是人手写的、还没有锚点 → 锚上当前值（给人一个可追溯的起点）；
+ * - 策略是人手写的、锚点已经在了 → **一个字都不改**。对不上就是失配，
+ *   说明策略被改过而没人承认，由人显式 `zelto policy lock --update` 改锚。
+ */
+export function syncPolicyAnchor(
+  rootDir: string,
+  source: 'generated' | 'manual',
+): PolicyAnchorOutcome {
+  const policyPath = join(rootDir, 'policy', 'policy.yaml');
+  if (!existsSync(policyPath)) {
+    return { status: 'no-policy', locked: null, current: null };
+  }
+
+  const current = computePolicyHash(readFileSync(policyPath, 'utf-8'));
+  const lock = readPolicyLock(rootDir);
+
+  if (source === 'generated' || !lock) {
+    writePolicyLock(rootDir, {
+      version: 1,
+      policy: current,
+      lockedAt: new Date().toISOString(),
+      source,
+    });
+    return { status: 'anchored', locked: current, current };
+  }
+
+  if (lock.policy !== current) {
+    // 策略被改过、锚点没动 —— 不自动改锚，改锚是人的决定
+    return { status: 'mismatch', locked: lock.policy, current };
+  }
+
+  return { status: 'unchanged', locked: lock.policy, current };
+}
+
 export function initializeProject(
   projectMap: ProjectMap,
   options: ProjectInitOptions = { autoDetect: true, policyTemplate: 'default' },
-): { zeltoDir: string; created: string[]; updated: string[]; skipped: string[] } {
+): { zeltoDir: string; created: string[]; updated: string[]; skipped: string[]; anchor: PolicyAnchorOutcome } {
   const rootDir = projectMap.rootDir;
   const created: string[] = [];
   const updated: string[] = [];
@@ -204,9 +263,11 @@ export function initializeProject(
 
   const policyPath = join(policyDir, 'policy.yaml');
   const policyGenerated = isGeneratedFile(policyPath);
+  let policySource: 'generated' | 'manual';
   if (!existsSync(policyPath)) {
     writeFileSync(policyPath, buildPolicyYaml(projectMap), 'utf-8');
     created.push('policy/policy.yaml');
+    policySource = 'generated';
   } else if (policyGenerated) {
     // 同样是 zelto 生成的 → 按实际模块重建写集规则
     const rebuilt = buildPolicyYaml(projectMap);
@@ -215,9 +276,22 @@ export function initializeProject(
       writeFileSync(policyPath, rebuilt, 'utf-8');
       updated.push('policy/policy.yaml');
     }
+    policySource = 'generated';
   } else {
     // 人手写的 policy 是保护域的真源（C5）—— 绝不覆盖
     skipped.push('policy/policy.yaml（人手写的，未改动）');
+    policySource = 'manual';
+  }
+
+  // 3.5 策略锚点（C5）
+  //
+  // 锚点存 `policy/lock.json`，独立于策略本身。策略被改过而锚点没动，
+  // 就是一件可检出的事（哈希失配）—— 由人显式 `zelto policy lock --update` 改锚。
+  const anchor = syncPolicyAnchor(rootDir, policySource);
+  if (anchor.status === 'anchored') {
+    created.push(POLICY_LOCK_PATH);
+  } else if (anchor.status === 'mismatch') {
+    skipped.push(`${POLICY_LOCK_PATH}（策略已被改动，锚点未更新 —— 确认改动是有意的再跑 zelto policy lock --update）`);
   }
 
   // 4. Save project map
@@ -239,7 +313,7 @@ export function initializeProject(
   // 只追加 zelto 需要的条目，不动用户已有的规则。
   created.push(...ensureGitignore(rootDir));
 
-  return { zeltoDir, created, updated, skipped };
+  return { zeltoDir, created, updated, skipped, anchor };
 }
 
 /**
@@ -352,8 +426,9 @@ function buildPolicyYaml(projectMap: ProjectMap): string {
     '    basis: "policy.yaml#protect-agents"',
     '    reason: "Project instructions are read-only"',
     '',
-    'anchors:',
-    '  policy: "sha256:init"',
+    '# 策略哈希锚点不在这里 —— 它独立存放在 policy/lock.json（C5）。',
+    '# 锚点写在策略文件里是自证：改策略的人顺手把哈希也改掉，事后就看不出',
+    '# 「当时按什么标准拦的」被换过。改策略不改锚点 = 可检出的失配。',
     '',
   ].join('\n'));
 }

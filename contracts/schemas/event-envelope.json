@@ -11,8 +11,9 @@
     "run": { "type": ["string", "null"], "description": "Run identifier" },
     "type": {
       "type": "string",
+      "description": "Event type. The enum here is the source of truth; src/core/events/stream.ts (EVENT_TYPES) and src/core/audit/trail.ts must stay in sync with it.",
       "enum": [
-        "slice.state.changed", "slice.drift_detected", "slice.hotfix",
+        "slice.state.changed", "slice.baseline_registered", "slice.drift_detected", "slice.hotfix",
         "spec.drafted", "spec.checked", "spec.frozen",
         "clarify.question", "clarify.answer",
         "run.started", "run.resumed", "run.stalled", "run.finished", "run.aborted",
@@ -30,7 +31,8 @@
         "merge.planned",
         "merge.phase_complete",
         "merge.conflict",
-        "sched.admitted", "sched.blocked", "merge.stale_base",
+        "merge.stale_base",
+        "sched.admitted", "sched.blocked",
         "worktree.created", "worktree.removed",
         "coord.dep_added",
         "coord.phase_ready",
@@ -41,7 +43,11 @@
         "version.delivered",
         "draft.created",
         "draft.revised",
-        "draft.confirmed"
+        "draft.confirmed",
+        "contract.evolution_checked",
+        "contract.baseline_updated",
+        "version.regression_recorded",
+        "version.regression_detected"
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },

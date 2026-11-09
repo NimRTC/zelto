@@ -333,6 +333,31 @@ register('init', async (args) => {
     }
   }
 
+  // 人手写的文件没动 —— 说清楚，否则人以为接管成了，其实门禁命令
+  // 还是他自己写的那套（或 zelto 最初写的通用那套）。
+  for (const item of result.skipped) {
+    console.log(`  ⚠️  ${item}`);
+  }
+
+  // ── 基线切片 ──
+  //
+  // `zelto init` 与 `zelto project init` 必须走**同一条**登记路径
+  // （ADR-039 §3）：接管既有项目时，现状要在第一条命令之后就被登记进追溯链，
+  // 否则人先跑 init 再跑 project init，会看到两次不同的登记记录
+  // （切片 id 相同、内容不同），追溯链就说不清了。
+  const { registerBaselineSlices } = await import('../../core/project/baseline.js');
+  const { created: createdBaselines } = await registerBaselineSlices(projectMap, {
+    store,
+    events,
+    specsDir: 'specs/slices',
+  });
+  if (createdBaselines.length > 0) {
+    console.log(`  ✅ 基线切片 ${createdBaselines.length} 片 —— 现有代码已登记为追溯链的起点`);
+    for (const plan of createdBaselines) {
+      console.log(`     · ${plan.id} — ${plan.moduleName === '.' ? '项目根目录' : plan.moduleName}`);
+    }
+  }
+
   // Create example slice if --with-examples
   if (withExamples) {
     const exampleId = 'example-hello-world';

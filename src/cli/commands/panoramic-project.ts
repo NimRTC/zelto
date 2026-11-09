@@ -1,6 +1,7 @@
 // Panoramic and project takeover commands: pipeline, trace, impact, report, project
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
@@ -14,6 +15,8 @@ import { EventStream } from '../../core/events/stream.js';
 import type { EventEnvelope } from '../../core/events/stream.js';
 import { register } from './shared.js';
 import { ZELTO_DIR, SLICES_DIR, EVENTS_DIR, createLlmFromConfig } from './shared.js';
+import { events as sharedEvents } from './shared.js';
+import { appendBaselineRegisteredEvent } from '../../core/project/baseline.js';
 
 // ─── pipeline ────────────────────────────────────────────────────────────────
 
@@ -373,36 +376,27 @@ register('project', async (args) => {
     // 这一步刻意**不依赖 LLM**：它表达的是「这个模块现在有哪些文件」，
     // 那是 `project scan` 已经拿到的确定性事实。让它依赖模型，
     // 只会让「接管既有项目」在没配 LLM 的机器上直接走不通。
-    const { planBaselineSlices, baselineSpecContent, baselineSliceTitle } = await import('../../core/project/baseline.js');
+    //
+    // 登记动作收敛在 `registerBaselineSlices` 一个函数里（ADR-039 §3）：
+    // `zelto init` 与 `zelto project init` 走同一条路径，
+    // 两条入口产出的基线切片完全一致。
+    const { registerBaselineSlices } = await import('../../core/project/baseline.js');
     const sliceStore = new SliceStore(SLICES_DIR);
-    const slicesDir = 'specs/slices';
-    if (!existsSync(slicesDir)) mkdirSync(slicesDir, { recursive: true });
+    const { created: createdPlans, skipped: skippedPlans } = await registerBaselineSlices(projectMap, {
+      store: sliceStore,
+      events: sharedEvents,
+      specsDir: 'specs/slices',
+    });
 
-    const plans = planBaselineSlices(projectMap);
-    let createdSlices = 0;
-    for (const plan of plans) {
-      if (await sliceStore.exists(plan.id)) continue;
-
-      const slice = sliceStore.create(plan.id, baselineSliceTitle(plan.moduleName), {
-        writes: plan.writes,
-        baseline: true,
-      });
-      // 基线切片是既成事实，不是待办的活 —— 直接落在 completed。
-      slice.state = 'completed';
-      slice.trace.requirements = ['(v0 baseline)'];
-      slice.traceWaiver = '基线切片 — 描述现状，不改代码，无需契约追踪';
-      slice.spec.frozenHash = 'sha256:v0-baseline';
-      slice.spec.frozenAt = new Date().toISOString();
-      await sliceStore.write(slice);
-
-      writeFileSync(join(slicesDir, `${plan.id}.md`), baselineSpecContent(plan), 'utf-8');
-      createdSlices++;
-      console.log(`  ✅ "${plan.id}" — ${plan.moduleName === '.' ? '项目根目录' : plan.moduleName} (${plan.writes.length} 个文件)`);
+    for (const plan of createdPlans) {
+      console.log(
+        `  ✅ "${plan.id}" — ${plan.moduleName === '.' ? '项目根目录' : plan.moduleName} (${plan.files.length + plan.testFiles.length} 个文件)`,
+      );
     }
-    if (createdSlices > 0) {
-      console.log(`\n✅ Created ${createdSlices} baseline slice(s) — 现有代码已登记为追溯链的起点。`);
-    } else if (plans.length > 0) {
-      console.log(`\n✅ Baseline slices already present (${plans.length} modules).`);
+    if (createdPlans.length > 0) {
+      console.log(`\n✅ Created ${createdPlans.length} baseline slice(s) — 现有代码已登记为追溯链的起点。`);
+    } else if (skippedPlans.length > 0) {
+      console.log(`\n✅ Baseline slices already present (${skippedPlans.length} modules).`);
     }
 
     console.log(`\n👉 Next: zelto project design （可选 — 生成更细的模块划分）`);
@@ -483,18 +477,29 @@ register('project', async (args) => {
         continue;
       }
 
-      const slice = sliceStore.create(sliceId, `v0 baseline: ${mod.name}`, {
-        writes: mod.filePatterns.length > 0 ? mod.filePatterns : ['src/**/*.ts'],
-      });
+      const specPath = `specs/slices/${sliceId}.md`;
+      const specContent = `# Slice: ${sliceId}\n\n## 目的\nv0 基线 — ${mod.name}\n\n## 范围\n${mod.filePatterns.map((p: string) => `- \`${p}\``).join('\n')}\n\n## 验收标准\n1. 现有代码不变\n\n## 风险\n- 无\n`;
+      const writes = mod.filePatterns.length > 0 ? mod.filePatterns : ['src/**/*.ts'];
+
+      const slice = sliceStore.create(sliceId, `v0 baseline: ${mod.name}`, { writes });
       slice.state = 'completed';
       slice.trace.requirements = ['(v0 baseline)'];
-      slice.spec.frozenHash = 'sha256:v0-baseline';
+      slice.traceWaiver = '基线切片 — 描述现状，不改代码，无需契约追踪';
+      // 冻结哈希取规格正文的真实哈希 —— 假的占位哈希会让「规格是否被改过」
+      // 这件事永远判不出来（ADR-039 §2）。
+      slice.spec.frozenHash = `sha256:${createHash('sha256').update(specContent, 'utf-8').digest('hex')}`;
       slice.spec.frozenAt = new Date().toISOString();
       await sliceStore.write(slice);
 
-      const specPath = `specs/slices/${sliceId}.md`;
-      const specContent = `# Slice: ${sliceId}\n\n## 目的\nv0 基线 — ${mod.name}\n\n## 范围\n${mod.filePatterns.map((p: string) => `- \`${p}\``).join('\n')}\n\n## 验收标准\n1. 现有代码不变\n\n## 风险\n- 无\n`;
       writeFileSync(specPath, specContent, 'utf-8');
+
+      // C4：基线切片有两条产生路径（扫描结果 / 设计文档），两条都要留痕
+      await appendBaselineRegisteredEvent(sharedEvents, sliceId, {
+        module: mod.name,
+        writes,
+        fileCount: mod.filePatterns.length,
+        reason: '按设计文档登记的基线切片',
+      });
 
       created++;
       console.log(`  ✅ "${sliceId}" — ${mod.name}`);
