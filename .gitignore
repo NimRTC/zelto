@@ -11,6 +11,9 @@ dist-test
 .claude/worktrees/
 # 排障临时产物（不得进版本库）
 tmp-*
+
+# `npm pack` 产物
+*.tgz
 suite.txt
 # Go companion CLI
 zelto
