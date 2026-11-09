@@ -1,6 +1,6 @@
 # zelto 项目目标
 
-> 版本: v0.5.0 · 最后更新: 2026-11-06
+> 版本: v0.5.0 · 最后更新: 2026-11-09
 > 关联文档: `docs/zelto-场景功能地图.md`（功能全貌）、`docs/zelto-技术架构.md`（架构与不变量）、
 > `docs/zelto-开工包.md`（上手）、`docs/zelto-并行自治计划.md`（并行自治路线）、
 > `docs/adr-018-no-auto-merge-on-sign.md`（签字与合并的职责切分）、

@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.0] — 2026-11-09
 
 ### Added
 - **Five follow-ups to taking over an existing project** (ADR-039). The
@@ -82,6 +82,35 @@
   path's advice. The wording now lives in one module (`run-messages.ts`) and
   every path says the same thing: this round does not count, the slice is
   back at `frozen` (not dead), and here is the exact command to run next.
+- Planning confirmation is now a review view instead of a wall of markdown:
+  `zelto require|design|plan show <id>` prints a summary, the **decision points**
+  (acceptance criteria, modules, module dependencies, versions, slices — each
+  marked added / removed / changed) and, with `--diff`, the change against the
+  previous revision; `--full` appends the body (ADR-023).
+- Draft revisions are snapshotted before every refine, so "what changed" is
+  always visible. Snapshots live in `.zelto/revisions/<kind>/<id>/`.
+- New event types `draft.created` / `draft.revised` / `draft.confirmed` —
+  changes to a requirement, design or version plan are now traceable.
+- `zelto pipeline status` lists the drafts that still need confirmation and
+  the exact command to review them.
+- LLM credentials can come from the environment instead of a file:
+  `ZELTO_LLM_API_KEY` > `DEEPSEEK_API_KEY` > `llm.apiKey` in `.zelto/config.yaml`
+  (ADR-022). `baseUrl` / `model` / `pricing` stay in the config file so the
+  project remains reproducible.
+- The config file can point at the environment itself: `apiKey: "${NIMRTC_LLM_API_KEY}"`
+  in `.zelto/config.yaml` is replaced with that variable's value, so the key never
+  touches disk (ADR-026). If the variable is unset, zelto reports "no key" with a
+  warning — the literal `${...}` text is never sent as a credential. Only whole-value
+  references are expanded; `"prefix-${FOO}"` is left as-is.
+- `pnpm check:credentials` — scans changed, untracked and tracked files for
+  credentials before a commit; wired into CI as a gate
+- `zelto arch check` and the architecture guard now pick the **project baseline
+  design** (`zelto project design`, tagged `__project__`) by default instead of
+  "the most recently created confirmed design". Picking a local feature design
+  and comparing it against the whole repo marked every unrelated file as
+  unmapped — the report was misleading and the guard could block legitimate
+  write sets. Other confirmed designs are listed in the report so `--design
+  <id>` is discoverable.
 
 ### Fixed
 - **The installed package was never actually exercised.** The `files`
@@ -163,41 +192,6 @@
   produced two `run.aborted` entries, which reads as "this happened twice" in
   an append-only stream. The second entry is now written only when the audit
   did not already write one.
-
-## [0.5.0] — 2026-11-06
-
-### Added
-- Planning confirmation is now a review view instead of a wall of markdown:
-  `zelto require|design|plan show <id>` prints a summary, the **decision points**
-  (acceptance criteria, modules, module dependencies, versions, slices — each
-  marked added / removed / changed) and, with `--diff`, the change against the
-  previous revision; `--full` appends the body (ADR-023).
-- Draft revisions are snapshotted before every refine, so "what changed" is
-  always visible. Snapshots live in `.zelto/revisions/<kind>/<id>/`.
-- New event types `draft.created` / `draft.revised` / `draft.confirmed` —
-  changes to a requirement, design or version plan are now traceable.
-- `zelto pipeline status` lists the drafts that still need confirmation and
-  the exact command to review them.
-- LLM credentials can come from the environment instead of a file:
-  `ZELTO_LLM_API_KEY` > `DEEPSEEK_API_KEY` > `llm.apiKey` in `.zelto/config.yaml`
-  (ADR-022). `baseUrl` / `model` / `pricing` stay in the config file so the
-  project remains reproducible.
-- The config file can point at the environment itself: `apiKey: "${NIMRTC_LLM_API_KEY}"`
-  in `.zelto/config.yaml` is replaced with that variable's value, so the key never
-  touches disk (ADR-026). If the variable is unset, zelto reports "no key" with a
-  warning — the literal `${...}` text is never sent as a credential. Only whole-value
-  references are expanded; `"prefix-${FOO}"` is left as-is.
-- `pnpm check:credentials` — scans changed, untracked and tracked files for
-  credentials before a commit; wired into CI as a gate
-- `zelto arch check` and the architecture guard now pick the **project baseline
-  design** (`zelto project design`, tagged `__project__`) by default instead of
-  "the most recently created confirmed design". Picking a local feature design
-  and comparing it against the whole repo marked every unrelated file as
-  unmapped — the report was misleading and the guard could block legitimate
-  write sets. Other confirmed designs are listed in the report so `--design
-  <id>` is discoverable.
-
-### Fixed
 - **Policy YAML parsing now ignores quote style and inline key order**
   (ADR-028). A `deny` rule written as `path: 'secrets/**'` was parsed into the
   literal `'secrets/**'`, which never matches a real path — so the rule was
