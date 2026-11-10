@@ -1,6 +1,6 @@
 # zelto 项目目标
 
-> 版本: v0.5.0 · 最后更新: 2026-11-09
+> 版本: v0.5.0 · 最后更新: 2026-11-10
 > 关联文档: `docs/zelto-场景功能地图.md`（功能全貌）、`docs/zelto-技术架构.md`（架构与不变量）、
 > `docs/zelto-开工包.md`（上手）、`docs/zelto-并行自治计划.md`（并行自治路线）、
 > `docs/adr-018-no-auto-merge-on-sign.md`（签字与合并的职责切分）、
@@ -365,9 +365,9 @@ refine 前自动留快照，所以「改了什么」永远看得见。
 
 ## 7. 待决策
 
-以下三处「规格里没写的行为」，按 AGENTS.md 的规矩**停下来问，不自己选**。
+以下四处「规格里没写的行为」，按 AGENTS.md 的规矩**停下来问，不自己选**。
 
-D1、D2、D3 都已决策（见 §6）。
+D1、D2、D3 都已决策（见 §6）。**D4 尚未决策。**
 
 ### D1 版本内切片的依赖从哪来？——已决策：A
 
@@ -410,6 +410,30 @@ A 要动 policy schema，届时单独写 ADR。
 当前进度：**B 与 A 均已落地**（B：`zelto arch check` 只读偏离报告，见 §6.1；
 A：ADR-027，六类硬偏离做成 `policy.yaml` 的 `arch:` 段，`arch check --strict` /
 `version deliver` / `batch` 准入 / 单片 `gate` 四处执行点全部接通）。
+
+### D4 对外分发走什么通道？——**待定**
+
+**尚未决策。** 当前仓库里的事实是：README「Status」一节写着
+「Not published to npm yet (`private: true` still set)」—— 即**尚未发布**，
+但仓库里已有的 npm 打包产物是可用且装得上（`npm pack` 出的 tarball 自包含，
+能在空项目上跑 `zelto init`）。npm 与镜像两条路都还没走完，
+最后选哪条（或都要）由人拍板。
+
+- **选项 A**：npm 为唯一通道。翻转 `private: true`，`files` 白名单已就位
+  （`dist/` `contracts/` `policy/` `bin/` `misc/` `syntax/` + 两份 README + LICENSE，
+  见 commit `8ff3cba`），加发布流水线。
+- **选项 B**：镜像为唯一通道（GHCR 等 registry）。需要补镜像构建与推送流水线；
+  现有 `Dockerfile` 只 COPY 了 `dist/` `contracts/schemas/` 与 `package.json`，
+  且 `docker-compose.yml` 的 `.:/app` 挂载会盖住镜像里的 `/app/dist`（已知限制，
+  已在 compose 头部标注）。
+- **选项 C**：两者都要 —— npm 给开发者装 CLI，镜像给「不想装 Node 的用户」与
+  CI 场景。
+
+未定之前的影响面：README「Status」一节的措辞、`private` 字段的取值、
+CI 里是否加发布 job、`Dockerfile` 与 compose 是否继续维护。
+**这些都不影响 C1–C9** —— 发布通道与判定确定性、状态落文件等不变量无关。
+
+当前倾向（非决策）：先按 npm 走最小可用路径，镜像等有人真的需要再补。
 
 ---
 
