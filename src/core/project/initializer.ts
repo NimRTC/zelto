@@ -11,8 +11,15 @@ import {
   readPolicyLock,
   writePolicyLock,
 } from '../policy/lock.js';
-import type { ProjectMap, ProjectInitOptions } from './types.js';
+import type { ProjectMap, ProjectInitOptions, ProjectInitDeps } from './types.js';
 import { detectRootBuildFiles } from './scanner.js';
+import {
+  extractLegacyAnchor,
+  isLegacyConfigContent,
+  isLegacyPolicyContent,
+  legacyConfigIsRebuildable,
+  legacyPolicyIsRebuildable,
+} from './legacy-migration.js';
 
 /**
  * 自动生成文件的标记。
@@ -212,14 +219,28 @@ export function syncPolicyAnchor(
   return { status: 'unchanged', locked: lock.policy, current };
 }
 
-export function initializeProject(
+/** 一次迁移的记录（接管时把老版本生成物升级成当前版本） */
+export interface PolicyMigration {
+  /** 被迁移的文件 */
+  file: string;
+  /** 迁移前的样子 */
+  from: 'legacy' | 'legacy-anchors';
+  /** 迁移后的样子 */
+  to: 'generated' | 'external';
+  /** 人话说明 */
+  detail: string;
+}
+
+export async function initializeProject(
   projectMap: ProjectMap,
   options: ProjectInitOptions = { autoDetect: true, policyTemplate: 'default' },
-): { zeltoDir: string; created: string[]; updated: string[]; skipped: string[]; anchor: PolicyAnchorOutcome } {
+  deps: ProjectInitDeps = {},
+): Promise<{ zeltoDir: string; created: string[]; updated: string[]; skipped: string[]; migrated: PolicyMigration[]; anchor: PolicyAnchorOutcome }> {
   const rootDir = projectMap.rootDir;
   const created: string[] = [];
   const updated: string[] = [];
   const skipped: string[] = [];
+  const migrated: PolicyMigration[] = [];
 
   // 1. Create .zelto directory structure
   const zeltoDir = join(rootDir, '.zelto');
@@ -237,6 +258,10 @@ export function initializeProject(
   // 接管既有项目时（`zelto init` 已经建过），要按真实探测结果更新门禁命令 ——
   // 通用的 `pnpm test` 在一个 npm 项目或 Rust 项目上是错的。
   // 但人手写的 config.yaml 一个字都不动。
+  //
+  // 老版本 zelto 生成的 config 没有标记行（ADR-040 §3.1），既不是「生成的」
+  // 也不是「人写的」—— 单独一档 `legacy`：门禁命令还是通用默认值就重建，
+  // 是自定义的就一个字都不动。
   const configPath = join(zeltoDir, 'config.yaml');
   const configGenerated = isGeneratedFile(configPath);
   if (!existsSync(configPath)) {
@@ -251,8 +276,28 @@ export function initializeProject(
       updated.push('.zelto/config.yaml');
     }
   } else {
-    // 人手写的 → 不动，但要让人知道「门禁命令可能与项目不符」
-    skipped.push('.zelto/config.yaml（人手写的，未改动）');
+    const previous = readFileSync(configPath, 'utf-8');
+    if (isLegacyConfigContent(previous)) {
+      // 老版本生成的 → 看门禁命令还是不是通用默认值（ADR-040 §3.2）
+      if (legacyConfigIsRebuildable(previous)) {
+        const rebuilt = buildConfigYaml(projectMap, options);
+        if (previous !== rebuilt) {
+          writeFileSync(configPath, rebuilt, 'utf-8');
+          updated.push('.zelto/config.yaml');
+          migrated.push({
+            file: '.zelto/config.yaml',
+            from: 'legacy',
+            to: 'generated',
+            detail: '老版本 zelto 生成的配置，门禁命令还是通用默认值 → 按真实探测结果重建',
+          });
+        }
+      } else {
+        skipped.push('.zelto/config.yaml（老版本 zelto 生成，门禁命令是自定义的，未改动 —— 请人工核对）');
+      }
+    } else {
+      // 人手写的 → 不动，但要让人知道「门禁命令可能与项目不符」
+      skipped.push('.zelto/config.yaml（人手写的，未改动）');
+    }
   }
 
   // 3. Create policy/policy.yaml
@@ -265,6 +310,7 @@ export function initializeProject(
   const policyPath = join(policyDir, 'policy.yaml');
   const policyGenerated = isGeneratedFile(policyPath);
   let policySource: 'generated' | 'manual';
+  let legacyAnchor: string | null = null;
   if (!existsSync(policyPath)) {
     writeFileSync(policyPath, buildPolicyYaml(projectMap), 'utf-8');
     created.push('policy/policy.yaml');
@@ -279,16 +325,69 @@ export function initializeProject(
     }
     policySource = 'generated';
   } else {
-    // 人手写的 policy 是保护域的真源（C5）—— 绝不覆盖
-    skipped.push('policy/policy.yaml（人手写的，未改动）');
-    policySource = 'manual';
+    const previous = readFileSync(policyPath, 'utf-8');
+    if (isLegacyPolicyContent(previous)) {
+      // 老版本生成的策略（ADR-040 §3.2）。
+      //
+      // 老生成器只给「顶层目录」发规则，根级构建清单不在任何规则里 →
+      // 落到 default: deny。规格里明写「在顶层 CMakeLists.txt 注册新模块」，
+      // agent 一改就被钩子当场拒掉 —— 接管路径整体走不通。
+      //
+      // 老锚点先取出来：哪怕这次是**我们**迁移动了策略，策略也「变过了」——
+      // 失配要被判出来，而不是被迁移顺手洗掉。
+      legacyAnchor = extractLegacyAnchor(previous);
+      const rebuilt = buildPolicyYaml(projectMap);
+      if (legacyPolicyIsRebuildable(previous, rebuilt)) {
+        writeFileSync(policyPath, rebuilt, 'utf-8');
+        updated.push('policy/policy.yaml');
+        policySource = 'generated';
+        migrated.push({
+          file: 'policy/policy.yaml',
+          from: 'legacy',
+          to: 'generated',
+          detail: '老版本 zelto 生成的策略，无人工规则 → 按真实模块重建（补上根级构建清单）',
+        });
+      } else {
+        // 含人工规则 → 一个字都不动（C5：策略是保护域的真源）
+        skipped.push('policy/policy.yaml（老版本 zelto 生成且含人工规则，未改动 —— 请人工核对）');
+        policySource = 'manual';
+      }
+    } else {
+      // 人手写的 policy 是保护域的真源（C5）—— 绝不覆盖
+      skipped.push('policy/policy.yaml（人手写的，未改动）');
+      policySource = 'manual';
+      legacyAnchor = extractLegacyAnchor(previous);
+    }
   }
 
   // 3.5 策略锚点（C5）
   //
   // 锚点存 `policy/lock.json`，独立于策略本身。策略被改过而锚点没动，
   // 就是一件可检出的事（哈希失配）—— 由人显式 `zelto policy lock --update` 改锚。
-  const anchor = syncPolicyAnchor(rootDir, policySource);
+  //
+  // 老版本（ADR-039 之前）把锚点写在策略自己体内的 `anchors:` 段里。
+  // 那份锚点不能丢：它记的是「当时按什么标准拦的」。哪怕这次是**我们**
+  // 迁移动了策略，策略也「变过了」—— 失配应当被判出来，由人确认后改锚，
+  // 而不是被迁移顺手洗掉。所以老锚点搬进 lock.json 之后，
+  // 这一轮**不再**自动覆盖它。
+  if (legacyAnchor && !readPolicyLock(rootDir)) {
+    writePolicyLock(rootDir, {
+      version: 1,
+      policy: legacyAnchor,
+      lockedAt: new Date().toISOString(),
+      source: 'manual',
+    });
+    migrated.push({
+      file: POLICY_LOCK_PATH,
+      from: 'legacy-anchors',
+      to: 'external',
+      detail: '老策略内嵌的 anchors 锚点已外部化到 policy/lock.json',
+    });
+  }
+
+  // 有老锚点时按「人工策略」口径同步 —— 锚点已经在了，一个字都不改，
+  // 对不上就报失配（ADR-039 §3.2 的第三条）。
+  const anchor = syncPolicyAnchor(rootDir, legacyAnchor ? 'manual' : policySource);
   if (anchor.status === 'anchored') {
     created.push(POLICY_LOCK_PATH);
   } else if (anchor.status === 'mismatch') {
@@ -314,7 +413,17 @@ export function initializeProject(
   // 只追加 zelto 需要的条目，不动用户已有的规则。
   created.push(...ensureGitignore(rootDir));
 
-  return { zeltoDir, created, updated, skipped, anchor };
+  // 6. 迁移留痕（C4）
+  //
+  // 迁移是一个动作：它动了策略 —— 「当时按什么标准拦的」换过了，
+  // 这件事必须事后可查。事件落 `project.policy_migrated`。
+  if (migrated.length > 0 && deps.events) {
+    await deps.events.append('project', 'project.policy_migrated', 'zelto', {
+      migrations: migrated,
+    });
+  }
+
+  return { zeltoDir, created, updated, skipped, migrated, anchor };
 }
 
 /**

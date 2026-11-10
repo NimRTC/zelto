@@ -321,7 +321,7 @@ register('init', async (args) => {
   }
 
   // Initialize governance (config.yaml + policy.yaml)
-  const result = initializeProject(projectMap, { autoDetect: true, policyTemplate: 'default' });
+  const result = await initializeProject(projectMap, { autoDetect: true, policyTemplate: 'default' }, { events });
   created += result.created.length;
 
   if (created === 0) {
@@ -331,6 +331,11 @@ register('init', async (args) => {
     for (const item of result.created) {
       console.log(`  ✅ ${item}`);
     }
+  }
+
+  // 老版本生成物被迁移了 —— 说清楚迁了什么（ADR-040）
+  for (const item of result.migrated) {
+    console.log(`  🔄 ${item.file}：${item.detail}`);
   }
 
   // 人手写的文件没动 —— 说清楚，否则人以为接管成了，其实门禁命令

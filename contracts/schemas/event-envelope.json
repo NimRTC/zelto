@@ -14,6 +14,7 @@
       "description": "Event type. The enum here is the source of truth; src/core/events/stream.ts (EVENT_TYPES) and src/core/audit/trail.ts must stay in sync with it.",
       "enum": [
         "slice.state.changed", "slice.baseline_registered", "slice.drift_detected", "slice.hotfix",
+        "project.policy_migrated",
         "spec.drafted", "spec.checked", "spec.frozen",
         "clarify.question", "clarify.answer",
         "run.started", "run.resumed", "run.stalled", "run.finished", "run.aborted",

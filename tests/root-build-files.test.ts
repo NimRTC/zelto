@@ -75,8 +75,8 @@ describe('根级构建清单 · policy 生成', () => {
     assert.deepEqual(detectRootBuildFiles(cppDir, 'unknown'), []);
   });
 
-  it('C++ 项目的根级 CMakeLists.txt 在策略里是 allow', () => {
-    initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
+  it('C++ 项目的根级 CMakeLists.txt 在策略里是 allow', async () => {
+    await initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
 
     const { rules } = parsePolicyYaml(
       // 策略由 initializeProject 写到 policy/policy.yaml
@@ -90,8 +90,8 @@ describe('根级构建清单 · policy 生成', () => {
     assert.equal(preset.decision, 'allow', 'CMakePresets.json 同样要可写');
   });
 
-  it('粒度是精确路径 —— 子目录里的同名文件不由根级规则管', () => {
-    initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
+  it('粒度是精确路径 —— 子目录里的同名文件不由根级规则管', async () => {
+    await initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
 
     const { rules } = parsePolicyYaml(
       readFileSync(join(cppDir, 'policy', 'policy.yaml'), 'utf-8'),
@@ -107,8 +107,8 @@ describe('根级构建清单 · policy 生成', () => {
     assert.notEqual(nested.ruleId, rootRule.id, '子目录那条应由目录规则命中，而不是根级规则');
   });
 
-  it('node 项目的根级 package.json 可写', () => {
-    initializeProject(scanProject(nodeDir), { autoDetect: true, policyTemplate: 'default' });
+  it('node 项目的根级 package.json 可写', async () => {
+    await initializeProject(scanProject(nodeDir), { autoDetect: true, policyTemplate: 'default' });
 
     const { rules } = parsePolicyYaml(
       readFileSync(join(nodeDir, 'policy', 'policy.yaml'), 'utf-8'),
@@ -118,8 +118,8 @@ describe('根级构建清单 · policy 生成', () => {
     assert.equal(decision.decision, 'allow', `根级 package.json 必须可写，实际：${JSON.stringify(decision)}`);
   });
 
-  it('根级非构建文件仍然落在 default deny（不因修一个洞开更大的洞）', () => {
-    initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
+  it('根级非构建文件仍然落在 default deny（不因修一个洞开更大的洞）', async () => {
+    await initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
 
     const { rules } = parsePolicyYaml(
       readFileSync(join(cppDir, 'policy', 'policy.yaml'), 'utf-8'),
@@ -130,13 +130,13 @@ describe('根级构建清单 · policy 生成', () => {
   });
 
   it('接管重建策略时根级规则仍在（不是只在首次生成时）', async () => {
-    initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
 
     // 接管之间项目变了：新增一个顶层模块目录（策略里会多一条 lib/** 规则）
     await mkdir(join(cppDir, 'lib'), { recursive: true });
     await writeFile(join(cppDir, 'lib', 'c.cpp'), 'int c() { return 3; }\n', 'utf-8');
 
-    const result = initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(scanProject(cppDir), { autoDetect: true, policyTemplate: 'default' });
     assert.ok(result.updated.includes('policy/policy.yaml'), '第二次接管应当重建策略');
 
     const { rules } = parsePolicyYaml(

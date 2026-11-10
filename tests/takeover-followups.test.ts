@@ -132,8 +132,8 @@ describe('ADR-039 · 策略锚点独立于策略（C5）', () => {
     await rm(TEST_DIR, { recursive: true, force: true });
   });
 
-  it('初始化会写 policy/lock.json，锚点值就是当前策略的哈希', () => {
-    initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
+  it('初始化会写 policy/lock.json，锚点值就是当前策略的哈希', async () => {
+    await initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
 
     const lockPath = join(dir, 'policy', 'lock.json');
     assert.ok(existsSync(lockPath), `锚点文件应存在：${lockPath}`);
@@ -155,7 +155,7 @@ describe('ADR-039 · 策略锚点独立于策略（C5）', () => {
     );
     await writeDemoProject(manualDir);
 
-    initializeProject(scanProject(manualDir), { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(scanProject(manualDir), { autoDetect: true, policyTemplate: 'default' });
 
     const lock = readPolicyLock(manualDir);
     assert.ok(lock, '人手写的策略也要有锚点');
@@ -172,7 +172,7 @@ describe('ADR-039 · 策略锚点独立于策略（C5）', () => {
     assert.equal(status.mismatch, true, '策略被改过而锚点没动 = 失配');
 
     // 再跑一次接管：失配要被报告出来，但锚点一个字都不改
-    const result = initializeProject(scanProject(manualDir), { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(scanProject(manualDir), { autoDetect: true, policyTemplate: 'default' });
     assert.equal(result.anchor.status, 'mismatch', '接管不应自动改锚');
     assert.ok(
       result.skipped.some((s) => s.includes('lock.json')),

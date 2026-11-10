@@ -23,6 +23,7 @@ export const EVENT_TYPES = [
   'slice.baseline_registered',
   'slice.drift_detected',
   'slice.hotfix',
+  'project.policy_migrated',
   'spec.drafted',
   'spec.checked',
   'spec.frozen',

@@ -338,7 +338,16 @@ register('project', async (args) => {
 
     console.log('🏗️  Initializing zelto governance...');
     const { initializeProject } = await import('../../core/project/initializer.js');
-    const result = initializeProject(projectMap, { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(
+      projectMap,
+      { autoDetect: true, policyTemplate: 'default' },
+      { events: sharedEvents },
+    );
+
+    // 老版本生成物被迁移了 —— 说清楚迁了什么（ADR-040）
+    for (const item of result.migrated) {
+      console.log(`   🔄 ${item.file}：${item.detail}`);
+    }
 
     if (result.created.length === 0 && result.updated.length === 0) {
       console.log('   ✅ Already initialized.');

@@ -28,6 +28,19 @@ export interface ValidationError {
 export interface ValidationResult {
   valid: boolean;
   errors: ValidationError[];
+  /**
+   * 警告 —— 「不致命但人该知道」的事。
+   *
+   * 为什么要有这一档：`anchors:` 段在 ADR-039 之前把策略哈希锚点写在
+   * 策略自己体内（自证）。ADR-039 把锚点外部化到 `policy/lock.json`，
+   * 但**没有**处置老项目里已经存在的 `anchors:` 段 ——
+   * 校验器把它当「未知顶层键」直接判红，于是老项目一接管就
+   * `policy validate` FAILED，接管路径整体走不通。
+   *
+   * 正确处置是「认它、忽略它、报出来」：它不参与任何判定
+   * （锚点真源在 lock.json），但人该知道策略里还留着这么一段。
+   */
+  warnings?: ValidationError[];
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +445,7 @@ export function validateMatch(match: unknown, basePath: string): ValidationError
  */
 export function validatePolicyYaml(content: string): ValidationResult {
   const errors: ValidationError[] = [];
+  const warnings: ValidationError[] = [];
 
   if (typeof content !== 'string' || content.trim() === '') {
     errors.push({
@@ -443,11 +457,12 @@ export function validatePolicyYaml(content: string): ValidationResult {
   }
 
   // Phase 1: structural YAML parsing checks
-  const structuralErrors = validateYamlStructure(content);
-  errors.push(...structuralErrors);
+  const structural = validateYamlStructure(content);
+  errors.push(...structural.errors);
+  warnings.push(...structural.warnings);
 
-  if (structuralErrors.length > 0) {
-    return { valid: false, errors };
+  if (structural.errors.length > 0) {
+    return { valid: false, errors, warnings };
   }
 
   // Phase 2: parse with the single parser and validate rules + arch
@@ -460,7 +475,7 @@ export function validatePolicyYaml(content: string): ValidationResult {
       message: 'Could not parse any rules from policy YAML. Check formatting.',
       code: 'E_PARSE',
     });
-    return { valid: false, errors };
+    return { valid: false, errors, warnings };
   }
 
   // Validate each parsed rule
@@ -498,7 +513,7 @@ export function validatePolicyYaml(content: string): ValidationResult {
     }
   }
 
-  return { valid: errors.length === 0, errors };
+  return { valid: errors.length === 0, errors, warnings };
 }
 
 /**
@@ -550,9 +565,14 @@ export function validateRuleResult(rule: unknown): ValidationResult {
 /**
  * Quick structural check on YAML content before attempting to parse rules.
  * Looks for obvious structural issues.
+ *
+ * 返回 `{errors, warnings}` 两档：
+ *   - **错误**：策略文件本身不合法（`validate` 退出码 1）；
+ *   - **警告**：不致命但人该知道（`validate` 仍退出 0，但会报出来）。
  */
-function validateYamlStructure(content: string): ValidationError[] {
+function validateYamlStructure(content: string): { errors: ValidationError[]; warnings: ValidationError[] } {
   const errors: ValidationError[] = [];
+  const warnings: ValidationError[] = [];
 
   // Check for "rules:" header
   if (!content.includes('rules:')) {
@@ -561,7 +581,7 @@ function validateYamlStructure(content: string): ValidationError[] {
       message: 'Policy YAML must contain a "rules:" top-level key',
       code: 'E_STRUCTURE',
     });
-    return errors;
+    return { errors, warnings };
   }
 
   const lines = content.split('\n');
@@ -600,7 +620,17 @@ function validateYamlStructure(content: string): ValidationError[] {
       // Only check lines that have no leading whitespace (top-level keys)
       if (line.length > 0 && line[0] !== ' ' && line[0] !== '\t' && originalTrimmed !== '' && !originalTrimmed.startsWith('#') && !originalTrimmed.startsWith('-')) {
         const keyName = originalTrimmed.split(':')[0].trim();
-        if (keyName !== 'rules' && keyName !== 'protected' && keyName !== 'arch') {
+        if (keyName === 'anchors') {
+          // 老版本（ADR-039 之前）把策略哈希锚点写在策略自己体内。
+          // 锚点已外部化到 policy/lock.json，这一段现在**不参与任何判定**。
+          // 但它不该让整份策略判红 —— 否则老项目一接管就 validate FAILED，
+          // 接管路径整体走不通。认它、忽略它、报出来（ADR-040 §3.3）。
+          warnings.push({
+            path: `line:${lineIdx + 1}`,
+            message: 'Deprecated "anchors" section — the policy hash anchor now lives in policy/lock.json; this section is ignored',
+            code: 'W_DEPRECATED_ANCHORS',
+          });
+        } else if (keyName !== 'rules' && keyName !== 'protected' && keyName !== 'arch') {
           errors.push({
             path: `line:${lineIdx + 1}`,
             message: `Unknown top-level key "${keyName}". Only "rules", "protected" and "arch" are allowed`,
@@ -611,5 +641,5 @@ function validateYamlStructure(content: string): ValidationError[] {
     }
   }
 
-  return errors;
+  return { errors, warnings };
 }

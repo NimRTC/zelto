@@ -80,7 +80,7 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
 
   it('生成的 config.yaml 带哈希标记行（判据是内容，不是「文件存在」）', async () => {
     const map = scanProject(dir);
-    initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
 
     const config = await readFile(join(dir, '.zelto', 'config.yaml'), 'utf-8');
     assert.ok(
@@ -91,7 +91,7 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
 
   it('zelto 生成的文件被接管重建：门禁命令按真实探测结果更新', async () => {
     const map = scanProject(dir);
-    initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
 
     // 第一次生成用的是探测结果 —— 这里必须是 npm test 而不是通用的 pnpm test
     let config = await readFile(join(dir, '.zelto', 'config.yaml'), 'utf-8');
@@ -100,7 +100,7 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
     // 改项目实际情况（换测试命令）→ 重新接管 → config 必须跟着更新
     await writeDemoProject(dir, 'vitest run');
     const map2 = scanProject(dir);
-    const result = initializeProject(map2, { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(map2, { autoDetect: true, policyTemplate: 'default' });
 
     assert.ok(result.updated.includes('.zelto/config.yaml'), 'zelto 生成的 config 应被更新');
     config = await readFile(join(dir, '.zelto', 'config.yaml'), 'utf-8');
@@ -109,13 +109,13 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
 
   it('人改过的 config.yaml 一个字都不动（接管不能覆盖人的意图）', async () => {
     const map = scanProject(dir);
-    initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(map, { autoDetect: true, policyTemplate: 'default' });
 
     const configPath = join(dir, '.zelto', 'config.yaml');
     const original = (await readFile(configPath, 'utf-8')).replace('run: vitest run', 'run: my-own-test');
     await writeFile(configPath, original, 'utf-8');
 
-    const result = initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
 
     assert.ok(!result.updated.includes('.zelto/config.yaml'), '人改过的 config 不能被更新');
     assert.ok(
@@ -131,7 +131,7 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
     const original = `# 我手写的策略\nrules: []\n`;
     await writeFile(policyPath, original, 'utf-8');
 
-    const result = initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
+    const result = await initializeProject(scanProject(dir), { autoDetect: true, policyTemplate: 'default' });
 
     assert.ok(!result.updated.includes('policy/policy.yaml'), '人手写的 policy 不可被更新');
     const after = await readFile(policyPath, 'utf-8');
@@ -143,7 +143,7 @@ describe('接管既有项目 · 初始化能接管而不是静默失败', () => 
     await mkdir(dir2, { recursive: true });
     await writeDemoProject(dir2);
 
-    initializeProject(scanProject(dir2), { autoDetect: true, policyTemplate: 'default' });
+    await initializeProject(scanProject(dir2), { autoDetect: true, policyTemplate: 'default' });
 
     const gitignore = await readFile(join(dir2, '.gitignore'), 'utf-8');
     assert.ok(gitignore.includes('.zelto/'), '.gitignore 必须包含 .zelto/');

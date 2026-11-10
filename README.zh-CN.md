@@ -72,7 +72,7 @@ clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ fr
 - **并行准入** — 写集冲突检测，保证切片不会互相踩踏
 - **停机分类** — 9 类停机（权限确认、环境失败、上下文耗尽、认知卡壳、计划门禁、预算耗尽、门禁重试、agent 提问、人工拉闸）
 - **签名管理** — 审批/拒绝/撤销工作流，待签队列（签字只改状态，合并需显式跑 `zelto merge`）
-- **事件流** — 57 种事件的 append-only JSONL 日志
+- **事件流** — 58 种事件的 append-only JSONL 日志
 - **草稿评审** — `require/design/plan show <id>` 给出摘要、决策点（新增/移除/变更）与相对上一版的 diff；refine 前自动留快照（ADR-023）
 - **审计追踪** — 覆盖主要事件摘要，可读文本报告
 - **度量收集** — rework rate、cycle time、stall counts
@@ -179,7 +179,7 @@ zelto/
 │   ├── core/
 │   │   ├── policy/     策略引擎（规则匹配·保护域·锚点校验）
 │   │   ├── slice/      切片状态机（6 状态·文件持久化）
-│   │   ├── events/     append-only 事件流（57 种事件）
+│   │   ├── events/     append-only 事件流（58 种事件）
 │   │   ├── gate/       门禁执行器 + 签名管理器
 │   │   ├── stall/      停机分类器（9 类）
 │   │   ├── sched/      并行准入 + 约束分发

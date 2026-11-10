@@ -240,7 +240,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Policy Engine** | `src/core/policy/engine.ts` | 策略规则匹配、保护域、路径逃逸检测、锚点校验 |
 | **Slice State Machine** | `src/core/slice/state.ts` | 6 状态状态机，9 事件转换 |
 | **Slice Store** | `src/core/slice/store.ts` | 切片文件持久化（`.zelto/slices/<id>.json`） |
-| **Event Stream** | `src/core/events/stream.ts` | 57 种事件的 append-only JSONL 流 |
+| **Event Stream** | `src/core/events/stream.ts` | 58 种事件的 append-only JSONL 流 |
 | **Gate Executor** | `src/core/gate/executor.ts` | Shell 命令执行器（门禁②） |
 | **Sign Manager** | `src/core/gate/sign.ts` | 签名请求、审批/拒绝工作流 |
 | **Stall Classifier** | `src/core/stall/classifier.ts` | 9 类停机分类 |
@@ -248,7 +248,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
-| **Audit Trail** | `src/core/audit/trail.ts` | 57 种事件摘要、可读审计报告 |
+| **Audit Trail** | `src/core/audit/trail.ts` | 58 种事件摘要、可读审计报告 |
 | **Spec Executor** | `src/core/spec/SpecMdExecutor.ts` | Markdown 规格文件自校验（parse/validate/runChecklists） |
 | **Spec Format** | `src/core/spec/format.ts` | 规格章节契约唯一真源（概念 + 双语别名，ADR-016） |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
@@ -386,7 +386,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 
 ---
 
-## 5. 事件类型（57 种）
+## 5. 事件类型（58 种）
 
 事件类型是**契约**：`contracts/schemas/event-envelope.json` 的 enum 是真源，
 `core/events/stream.ts` 与 `core/audit/trail.ts` 必须与它一致。
@@ -421,6 +421,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | 版本 | `version.accepted`, `version.delivered`, `version.regression_recorded`, `version.regression_detected` |
 | 草稿 | `draft.created`, `draft.revised`, `draft.confirmed` |
 | 契约 | `contract.evolution_checked`, `contract.baseline_updated` |
+| 接管 | `project.policy_migrated` |
 
 **版本级事件**用 `version-<label>` 作归属键（版本不是切片，事件流按切片分目录），
 见 `docs/adr-017-version-level-orchestration.md`。

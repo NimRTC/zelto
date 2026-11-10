@@ -156,6 +156,10 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
     : null;
 
   // All valid
+  const warnings = [
+    ...(yamlResult.warnings ?? []).map((w) => ({ path: w.path, message: w.message, code: w.code })),
+    ...(anchorWarning ? [{ path: '', message: anchorWarning, code: 'W_ANCHOR_MISMATCH' }] : []),
+  ];
   if (options.json) {
     writeOutput(
       {
@@ -173,7 +177,7 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
           mismatch: anchor.mismatch,
           source: anchor.source,
         },
-        ...(anchorWarning ? { warnings: [anchorWarning] } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
       },
       undefined,
       { json: true },
@@ -182,6 +186,10 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
     console.log(`${colors.green('✓')} ${colors.bold('Validation: PASSED')}`);
     console.log(`  ${colors.dim(`Rules: ${config.rules.length}, Protected paths: ${config.protected.length}`)}`);
     console.log(`  ${colors.dim(`Source: ${policyPath}`)}`);
+    // 废弃段：不致命，但人该知道（ADR-040 §3.3）
+    for (const w of yamlResult.warnings ?? []) {
+      console.log(`${colors.yellow('⚠')} ${colors.bold('弃用段')} ${w.path ? `${colors.dim(w.path)}: ` : ''}${w.message}`);
+    }
     if (anchorWarning) {
       console.log('');
       console.log(`${colors.yellow('⚠')} ${colors.bold('锚点失配')} ${colors.dim('（不影响 validate 的退出码 —— 判锚点用 zelto policy lock）')}`);

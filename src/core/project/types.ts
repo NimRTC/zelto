@@ -1,5 +1,7 @@
 // Project types — project scan results and governance state
 
+import type { EventType } from '../events/stream.js';
+
 export type ProjectType = 'node' | 'python' | 'rust' | 'go' | 'cpp' | 'unknown';
 
 export interface ProjectModule {
@@ -28,6 +30,23 @@ export interface ProjectInitOptions {
   autoDetect: boolean;
   /** Policy rules to include (default: src/** writes, policy/** protected) */
   policyTemplate: 'default' | 'minimal';
+}
+
+/**
+ * 初始化时可选的依赖注入。
+ *
+ * 只有事件流一处：迁移是一个动作，动了文件就要留痕（C4）。
+ * 不注入也能调 —— 只是不留痕（单元测试用）。
+ */
+export interface ProjectInitDeps {
+  events?: {
+    append(
+      sliceId: string,
+      type: EventType,
+      actor: string,
+      payload: Record<string, unknown>,
+    ): Promise<unknown>;
+  };
 }
 
 export interface ProjectStatus {

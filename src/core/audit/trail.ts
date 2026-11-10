@@ -40,6 +40,11 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
     `Drift detected: ${String(e.payload?.reason ?? 'unknown reason')}`,
   'slice.hotfix': (e) =>
     `Hotfix applied (gate skipped, auto-approved) in ${String(e.payload?.elapsed ?? '?')}s: ${String(e.payload?.note ?? '')}`,
+  'project.policy_migrated': (e) => {
+    const migrations = Array.isArray(e.payload?.migrations) ? (e.payload.migrations as Array<Record<string, unknown>>) : [];
+    const files = migrations.map((m) => String(m.file ?? '?')).join(', ');
+    return `Policy migrated (${migrations.length} file(s)): ${files || '?'}`;
+  },
   'spec.drafted': () => 'Spec drafted',
   'spec.checked': () => 'Spec checked',
   'spec.frozen': () => 'Spec frozen',
