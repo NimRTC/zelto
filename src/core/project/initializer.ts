@@ -12,6 +12,7 @@ import {
   writePolicyLock,
 } from '../policy/lock.js';
 import type { ProjectMap, ProjectInitOptions } from './types.js';
+import { detectRootBuildFiles } from './scanner.js';
 
 /**
  * 自动生成文件的标记。
@@ -388,6 +389,30 @@ function buildPolicyYaml(projectMap: ProjectMap): string {
     '',
   ].join('\n'));
 
+  // 根级构建清单 —— 单独一组规则。
+  //
+  // 为什么必须单独一组：上面的目录规则只覆盖「顶层目录/**」，
+  // 根级的构建清单（CMakeLists.txt / package.json / Cargo.toml …）
+  // 不在任何目录里，于是落到 `default: deny`。而规格里常明写
+  // 「在顶层 CMakeLists.txt 注册新模块」—— agent 一改就被钩子当场拒掉。
+  //
+  // 用**精确路径**而不是通配：`CMakeLists.txt` 只匹配根级那一个，
+  // 子目录里的 CMakeLists.txt 由各自的目录规则管（粒度更细的边界不丢）。
+  //
+  // 这一层是外层粗边界：真正的精确边界是每个切片的写集预约（人批准的），
+  // 以及运行后的 git 审计。门禁命令本身存在 `.zelto/config.yaml`（保护域）。
+  const rootBuildFiles = detectRootBuildFiles(projectMap.rootDir, projectMap.projectType);
+  const rootBuildRules = rootBuildFiles.map((file, i) => [
+    `  - id: allow-write-root-${i}`,
+    `    match:`,
+    `      path: "${file}"`,
+    `      operation: "write"`,
+    `    action: allow`,
+    `    basis: "policy.yaml#allow-write-root-${i}"`,
+    `    reason: "Root build manifest — agents may register new modules here"`,
+    '',
+  ].join('\n'));
+
   return withMarker([
     '# zelto policy rules',
     `# Auto-generated for "${projectMap.projectName}"`,
@@ -396,6 +421,7 @@ function buildPolicyYaml(projectMap: ProjectMap): string {
     'rules:',
     '',
     ...writeRules,
+    ...rootBuildRules,
     '  - id: allow-read-all',
     '    match:',
     '      path: "**"',

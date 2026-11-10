@@ -41,6 +41,45 @@ const CONFIG_FILES: Record<string, ProjectType> = {
   'Makefile': 'cpp',
 };
 
+/**
+ * 根级构建清单文件 —— agent 加模块时必须能改的那几个文件。
+ *
+ * 为什么需要它：policy 生成时只给「顶层目录」发 allow 规则（`src/**` 等），
+ * 根级的构建清单不在任何规则里 → 落到 `default: deny`。于是
+ * 「在顶层 CMakeLists.txt 里加一个 module」这种规格里明确要求的动作，
+ * 会被 PreToolUse 钩子当场拒掉。接管任何 CMake / npm 项目都会踩到。
+ *
+ * 按项目类型认，而不是「根目录里出现过的所有已知文件」：
+ * 一个仓库里混着别的语言的构建文件（例如前端工程里的 package.json）
+ * 不代表它就是该项目的构建入口。
+ *
+ * 清单只收**枚举源码/依赖/构建目标**的文件：
+ *   - 不收 `tsconfig.json` 之类纯编译期配置（不枚举源码）；
+ *   - 收 `package.json`（枚举依赖与入口脚本）——
+ *     门禁命令本身存在 `.zelto/config.yaml`（保护域），改不到；
+ *     逐写判定还会先过「切片写集预约」，写集是人批准的。
+ *     这一层是外层粗粒度边界，不是唯一防线。
+ */
+const ROOT_BUILD_FILES: Record<ProjectType, readonly string[]> = {
+  node: ['package.json'],
+  python: ['pyproject.toml', 'setup.py'],
+  rust: ['Cargo.toml'],
+  go: ['go.mod'],
+  cpp: ['CMakeLists.txt', 'CMakePresets.json', 'Makefile'],
+  unknown: [],
+};
+
+/**
+ * 探测根级构建清单文件 —— 只返回**实际存在**的那些。
+ *
+ * 不存在的文件不该出现在规则里：规则写成 allow 但文件不存在，
+ * 只会让人误以为「这个项目有根级 Cargo.toml 可以改」。
+ */
+export function detectRootBuildFiles(rootDir: string, projectType: ProjectType): string[] {
+  const candidates = ROOT_BUILD_FILES[projectType] ?? [];
+  return candidates.filter((f) => existsSync(join(rootDir, f)));
+}
+
 function detectProjectType(rootDir: string): ProjectType {
   for (const [file, type] of Object.entries(CONFIG_FILES)) {
     if (existsSync(join(rootDir, file))) return type;
