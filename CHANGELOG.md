@@ -111,6 +111,13 @@
   unmapped — the report was misleading and the guard could block legitimate
   write sets. Other confirmed designs are listed in the report so `--design
   <id>` is discoverable.
+- **Published to npm.** `npm install -g zelto` installs the CLI and the
+  standalone hook. npm is the only distribution channel — the repository's
+  `Dockerfile` and `docker-compose.yml` stay as development conveniences and
+  do not carry releases. Releases run from a tag: `v<version>` must match the
+  version in `package.json`, the tarball is installed into a clean directory
+  and exercised (`zelto init` + policy-anchor self-check) before
+  `npm publish --provenance` runs.
 
 ### Fixed
 - **The installed package was never actually exercised.** The `files`

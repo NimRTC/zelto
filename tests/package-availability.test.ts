@@ -51,21 +51,30 @@ function runCli(cwd: string, args: string[]): { stdout: string; code: number } {
 before(() => {
   packRoot = mkdtempSync(join(tmpdir(), 'zelto-pack-'));
 
-  // npm pack --json 给出产物清单与生成的 tarball 路径
-  const out = execFileSync('npm', ['pack', '--json', '--pack-destination', packRoot], {
-    cwd: REPO_ROOT,
-    encoding: 'utf-8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
-    timeout: 180_000,
-  });
+  // npm pack --json 给出产物清单与生成的 tarball 路径。
+  //
+  // `--dry-run=false` 是必须的：npm 会把 `npm_config_dry_run` 传给子进程，
+  // 所以当这组用例跑在 `npm publish` 内部（prepublishOnly → pnpm test）时，
+  // 不显式关掉的话子命令会跟着变成 dry-run —— 不落盘，于是 tarball 读不到，
+  // 报「tarball seems to be corrupted」。显式传参把外层的影响切掉。
+  const out = execFileSync(
+    'npm',
+    ['pack', '--json', '--dry-run=false', '--pack-destination', packRoot],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: process.platform === 'win32',
+      timeout: 180_000,
+    },
+  );
   const parsed = JSON.parse(out) as Array<{ filename: string; files: PackEntry[] }>;
   tarball = join(packRoot, parsed[0].filename);
 
   // 装到临时目录里 —— 用 npm install 本地 tarball，模拟用户拿到的样子
   installed = mkdtempSync(join(tmpdir(), 'zelto-install-'));
   writeFileSync(join(installed, 'package.json'), JSON.stringify({ name: 'pack-test', version: '1.0.0' }));
-  execFileSync('npm', ['install', tarball, '--no-audit', '--no-fund'], {
+  execFileSync('npm', ['install', tarball, '--no-audit', '--no-fund', '--dry-run=false'], {
     cwd: installed,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -162,10 +171,31 @@ describe('发布产物装出来能用', () => {
       version: string;
     };
     const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8');
-    // private 为 true 时 README 必须说「还没发布」，不能反过来
+    // private 为 true 时 README 必须说「还没发布」，不能反过来；
+    // 不是 private 时 README 必须说「已发布」—— 发布状态与 README 反着写，
+    // 用户照着 README 装不上，是最直接的事故。
     if (pkg.private) {
       assert.match(readme, /Not published to npm yet/);
+    } else {
+      assert.match(readme, /Published to npm/);
+      assert.doesNotMatch(readme, /Not published to npm yet/);
     }
     assert.match(readme, new RegExp(`v${pkg.version.replace(/\./g, '\\.')}`));
+  });
+
+  it('中英文 README 的发布状态一致 —— 两版漂移了用户就会照着错的那版装', () => {
+    const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as {
+      private?: boolean;
+    };
+    const readmeZh = readFileSync(join(REPO_ROOT, 'README.zh-CN.md'), 'utf-8');
+    if (pkg.private) {
+      assert.match(readmeZh, /尚未发布|还没发布/);
+    } else {
+      assert.match(readmeZh, /已发布到 npm/);
+    }
+    // 两版都得给出可用的安装命令
+    assert.match(readmeZh, /npm install -g zelto/);
+    const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8');
+    assert.match(readme, /npm install -g zelto/);
   });
 });

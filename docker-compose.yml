@@ -1,8 +1,8 @@
 # zelto Docker Compose — development and CI usage
 #
-# 发布通道尚未定：对外分发是走 npm、还是推镜像（GHCR）、还是两者，
-# 记在 `docs/zelto-项目目标.md` §7 待决策 D4。在那之前，这里只当作
-# 「把 zelto 跑在容器里、管一个挂载进来的项目」的开发/联调便利。
+# 这不是发布通道 —— 对外分发走 npm（`npm install -g zelto`），
+# 见 `docs/zelto-项目目标.md` §7 待决策 D4。这里只用于「把 zelto 跑在容器里、
+# 管一个挂载进来的项目」这种开发/联调场景。
 #
 # ⚠️ 已知限制：需要先在宿主机构建一次
 #

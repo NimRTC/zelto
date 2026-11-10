@@ -1,0 +1,95 @@
+name: Release
+
+# 发布到 npm —— 唯一对外分发通道（D4 决策 A，见 docs/zelto-项目目标.md §7）。
+#
+# 触发方式：打 tag `v<version>`（如 v0.5.0）。tag 上的版本号必须与
+# package.json 的 version 一致，不一致直接失败 —— 发出去的包和仓库对不上，
+# 比不发更糟。
+#
+# 需要配置两个 secret：
+#   NPM_TOKEN   —— npm 的 automation token（发布用，勾选 2FA 时仍可用）
+#   （可选）NPM_PROVENANCE —— 不需要，provenance 走 GitHub OIDC 自动完成
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: '只打包验证，不真正发布'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance 用 OIDC，不要这个权限 provenance 签不了
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验 tag 版本与 package.json 一致
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            PKG=$(node -p "require('./package.json').version")
+            if [ "v${PKG}" != "${TAG}" ]; then
+              echo "::error::tag ${TAG} 与 package.json 的 version ${PKG} 不一致"
+              exit 1
+            fi
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: 编码与凭据扫描
+        run: |
+          pnpm check:encoding
+          pnpm check:credentials
+
+      - run: pnpm build
+
+      - run: pnpm lint
+
+      - run: pnpm test
+
+      # 打包后装到干净目录里跑一遍 —— 白名单少一个文件，npm publish 照样成功，
+      # 只是装出来的包在某个命令上炸掉（见 tests/package-availability.test.ts）。
+      - name: 验证发布产物装出来能用
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          npm pack --pack-destination "$TMP"
+          mkdir -p "$TMP/probe" && cd "$TMP/probe"
+          echo '{"name":"probe","version":"1.0.0"}' > package.json
+          npm install "$TMP"/zelto-*.tgz --no-audit --no-fund
+          node node_modules/zelto/dist/cli/index.js --version
+          mkdir -p "$TMP/probe/proj" && cd "$TMP/probe/proj"
+          node ../node_modules/zelto/dist/cli/index.js init
+          test -f policy/lock.json
+
+      - name: 发布到 npm
+        if: ${{ !inputs.dry-run }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+      - name: 仅打包（dry run）
+        if: ${{ inputs.dry-run }}
+        run: npm publish --dry-run

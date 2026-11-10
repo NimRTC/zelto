@@ -33,6 +33,10 @@ the acceptance checks frozen alongside that spec.
 ## Quick start
 
 ```bash
+# 装 CLI 与独立 hook
+npm install -g zelto
+
+# 或者从源码装
 git clone https://github.com/NimRTC/zelto && cd zelto
 pnpm install && pnpm build && pnpm link --global
 
@@ -115,10 +119,10 @@ Protected paths are hard-coded outside policy reach, and `core/` has zero third-
 - **Two executors, default included.** `claude-agent` (CLI spawn) is the default; `claude-agent-sdk`
   is opt-in via `--adapter claude-agent-sdk`. The policy/gate layer is harness-agnostic,
   but claiming more harnesses before the adapters exist would be a lie.
-- **Install from source.** Not published to npm yet (`private: true` still set).
-  The package is packable and verified installable — `npm pack` produces a
-  self-contained tarball that runs `zelto init` on a fresh project — but
-  publishing is a separate, explicit step.
+- **Published to npm.** `npm install -g zelto` gets you the CLI and the standalone
+  hook. Installing from source still works if you prefer it — the package is
+  packable and verified installable (`npm pack` produces a self-contained
+  tarball that runs `zelto init` on a fresh project).
 
 ## CLI reference
 

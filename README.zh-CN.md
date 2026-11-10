@@ -80,20 +80,27 @@ clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ fr
 - **独立 hook** — 可独立编译的策略判定进程，零依赖，可用于 git hooks / CI 门禁
 - **架构约束** — `core/` 零第三方运行时依赖，纯 Node 内置
 
+## 状态
+
+- **pre-1.0** — CLI 参数、配置格式与事件格式都可能变，不保证向后兼容。需要稳定请锁定版本。
+- **已发布到 npm** — `npm install -g zelto` 装 CLI 与独立 hook。也可以从源码装（`git clone` + `pnpm install && pnpm build && pnpm link --global`）。
+- **两个执行器，默认带一个** — `claude-agent`（拉 CLI 进程）是默认；`claude-agent-sdk` 用 `--adapter claude-agent-sdk` 显式开启。策略与门禁层与 harness 无关，但在适配器写出来之前不吹更多。
+
 ## 快速开始
 
 ```bash
-# 安装
+# 安装（已发布到 npm）
+npm install -g zelto
+zelto help
+zelto-hook < input.json
+
+# 或者从源码装
 pnpm install
 pnpm build
+pnpm link --global
 
 # 运行测试
 pnpm test
-
-# 全局安装（可选）
-pnpm link --global
-zelto help
-zelto-hook < input.json
 
 # CLI 命令（常用；完整 57 个命令以 `zelto help` 为准）
 zelto slices          # 列出所有切片
