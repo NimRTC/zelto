@@ -1,6 +1,22 @@
 # zelto Docker Compose — development and CI usage
 #
+# 这不是发布通道。zelto 对外分发走 npm（见 README「Status」一节），
+# 这里只用于「把 zelto 跑在容器里、管一个挂载进来的项目」这种开发/联调场景。
+#
+# ⚠️ 已知限制：需要先在宿主机构建一次
+#
+#   下面 `.:/app` 把整个项目挂到 /app，会**盖住镜像里的 /app/dist**，
+#   而 entrypoint 跑的是 `node dist/cli/index.js`。所以宿主机的仓库里
+#   必须已经有构建产物，否则容器里找不到 dist，命令直接失败：
+#
+#     pnpm install && pnpm build    # ← 漏了这步，容器起不来
+#
+#   node_modules 用匿名卷保住了容器内的版本，所以只有 dist 需要在宿主机准备。
+#   想要一个自包含的镜像，直接 `docker build -t zelto .` 跑 `docker run`
+#   （不挂载项目），那条路不受这个限制影响。
+#
 # Usage:
+#   pnpm install && pnpm build
 #   docker compose run --rm zelto --help
 #   docker compose run --rm zelto init
 #   docker compose run --rm zelto project scan
