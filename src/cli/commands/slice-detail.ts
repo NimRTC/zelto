@@ -124,7 +124,7 @@ register('slice', async (args) => {
 const SLICE_SETTABLE_FIELDS = new Set([
   'title', 'traceWaiver', 'writes', 'acceptance.dir',
   'trace.requirements', 'trace.contracts', 'trace.tests',
-  'baseCommit', 'baseline',
+  'baseCommit', 'baseline', 'spec.gateCommands',
 ]);
 
 register('set', async (args) => {
@@ -170,7 +170,20 @@ register('set', async (args) => {
     // Parse value: comma-separated for array fields, boolean for boolean fields
     if (field === 'writes' || field === 'trace.requirements' || field === 'trace.contracts' || field === 'trace.tests') {
       const values = rawValue.split(',').map((v: string) => v.trim()).filter(Boolean);
-      if (field === 'writes') slice.writes = values;
+      if (field === 'writes') {
+        // 写集路径统一成**正斜杠**并去重（ADR-051 配套）：
+        // 写集路径要与策略引擎、hook 的判定对齐，那些地方都按正斜杠归一。
+        // 不归一时同一个文件会出现两次（`a/b` 与 `a\b`）——
+        // 重复项让「写集覆盖了什么」这件事说不清。
+        const seen = new Set<string>();
+        slice.writes = values
+          .map((v: string) => v.replace(/\\/g, '/'))
+          .filter((v: string) => {
+            if (seen.has(v)) return false;
+            seen.add(v);
+            return true;
+          });
+      }
       else if (field === 'trace.requirements') slice.trace.requirements = values;
       else if (field === 'trace.contracts') slice.trace.contracts = values;
       else if (field === 'trace.tests') slice.trace.tests = values;
@@ -184,6 +197,43 @@ register('set', async (args) => {
       slice.acceptance.dir = rawValue;
     } else if (field === 'baseCommit') {
       slice.baseCommit = rawValue || null;
+    } else if (field === 'spec.gateCommands') {
+      // 格式：JSON 数组（ADR-051）。
+      //
+      // 为什么用 JSON 而不是 `name=run` 逗号分隔：门禁命令里**经常**有逗号
+      // （`-DFOO=a,b`、多参数 cmake 调用），也经常有引号（`-G "Visual Studio 17 2022"`）。
+      // 任何基于分隔符的格式都会在这里切错 —— 实测就把
+      // `-G "Visual Studio 17 2022"` 切成了两半。
+      //
+      // JSON 是无歧义的：值是一个数组，每项 {name, run}。
+      //
+      // 还支持 `@<文件路径>`：值从文件读。命令行里的引号经过 shell 转义
+      // 会被吃掉（Windows 上尤其明显），文件是可靠的通道。
+      let raw = rawValue;
+      if (raw.startsWith('@')) {
+        raw = readFileSync(raw.slice(1).trim(), 'utf-8');
+      }
+      let parsed: Array<{ name: string; run: string }>;
+      try {
+        const rawJson = JSON.parse(raw);
+        if (!Array.isArray(rawJson)) throw new Error('期望一个数组');
+        parsed = rawJson.map((item: unknown) => {
+          if (typeof item === 'string') {
+            throw new Error('数组元素应为 {name, run} 对象，不是字符串');
+          }
+          const entry = item as { name?: unknown; run?: unknown };
+          if (typeof entry.name !== 'string' || typeof entry.run !== 'string') {
+            throw new Error('每个元素都要有字符串的 name 与 run');
+          }
+          return { name: entry.name, run: entry.run };
+        });
+      } catch (err) {
+        throw new Error(
+          `门禁命令格式应为 JSON 数组，如 [{"name":"build","run":"cmake --build build"}]：` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      slice.spec.gateCommands = parsed;
     }
 
     await store.write(slice);

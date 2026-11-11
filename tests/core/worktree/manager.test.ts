@@ -1,7 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorktreeManager, WorktreeError, WORKTREE_BASE_DIR } from '../../../src/core/worktree/index.js';
@@ -270,6 +270,91 @@ describe('WorktreeManager — submodules (ADR-044)', () => {
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('initializes a submodule cloned as a standalone nested repo (.git is a directory)', async () => {
+    // 有些工程不把 submodule 放进 `.git/modules/`，而是让它自带一个
+    // **独立的 .git 目录**（独立嵌套克隆）。
+    //
+    // 原来只找 `.git/modules/<name>`，这种布局就整个漏掉 —— worktree 里
+    // 那个目录是空的，或者内容来自错误的 commit（ADR-047）。
+    const root = mkdtempSync(join(tmpdir(), 'zelto-wt-nested-'));
+    const subOrigin = join(root, 'sub-origin');
+    mkdirSync(subOrigin, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: subOrigin, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: subOrigin });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: subOrigin });
+    writeFileSync(join(subOrigin, 'lib.txt'), 'vendored content\n');
+    execFileSync('git', ['add', '.'], { cwd: subOrigin });
+    execFileSync('git', ['commit', '-m', 'sub init'], { cwd: subOrigin });
+
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    execFileSync('git', ['config', 'protocol.file.allow', 'always'], { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), '# test\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    // 登记 submodule，然后把它的 .git 换成**独立目录**（模拟嵌套克隆）
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+    execFileSync('git', ['commit', '-m', 'add submodule'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+
+    // 把它从共享布局搬到独立目录
+    const sharedGitDir = join(repo, '.git', 'modules', 'vendor', 'lib');
+    const nestedGitDir = join(repo, 'vendor', 'lib', '.git');
+    if (existsSync(sharedGitDir) && existsSync(nestedGitDir)) {
+      rmSync(nestedGitDir, { recursive: true, force: true });
+      cpSync(sharedGitDir, nestedGitDir, { recursive: true });
+      rmSync(sharedGitDir, { recursive: true, force: true });
+    }
+
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('nested-sub');
+
+      assert.ok(
+        existsSync(join(info.path, 'vendor', 'lib', 'lib.txt')),
+        'nested-clone submodule content should be present in the worktree',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('aligns submodules to the pointer recorded in the worktree index (ADR-047)', async () => {
+    // 场景：共享 module git 目录的 HEAD 漂到了别的 commit（被别人改过），
+    // 而主仓 index 记的是另一个。同步完必须检出到 index 记的那个 ——
+    // 否则 `git status` 报 vendor 被改，审计误判成 agent 越界。
+    const { repo, subPath } = makeRepoWithSubmodule();
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('align-sub');
+
+      const recorded = execFileSync('git', ['ls-files', '-s', '--', subPath], {
+        cwd: info.path, encoding: 'utf-8',
+      });
+      const target = recorded.match(/^160000 ([0-9a-f]{40})/)?.[1];
+      assert.ok(target, 'should have a recorded gitlink');
+
+      const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: join(info.path, subPath), encoding: 'utf-8',
+      }).trim();
+      assert.equal(head, target, 'worktree submodule should sit on the recorded pointer');
+    } finally {
+      rmSync(join(repo, '..'), { recursive: true, force: true });
     }
   });
 

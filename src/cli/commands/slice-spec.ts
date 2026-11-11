@@ -218,6 +218,64 @@ async function handleDraft(args: string[]): Promise<number> {
   return 0;
 }
 
+// ─── skeleton ─────────────────────────────────────────────────────────────
+
+/**
+ * 从**正式规格**重新生成验收测试骨架。
+ *
+ * 为什么要有这条命令（ADR-050）：
+ * `zelto spec draft` 的骨架是从**草稿**正文生成的。草稿是模型写的，
+ * 而正式规格是人批准过的 —— 两者可能不一样（人改了字段名、调整了验收标准）。
+ * 骨架要是还停在草稿那一版，agent 拿到的 todo 就是在追一个**已经不存在的**契约。
+ *
+ * 所以骨架的**唯一出处**是正式规格：正式规格是人批准的出处，
+ * 骨架是它的可执行投影。
+ */
+async function handleSkeleton(args: string[]): Promise<number> {
+  const f = getDefaultFormatter();
+  const id = args[0];
+  if (!id || id.startsWith('--')) {
+    f.error('USAGE', 'Usage: zelto spec skeleton <slice-id> [--force]');
+    return 1;
+  }
+
+  if (!(await store.exists(id))) {
+    f.error('NOT_FOUND', `Slice "${id}" not found.`);
+    return 1;
+  }
+
+  const slice = await store.read(id);
+  if (!existsSync(slice.spec.path)) {
+    f.error('NOT_FOUND', `切片 "${id}" 没有正式规格（${slice.spec.path}），无从生成骨架。`);
+    return 1;
+  }
+
+  const specContent = readFileSync(slice.spec.path, 'utf-8');
+  const skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, specContent, id, process.cwd(), {
+    force: args.includes('--force'),
+  });
+
+  if (!skeleton.path) {
+    f.error('SKELETON', skeleton.reason ?? '验收骨架未生成');
+    return 1;
+  }
+
+  await addAcceptanceSkeletonToWriteSet(id, skeleton.path);
+  await events.append(id, 'draft.created', 'zelto', {
+    kind: 'skeleton',
+    id,
+    title: slice.title,
+    path: skeleton.path,
+    caseCount: skeleton.caseCount,
+    from: slice.spec.path,
+  });
+
+  f.success(`验收骨架已从正式规格重新生成：${skeleton.path}`);
+  f.out(`  用例数：${skeleton.caseCount}`);
+  f.out('  骨架里全是 todo —— 需要实现成真正的断言，门禁②才认。');
+  return 0;
+}
+
 // ─── show ──────────────────────────────────────────────────────────────────
 
 async function handleShow(args: string[]): Promise<number> {
@@ -328,8 +386,20 @@ async function handleConfirm(args: string[]): Promise<number> {
     draftPath: specDraftPath(id),
   });
 
+  // 确认后按新规格重建骨架（ADR-050）：骨架的出处是**正式规格**。
+  // 人改了验收标准，骨架就该跟着变 —— 否则 agent 追的是上一版的契约。
+  const skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, draft, id, process.cwd(), {
+    force: true,
+  });
+  if (skeleton.path) {
+    await addAcceptanceSkeletonToWriteSet(id, skeleton.path);
+  }
+
   f.success(`规格已确认，写入 ${specPath}`);
   f.out('  这份规格现在是「人批准的出处」—— 冻结时它会物化成本片的需求追溯。');
+  if (skeleton.path) {
+    f.out(`  验收骨架已同步重建：${skeleton.path}（${skeleton.caseCount} 条用例）`);
+  }
   return 0;
 }
 
@@ -340,18 +410,20 @@ register('spec', async (args: string[]): Promise<number> => {
   const subcmd = args[0];
 
   if (!subcmd) {
-    f.error('USAGE', 'Usage: zelto spec <draft|show|confirm> <slice-id>');
+    f.error('USAGE', 'Usage: zelto spec <draft|show|confirm|skeleton> <slice-id>');
     f.out('       zelto spec draft <slice-id>    生成规格草稿 + 验收测试骨架');
     f.out('       zelto spec show <slice-id>     看草稿 / 正式规格');
     f.out('       zelto spec confirm <slice-id>  确认草稿 → 写进正式规格');
+    f.out('       zelto spec skeleton <slice-id> 从正式规格重新生成验收骨架');
     return 1;
   }
 
   if (subcmd === 'draft') return handleDraft(args.slice(1));
   if (subcmd === 'show') return handleShow(args.slice(1));
   if (subcmd === 'confirm') return handleConfirm(args.slice(1));
+  if (subcmd === 'skeleton') return handleSkeleton(args.slice(1));
 
   f.error('USAGE', `Unknown spec subcommand: ${subcmd}`);
-  f.out('       zelto spec draft|show|confirm <slice-id>');
+  f.out('       zelto spec draft|show|confirm|skeleton <slice-id>');
   return 1;
 });

@@ -29,6 +29,29 @@ describe('parseScopePaths', () => {
     ]);
   });
 
+  it('parses plain paths (no backticks) from a 「范围」 section', () => {
+    // 规格是人写的 —— 不加反引号的写法同样常见（本仓既有规格全是这种）。
+    // 解析器只认反引号的话，写集就是空的，切片拿不到写集就被冻结准入卡住。
+    const spec = [
+      '## 范围',
+      '',
+      '- src/core/worktree/manager.ts',
+      '- src/cli/commands/shared.ts',
+      '- docs/adr-011.md',
+    ].join('\n');
+
+    assert.deepEqual(parseScopePaths(spec), [
+      'src/core/worktree/manager.ts',
+      'src/cli/commands/shared.ts',
+      'docs/adr-011.md',
+    ]);
+  });
+
+  it('drops the trailing note from a plain path', () => {
+    const spec = ['## 范围', '', '- src/core/worktree/manager.ts - 新建 worktree 管理'].join('\n');
+    assert.deepEqual(parseScopePaths(spec), ['src/core/worktree/manager.ts']);
+  });
+
   it('matches the English "Scope" heading too', () => {
     const spec = ['## Scope', '', '- `src/**`', '- `docs/**`'].join('\n');
     assert.deepEqual(parseScopePaths(spec), ['src/**', 'docs/**']);
@@ -93,5 +116,35 @@ describe('parseAcceptanceCriteria', () => {
 
   it('returns an empty array when there is no acceptance section', () => {
     assert.deepEqual(parseAcceptanceCriteria('## 目的\n\n内容\n'), []);
+  });
+
+  // ADR-050：条目可以跨行。原来的实现只取编号行本行，
+  // 「验证方式：……」整段丢掉，剩下的用例名只有半句。
+  it('joins continuation lines into the numbered item', () => {
+    const spec = [
+      '## 验收标准',
+      '',
+      '1. `signal_source` 判别式存在，且能表达三种来源；',
+      '   验证方式：单元测试对三种取值各断言一次。',
+      '2. transport-cc 的三个字段存在且默认值表示「没有该信号」；',
+      '   验证方式：单元测试对默认构造的 `BweFeedback` 断言缺省值。',
+    ].join('\n');
+
+    assert.deepEqual(parseAcceptanceCriteria(spec), [
+      '`signal_source` 判别式存在，且能表达三种来源； 验证方式：单元测试对三种取值各断言一次。',
+      'transport-cc 的三个字段存在且默认值表示「没有该信号」； 验证方式：单元测试对默认构造的 `BweFeedback` 断言缺省值。',
+    ]);
+  });
+
+  it('does not swallow the next item after a continuation', () => {
+    const spec = [
+      '## 验收标准',
+      '',
+      '1. 第一条',
+      '   续行。',
+      '2. 第二条',
+    ].join('\n');
+
+    assert.deepEqual(parseAcceptanceCriteria(spec), ['第一条 续行。', '第二条']);
   });
 });

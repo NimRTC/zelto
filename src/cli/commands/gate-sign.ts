@@ -62,15 +62,24 @@ register('gate', async (args) => {
 
     // Resolve target project directory for cross-project execution
     const targetDir = resolveTargetDir();
-    const gateCommands = targetDir && config.targetProject?.gate?.commands
+    // 本片专属命令优先（ADR-051）：不同模块的测试目标名不同，
+    // 项目级命令去构建别的模块的目标，既不验本片产物又白等一次构建。
+    const sliceSpecific = slice.spec?.gateCommands;
+    const projectGateCommands = targetDir && config.targetProject?.gate?.commands
       ? config.targetProject.gate.commands
       : config.gate.commands;
+    const gateCommands = sliceSpecific && sliceSpecific.length > 0
+      ? sliceSpecific
+      : projectGateCommands;
     const gateProfiles = targetDir && config.targetProject?.gate?.profiles
       ? config.targetProject.gate.profiles
       : config.gate.profiles;
 
     if (targetDir) {
       console.log(`  Target:   ${targetDir}`);
+    }
+    if (sliceSpecific && sliceSpecific.length > 0) {
+      console.log(`  Commands: 本片专属（${gateCommands.length} 条）`);
     }
 
     // Dry run: show what would be executed

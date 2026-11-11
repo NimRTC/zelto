@@ -23,30 +23,95 @@ export interface ExtractedRequirement {
   source: 'acceptance' | 'requirements';
 }
 
-/** 从章节正文里取编号条目（`1. xxx`） */
+/**
+ * 从章节正文里取编号条目（`1. xxx`）。
+ *
+ * **条目可以跨行**（ADR-050）：规格里的验收标准常写成
+ *
+ * ```markdown
+ * 1. `signal_source` 判别式存在，且能表达三种来源；
+ *    验证方式：单元测试对三种取值各断言一次。
+ * ```
+ *
+ * 续行是缩进的、非编号的行。原来的实现只取编号行**本行**，
+ * 于是「验证方式」被整段丢掉 —— 骨架里剩下的用例名只有半句，
+ * agent 拿到的契约是残缺的。
+ *
+ * 拼回时用空格连接：条目正文是散文，空格分隔比换行更贴近原文语义。
+ */
 function numberedItems(body: string): string[] {
   const items: string[] = [];
+  let current: string | null = null;
+
+  const flush = (): void => {
+    if (current !== null) {
+      const text = current.trim();
+      if (text) items.push(text);
+      current = null;
+    }
+  };
+
   for (const line of body.split('\n')) {
     const m = line.match(/^\s*\d+\.\s+(.+?)\s*$/);
-    if (!m) continue;
-    const text = m[1].trim();
-    if (text) items.push(text);
+    if (m) {
+      flush();
+      current = m[1].trim();
+      continue;
+    }
+    // 续行：缩进、非空、且不是新的列表项 → 接上一条
+    if (current !== null && line.trim() && /^\s{2,}/.test(line) && !/^\s*([-*+]|\d+\.)\s/.test(line)) {
+      current = `${current} ${line.trim()}`;
+      continue;
+    }
+    // 空行或新列表项 → 当前条目结束
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    flush();
   }
+  flush();
+
   return items;
 }
-
-/** 从章节正文里取无序条目（`- xxx` / `* xxx`） */
+/**
+ * 从章节正文里取无序条目（`- xxx` / `* xxx`）。
+ *
+ * 续行的处理与编号条目一致（ADR-050）：缩进的非列表行接上一条。
+ */
 function bulletItems(body: string): string[] {
   const items: string[] = [];
+  let current: string | null = null;
+
+  const flush = (): void => {
+    if (current !== null) {
+      const text = current.trim();
+      if (text) items.push(text);
+      current = null;
+    }
+  };
+
   for (const line of body.split('\n')) {
     const m = line.match(/^\s*[-*]\s+(.+?)\s*$/);
-    if (!m) continue;
-    const text = m[1].trim();
-    if (text) items.push(text);
+    if (m) {
+      flush();
+      current = m[1].trim();
+      continue;
+    }
+    if (current !== null && line.trim() && /^\s{2,}/.test(line) && !/^\s*([-*+]|\d+\.)\s/.test(line)) {
+      current = `${current} ${line.trim()}`;
+      continue;
+    }
+    if (!line.trim()) {
+      flush();
+      continue;
+    }
+    flush();
   }
+  flush();
+
   return items;
 }
-
 /**
  * 从规格正文的「验收标准」章节里提取条目。
  *

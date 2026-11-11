@@ -18,7 +18,7 @@
 //
 // 选取规则（有优先级，逐级退化）：
 //
-// 1. **项目基线设计**（`requirementId === '__project__'`）——
+// 1. **项目基线设计**（`requirementId` 是项目基线标记）——
 //    由 `zelto project design` 生成，模块覆盖整个仓库，是「拿设计与
 //    仓库对照」这件事唯一说得通的对象。同级有多份时取最新。
 // 2. **最新的已确认设计** —— 没有基线设计时的退化选择，
@@ -31,8 +31,25 @@
 
 import type { DesignSummary } from './types.js';
 
-/** 项目基线设计的 requirementId（`zelto project design` 生成的标记） */
+/**
+ * 项目基线设计的 requirementId（`zelto project design` 生成的标记）。
+ *
+ * 这里用**正则**而不是全等比较：基线设计有两个历史写法 ——
+ * `__project__`（设计文档里写的）与 `(project-takeover)`（接管路径里写的），
+ * 只认其中一个就等于「基线设计认不出来」，于是拿一份局部功能设计去
+ * 对照整个仓库，全仓文件都被判「无归属」，门禁护栏随之误拦。
+ */
 export const PROJECT_REQUIREMENT_ID = '__project__';
+
+/** 项目基线设计 requirementId 的全部已知写法 */
+const PROJECT_REQUIREMENT_IDS: RegExp = /^(__project__|\(project-takeover\))$/;
+
+/** 这个设计是不是项目基线设计 */
+export function isProjectBaselineDesign(design: { requirementId?: string }): boolean {
+  const id = (design.requirementId ?? '').trim();
+  if (!id) return false;
+  return PROJECT_REQUIREMENT_IDS.test(id);
+}
 
 /**
  * 选出用于架构对照的默认设计。
@@ -49,7 +66,7 @@ export function pickDefaultDesign(designs: DesignSummary[]): DesignSummary | nul
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
-  const baseline = byNewest.find((d) => d.requirementId === PROJECT_REQUIREMENT_ID);
+  const baseline = byNewest.find((d) => isProjectBaselineDesign(d));
   return baseline ?? byNewest[0];
 }
 

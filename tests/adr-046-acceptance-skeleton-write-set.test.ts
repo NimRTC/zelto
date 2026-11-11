@@ -33,7 +33,8 @@ describe('ADR-046 · 验收骨架路径', () => {
 
   it('目录形态 → <目录>/acceptance.test.cjs', () => {
     const target = acceptanceSkeletonTarget('tests/acceptance/s1/', TEST_DIR);
-    assert.equal(target, join('tests', 'acceptance', 's1', 'acceptance.test.cjs'));
+    // 路径统一正斜杠（ADR-051）：不能用 join() 断言 —— Windows 上它给反斜杠。
+    assert.equal(target, 'tests/acceptance/s1/acceptance.test.cjs');
   });
 
   it('文件形态 → 那个文件本身', () => {
@@ -45,7 +46,7 @@ describe('ADR-046 · 验收骨架路径', () => {
     const dir = join(TEST_DIR, 'tests', 'acceptance', 'existing');
     await mkdir(dir, { recursive: true });
     const target = acceptanceSkeletonTarget('tests/acceptance/existing', TEST_DIR);
-    assert.equal(target, join('tests', 'acceptance', 'existing', 'acceptance.test.cjs'));
+    assert.equal(target, 'tests/acceptance/existing/acceptance.test.cjs');
   });
 
   it('算出来的路径与实际生成的文件一致', () => {

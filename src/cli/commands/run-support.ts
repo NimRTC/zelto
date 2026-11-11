@@ -41,9 +41,18 @@ export function resolveGateCommands(sliceType: string): GateCommandSummary[] {
   return commands.map((c) => ({ name: c.name, run: c.run }));
 }
 
-/** 按切片的写集推出它的类型（与门禁选 profile 的口径一致）。 */
-export function gateCommandsForSlice(writes: string[]): GateCommandSummary[] {
-  return resolveGateCommands(detectSliceType(writes));
+/**
+ * 按切片的写集推出它的类型（与门禁选 profile 的口径一致）。
+ *
+ * 本片**专属**的门禁命令优先（ADR-051）—— `slice.spec.gateCommands` 是
+ * 人写的「这片怎么算验过了」，比项目级命令更具体。
+ */
+export function gateCommandsForSlice(slice: { writes: string[]; spec?: { gateCommands?: Array<{ name: string; run: string }> } }): GateCommandSummary[] {
+  const specific = slice.spec?.gateCommands;
+  if (specific && specific.length > 0) {
+    return specific.map((c) => ({ name: c.name, run: c.run }));
+  }
+  return resolveGateCommands(detectSliceType(slice.writes));
 }
 
 /**

@@ -11,6 +11,20 @@ export interface SliceSpec {
   path: string;
   frozenHash: string | null;
   frozenAt: string | null;
+  /**
+   * 本片**专属**的门禁命令（ADR-051）。
+   *
+   * 为什么需要：项目级 `gate.commands` 只能有一套 —— 在 nimrtc 上它指向
+   * `net_feedback` 模块的测试目标。但不同模块的测试目标名字不同
+   * （`test_net_feedback_test` vs `test_bwe_feedback_fields_test`），
+   * 门禁去构建**别的模块**的目标，既不验本片的产物，又白等一次构建。
+   *
+   * 本片的门禁命令由**人**写在这里 —— 它是「这片怎么算验过了」的口径，
+   * 不该由工具从写集路径猜（猜出来的名字多半不对）。
+   *
+   * 缺省 = 用项目级命令（`gate.commands` 或对应 profile）。
+   */
+  gateCommands?: Array<{ name: string; run: string; timeoutSec?: number }>;
 }
 
 export interface SliceAcceptance {

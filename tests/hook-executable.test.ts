@@ -32,6 +32,11 @@ async function runHook(input: object): Promise<object> {
     const child = spawn('node', [HOOK_SCRIPT], {
       cwd: TEST_DIR,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // hook 进程用 `ZELTO_PROJECT_ROOT` 找 `policy/policy.yaml`
+      // （src/hook/index.ts）。父进程里带着这个变量时（装着 git hook 的
+      // 机器上就有），子进程会去读**别人的**策略文件而不是 TEST_DIR 里
+      // 这份 —— 断言就变成在测环境而不是测代码。显式指到 TEST_DIR。
+      env: { ...process.env, ZELTO_PROJECT_ROOT: TEST_DIR },
     });
 
     let stdout = '';

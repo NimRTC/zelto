@@ -23,7 +23,15 @@ import type { PolicyConfig } from '../src/core/policy/types.js';
 
 const HOOK_BIN = join(process.cwd(), 'dist', 'hook', 'index.js');
 
-/** 跑一次真实 hook 进程，拿到它的判定。 */
+/** 跑一次真实 hook 进程，拿到它的判定。
+ *
+ *  必须**清掉** `ZELTO_PROJECT_ROOT`：hook 进程会用它去找
+ * `policy/policy.yaml`（src/hook/index.ts）。父进程里带着这个变量时
+ * （zelto 装着 git hook 的机器上就有），子进程会读到**别人的**策略文件，
+ * 而不是这个临时目录里的那份 —— 于是判定基于错误的策略，测试变成
+ * 「测环境」而不是「测代码」。
+ *
+ * 判定必须对着**这个测试自己造的策略**跑，所以这里显式把它指到临时目录。 */
 function runHook(policyYaml: string, path: string, operation = 'write') {
   const root = mkdtempSync(join(tmpdir(), 'zelto-policy-parse-'));
   mkdirSync(join(root, 'policy'), { recursive: true });
@@ -33,6 +41,7 @@ function runHook(policyYaml: string, path: string, operation = 'write') {
     input: JSON.stringify({ path, operation, harness: 'test' }),
     encoding: 'utf8',
     cwd: root,
+    env: { ...process.env, ZELTO_PROJECT_ROOT: root },
   });
   return JSON.parse(stdout.trim()) as {
     decision: string;

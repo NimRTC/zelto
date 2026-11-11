@@ -63,6 +63,28 @@ describe('parseFieldList', () => {
     // `[根命令模块](#2-根命令模块)` —— 锚点是给渲染器看的，不是模块名
     assert.deepEqual(parseFieldList('[根命令模块](#2-根命令模块)'), ['根命令模块']);
   });
+
+  it('多行列表的每一条都是一项', () => {
+    // 设计正文常把文件路径写成多行列表 ——
+    // 列表项前缀（`- `）不剥掉，这些模式就永远匹配不上任何真实路径。
+    assert.deepEqual(
+      parseFieldList(['- `src/a.cpp`', '- `src/b.cpp`'].join('\n')),
+      ['src/a.cpp', 'src/b.cpp'],
+    );
+  });
+
+  it('方括号里的逗号不算分隔符', () => {
+    assert.deepEqual(parseFieldList('[a, b]（说明）'), ['a', 'b']);
+    // 说明里自己带逗号，也不能多出一条「被其他模块依赖）」
+    assert.deepEqual(parseFieldList('[无]（作为核心层，被其他模块依赖）'), []);
+  });
+
+  it('多项各自带方括号时都认出来', () => {
+    assert.deepEqual(
+      parseFieldList('[engine RTCP demux], [rtp模块的transport-cc解析]'),
+      ['engine RTCP demux', 'rtp模块的transport-cc解析'],
+    );
+  });
 });
 
 // ─── 模块声明 ────────────────────────────────────────────────────────────────
@@ -108,6 +130,31 @@ describe('parseDesignModules', () => {
 
   it('正文里没有模块时返回空数组', () => {
     assert.deepEqual(parseDesignModules('# 标题\n\n只是一段话。\n'), []);
+  });
+
+  it('多行文件路径列表全部解析出来', () => {
+    // 字段写成多行列表时，解析层必须把整段列表都取出来 ——
+    // 只取第一行的话，模块只认领一个文件，
+    // 仓库里其余文件全被判「无归属」（ADR-048）。
+    const modules = parseDesignModules(
+      [
+        '### net_feedback',
+        '- **职责**：聚合接收侧网络信号',
+        '- **文件路径**:',
+        '  - `src/modules/net_feedback/CMakeLists.txt`',
+        '  - `src/modules/net_feedback/src/aggregator.cpp`',
+        '  - `src/modules/net_feedback/tests/aggregator_test.cpp`',
+        '- **依赖模块**: [core]',
+        '',
+      ].join('\n'),
+    );
+    assert.equal(modules[0].description, '聚合接收侧网络信号');
+    assert.deepEqual(modules[0].filePatterns, [
+      'src/modules/net_feedback/CMakeLists.txt',
+      'src/modules/net_feedback/src/aggregator.cpp',
+      'src/modules/net_feedback/tests/aggregator_test.cpp',
+    ]);
+    assert.deepEqual(modules[0].dependencies, ['core']);
   });
 
   it('模块名里的括号与路径写法原样保留', () => {

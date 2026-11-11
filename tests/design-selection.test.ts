@@ -86,6 +86,22 @@ describe('pickDefaultDesign', () => {
   it('空输入返回 null', () => {
     assert.equal(pickDefaultDesign([]), null);
   });
+
+  it('接管路径写的基线标记（`(project-takeover)`）也算基线', () => {
+    // 基线设计有两个历史写法：设计文档里的 `__project__`，
+    // 与接管路径（`zelto project design`）里的 `(project-takeover)`。
+    // 只认一个就等于「基线设计认不出来」——
+    // 于是拿一份局部功能设计去对照整个仓库，
+    // 全仓文件被判「无归属」，门禁护栏随之误拦（ADR-048）。
+    const takeover = summary({
+      id: 'takeover',
+      requirementId: '(project-takeover)',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    });
+    const local = summary({ id: 'local', createdAt: '2026-11-01T00:00:00.000Z' });
+    assert.equal(pickDefaultDesign([local, takeover])?.id, 'takeover');
+    assert.equal(pickDefaultDesign([takeover, local])?.id, 'takeover');
+  });
 });
 
 describe('otherConfirmedDesigns', () => {

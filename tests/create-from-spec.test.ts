@@ -198,4 +198,64 @@ describe('zelto create --from-spec', () => {
     assert.equal(content.writes.length, 0);
     assert.equal(content.trace.requirements.length, 1);
   });
+
+  // ADR-049：`create --from-spec` 以前自己写了一份只认反引号的行内正则，
+  // 于是按自然写法写的规格（`- src/foo.hpp`，不带反引号）写集是空的。
+  // 现在它走共享的 parseScopePaths，与 resolveWriteSet 口径一致。
+  it('parses plain (unquoted) paths from ## 范围 section', async () => {
+    const plainSpec = [
+      '# Slice: v1-plain-paths',
+      '',
+      '## 目的',
+      '规格里不写反引号',
+      '',
+      '## 范围',
+      '- src/plugins/include/nimrtc/plugins/bwe.hpp',
+      '- src/plugins/tests/test_bwe_feedback_fields.cpp',
+      '- src/plugins/tests/CMakeLists.txt',
+      '',
+      '## 验收标准',
+      '1. 写集被正确解析',
+      '',
+    ].join('\n');
+    await writeFile(join(SPECS_DIR, 'v1-plain-paths.md'), plainSpec, 'utf-8');
+
+    const { stdout, code } = await runCreate('v1-plain-paths', '--from-spec');
+    assert.equal(code, 0, stdout);
+
+    const content = JSON.parse(
+      await readFile(join(TEST_DIR, '.zelto', 'slices', 'v1-plain-paths.json'), 'utf-8'),
+    );
+    assert.deepEqual(content.writes, [
+      'src/plugins/include/nimrtc/plugins/bwe.hpp',
+      'src/plugins/tests/test_bwe_feedback_fields.cpp',
+      'src/plugins/tests/CMakeLists.txt',
+    ]);
+  });
+
+  it('ignores prose bullets in ## 范围 section', async () => {
+    const proseSpec = [
+      '# Slice: v1-prose-scope',
+      '',
+      '## 目的',
+      '范围里混着散文说明',
+      '',
+      '## 范围',
+      '- 读配置文件并校验字段',
+      '- src/core/audit/manager.ts',
+      '',
+      '## 验收标准',
+      '1. 散文条目不进写集',
+      '',
+    ].join('\n');
+    await writeFile(join(SPECS_DIR, 'v1-prose-scope.md'), proseSpec, 'utf-8');
+
+    const { stdout, code } = await runCreate('v1-prose-scope', '--from-spec');
+    assert.equal(code, 0, stdout);
+
+    const content = JSON.parse(
+      await readFile(join(TEST_DIR, '.zelto', 'slices', 'v1-prose-scope.json'), 'utf-8'),
+    );
+    assert.deepEqual(content.writes, ['src/core/audit/manager.ts']);
+  });
 });

@@ -10,8 +10,8 @@
   },
   "type": "module",
   "bin": {
-    "zelto": "./dist/cli/index.js",
-    "zelto-hook": "./dist/hook/index.js"
+    "zelto": "dist/cli/index.js",
+    "zelto-hook": "dist/hook/index.js"
   },
   "scripts": {
     "build": "tsc",

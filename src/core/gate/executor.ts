@@ -119,14 +119,21 @@ export class GateExecutor {
 
     // Select gate commands based on slice type
     const sliceType: SliceType = slice.type ?? detectSliceType(slice.writes);
-    const commands = this.selectCommands(sliceType);
+    // 本片专属命令优先（ADR-051）：不同模块的测试目标名不同，
+    // 项目级命令去构建别的模块的目标，既不验本片产物又白等一次构建。
+    const sliceCommands = slice.spec?.gateCommands;
+    const commands = sliceCommands && sliceCommands.length > 0
+      ? sliceCommands
+      : this.selectCommands(sliceType);
 
     // Log profile selection
     await this.appendEvent(sliceId, 'gate.executed', actor, {
       sliceId,
       sliceType,
       commandCount: commands.length,
-      profile: commands === this.config.commands ? 'default' : sliceType,
+      profile: sliceCommands && sliceCommands.length > 0
+        ? 'slice-specific'
+        : commands === this.config.commands ? 'default' : sliceType,
     });
 
     // Check for uninitialized git submodules before running commands

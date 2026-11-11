@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { deriveModules } from '../../core/design/derive.js';
+import { PROJECT_REQUIREMENT_ID } from '../../core/design/selection.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
@@ -438,7 +439,10 @@ register('project', async (args) => {
     const designStore = new DesignStore(ZELTO_DIR);
     const doc: DesignDoc = {
       id: existingId,
-      requirementId: '(project-takeover)',
+      // 基线标记用共享常量（core/design/selection.ts）——
+      // 写字面量的话，写的人与认的人可能对不上，
+      // 于是基线设计认不出来，护栏拿局部设计对照整个仓库。
+      requirementId: PROJECT_REQUIREMENT_ID,
       title: design.title,
       body: design.body,
       // 存的 modules 只是快照：判定时一律从正文重新推导（core/design/derive.ts）

@@ -47,7 +47,12 @@ export function acceptanceSkeletonTarget(acceptanceDir: string, root: string = p
   const normalized = raw.replace(/[\\/]+$/, '');
   const abs = join(root, normalized);
   const isDirShape = raw.endsWith('/') || raw.endsWith('\\') || (existsSync(abs) && statSync(abs).isDirectory());
-  return isDirShape ? join(normalized, SKELETON_FILE_NAME) : normalized;
+  // 路径统一成**正斜杠**（ADR-051 配套）：写集里的路径最终要与策略引擎、
+  // hook 的判定比大小，而那些地方都按正斜杠归一。这里用 join() 会得到
+  // Windows 的反斜杠 —— 同一个文件在写集里出现两次（`a/b` 与 `a\b`），
+  // 重复项、且与规格里写的路径对不上。
+  const target = isDirShape ? `${normalized}/${SKELETON_FILE_NAME}` : normalized;
+  return target.replace(/\\/g, '/');
 }
 
 /**
@@ -94,6 +99,7 @@ export function writeAcceptanceSkeleton(
   specContent: string,
   sliceId: string,
   root: string = process.cwd(),
+  opts?: { force?: boolean },
 ): SkeletonResult {
   const raw = (acceptanceDir ?? '').trim();
   if (!raw) {
@@ -115,7 +121,9 @@ export function writeAcceptanceSkeleton(
 
   let target: string;
   if (isDirShape) {
-    target = join(normalized, SKELETON_FILE_NAME);
+    // 正斜杠（ADR-051 配套）：写集路径要与策略引擎、hook 的判定对齐，
+    // 那些地方都按正斜杠归一；join() 在 Windows 上给的是反斜杠。
+    target = `${normalized}/${SKELETON_FILE_NAME}`;
   } else {
     // 文件形态：那是人自己登记的验收文件，不覆盖
     if (existsSync(join(root, normalized))) {
@@ -130,7 +138,7 @@ export function writeAcceptanceSkeleton(
   }
 
   const targetAbs = join(root, target);
-  if (existsSync(targetAbs)) {
+  if (existsSync(targetAbs) && !opts?.force) {
     return {
       path: null,
       caseCount: 0,
