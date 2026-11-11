@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Added
+- **Dead slices can now be cleaned up in one command** (ADR-053). ADR-047 made
+  a failed agent stop stranding its slice in `running`, but the leftovers from
+  before that fix were still sitting there: they occupied the "running" count
+  in `zelto status`, and the only way out was `zelto resume`, one slice at a
+  time. `zelto halt --rollback` could not help — it hunts for slices whose
+  *reserved* process died (a crashed batch), while a dead slice holds no
+  reservation at all (the agent died, the reservation was released). Two
+  different diseases, so two different commands. `zelto stall --reap` now
+  reverts every slice that is still `running` with a stall classification back
+  to `frozen`, and lists them in `zelto stall` so the "still stuck" ones are
+  distinguishable from the "waiting to be handled" ones. The classification
+  is deliberately **kept**: `resume` means "a human looked at this", reaping
+  only means "the state is runnable again" — the stall still stands until
+  someone deals with it. Slices waiting for an answer (`agent_question`) are
+  excluded: that agent is still alive, just waiting for a human. `--dry-run`
+  lists without touching anything; `--json` is machine-readable.
 - **The constraint bundle now carries the gate commands** (ADR-045). The gate
   runs on the tree the agent left behind, but zelto only put the write-set,
   the protected paths and the policy rules into the bundle — so the agent had

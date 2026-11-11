@@ -51,7 +51,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'abandon', group: '核心切片', args: '<id>', summary: '废弃一个切片' },
   { name: 'next', group: '核心切片', args: '', summary: '推荐该切片的下一步动作' },
   { name: 'suggest', group: '核心切片', args: '', summary: '项目全貌与建议动作' },
-  { name: 'stall', group: '核心切片', args: '[id]', summary: '列出停机切片或查看其中一个', detail: '--auto-resolved' },
+  { name: 'stall', group: '核心切片', args: '[id]', summary: '列出停机切片或查看其中一个', detail: '--auto-resolved, --reap, --dry-run, --json' },
   { name: 'resume', group: '核心切片', args: '<id>', summary: '恢复停机切片', detail: '--skip, --abandon, --reset-retry' },
   { name: 'ask', group: '核心切片', args: '', summary: '列出待回答的 agent 提问', detail: '--slice, --json' },
   { name: 'answer', group: '核心切片', args: '<qid> "<text>"', summary: '回答 agent 提问并恢复切片', detail: '--list' },

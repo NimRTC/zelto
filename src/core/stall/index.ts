@@ -9,3 +9,5 @@ export type {
   StallInfo,
   StallResolution,
 } from './types.js';
+export { findDeadSlices, reapDeadSlices } from './reap.js';
+export type { DeadSlice, ReapResult } from './reap.js';

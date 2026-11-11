@@ -3,7 +3,8 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Scheduler } from '../../core/sched/engine.js';
-import { isSliceStalled } from '../../core/stall/index.js';
+import { isSliceStalled, findDeadSlices, reapDeadSlices } from '../../core/stall/index.js';
+import type { SliceData } from '../../core/slice/store.js';
 import { AuditTrail } from '../../core/audit/trail.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
@@ -732,9 +733,104 @@ register('reservation', async (args) => {
 
 // ─── stall ───────────────────────────────────────────────────────────────────
 
+/**
+ * `zelto stall --reap`：批量把死切片退回 `frozen`（ADR-053）。
+ *
+ * 「死切片」= 状态还停在 `running`，但 agent 早就挂了 —— 它带停机分类，
+ * 且不是提问回路（`agent_question` 的 agent 还活着，只是等人数码）。
+ *
+ * **为什么是显式的批量命令**：批量改状态的动作必须显式（ADR-047 §6）。
+ * 这条命令只把状态掰回「可跑」，不动停机分类，也不碰预约 ——
+ * 停机这件事本身仍然成立，人还是得逐片 `zelto resume` 走正式流程。
+ */
+async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean }): Promise<number> {
+  const allIds = await store.list();
+  const slices: SliceData[] = [];
+  for (const sid of allIds) {
+    const s = await store.read(sid).catch(() => null);
+    if (s) slices.push(s);
+  }
+
+  const dead = findDeadSlices(slices);
+
+  if (options.isJson) {
+    if (options.dryRun) {
+      console.log(JSON.stringify({ dryRun: true, dead, reaped: [] }, null, 2));
+      return 0;
+    }
+    const reaped = await reapDeadSlices(store, events, dead.map((d) => d.sliceId), {
+      actor: 'human',
+      reason: '清理死切片：agent 已停机，切片卡在 running',
+    });
+    console.log(JSON.stringify({ dead, reaped }, null, 2));
+    return 0;
+  }
+
+  if (dead.length === 0) {
+    console.log('没有死切片（没有卡在 running 的停机切片）。');
+    return 0;
+  }
+
+  console.log(`死切片（卡在 running，agent 已停机）：${dead.length} 个`);
+  for (const d of dead) {
+    console.log(`  ${d.sliceId.padEnd(20)} ${d.stallClass.padEnd(25)} ${d.lastRunAt ?? '(无运行记录)'}`);
+  }
+
+  if (options.dryRun) {
+    console.log('');
+    console.log('--dry-run：以上是将会被清理的切片，没有改动任何状态。');
+    return 0;
+  }
+
+  const reaped = await reapDeadSlices(store, events, dead.map((d) => d.sliceId), {
+    actor: 'human',
+    reason: '清理死切片：agent 已停机，切片卡在 running',
+  });
+
+  console.log('');
+  console.log(`↩️  已清理 ${reaped.length} 个死切片（running → frozen）`);
+  for (const r of reaped) {
+    if (r.reverted) {
+      console.log(`  ${r.sliceId}: ${r.from} → ${r.to}（stall: ${r.stallClass} 保留）`);
+    } else {
+      console.log(`  ${r.sliceId}: 状态未变（${r.from}），已记录事件`);
+    }
+  }
+  console.log('');
+  console.log('停机分类仍保留 —— 逐片处理：zelto resume <id> → zelto run <id>');
+  console.log('写集预约不受影响（C9）：确认现场后再 zelto reservation release <id>。');
+  return 0;
+}
+
 register('stall', async (args) => {
   const [id] = args;
   const showAutoResolved = args.includes('--auto-resolved');
+  const doReap = args.includes('--reap');
+  const isJson = args.includes('--json');
+  const dryRun = args.includes('--dry-run');
+
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('Usage: zelto stall [id] [--auto-resolved] [--json]');
+    console.log('       zelto stall --reap [--dry-run] [--json]   批量清理死切片（ADR-053）');
+    console.log('');
+    console.log('死切片 = 状态卡在 running 且带停机分类（提问回路 agent_question 除外）。');
+    console.log('--reap 把它们退回 frozen；停机分类保留，人仍需逐片 zelto resume。');
+    return 0;
+  }
+
+  // ── zelto stall --reap：批量清理死切片（ADR-053）────────────────────
+  //
+  // 「死切片」= 状态还停在 `running`，但 agent 早就挂了。
+  //
+  // 为什么要有这条命令：ADR-047 让死切片不再阻塞别人，但它们仍然占着
+  // `zelto status` 的「running」计数，人得逐片 `zelto resume` 才能清掉。
+  //
+  // 为什么不能塞进 `zelto halt --rollback`：那扫的是「持有预约的进程已死」
+  // （批次崩了）。死切片**没有预约** —— agent 挂了，预约已释放。
+  // 两个不同的问题，不该混在一条命令里。
+  if (doReap) {
+    return reapDeadSlicesCommand({ isJson, dryRun });
+  }
 
   if (id && !id.startsWith('--')) {
     try {
@@ -792,6 +888,22 @@ register('stall', async (args) => {
   for (const s of stalled) {
     console.log(`  ${s.id.padEnd(20)} ${s.stallClass.padEnd(25)} auto-resolved: ${s.autoResolved}`);
   }
+
+  // 死切片单独点出来 —— 它们的状态是 `running`，混在停机列表里看不出
+  // 「这个还在卡着、那个只是等着处理」的差别（ADR-053）。
+  const dead = findDeadSlices(await Promise.all(
+    (await store.list()).map((sid) => store.read(sid).catch(() => null)),
+  ).then((list) => list.filter((s): s is SliceData => s !== null)));
+
+  if (dead.length > 0) {
+    console.log('');
+    console.log(`死切片（卡在 running，agent 已停机）：${dead.length} 个`);
+    for (const d of dead) {
+      console.log(`  ${d.sliceId.padEnd(20)} ${d.stallClass.padEnd(25)} ${d.lastRunAt ?? '(无运行记录)'}`);
+    }
+    console.log('  清理：zelto stall --reap');
+  }
+
   return 0;
 });
 
