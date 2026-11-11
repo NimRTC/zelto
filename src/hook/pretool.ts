@@ -70,6 +70,7 @@ export interface PreToolPayload {
 // ── 路径处理 ────────────────────────────────────────────────────────────────
 
 import { isProtectedPath, matchPath, toPosix } from './protected.js';
+import { isZeltoManagedSpecPath } from './managed-spec.js';
 
 export { isProtectedPath, matchPath } from './protected.js';
 
@@ -330,7 +331,8 @@ export function extractWriteTargets(payload: PreToolPayload): string[] {
  * 按 zelto 的策略语义评估一条规则集合。
  *
  * 与 core/policy/engine.ts 的 evaluatePolicy 保持同一套规则：
- * 保护域 → 路径逃逸 → deny 优先 → 首个 allow/ask → 默认 deny。
+ * 保护域 → 路径逃逸 → zelto 托管的规格文件（ADR-054）→ deny 优先 →
+ * 首个 allow/ask → 默认 deny。
  */
 export function evaluateRules(
   rules: NonNullable<PreToolContext['rules']>,
@@ -356,6 +358,24 @@ export function evaluateRules(
 
   if (finalAction && matched) {
     return { action: finalAction, ruleId: matched.id, basis: matched.basis, guidance: matched.guidance ?? null };
+  }
+
+  // 兜底：default deny —— 例外是 zelto 托管的规格文件（ADR-054）。
+  //
+  // 与提交时刻同一口径：这些文件是 zelto 自己写的。
+  // 放在兜底这一档、而不是判定之前就放行：策略里显式写的 deny 规则
+  // 必须仍然拦得住。
+  //
+  // 放行不放松 agent 的边界 —— `judgeWriteTargets` 的第 3 步
+  // （写集预约）在策略判定**之前**就判过了：规格文件不在 agent 的
+  // 写集里，agent 写它照样被拦。
+  if (operation === 'write' && isZeltoManagedSpecPath(path)) {
+    return {
+      action: 'allow',
+      ruleId: 'zelto:managed-spec',
+      basis: 'zelto:managed-spec',
+      guidance: null,
+    };
   }
 
   return { action: 'deny', ruleId: 'default', basis: 'policy.yaml#default', guidance: null };

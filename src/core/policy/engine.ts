@@ -4,6 +4,7 @@
 import { type PolicyConfig, type PolicyDecision, type PolicyRule, type Decision } from './types.js';
 import { createHash } from 'node:crypto';
 import { normalize } from 'node:path';
+import { isZeltoManagedSpecPath } from '../project/managed-paths.js';
 
 /**
  * 保护域（C5 / C8）：硬编码，**不可被任何策略规则覆盖**。
@@ -113,6 +114,30 @@ export function evaluatePolicy(
   }
 
   // 4. Default: deny with guidance
+  //
+  // 例外：zelto 托管的规格文件（ADR-054）。
+  //
+  // `specs/slices/*.md` 是**zelto 自己写的**：人批准规格时写入，隔离运行时
+  // 复制进 worktree，合并时提交回主干。所以它在提交 diff 里出现是正常的，
+  // 报「不在策略允许范围内」是假警报 —— 提交这个文件的人就是 zelto 自己。
+  //
+  // 为什么放在**兜底**这一档、而不是判定之前就放行：策略里显式写的
+  // deny 规则必须仍然拦得住 —— 「豁免托管文件」不能变成
+  // 「谁都能改策略把保护解除」。人想真拦它，写一条 deny 规则即可。
+  //
+  // 这里放行的只是**提交时刻的策略判定**。更细的边界没有放松：
+  //   - agent 能不能写它，由写集预约管（预留在 `.zelto/locks/<id>.json`）；
+  //   - worktree 里的规格副本被改动，由托管文件哈希审计报篡改。
+  if (operation === 'write' && isZeltoManagedSpecPath(path)) {
+    return {
+      decision: 'allow',
+      ruleId: 'zelto:managed-spec',
+      basis: 'zelto:managed-spec',
+      guidance: null,
+      policyVersion,
+    };
+  }
+
   return {
     decision: 'deny',
     ruleId: 'default',

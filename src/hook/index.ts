@@ -12,6 +12,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { isProtectedPath, matchPath } from './protected.js';
+import { isZeltoManagedSpecPath } from './managed-spec.js';
 
 // ── Inline policy engine (self-contained, no import from core/) ──────────
 
@@ -66,7 +67,7 @@ function evaluatePolicy(
     };
   }
 
-  // 3. Sort rules by priority
+  // 3. Sort rules by priority (highest first), then evaluate
   const sorted = [...config.rules].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
 
   let finalDecision: Decision | null = null;
@@ -98,6 +99,27 @@ function evaluatePolicy(
       ruleId: matchedRule.id,
       basis: matchedRule.basis,
       guidance: matchedRule.guidance ?? null,
+      policyVersion,
+    };
+  }
+
+  // 兜底：default deny —— 例外是 zelto 托管的规格文件（ADR-054）。
+  //
+  // `specs/slices/*.md` 是 zelto 自己写的（人批准规格时写入 → 隔离运行时
+  // 复制进 worktree → 合并时提交回主干）。它在提交 diff 里出现是正常的，
+  // 报「不在策略允许范围内」是假警报。
+  //
+  // 放在兜底这一档、而不是判定之前就放行：策略里显式写的 deny 规则
+  // 必须仍然拦得住 —— 豁免不能变成「谁都能改策略把保护解除」。
+  //
+  // 放行的只是**提交时刻的策略判定**；agent 能不能写它仍由写集预约管，
+  // 规格副本被改动仍由托管文件哈希审计报篡改。
+  if (operation === 'write' && isZeltoManagedSpecPath(path)) {
+    return {
+      decision: 'allow',
+      ruleId: 'zelto:managed-spec',
+      basis: 'zelto:managed-spec',
+      guidance: null,
       policyVersion,
     };
   }
