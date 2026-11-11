@@ -143,6 +143,89 @@ function nonFlagArgs(tokens: string[]): string[] {
 }
 
 /**
+ * 从一条 shell 命令里抽出**重定向**的写入目标。
+ *
+ * 为什么要自己扫而不是用正则：正则分不清「引号里的 `>`」与
+ * 「引号外的 `>`」。原实现直接在原串上扫 `>{1,2}\s*(\S+)`，
+ * 于是 `awk 'NR>100'` 里的 `100` 被当成「重定向到文件 100」，
+ * 拿这个假目标去判写集 —— 判定结果是「越界」，把一条完全无害的
+ * 命令拦掉了。
+ *
+ * 真实案例：nimrtc-zelto 的 `v1-exception-handling` 切片里，
+ * agent 跑 `awk 'NR>100{...}'` 被 hook 判成越界写入 `100`。
+ *
+ * 这里按字符扫，跟踪引号状态：
+ *   - 引号外的 `>` / `>>` / `&>` → 真的重定向，取后面的目标；
+ *   - 引号内的 `>` → 普通字符，忽略；
+ *   - `>&` / `2>&1` → 文件描述符复制，不是写文件，忽略。
+ */
+export function extractRedirectTargets(command: string): string[] {
+  const targets: string[] = [];
+  let i = 0;
+  let quote: '"' | "'" | null = null;
+
+  while (i < command.length) {
+    const ch = command[i];
+
+    // ── 引号内：只找配对的结束引号，其余字符全部忽略 ──
+    if (quote) {
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+
+    // ── 进入引号 ──
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
+
+    // ── 文件描述符复制（`>&` / `2>&1`）：不是写文件 ──
+    if (ch === '>' && command[i + 1] === '&') {
+      i += 2;
+      // 跳过 `>&N` 的目标
+      while (i < command.length && /[0-9]/.test(command[i])) i++;
+      continue;
+    }
+
+    // ── 真正的重定向 ──
+    if (ch === '>') {
+      i++;
+      // `>>` 是追加，同样是写
+      if (command[i] === '>') i++;
+
+      // 跳过空白
+      while (i < command.length && /\s/.test(command[i])) i++;
+
+      // 读目标：引号包裹的取引号内内容，否则取到空白/分隔符为止
+      let target = '';
+      if (command[i] === '"' || command[i] === "'") {
+        const q = command[i];
+        i++;
+        while (i < command.length && command[i] !== q) {
+          target += command[i];
+          i++;
+        }
+        i++; // 跳过结束引号
+      } else {
+        while (i < command.length && !/[\s"';&|<>]/.test(command[i])) {
+          target += command[i];
+          i++;
+        }
+      }
+
+      if (target && target !== '&1' && target !== '&2') targets.push(target);
+      continue;
+    }
+
+    i++;
+  }
+
+  return targets;
+}
+
+/**
  * 从一条 shell 命令里抽出「可能被写」的路径。
  *
  * 这是保守的静态分析，不是 shell 解析器：
@@ -157,16 +240,7 @@ export function extractBashWriteTargets(command: string): string[] {
   const targets: string[] = [];
 
   // 1. 重定向
-  const redirect = /(?:^|[^0-9&]|\d)>{1,2}\s*(?:"([^"]*)"|'([^']*)'|([^\s"';&|<>]+))/g;
-  const redirectErr = /&>\s*(?:"([^"]*)"|'([^']*)'|([^\s"';&|<>]+))/g;
-  for (const re of [redirect, redirectErr]) {
-    let m = re.exec(command);
-    while (m !== null) {
-      const value = m[1] ?? m[2] ?? m[3];
-      if (value && value !== '&1' && value !== '&2') targets.push(value);
-      m = re.exec(command);
-    }
-  }
+  targets.push(...extractRedirectTargets(command));
 
   // 2. 写文件命令
   for (const segment of splitSegments(command)) {

@@ -4,6 +4,15 @@ export { validateDeterministic, DETERMINISTIC_CHECKS, EXPECTED_SECTIONS } from '
 export { analyzeSemantic, SEMANTIC_CHECKS } from './semantic/analyzer.js';
 export { parseScopePaths, parseAcceptanceCriteria, parsePrerequisites } from './scope.js';
 export {
+  evaluateWriteSet,
+  findUnproducedWriteSetPaths,
+  isInWriteSet,
+  writeSetCoversDir,
+  writeSetEscapesRoot,
+  writeSetHitsProtectedDomain,
+} from './write-set.js';
+export type { WriteSetCheckResult, WriteSetCheckOptions } from './write-set.js';
+export {
   SPEC_SECTIONS, REQUIRED_SECTIONS, sectionByConcept, headingMatches,
   extractSection, missingRequiredSections,
 } from './format.js';

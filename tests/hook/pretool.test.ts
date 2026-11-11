@@ -9,6 +9,7 @@ import {
   type PreToolContext,
   extractWriteTargets,
   extractBashWriteTargets,
+  extractRedirectTargets,
   isProtectedPath,
   judgeWriteTargets,
   parsePolicyRules,
@@ -99,6 +100,44 @@ describe('extractWriteTargets', () => {
   it('ignores commands that do not write', () => {
     assert.deepEqual(extractBashWriteTargets('ls -la'), []);
     assert.deepEqual(extractBashWriteTargets('cat README.md'), []);
+  });
+});
+
+describe('extractRedirectTargets —— 重定向必须认引号（ADR-043）', () => {
+  it('引号里的 > 不是重定向（回归点：awk 的 NR>100）', () => {
+    // 原实现直接用正则扫原串，于是把 `NR>100` 读成「重定向到 100」，
+    // 拿这个假目标去判写集 → 判定「越界写入」→ 把无害命令拦掉。
+    assert.deepEqual(extractBashWriteTargets("awk 'NR>100 {print}' data.txt"), []);
+  });
+
+  it('双引号里的 > 同样不是重定向', () => {
+    assert.deepEqual(extractBashWriteTargets('echo "a > b"'), []);
+  });
+
+  it('引号外的 > 仍然是重定向', () => {
+    assert.deepEqual(extractBashWriteTargets('echo hi > out.txt'), ['out.txt']);
+  });
+
+  it('引号包裹的重定向目标能正确取出', () => {
+    assert.deepEqual(extractBashWriteTargets('echo hi > "out file.txt"'), ['out file.txt']);
+    assert.deepEqual(extractBashWriteTargets("echo hi > 'out file.txt'"), ['out file.txt']);
+  });
+
+  it('追加重定向 >> 也算写', () => {
+    assert.deepEqual(extractBashWriteTargets('echo hi >> log.txt'), ['log.txt']);
+  });
+
+  it('文件描述符复制 >& 不是写文件', () => {
+    assert.deepEqual(extractBashWriteTargets('cmd 2>&1'), []);
+    assert.deepEqual(extractBashWriteTargets('cmd >&2'), []);
+  });
+
+  it('&> 是真重定向', () => {
+    assert.deepEqual(extractBashWriteTargets('cmd &> all.log'), ['all.log']);
+  });
+
+  it('引号在前、后面才有真重定向时，两边都认', () => {
+    assert.deepEqual(extractBashWriteTargets("echo 'x > y' > out.txt"), ['out.txt']);
   });
 });
 

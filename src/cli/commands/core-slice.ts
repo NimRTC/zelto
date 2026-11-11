@@ -51,6 +51,7 @@ import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
+import { evaluateWriteSet } from '../../core/spec/write-set.js';
 import { judgeTrace, traceCountsOf, blockingViolations, advisoryViolations } from '../../core/trace/index.js';
 import { validateDeterministic } from '../../core/spec/deterministic/validator.js';
 import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
@@ -479,14 +480,22 @@ register('check', async (args) => {
     for (const v of advisoryViolations(traceJudgment)) advisories.push(v.short);
     if (slice.drift.detected) issues.push(`Drift detected: ${slice.drift.reason}`);
 
-    // Validate write-set paths exist in the repo
-    const missingWrites = slice.writes.filter((w) => {
-      // Glob patterns with * are hard to verify; skip those
-      if (w.includes('*') || w.includes('?')) return false;
-      return !existsSync(w);
-    });
-    if (missingWrites.length > 0) {
-      issues.push(`Write-set paths not found: ${missingWrites.join(', ')}`);
+    // 写集判定（ADR-042 §3.1）：
+    //   - 写集写进保护域 / 逃出项目根 → 阻断（跑之前就注定跑不起来）
+    //   - 写集路径还不存在 → 提示（那是 agent 要**新建**的文件，
+    //     不是错误；原来这里直接阻断，导致「新建文件型切片」永远过不了门禁①）
+    if (slice.writes.length > 0) {
+      const writeSetResult = evaluateWriteSet({
+        writes: slice.writes,
+        projectRoot: process.cwd(),
+      });
+      for (const issue of writeSetResult.issues) issues.push(issue);
+      for (const advisory of writeSetResult.advisories) advisories.push(advisory);
+      if (writeSetResult.toCreate.length > 0) {
+        console.log(
+          `  New files: ${writeSetResult.toCreate.length} path(s) will be created by the agent`,
+        );
+      }
     }
 
     // Validate acceptance test path exists
