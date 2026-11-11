@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Multi-line gate commands in `.zelto/config.yaml` are no longer swallowed**
+  (ADR-041). YAML's idiomatic way of writing a long shell command is a folded
+  block scalar (`run: >`), but the config parser only understood a single-line
+  `run: <one line>` — so `run: >` was read as the literal command `>`, and the
+  gate failed instantly with a syntax error that pointed at the *build*, not at
+  the parser. The failure was in the wrong place: the code that was actually
+  broken (the parser) reported nothing, and the error surfaced several layers
+  downstream. The parser now understands block scalars (`>` folded, `|`
+  literal) in all four places they may appear (gate commands, slice-level
+  acceptance, agent command, target-project gate), and the cursor advances
+  exactly past the block. A folded value never contains a newline — a value
+  with newlines would turn "one command" into "several commands".
+- **The slice ledger now matches what actually happened** (ADR-041). Three
+  fields were structurally present but never filled in, so a person reading a
+  slice's state file was reading fiction. `runs` was a dead field (nothing in
+  the repository ever pushed to it) and the clarification round number was
+  derived from it, so the round was always 1 — asking the same questions in
+  every round and colliding on question ids; each agent run now appends a
+  `{ at, ok, exitCode }` record and the clarification round has its own
+  monotonic counter. `baseCommit` was always `null`, which made the merge
+  guard's "the base moved — block the merge" rule a no-op; the base commit is
+  now written back when the worktree is created (an existing base is never
+  overwritten). A slice in a terminal state (`completed` / `abandoned`) no
+  longer carries a stall classification — "this slice is stuck" is simply not
+  true of a finished slice — and legacy state files are corrected when read.
+
 ## [0.5.0] — 2026-11-10
 
 ### Added

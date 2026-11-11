@@ -631,7 +631,16 @@ register('clarify', async (args) => {
     }
 
     const current = isDryRun ? slice : await store.read(id);
-    const round = (current.runs?.length ?? 0) + 1;
+    // 澄清轮次（ADR-041 §3.1）：轮次号会进澄清问题 ID（`<slice>-<category>-<round>`），
+    // 必须单调递增。之前这里读的是 `runs.length` —— 那是「跑过几次」，
+    // 和澄清轮次根本不是一回事，于是轮次永远停在第 1 轮，
+    // 人澄清了三轮，zelto 还在问第一轮的问题。
+    const round = isDryRun
+      ? (current.clarifyRounds ?? 0) + 1
+      : await store.nextClarifyRound(id);
+    // 记住新轮次：下面的 `store.write(current)` 会把整份快照写回去，
+    // 不带上这个值就等于把刚记上的轮次抹掉。
+    current.clarifyRounds = round;
 
     if (isAuto || isDryRun) {
       const result = await engine.generateQuestions(current, round);
@@ -1218,6 +1227,10 @@ register('run', async (args) => {
       break;
     }
 
+    // 记账（ADR-041 §3.1）：一次 agent 运行 = 一条运行记录。
+    // 记在写集审计之前 —— 审计只判「有没有越界」，不改变「agent 跑没跑完」这个事实。
+    await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+
     // 写集审计（ADR-014 §5）：agent 跑完了，拿 git 的真实改动再对一次写集。
     // 静态分析拦不住的写（`node -e "fs.writeFileSync(...)"` 之类）到这里兜住。
     const withinBounds = await enforceWriteSet(id, activeGuard);
@@ -1638,6 +1651,9 @@ register('start', async (args) => {
       break;
     }
 
+    // 记账（ADR-041 §3.1）
+    await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+
     if (finalExitCode === 0) {
       // 提问回路：agent 以问题收尾 → 挂起切片，不跑门禁（ADR-013 §3.6）
       const question = await detectQuestion(id, adapter, sessionId);
@@ -1732,6 +1748,9 @@ async function monitorTaskInBackground(
     const exitCode = await adapter.waitForExit(sessionId);
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     const status = exitCode === 0 ? 'completed' : 'failed';
+
+    // 记账（ADR-041 §3.1）：后台运行同样是一次运行。
+    await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
 
     // Update task file
     const task = await loadTask(taskId);

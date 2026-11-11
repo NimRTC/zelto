@@ -159,10 +159,17 @@ interface SliceData {
   trace: { requirements, contracts, tests };
   traceWaiver: string | null;
   writes: string[];
-  runs: string[];
+  runs: SliceRun[];              // 运行记录：每次 agent 运行结束追加一条
+  clarifyRounds?: number;        // 已走过的澄清轮次（单调递增）
   stall: { class, autoResolved, gateRetries };
   createdAt: string;
   updatedAt: string;
+}
+
+interface SliceRun {
+  at: string;          // 运行结束时刻（ISO 8601）
+  ok: boolean;         // agent 进程是否正常退出
+  exitCode: number | null;
 }
 ```
 

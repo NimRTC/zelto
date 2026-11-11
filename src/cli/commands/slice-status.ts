@@ -251,7 +251,7 @@ async function showSingleSliceStatus(id: string, isJson: boolean, f: ReturnType<
       f.out('');
       f.out(`  ${colors.dim('Recent runs:')}`);
       for (const run of s.runs.slice(-3)) {
-        f.out(`    - ${run}`);
+        f.out(`    - ${run.at.slice(0, 19).replace('T', ' ')}  ${run.ok ? '✔ ok' : '✘ failed'}${run.exitCode !== null ? ` (exit ${run.exitCode})` : ''}`);
       }
       if (s.runs.length > 3) f.out(`    ... (${s.runs.length - 3} more)`);
     }

@@ -847,7 +847,7 @@ register('status', async (args) => {
         if (s.state === 'running') {
           activeSlices.push({
             id, title: s.title, state: s.state,
-            runningSince: s.runs.length > 0 ? s.runs[s.runs.length - 1] : undefined,
+            runningSince: s.runs.length > 0 ? s.runs[s.runs.length - 1].at : undefined,
           });
         }
       } catch { /* skip */ }

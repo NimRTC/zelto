@@ -53,7 +53,24 @@
     "traceWaiver": { "type": ["string", "null"] },
     "baseline": { "type": "boolean" },
     "writes": { "type": "array", "items": { "type": "string" } },
-    "runs": { "type": "array", "items": { "type": "string" } },
+    "runs": {
+      "type": "array",
+      "description": "运行记录 —— 每次 agent 运行结束追加一条（ADR-041 §3.1）",
+      "items": {
+        "type": "object",
+        "required": ["at", "ok", "exitCode"],
+        "properties": {
+          "at": { "type": "string", "format": "date-time", "description": "运行结束时刻（ISO 8601）" },
+          "ok": { "type": "boolean", "description": "agent 进程是否正常退出（退出码 0）" },
+          "exitCode": { "type": ["integer", "null"], "description": "agent 退出码；被信号打断为 null" }
+        }
+      }
+    },
+    "clarifyRounds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "已经走过的澄清轮次（澄清问题 ID 里带轮次号，必须单调递增）"
+    },
     "stall": {
       "type": "object",
       "properties": {

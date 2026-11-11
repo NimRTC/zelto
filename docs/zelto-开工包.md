@@ -137,6 +137,7 @@ cat > .zelto/slices/my-first-slice.json << 'EOF'
   "traceWaiver": null,
   "writes": ["src/**/*.ts"],
   "runs": [],
+  "clarifyRounds": 0,
   "stall": { "class": null, "autoResolved": 0, "gateRetries": 0 },
   "createdAt": "2026-10-15T00:00:00.000Z",
   "updatedAt": "2026-10-15T00:00:00.000Z"
@@ -569,6 +570,7 @@ echo '{"path":"<your-path>","operation":"write","harness":"test"}' | node dist/h
   "traceWaiver": null,
   "writes": [],
   "runs": [],
+  "clarifyRounds": 0,
   "stall": { "class": null, "autoResolved": 0, "gateRetries": 0 },
   "createdAt": "<ISO-8601>",
   "updatedAt": "<ISO-8601>"

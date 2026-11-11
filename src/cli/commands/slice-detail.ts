@@ -99,7 +99,7 @@ register('slice', async (args) => {
     if (slice.runs.length > 0) {
       f.out(`  Runs:      ${slice.runs.length}`);
       for (const run of slice.runs.slice(-3)) {
-        f.out(`    - ${run}`);
+        f.out(`    - ${run.at.slice(0, 19).replace('T', ' ')}  ${run.ok ? '✔ ok' : '✘ failed'}${run.exitCode !== null ? ` (exit ${run.exitCode})` : ''}`);
       }
       if (slice.runs.length > 3) f.out(`    ... (${slice.runs.length - 3} more)`);
     }

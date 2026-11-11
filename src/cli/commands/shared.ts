@@ -13,6 +13,7 @@ import { EventStream } from '../../core/events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
 import type { GateAcceptanceConfig } from '../../core/gate/types.js';
+import { parseBlockScalarHeader, readBlockScalar } from './config-blocks.js';
 import { SliceStore } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import { buildDeterministicSliceSpec } from '../../llm/generators/slice-spec.js';
@@ -363,7 +364,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let currentTpProfile: string | null = null;
 
   const lines = content.split('\n');
-  for (const line of lines) {
+  // 索引式循环：块标量（run: > / command: |）要一次吃掉若干行，
+  // 需要能把游标推进到块之后的下一行（见 config-blocks.ts）。
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const trimmed = line.trim();
     const indent = line.length - trimmed.length;
     if (trimmed.startsWith('#') || trimmed === '') continue;
@@ -457,7 +461,17 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         if (indent <= acceptanceIndent) {
           inAcceptanceSection = false;
         } else if (trimmed.startsWith('command:')) {
-          acceptanceCommand = stripSurroundingQuotes(trimmed.slice(8).trim());
+          const raw = trimmed.slice(8).trim();
+          const header = parseBlockScalarHeader(raw);
+          if (header) {
+            const block = readBlockScalar(lines, i, indent, header);
+            if (block) {
+              acceptanceCommand = block.value;
+              i = block.nextIndex - 1;
+              continue;
+            }
+          }
+          acceptanceCommand = stripSurroundingQuotes(raw);
           continue;
         } else if (trimmed.startsWith('required:')) {
           const raw = trimmed.slice(9).trim().toLowerCase();
@@ -503,8 +517,18 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
 
       if (trimmed.startsWith('run:')) {
+        const raw = trimmed.slice(4).trim();
+        const header = parseBlockScalarHeader(raw);
+        if (header) {
+          const block = readBlockScalar(lines, i, indent, header);
+          if (block) {
+            if (currentCommand) currentCommand.run = block.value;
+            i = block.nextIndex - 1;
+            continue;
+          }
+        }
         if (currentCommand) {
-          currentCommand.run = stripSurroundingQuotes(trimmed.slice(4).trim());
+          currentCommand.run = stripSurroundingQuotes(raw);
         }
         continue;
       }
@@ -527,7 +551,17 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     }
 
     if (inAgentSection && trimmed.startsWith('command:')) {
-      agentCommand = stripSurroundingQuotes(trimmed.slice(8).trim());
+      const raw = trimmed.slice(8).trim();
+      const header = parseBlockScalarHeader(raw);
+      if (header) {
+        const block = readBlockScalar(lines, i, indent, header);
+        if (block) {
+          agentCommand = block.value;
+          i = block.nextIndex - 1;
+        }
+      } else {
+        agentCommand = stripSurroundingQuotes(raw);
+      }
     }
 
     if (inAgentSection && trimmed.startsWith('adapter:')) {
@@ -652,8 +686,18 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         }
 
         if (trimmed.startsWith('run:')) {
+          const raw = trimmed.slice(4).trim();
+          const header = parseBlockScalarHeader(raw);
+          if (header) {
+            const block = readBlockScalar(lines, i, indent, header);
+            if (block) {
+              if (currentTpCommand) currentTpCommand.run = block.value;
+              i = block.nextIndex - 1;
+              continue;
+            }
+          }
           if (currentTpCommand) {
-            currentTpCommand.run = stripSurroundingQuotes(trimmed.slice(4).trim());
+            currentTpCommand.run = stripSurroundingQuotes(raw);
           }
           continue;
         }
@@ -829,6 +873,13 @@ export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
     specPath: slice.spec.path,
     acceptanceDir: slice.acceptance.dir,
   });
+
+  // 基点回写（ADR-041 §3.2）：worktree 管理器知道基点是谁，但没人把它记下来。
+  // `baseCommit` 为 null 时合并守卫的「基点漂移就拦合并」判据形同虚设。
+  if (slice.baseCommit === null && info.baseCommit) {
+    slice.baseCommit = info.baseCommit;
+    await store.write(slice);
+  }
 
   if (!existed) {
     await events.append(id, 'worktree.created', 'zelto', {

@@ -60,3 +60,14 @@ export function transitionSlice(current: SliceState, event: SliceEvent): SliceSt
   }
   return next;
 }
+
+/**
+ * 终态 —— 不会再回到工作流里的状态。
+ *
+ * 终态的切片不该再带停机分类（ADR-041 §3.3）：
+ * 停机的语义是「这片现在卡住了，需要人介入」，
+ * 而一片已经完成或已放弃的切片，「卡着」这个结论本身就是错的。
+ */
+export function isTerminalState(state: SliceState): boolean {
+  return state === 'completed' || state === 'abandoned';
+}
