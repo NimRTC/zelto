@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { Scheduler } from '../../core/sched/engine.js';
 import { listFilesUnder } from '../../core/sched/audit.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
+import { classifyStall } from '../../core/stall/classifier.js';
 import type { SliceData } from '../../core/slice/store.js';
 import type { WorktreeInfo } from '../../core/worktree/index.js';
 
@@ -30,7 +31,7 @@ import {
   store,
   worktreeManager,
 } from './shared.js';
-import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost } from './run-support.js';
+import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, markSliceStalled } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -112,6 +113,13 @@ export interface ParallelExecutionResult {
  * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
  * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
  * 但内容被改动就是篡改：改了规格副本等于自动改规格（AGENTS.md 禁区）。
+ *
+ * **例外（ADR-046）**：验收目录里那些**在写集里**的文件不是「zelto 托管」的
+ * —— 它们是 agent 该改的东西（验收骨架里的 `test.todo` 必须被换成真断言）。
+ * 把它们同时登记成托管文件，等于一边叫 agent 改、一边拦它改。
+ *
+ * 判据是**写集**：写集里有的 → agent 的地盘；没在写集里的验收文件 →
+ * zelto 的地盘，agent 不该动。
  */
 export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): string[] {
   if (!worktreePath) return [];
@@ -119,7 +127,11 @@ export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): 
   const paths: string[] = [];
   if (slice.spec.path) paths.push(slice.spec.path);
   if (slice.acceptance.dir) {
-    paths.push(...listFilesUnder(worktreePath, slice.acceptance.dir));
+    const writeSet = new Set(slice.writes.map((w) => w.replace(/\\/g, '/')));
+    for (const file of listFilesUnder(worktreePath, slice.acceptance.dir)) {
+      if (writeSet.has(file)) continue; // agent 要改它（ADR-046）
+      paths.push(file);
+    }
   }
   paths.push(join(ZELTO_DIR, `${slice.id}-bundle.json`));
   return paths;
@@ -380,7 +392,7 @@ export async function executeSlicesParallel(
       affinityGroup !== null
         ? await scheduler.buildAffinityContext(st.id, affinityGroup, affinityPrev)
         : null;
-    const bundle = scheduler.buildConstraints(slice, affinityCtx);
+    const bundle = scheduler.buildConstraints(slice, affinityCtx, gateCommandsForSlice(slice.writes));
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
@@ -566,6 +578,7 @@ export async function executeSlicesParallel(
         }
 
         // 失败 —— 按配置在 CLI 层自动重试
+        let stalled = false;
         if (attempt < maxRetries) {
           await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
           const result = await handleAgentFailure(st.id, exitCode.exitCode, { maxRetries });
@@ -588,10 +601,28 @@ export async function executeSlicesParallel(
               console.error(`  ❌ ${st.id}: retry start failed: ${msg}`);
             }
           }
+          // handleAgentFailure 返回 'stall' 时，它**已经**把切片停机了
+          // （退 frozen + 写分类 + 留痕）—— 不再重复一遍。
+          stalled = result.action === 'stall';
         }
 
         // 不再重试 —— 最终失败
-        await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
+        if (!stalled) {
+          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
+          // 停机标记（ADR-047）：并行路径原本**完全不写停机** ——
+          // 只有单片路径写。于是并行批次里失败的切片既没有停机分类，
+          // 也没有退回 frozen：人看不见它卡住了，而它还占着写集，
+          // 继续阻塞别的切片（准入只认 frozen / completed）。
+          // 走「停机的唯一落点」：退 frozen + 写分类 + 留痕。
+          await markSliceStalled(st.id, classifyStall({
+            type: exitCode.exitCode === null ? 'build_failure' : 'test_failure',
+            message: `Agent exited with code ${exitCode.exitCode ?? 'signal'}`,
+            attempts: 1,
+          }), {
+            exitCode: exitCode.exitCode,
+            reason: `agent failed: ${exitCode.exitCode ?? 'signal'}`,
+          });
+        }
         st.status = 'failed';
         return st;
       }

@@ -2,7 +2,55 @@
 
 ## [Unreleased]
 
+### Added
+- **The constraint bundle now carries the gate commands** (ADR-045). The gate
+  runs on the tree the agent left behind, but zelto only put the write-set,
+  the protected paths and the policy rules into the bundle — so the agent had
+  to *guess* which build system, which generator and which binary directory
+  the gate would use. In the field that guess cost a full 30-minute agent
+  round: the agent configured `build/` with NMake, the gate reconfigured the
+  *same* directory with Visual Studio, and CMake refused
+  (`generator platform: x64 does not match the platform used previously`).
+  The agent's work was correct — the build and test steps passed; only
+  `configure` failed. The error pointed at "the environment", not at "the
+  product", so the next agent round configured it the same wrong way and the
+  loop repeated. The bundle now states the gate's commands verbatim (the same
+  selection logic the gate itself uses) and tells the agent to verify with
+  exactly those. It is a statement of fact, not a constraint: the agent may
+  still run anything else, it just knows what the gate will do.
+- **A failed agent no longer strands the slice in `running`** (ADR-047). Four
+  paths were all blocked at once: `run` refused to run it (admission only
+  accepts `frozen` / `completed`), `merge` would not take it (unsigned),
+  `resume` cleared the stall classification but left the state at `running`
+  — so the "you can re-run it now" message was untrue — and the only way
+  out was `abandon`, throwing away the spec. One agent hiccup meant the
+  slice was dead. ADR-037 had fixed this same disease for out-of-bounds
+  writes but only on that one path. Now the stall has a **single landing
+  point** (`markSliceStalled`): revert the state to `frozen`, write the
+  classification, write the events — in that order, so a failure part-way
+  through still leaves a re-runnable slice. All three execution paths
+  (foreground, parallel, background) go through it; the parallel path
+  previously wrote no stall at all, so a failed slice in a batch was neither
+  visible nor re-runnable. `resume()` now moves the state as well, and the
+  admission refusal says what to do next instead of only stating the
+  precondition. Dead slices also stop blocking other slices from the
+  write-set — except the ones waiting for an answer, where the agent is
+  still alive and still holds the reservation.
+
 ### Fixed
+- **The acceptance skeleton is now inside the write-set** (ADR-046). zelto
+  generated an acceptance file full of `test.todo` placeholders (ADR-034),
+  required it to contain real assertions (ADR-033: "todos and skips do not
+  count as verification"), and then refused to let anyone touch it — the
+  skeleton was not in the write-set and the runtime hook blocked writes to
+  it. The agent did nothing wrong; it was told "you may only modify these
+  paths". The result: **every slice that went through `zelto spec draft`
+  was guaranteed to fail gate②** unless a person added the file to the
+  write-set by hand. zelto was manufacturing a thing it would not allow to
+  be changed. The skeleton now goes into the write-set when the draft is
+  created, and the instructions say explicitly that every `test.todo` has to
+  become a real assertion — being in the write-set does not mean the agent
+  will change it, and the instruction has to say so.
 - **Multi-line gate commands in `.zelto/config.yaml` are no longer swallowed**
   (ADR-041). YAML's idiomatic way of writing a long shell command is a folded
   block scalar (`run: >`), but the config parser only understood a single-line

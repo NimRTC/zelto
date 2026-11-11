@@ -70,8 +70,11 @@ describe('zelto resume command', () => {
   it('resumes a stalled slice (re-raise agent)', async () => {
     await scheduler.resume('stall-1', {});
     const s = await store.read('stall-1');
-    // Stall cleared, slice still in running state
+    // Stall cleared
     assert.equal(s.stall.class, null);
+    // ADR-047: resume 之后切片回到「可重跑」的状态。
+    // 留在 running 的话准入只认 frozen / completed —— 切片再也跑不了。
+    assert.equal(s.state, 'frozen', 'resume 后应退回 frozen');
     // Check that run.resumed event was emitted
     const evts = await events.read('stall-1');
     assert.ok(evts.some((e) => e.type === 'run.resumed'));
@@ -81,6 +84,7 @@ describe('zelto resume command', () => {
     await scheduler.resume('stall-2', { skip: true });
     const s = await store.read('stall-2');
     assert.equal(s.stall.class, null);
+    assert.equal(s.state, 'frozen', 'skip 同样要退回 frozen');
     const evts = await events.read('stall-2');
     assert.ok(evts.some((e) => e.type === 'run.resumed'));
   });

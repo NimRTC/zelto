@@ -34,6 +34,24 @@ export interface ConstraintBundle {
   instructions: string;
   /** 亲和上下文（ADR-024）：只读建议，不参与任何判定 */
   affinity?: AffinityContext | null;
+  /**
+   * 门禁命令原文（ADR-045）。
+   *
+   * agent 必须用**同一套**命令验证自己的产物，否则门禁②会在 agent
+   * 留下的现场上失败 —— 最典型的是 CMake 生成器不一致：agent 用
+   * NMake/Ninja 配的 `build/`，门禁用 Visual Studio 再配一次，直接报
+   * 「generator platform does not match the platform used previously」。
+   *
+   * 这是**事实陈述**，不是判定：agent 仍然可以跑别的命令，但要知道
+   * 门禁会用哪一套。
+   */
+  gateCommands?: GateCommandSummary[];
+}
+
+/** 门禁命令摘要（只给 agent 看，不参与任何判定） */
+export interface GateCommandSummary {
+  name: string;
+  run: string;
 }
 
 /** 亲和组前序切片的确定性摘要（只读文件与 git，不调模型） */

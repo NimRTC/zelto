@@ -309,22 +309,26 @@ export class WorktreeManager {
       if (!existsSync(join(mainSub, '.git'))) continue;
       if (!existsSync(wtSub)) continue;
 
-      // 主仓工作区里那个 submodule 当前在哪个 commit。
-      //
-      // 注意：`git rev-parse HEAD` 在 submodule 里会顺着 `.git` 文件指到
-      // **共享的** module git 目录 —— 那里的 HEAD 未必是主仓工作区里
-      // 检出的那个 commit。所以要读**工作区的 HEAD**：
-      // `git rev-parse HEAD` 对独立嵌套克隆（`.git` 是目录）是对的，
-      // 对共享布局要读主仓 index 里记录的 gitlink。
-      const mainHead = this.submoduleHead(mainSub, sub.path);
-      if (!mainHead) continue;
+      // 目标 commit：**worktree 自己的 index** 里记录的 gitlink。
+      // worktree 是从主仓同一个 commit 建出来的，所以它 index 里记的
+      // 就是主仓要的那一个 —— 这比「主仓工作区当前在哪个 commit」更准
+      // （主仓工作区可能被人工切过）。
+      let target: string | null = null;
+      try {
+        const recorded = this.git(['ls-files', '-s', '--', sub.path], undefined, true, worktreePath).trim();
+        const match = recorded.match(/^160000 ([0-9a-f]{40})/);
+        if (match) target = match[1];
+      } catch {
+        target = null;
+      }
+      if (!target) continue;
 
-      // worktree 里已经在同一个 commit 上 → 不用动
-      const wtHead = this.submoduleHead(wtSub, sub.path);
-      if (wtHead === mainHead) continue;
+      // worktree 里那个 submodule 当前实际在哪个 commit
+      const wtHead = this.submoduleHead(wtSub);
+      if (wtHead === target) continue;
 
       try {
-        this.git(['checkout', '--force', mainHead], undefined, false, wtSub);
+        this.git(['checkout', '--force', target], undefined, false, wtSub);
         aligned.push(sub.path);
       } catch {
         // 对不齐就留着 —— git status 会显示差异，审计会报出来（不静默）
@@ -335,25 +339,15 @@ export class WorktreeManager {
   }
 
   /**
-   * 求主仓工作区里那个 submodule 实际检出的 commit。
+   * 求一个 submodule 工作区当前实际检出的 commit。
    *
-   * 两种布局分别处理：
-   * - `.git` 是**目录**（独立嵌套克隆）→ `git rev-parse HEAD` 就是工作区的 HEAD；
-   * - `.git` 是**文件**（共享 module git 目录）→ 共享目录的 HEAD 可能被别的
-   *   操作改过，工作区的 HEAD 要从它自己的 index 读（`git rev-parse HEAD`
-   *   会读共享目录的 HEAD，不可靠）。
+   * `git rev-parse HEAD` 在 submodule 里会顺着 `.git` 文件指到
+   * **共享的** module git 目录 —— 那里的 HEAD 未必是这个工作区检出的
+   * commit（共享目录被别的操作改过就会漂）。
+   *
+   * 独立嵌套克隆（`.git` 是目录）没有这个问题，直接问它自己。
    */
-  private submoduleHead(subPath: string, subRelPath: string): string | null {
-    // 共享布局：主仓 index 里记录的 gitlink 才是「主仓工作区该在哪个 commit」
-    try {
-      const recorded = this.git(['ls-files', '-s', '--', subRelPath], undefined, true).trim();
-      const match = recorded.match(/^160000 ([0-9a-f]{40})/);
-      if (match) return match[1];
-    } catch {
-      // 读不到就往下走
-    }
-
-    // 独立嵌套克隆：直接问它自己
+  private submoduleHead(subPath: string): string | null {
     try {
       return this.git(['rev-parse', 'HEAD'], undefined, true, subPath).trim() || null;
     } catch {

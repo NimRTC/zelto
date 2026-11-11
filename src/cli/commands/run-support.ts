@@ -14,12 +14,37 @@ import { BudgetCollector } from '../../core/budget/collector.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
-import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
+import { detectSliceType } from '../../core/gate/types.js';
+import type { GateCommandSummary } from '../../core/sched/types.js';
+import { classifyStall, isAutoResolvable, type StallClass } from '../../core/stall/classifier.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
 import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
 import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
+
+/**
+ * 求本片实际会跑的门禁命令（ADR-045）。
+ *
+ * 与 `GateExecutor.selectCommands` 同一口径：按切片类型查 profile，
+ * 查不到就用默认命令。这里只**读**，不判定、不执行。
+ *
+ * 为什么要单独求一遍：门禁在 agent 跑完之后才执行，那时 agent 已经
+ * 走了。agent 必须**事先**知道门禁会用哪套命令，才能用同一套验证自己
+ * 的产物 —— 否则门禁②会在 agent 留下的现场上失败（CMake 生成器不一致
+ * 是最典型的例子），而失败的报错指向「环境不对」，不指向「产物不对」。
+ */
+export function resolveGateCommands(sliceType: string): GateCommandSummary[] {
+  const config = loadConfig();
+  const profile = config.gate.profiles?.[sliceType];
+  const commands = profile && profile.length > 0 ? profile : config.gate.commands;
+  return commands.map((c) => ({ name: c.name, run: c.run }));
+}
+
+/** 按切片的写集推出它的类型（与门禁选 profile 的口径一致）。 */
+export function gateCommandsForSlice(writes: string[]): GateCommandSummary[] {
+  return resolveGateCommands(detectSliceType(writes));
+}
 
 /**
  * Detect common source directories for default write-set.
@@ -306,6 +331,57 @@ export async function autoGateAfterRun(id: string): Promise<void> {
 }
 
 /**
+ * 标记一片「停机」：退回 `frozen` + 写停机分类 + 留痕。
+ *
+ * 这是**停机的唯一落点** —— 前台跑、并行跑、后台跑三条路径的失败都走这里，
+ * 免得三处各写各的、行为漂移（ADR-047）。
+ *
+ * 三件事，顺序不能换：
+ *
+ * 1. **退回 `frozen`**（`RUN_FINISH`）—— 状态机里 `running --RUN_FINISH--> frozen`
+ *    正是这条退路（frozen 可再次 `RUN_START`）。不退回的话切片卡在 `running`，
+ *    准入只认 frozen / completed，于是 `run` / `merge` / `resume` 全堵死，
+ *    唯一出路是 `abandon` —— 整个切片作废，规格得重写。
+ *    「agent 挂一次，切片就废了」不是设计意图：失败通常重跑就能过。
+ *
+ * 2. **写停机分类** —— 让它出现在 `zelto stall` / `zelto next` 里，
+ *    人被交还控制权，就得看得见哪些切片等着他处理。
+ *
+ * 3. **写 append-only 事件** —— 停机是追溯链上的一环（C4）。
+ *
+ * @returns 是否真的退了状态（`false` 表示切片本来就不在 running）
+ */
+export async function markSliceStalled(
+  id: string,
+  stallClass: StallClass,
+  options?: { exitCode?: number | null; reason?: string; actor?: string },
+): Promise<{ reverted: boolean; from: string | null; to: string | null }> {
+  const actor = options?.actor ?? 'zelto';
+  const exitCode = options?.exitCode ?? null;
+
+  // 先退状态：哪怕后面写分类失败，切片也已经是可重跑的 frozen，
+  // 而不是卡死的 running。
+  const rollback = await rollbackStalledSlice(id, { reason: options?.reason, actor });
+
+  try {
+    const slice = await store.read(id);
+    slice.stall.class = stallClass;
+    slice.stall.gateRetries = 0;
+    await store.write(slice);
+
+    await events.append(id, 'stall.classified', actor, {
+      sliceId: id, class: stallClass, exitCode, runAborted: true,
+      stateFrom: rollback.from, stateTo: rollback.to,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ⚠️ Could not write stall info: ${msg}`);
+  }
+
+  return rollback;
+}
+
+/**
  * Handle a failed agent execution. For auto-resolvable stalls (permission_prompt,
  * environment_failure, context_exhaustion), automatically retry up to maxRetries.
  * For non-auto-resolvable stalls, write stall info and return 'stall'.
@@ -356,30 +432,80 @@ export async function handleAgentFailure(
     }
   }
 
-  // Non-auto-resolvable or retries exhausted: write stall info
-  try {
-    const slice = await store.read(id);
-    slice.stall.class = stallClass;
-    slice.stall.gateRetries = 0;
-    await store.write(slice);
+  // Non-auto-resolvable or retries exhausted: 停机 = 退 frozen + 写分类。
+  const rollback = await markSliceStalled(id, stallClass, {
+    exitCode,
+    reason: `agent failed: ${exitCode ?? 'signal'}`,
+  });
 
-    await events.append(id, 'stall.classified', 'zelto', {
-      sliceId: id, class: stallClass, exitCode, runAborted: true,
-    });
-
-    // Prominent stall notification
-    const border = '═'.repeat(46);
-    console.log(`\n  ╔${border}╗`);
-    console.log(`  ║  ⚠️  SLICE STALLED: ${id.padEnd(28)}║`);
-    console.log(`  ║  Class: ${stallClass.padEnd(36)}║`);
-    console.log(`  ║  Action: zelto resume ${id.padEnd(22)}║`);
-    console.log(`  ╚${border}╝\n`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`  ⚠️ Could not write stall info: ${msg}`);
+  // Prominent stall notification
+  const border = '═'.repeat(46);
+  console.log(`\n  ╔${border}╗`);
+  console.log(`  ║  ⚠️  SLICE STALLED: ${id.padEnd(28)}║`);
+  console.log(`  ║  Class: ${stallClass.padEnd(36)}║`);
+  console.log(`  ║  Action: zelto resume ${id.padEnd(22)}║`);
+  console.log(`  ╚${border}╝\n`);
+  if (rollback.reverted) {
+    console.log(`  切片已退回 frozen —— 修好问题后直接重跑: zelto run ${id}\n`);
   }
 
   return { action: 'stall' };
+}
+
+/**
+ * 把「跑挂了」的切片退回 `frozen`（ADR-047）。
+ *
+ * 为什么必须退状态，而不是只写停机分类：
+ *
+ * 切片卡在 `running` 时，四条路全堵死：
+ *   - `zelto run` 拒绝跑（准入只认 frozen / completed）
+ *   - `zelto merge` 不收它（没签字）
+ *   - `zelto resume` 说它没停机 —— 或者反过来：清了停机却仍是 running
+ *   - 唯一出路是 `zelto abandon` —— 整个切片作废，规格得重写
+ *
+ * 也就是「agent 挂一次，切片就废了」。这不是设计意图：agent 失败通常意味着
+ * **重跑就能过**（环境抖动、上下文超限、边界划窄），人看一眼就能重跑。
+ *
+ * 状态机里 `running --RUN_FINISH--> frozen` 正是这条退路（frozen 可再次
+ * RUN_START），所以这里用 `RUN_FINISH` 事件退回 frozen —— 与 ADR-037 的
+ * 越界回退同一条路径、同一个语义：「这一轮跑完了，但不算数」。
+ *
+ * 不自动重试：agent 失败不该由 zelto 替人决定「再试一次」——
+ * 重试预算由 `handleAgentFailure` 的自动重试逻辑管（那是配置里写明的），
+ * 退到 frozen 是把控制权交还给人。
+ *
+ * C1: 状态只落在文件里；C4: 留痕写 append-only 事件
+ */
+export async function rollbackStalledSlice(
+  id: string,
+  options?: { reason?: string; actor?: string },
+): Promise<{ reverted: boolean; from: string | null; to: string | null }> {
+  const actor = options?.actor ?? 'zelto';
+
+  let slice;
+  try {
+    slice = await store.read(id);
+  } catch {
+    return { reverted: false, from: null, to: null };
+  }
+
+  const from = slice.state;
+  if (from !== 'running') {
+    // 不是 running 就不用退 —— frozen / completed 本来就能再跑，
+    // 硬转会撞「Invalid transition」。
+    return { reverted: false, from, to: from };
+  }
+
+  try {
+    await store.transit(id, 'RUN_FINISH', actor);
+    await events.append(id, 'slice.state.changed', actor, {
+      sliceId: id, from, to: 'frozen', event: 'RUN_FINISH',
+    });
+    return { reverted: true, from, to: 'frozen' };
+  } catch {
+    // 状态被别处改过（比如人手工改过）—— 不强改，停机分类照写。
+    return { reverted: false, from, to: from };
+  }
 }
 
 /**

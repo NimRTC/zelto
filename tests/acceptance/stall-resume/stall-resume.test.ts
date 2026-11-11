@@ -142,7 +142,12 @@ describe('acceptance: stall-resume', { concurrency: false }, () => {
     // Verify stall is cleared
     const slice = JSON.parse(await readFile(join(SLICES_DIR, 'resume-retry-test.json'), 'utf-8'));
     assert.equal(slice.stall.class, null, 'stall class should be cleared');
-    assert.equal(slice.state, 'running', 'slice should remain in running state');
+    // ADR-047: resume 之后切片必须回到「可重跑」的状态。
+    //
+    // 之前这里断言的是 `running` —— 把 bug 写成了期望。切片卡在 running 时
+    // 准入只认 frozen / completed，于是 `zelto run` 永远拒绝它，
+    // 「可以重跑了」是句假话。resume 必须把状态一并迁走。
+    assert.equal(slice.state, 'frozen', 'resume 后切片应退回 frozen（可重跑）');
 
     // Verify run.resumed event was emitted
     const events = await readEvents('resume-retry-test');

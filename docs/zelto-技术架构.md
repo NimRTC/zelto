@@ -140,7 +140,7 @@ checkAnchor(currentHash, anchorHash): { valid, mismatch }
 - `FREEZE` (draft → frozen)
 - `REFREEZE` (frozen → draft) — 人确认新规格后重新冻结（ADR-037）
 - `RUN_START` (frozen/completed → running)
-- `RUN_FINISH` (running → frozen) — 也用于**写集越界后退回 frozen**（ADR-037）
+- `RUN_FINISH` (running → frozen) — 也用于**写集越界后退回 frozen**（ADR-037）与**agent 失败后停机回退**（ADR-047）
 - `GATE_PASS` (frozen → completed)
 - `SIGN_APPROVE` (completed → completed)
 - `SIGN_REJECT` (completed → abandoned)
@@ -271,9 +271,9 @@ function isAutoResolvable(stallClass): boolean
 
 **职责**:
 1. 准入控制 — 切片必须 frozen 且有 frozenHash
-2. 写集冲突检测 — 不能与 running 切片有路径重叠
+2. 写集冲突检测 — 不能与 running 切片有路径重叠（**死切片除外**：带停机分类的切片不再占着写集，ADR-047）
 3. 约束分发 — 生成 ConstraintBundle 供 agent 使用
-4. 恢复执行 — `resume()` 方法处理 stalled slice 恢复
+4. 恢复执行 — `resume()` 方法处理 stalled slice 恢复（**同时把 `running` 迁回 `frozen`**，否则切片卡在 running 救不回来，ADR-047）
 
 ```typescript
 class Scheduler {

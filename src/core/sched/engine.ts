@@ -5,10 +5,25 @@
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
-import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext } from './types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
+
+/**
+ * 找出写集里那个「全是 test.todo 的验收骨架」。
+ *
+ * 判据是**路径形态**而不是读文件内容：骨架固定叫 `acceptance.test.cjs`，
+ * 落在 `tests/acceptance/` 下面。读内容反而更脆（agent 改了一半，
+ * 文件里有真断言也有 todo，那就不是「只有 todo」了）。
+ */
+function acceptanceSkeletonInWriteSet(slice: SliceData): string | null {
+  for (const w of slice.writes) {
+    const normalized = w.replace(/\\/g, '/');
+    if (normalized.endsWith('acceptance.test.cjs')) return w;
+  }
+  return null;
+}
 
 export class Scheduler {
   private readonly store: SliceStore;
@@ -30,10 +45,24 @@ export class Scheduler {
 
     // Must be frozen or completed to run
     if (slice.state !== 'frozen' && slice.state !== 'completed') {
+      // 卡在 running 且带停机分类 = 死切片（ADR-047）。
+      //
+      // 光说「must be frozen or completed」是**假话**：人是照着这句话去
+      // 找「为什么不是 frozen」的，而答案不在状态机里 —— 在停机分类里。
+      // 所以这里把出路直接说出来。
+      //
+      // 提问回路（`agent_question`）是另一回事：那不是「跑挂了」，
+      // 是 agent 停下来等人数码 —— 该答的是问题，不是 resume。
+      let reason = `Slice is in state "${slice.state}", must be "frozen" or "completed"`;
+      if (slice.state === 'running' && slice.stall.class !== null) {
+        reason = slice.stall.class === 'agent_question'
+          ? `Slice is waiting for an answer (agent_question) — answer it first: zelto ask`
+          : `Slice is stalled (${slice.stall.class}) and stuck in "running" — resume it first: zelto resume ${sliceId}`;
+      }
       return {
         sliceId,
         decision: 'blocked',
-        reason: `Slice is in state "${slice.state}", must be "frozen" or "completed"`,
+        reason,
         blockedBy: [],
       };
     }
@@ -92,6 +121,20 @@ export class Scheduler {
       try {
         const s = await this.store.read(id);
         if (s.state === 'running') {
+          // 停机切片大多不算「正在跑」（ADR-047）。
+          //
+          // 它状态还是 running 的原因有两个：要么是历史切片（修复前留下的
+          // 死切片），要么是停机发生在退状态之前的那一瞬间。
+          // 两种情况下它的 agent 都已经不在跑了 —— 继续拿它的写集
+          // 挡别的切片，就是「一片失败挡住整个队列」。
+          //
+          // **例外：提问回路**（`agent_question`）。那不是「跑挂了」——
+          // agent 还活着，只是停下来等人数码，答完就在原地续跑
+          // （ADR-013）。它的会话仍然会写文件，仍然占着写集。
+          // 把它排除掉 = 两个 agent 同时改同一批文件。
+          //
+          // 判据是**停机分类**（纯读文件，C3）。
+          if (s.stall.class !== null && s.stall.class !== 'agent_question') continue;
           runningWrites.set(id, s.writes);
         }
       } catch {
@@ -140,8 +183,16 @@ export class Scheduler {
    *
    * affinity 只读建议（ADR-024 §3.3）：调用方把算好的上下文传进来，
    * 这里只装包、不判定。null/缺省表示无亲和，语义与原来完全一致。
+   *
+   * gateCommands（ADR-045）：门禁命令原文也装进包里。agent 验证自己的
+   * 产物时必须用同一套命令 —— 否则门禁②会在 agent 留下的现场上失败
+   * （CMake 生成器不一致是最典型的例子）。
    */
-  buildConstraints(slice: SliceData, affinity?: AffinityContext | null): ConstraintBundle {
+  buildConstraints(
+    slice: SliceData,
+    affinity?: AffinityContext | null,
+    gateCommands?: GateCommandSummary[],
+  ): ConstraintBundle {
     // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
     const relevantRules = this.policy.rules.filter((r) => {
       // Include rules that match the slice's write paths or are general allow/deny
@@ -162,8 +213,9 @@ export class Scheduler {
         '.cursor/rules/**',
       ],
       policyRules: relevantRules,
-      instructions: this.buildInstructions(slice, affinity ?? null),
+      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands),
       affinity: affinity ?? null,
+      ...(gateCommands && gateCommands.length > 0 ? { gateCommands } : {}),
     };
   }
 
@@ -255,6 +307,21 @@ export class Scheduler {
   /**
    * Resume a stalled slice.
    *
+   * 三件事，顺序不能换（ADR-047）：
+   *
+   * 1. **退状态** —— `running` → `frozen`（`RUN_FINISH`）。
+   *    只清停机分类是**半截修复**：切片仍卡在 `running`，而准入只认
+   *    `frozen` / `completed` —— 于是 `zelto run` 仍然拒绝它，
+   *    「可以重跑了」这句话是假的。历史切片（修复前留下的）正是这个状态，
+   *    所以 resume 必须把状态一并迁走，不能只清分类。
+   *
+   *    已经在 `frozen` 的切片不动 —— 那本来就是可重跑的状态，
+   *    硬转会撞「Invalid transition」。
+   *
+   * 2. **清停机分类** —— 「停机」这个结论到此结束。
+   *
+   * 3. **写 `run.resumed` 事件** —— 人做的决定要留痕（C4）。
+   *
    * @param sliceId - The slice to resume
    * @param options - Resume options
    * @param options.skip - If true, mark the stall as resolved without re-execution
@@ -281,14 +348,36 @@ export class Scheduler {
 
     const resolution = options.skip ? 'manual_skip' : 'manual_retry';
 
+    // 先迁状态，再清分类。
+    //
+    // 顺序理由：`transit` 内部自己 read 一份最新快照再写回，
+    // 所以「先清分类再迁移」也不会把分类弄丢 —— 但反过来（先迁移再清）
+    // 更稳：迁移失败（状态被改过）时分类还在，切片仍标记为「待人处理」，
+    // 不会变成「什么都没发生」。
+    if (slice.state === 'running') {
+      try {
+        await this.store.transit(sliceId, 'RUN_FINISH', 'zelto');
+        await this.appendEvent(sliceId, 'slice.state.changed', 'zelto', {
+          sliceId, from: 'running', to: 'frozen', event: 'RUN_FINISH',
+        });
+      } catch {
+        // 状态被别处改过 —— 不强改，分类照清，事件照写。
+      }
+    }
+
     await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
       resolution,
       previousStallClass: slice.stall.class,
     });
 
-    // Clear stall info for retry or skip
-    slice.stall.class = null;
-    await this.store.write(slice);
+    // Clear stall info for retry or skip.
+    //
+    // 必须**重新读一遍**再写：上面那次 `transit` 改了状态，
+    // 而 `slice` 还是迁移前的那份快照 —— 直接写回去会把刚迁好的
+    // 状态改回 `running`，正好把这次修复抵消掉。
+    const current = await this.store.read(sliceId);
+    current.stall.class = null;
+    await this.store.write(current);
   }
 
   /**
@@ -312,7 +401,11 @@ export class Scheduler {
     return writeSetsOverlap(a, b);
   }
 
-  private buildInstructions(slice: SliceData, affinity?: AffinityContext | null): string {
+  private buildInstructions(
+    slice: SliceData,
+    affinity?: AffinityContext | null,
+    gateCommands?: GateCommandSummary[],
+  ): string {
     const lines = [
       `You are implementing slice "${slice.id}": ${slice.title}`,
       '',
@@ -333,6 +426,48 @@ export class Scheduler {
       `Run \`${slice.acceptance.dir}\` tests to verify your implementation.`,
       '',
     ];
+
+    // 验收骨架要变成真断言（ADR-046）。
+    //
+    // 骨架里全是 `test.todo` —— 门禁②不认 todo（「todo 与 skip 不算
+    // 验证」），所以骨架不改，这片就永远过不了门禁②。
+    //
+    // 骨架在写集里（`zelto spec draft` 时自动加入），所以 agent 改它
+    // 不会被 hook 拦。但「在写集里」不等于「会去改」—— 指令不说，
+    // agent 就可能只写实现、把骨架留成 todo，然后门禁②判 failed。
+    const skeleton = acceptanceSkeletonInWriteSet(slice);
+    if (skeleton) {
+      lines.push(
+        `The acceptance file \`${skeleton}\` contains only \`test.todo\` placeholders.`,
+        `**Replace every \`test.todo\` with a real assertion** that actually checks`,
+        `the behaviour described in its name. The gate rejects an acceptance file`,
+        `where no test really ran — todos and skips do not count as verification.`,
+        '',
+      );
+    }
+
+    // 门禁命令原文（ADR-045）：agent 必须用同一套命令验证自己的产物。
+    // 否则门禁②会在 agent 留下的现场上失败 —— 而失败的报错指向
+    // 「环境不对」，不指向「产物不对」，白跑一轮。
+    if (gateCommands && gateCommands.length > 0) {
+      lines.push(
+        `## How the gate will verify your work`,
+        `The gate runs these commands, in this order, in this directory:`,
+        '',
+      );
+      for (const cmd of gateCommands) {
+        lines.push(`- \`${cmd.name}\`: \`${cmd.run}\``);
+      }
+      lines.push(
+        '',
+        `Use the **same** commands to verify your implementation. Do not reconfigure`,
+        `the build tree with a different generator or a different binary directory —`,
+        `the gate reuses the tree you leave behind, and a mismatched configuration`,
+        `makes the gate fail for reasons that have nothing to do with your code.`,
+        '',
+      );
+    }
+
     // 亲和上下文只是只读建议（C7）：前片做了什么、供参考，不参与任何判定
     if (affinity && affinity.summaries.length > 0) {
       lines.push(`## Related slices (read-only context, advisory only)`);

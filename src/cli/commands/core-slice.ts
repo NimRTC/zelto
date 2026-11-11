@@ -68,7 +68,7 @@ import {
   printOutcome,
   writeSetOutcomeLines,
 } from './run-messages.js';
-import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost } from './run-support.js';
+import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost, gateCommandsForSlice, markSliceStalled } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -1035,7 +1035,7 @@ register('run', async (args) => {
     const isDryRun = args.includes('--dry-run');
 
     if (isDryRun) {
-      const bundle = scheduler.buildConstraints(slice);
+      const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
       if (isJson) {
         console.log(JSON.stringify({
           sliceId: id, decision: 'admitted', dryRun: true,
@@ -1055,7 +1055,7 @@ register('run', async (args) => {
 
     await scheduler.startRun(id);
 
-    const bundle = scheduler.buildConstraints(slice);
+    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
     console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
     console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
     console.log(`  Protected:     ${bundle.protectedPaths.join(', ')}`);
@@ -1207,6 +1207,10 @@ register('run', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`\n❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
+      // 停机只做一次：`handleAgentFailure` 返回 'stall' 时它已经把切片
+      // 停机了（退 frozen + 写分类 + 留痕，ADR-047）—— 不要再调一遍，
+      // 否则会写两遍事件、迁两次状态。
+      let stalled = false;
       if (attempt < maxRetries) {
         const result = await handleAgentFailure(id, exitCode, { maxRetries });
         if (result.action === 'retry') {
@@ -1228,10 +1232,13 @@ register('run', async (args) => {
 
           continue; // Retry
         }
+        stalled = true;
       }
 
       // Not retrying — write stall and stop
-      await handleAgentFailure(id, exitCode, { maxRetries });
+      if (!stalled) {
+        await handleAgentFailure(id, exitCode, { maxRetries });
+      }
       finalExitCode = exitCode;
       break;
     }
@@ -1576,7 +1583,7 @@ register('start', async (args) => {
     await scheduler.startRun(id);
 
     const slice = await store.read(id);
-    const bundle = scheduler.buildConstraints(slice);
+    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     const { writeFileSync: write } = await import('node:fs');
     write(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
@@ -1638,6 +1645,9 @@ register('start', async (args) => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`  ❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
+      // 停机只做一次（ADR-047）：`handleAgentFailure` 返回 'stall' 时
+      // 它已经把切片停机了（退 frozen + 写分类 + 留痕）—— 别调两遍。
+      let stalled = false;
       if (attempt < maxRetries) {
         const result = await handleAgentFailure(id, exitCode, { maxRetries });
         if (result.action === 'retry') {
@@ -1653,9 +1663,12 @@ register('start', async (args) => {
           }, 1000);
           continue;
         }
+        stalled = true;
       }
 
-      await handleAgentFailure(id, exitCode, { maxRetries });
+      if (!stalled) {
+        await handleAgentFailure(id, exitCode, { maxRetries });
+      }
       finalExitCode = exitCode;
       break;
     }
@@ -1819,14 +1832,13 @@ async function monitorTaskInBackground(
         message: `Agent exited with code ${exitCode ?? 'signal'}`,
         attempts: 1,
       });
-      try {
-        const bgSlice = await store.read(sliceId);
-        bgSlice.stall.class = stallClass;
-        await store.write(bgSlice);
-        await events.append(sliceId, 'stall.classified', 'zelto', {
-          sliceId, class: stallClass, exitCode, runAborted: true,
-        });
-      } catch { /* non-fatal */ }
+      // 后台路径同样走「停机的唯一落点」—— 退回 frozen + 写分类 + 留痕。
+      // 后台任务也是一次运行，它的 agent 挂了，切片不能留在 running：
+      // 留在 running 就再也跑不了（ADR-047）。
+      await markSliceStalled(sliceId, stallClass, {
+        exitCode,
+        reason: `background agent failed: ${exitCode ?? 'signal'}`,
+      });
     }
   } catch {
     // Background monitor failure is non-fatal

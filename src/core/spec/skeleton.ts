@@ -34,6 +34,23 @@ export interface SkeletonResult {
 }
 
 /**
+ * 验收目标下的骨架文件路径（相对仓库根）。
+ *
+ * 目录形态 → `<dir>/acceptance.test.cjs`；文件形态 → 那个文件本身。
+ *
+ * 单独抽出来是因为**写集也要用它**（ADR-046）：骨架是 zelto 生成的
+ * `test.todo` 列表，agent 必须把它改成真正的断言 —— 而这需要它落在
+ * 写集里，否则 hook 会拦住 agent 改它。
+ */
+export function acceptanceSkeletonTarget(acceptanceDir: string, root: string = process.cwd()): string {
+  const raw = acceptanceDir.trim();
+  const normalized = raw.replace(/[\\/]+$/, '');
+  const abs = join(root, normalized);
+  const isDirShape = raw.endsWith('/') || raw.endsWith('\\') || (existsSync(abs) && statSync(abs).isDirectory());
+  return isDirShape ? join(normalized, SKELETON_FILE_NAME) : normalized;
+}
+
+/**
  * 生成验收测试骨架的正文。
  *
  * 每条验收标准一条 `todo` 用例，用例名就是验收标准原文 —— 人和 agent

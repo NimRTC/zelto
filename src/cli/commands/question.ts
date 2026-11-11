@@ -16,7 +16,8 @@ import {
 // 直接从 run-support 拿 autoGateAfterRun —— core-slice.ts 只是再导出它。
 // 经 core-slice 绕一圈会形成 question.ts → core-slice.ts → question.ts 的环，
 // 而 core-slice.ts 又 import 并行执行器，于是变成三条命令文件互相咬。
-import { autoGateAfterRun, settleRunCost } from './run-support.js';
+import { autoGateAfterRun, settleRunCost, markSliceStalled } from './run-support.js';
+import { classifyStall } from '../../core/stall/classifier.js';
 import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
 
 const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
@@ -239,6 +240,17 @@ register('answer', async (args) => {
     const elapsedNote = `exit ${exitCode ?? 'signal'}`;
     console.error(`❌ Agent exited with ${elapsedNote} after the answer.`);
     await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+    // 续跑失败同样要退回 frozen（ADR-047）：切片本来就在 running
+    // （提问回路挂起时不迁状态），不退回就永远卡在 running ——
+    // 准入只认 frozen / completed，人救不回来。
+    await markSliceStalled(sliceId, classifyStall({
+      type: exitCode === null ? 'build_failure' : 'test_failure',
+      message: `Agent exited with code ${exitCode ?? 'signal'} after the answer`,
+      attempts: 1,
+    }), {
+      exitCode,
+      reason: `agent failed after answer: ${exitCode ?? 'signal'}`,
+    });
     return 1;
   }
 

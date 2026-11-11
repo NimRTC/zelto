@@ -129,12 +129,37 @@ export async function createSpecDraft(id: string): Promise<SpecDraftResult | nul
 
   const skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, content, id);
 
+  // 骨架进了写集（ADR-046）：骨架里全是 `test.todo`，门禁②不认 todo
+  // （「todo 与 skip 不算验证」）—— 必须有人把它改成真正的断言，而
+  // 那个「有人」是 agent。agent 改写集外的文件会被 hook 拦住，所以
+  // 骨架**必须**在写集里，否则本片永远过不了门禁②。
+  if (skeleton.path) {
+    await addAcceptanceSkeletonToWriteSet(id, skeleton.path);
+  }
+
   return {
     path: draftPath,
     content,
     source: llm ? 'llm' : 'deterministic',
     skeleton: { path: skeleton.path, caseCount: skeleton.caseCount, reason: skeleton.reason },
   };
+}
+
+/**
+ * 把验收骨架加进本片写集（ADR-046）。
+ *
+ * 已存在则不动 —— 写集是「人批准的边界」，这里只**补一个** agent
+ * 确实需要改的路径，不替换已有内容。
+ */
+async function addAcceptanceSkeletonToWriteSet(id: string, skeletonPath: string): Promise<void> {
+  try {
+    const slice = await store.read(id);
+    if (slice.writes.includes(skeletonPath)) return;
+    slice.writes = [...slice.writes, skeletonPath];
+    await store.write(slice);
+  } catch {
+    // 写集补不上不阻断草稿生成 —— 人还能用 zelto set 手工补
+  }
 }
 
 /** 读草稿；没有就返回 null */
