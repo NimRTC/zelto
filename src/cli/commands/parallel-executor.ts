@@ -392,7 +392,7 @@ export async function executeSlicesParallel(
       affinityGroup !== null
         ? await scheduler.buildAffinityContext(st.id, affinityGroup, affinityPrev)
         : null;
-    const bundle = scheduler.buildConstraints(slice, affinityCtx, gateCommandsForSlice(slice.writes));
+    const bundle = scheduler.buildConstraints(slice, affinityCtx, gateCommandsForSlice(slice));
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
@@ -592,7 +592,24 @@ export async function executeSlicesParallel(
             );
             const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
             try {
-              const { sessionId } = await adapters[i].start({ sliceId: st.id, prompt: bundlePath });
+              // 超时重试接着上一次跑，不从头再来（ADR-055）
+              const previousSessionId: string | null = st.sessionId;
+              let resumedSessionId: string | null = null;
+              if (previousSessionId && typeof adapters[i].continueSession === 'function') {
+                try {
+                  const resumed = await adapters[i].continueSession(
+                    previousSessionId,
+                    '继续完成这个切片。上一次运行超时被中止了，' +
+                    '工作区里已经有你之前做出的改动 —— 先检查当前状态，' +
+                    '补完没做完的部分，不要从头重做已经做完的事。',
+                  );
+                  resumedSessionId = resumed.sessionId;
+                } catch {
+                  resumedSessionId = null;
+                }
+              }
+              const sessionId: string = resumedSessionId
+                ?? (await adapters[i].start({ sliceId: st.id, prompt: bundlePath })).sessionId;
               st.sessionId = sessionId;
               st.status = 'running';
               continue; // 重试

@@ -50,13 +50,14 @@ import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
-import { parseScopePaths } from '../../core/spec/scope.js';
+import { parseScopePaths, parseAcceptanceCriteria } from '../../core/spec/scope.js';
 import { evaluateWriteSet } from '../../core/spec/write-set.js';
 import { judgeTrace, traceCountsOf, blockingViolations, advisoryViolations } from '../../core/trace/index.js';
 import { validateDeterministic } from '../../core/spec/deterministic/validator.js';
 import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
 import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 import { register } from './shared.js';
+import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
@@ -88,6 +89,48 @@ export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
 
 // `ensureWorktree` / `worktreeManager` / `removeWorktree` live in ./shared.ts so that
 // gate, diff and sign commands can reuse the same worktree convention.
+
+/**
+ * 重试时**接着上一次跑**，而不是从头再来（ADR-055）。
+ *
+ * 为什么这件事值得单独做：
+ *
+ * agent 跑超时被杀掉时，它已经做掉的工作都留在 worktree 里了 —— 代码改了一半、
+ * 测试跑了一半、上下文摸清了一半。从头再跑一遍等于把这些工作重做一遍，
+ * 还把 agent 的上下文清零，让它重新摸索已经摸清的东西。
+ *
+ * 实测（2026-11-11，nimrtc-zelto 的 v1-remb-parse-and-trust）：agent 跑了
+ * 34 分钟被杀，zelto 从头重跑，第二个 agent 又跑了 20 分钟 —— 而第一个 agent
+ * 的成果（一份全部通过的报告）被丢掉了。
+ *
+ * 所以：**能续就续**。同一个 agent 会话（`--resume`），提示它「继续」。
+ * 续不了（适配器不支持 resume / 没有 agent 会话 id）才退回从头跑。
+ *
+ * @returns 续跑得到的新 session id；续不了返回 null（调用方从头跑）。
+ */
+async function resumeForRetry(
+  adapter: ExecutorAdapter,
+  previousSessionId: string,
+  sliceId: string,
+  bundlePath: string,
+): Promise<string | null> {
+  if (!adapter.metadata.capabilities.resume) return null;
+  if (typeof adapter.continueSession !== 'function') return null;
+
+  try {
+    const { sessionId } = await adapter.continueSession(
+      previousSessionId,
+      '继续完成这个切片。上一次运行超时被中止了，' +
+      '工作区里已经有你之前做出的改动 —— 先检查当前状态，' +
+      '补完没做完的部分，不要从头重做已经做完的事。',
+    );
+    console.log(`  ↻ Continuing the same agent session (${sliceId})`);
+    return sessionId;
+  } catch {
+    // 续不上就退回从头跑 —— 不是致命错误，只是多花点时间。
+    return null;
+  }
+}
 
 /**
  * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
@@ -330,32 +373,12 @@ async function createSliceFromSpec(
     }
   }
 
-  // Parse writes and requirements in a single pass
-  const writes: string[] = [];
-  const requirements: string[] = [];
+  // 写集与验收标准都用**共享解析器**（ADR-049）：
+  // 这里原来自己写了一份只认反引号的行内正则，人按自然写法写规格
+  // （`- src/foo.hpp`，不带反引号）时写集就是空的 —— 与 scope.ts 的行为分叉。
   const cliWritesProvided = cliWrites.length > 0;
-
-  let inScope = false;
-  let inAcceptance = false;
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      inScope = /范围|scope|range/i.test(line);
-      inAcceptance = /验收标准|acceptance|criter/i.test(line);
-      continue;
-    }
-    if (inScope && !cliWritesProvided) {
-      const writeMatch = line.match(/^\s*[-*]\s*`([^`]+)`/);
-      if (writeMatch) {
-        writes.push(writeMatch[1]);
-      }
-    }
-    if (inAcceptance) {
-      const reqMatch = line.match(/^\s*\d+\.\s+(.+)/);
-      if (reqMatch) {
-        requirements.push(reqMatch[1].trim());
-      }
-    }
-  }
+  const writes: string[] = cliWritesProvided ? [] : parseScopePaths(content);
+  const requirements: string[] = parseAcceptanceCriteria(content);
 
   // Detect baseline slices (v0- prefix)
   const isBaseline = id.startsWith('v0-');
@@ -364,10 +387,17 @@ async function createSliceFromSpec(
   const hasTypeScriptFiles = writes.some((w) => w.endsWith('.ts') || w.endsWith('.tsx') || w.includes('.ts'));
   const traceWaiver = isBaseline && !hasTypeScriptFiles ? '基线切片 — 不修改代码，无需契约追踪' : null;
 
-  // Auto-detect acceptance test file
-  const acceptanceTestPath = `tests/acceptance/${id}.test.ts`;
-  const hasAcceptanceTest = existsSync(acceptanceTestPath);
-  const acceptanceTests = hasAcceptanceTest ? [acceptanceTestPath] : [];
+  // 自动探测验收目标（ADR-049）：两种形态都真实存在过 ——
+  //   - 目录：`tests/acceptance/<id>/acceptance.test.cjs`（zelto 骨架的形态）
+  //   - 文件：`tests/acceptance/<id>.test.ts`（人自己写的形态）
+  // 原来只认后者，于是目录形态的切片 trace.tests 恒为空，追溯门禁无从校验。
+  const acceptanceCandidates = [
+    `tests/acceptance/${id}/acceptance.test.cjs`,
+    `tests/acceptance/${id}.test.ts`,
+    `tests/acceptance/${id}.test.cjs`,
+  ];
+  const acceptanceTestPath = acceptanceCandidates.find((p) => existsSync(p));
+  const acceptanceTests = acceptanceTestPath ? [acceptanceTestPath] : [];
 
   const finalWrites = cliWritesProvided ? cliWrites : writes;
 
@@ -386,7 +416,7 @@ async function createSliceFromSpec(
   });
 
   // Update acceptance.dir if test file detected
-  if (hasAcceptanceTest) {
+  if (acceptanceTestPath) {
     slice.acceptance.dir = acceptanceTestPath;
   }
   await store.write(slice);
@@ -398,7 +428,7 @@ async function createSliceFromSpec(
       writes: finalWrites, spec: slice.spec.path,
       baseline: isBaseline, traceWaiver,
       requirements: requirements.length,
-      acceptanceTest: hasAcceptanceTest ? acceptanceTestPath : null,
+      acceptanceTest: acceptanceTestPath ?? null,
     }));
     return 0;
   }
@@ -410,7 +440,7 @@ async function createSliceFromSpec(
   console.log(`  Baseline: ${isBaseline ? '✅ (v0- prefix detected)' : 'no'}`);
   console.log(`  Writes:   ${finalWrites.length > 0 ? finalWrites.join(', ') : '(none — add with --writes)'}`);
   console.log(`  Reqs:     ${finalRequirements.length} ${declaredRequirements.length > 0 ? 'declared' : 'parsed from spec'}`);
-  if (hasAcceptanceTest) console.log(`  Accept:   ✅ ${acceptanceTestPath}`);
+  if (acceptanceTestPath) console.log(`  Accept:   ✅ ${acceptanceTestPath}`);
   if (traceWaiver) console.log(`  Waiver:   ${traceWaiver}`);
   console.log(`  Spec:     ${slice.spec.path}`);
   console.log(`  Next:     zelto check ${id} && zelto freeze ${id}`);
@@ -1035,7 +1065,7 @@ register('run', async (args) => {
     const isDryRun = args.includes('--dry-run');
 
     if (isDryRun) {
-      const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
+      const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
       if (isJson) {
         console.log(JSON.stringify({
           sliceId: id, decision: 'admitted', dryRun: true,
@@ -1055,7 +1085,7 @@ register('run', async (args) => {
 
     await scheduler.startRun(id);
 
-    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
+    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
     console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
     console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
     console.log(`  Protected:     ${bundle.protectedPaths.join(', ')}`);
@@ -1217,10 +1247,19 @@ register('run', async (args) => {
           attempt = result.retryCount ?? attempt + 1;
           // Re-create adapter and re-start agent for retry
           adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
-          const { sessionId: newSessionId } = await adapter.start({
-            sliceId: id, prompt: bundlePath,
-          });
-          sessionId = newSessionId;
+          // 超时重试要**接着上一次跑**，不是从头再来（ADR-055）。
+          //
+          // 上一次跑超时被杀时，它已经做掉的工作都留在 worktree 里了 ——
+          // 从头再跑一遍等于把那些工作重做一遍（编译、跑测试、改代码），
+          // 还把 agent 的上下文清零，让它重新摸索一遍已经摸清的东西。
+          // 能续就续：同一个 agent 会话（`--resume`），提示它「继续」。
+          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
+          if (resumed) {
+            sessionId = resumed;
+          } else {
+            const started = await adapter.start({ sliceId: id, prompt: bundlePath });
+            sessionId = started.sessionId;
+          }
 
           // Restart progress display
           progressTimer = setInterval(() => {
@@ -1583,7 +1622,7 @@ register('start', async (args) => {
     await scheduler.startRun(id);
 
     const slice = await store.read(id);
-    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice.writes));
+    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     const { writeFileSync: write } = await import('node:fs');
     write(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
@@ -1653,8 +1692,14 @@ register('start', async (args) => {
         if (result.action === 'retry') {
           attempt = result.retryCount ?? attempt + 1;
           adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
-          const { sessionId: newSessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
-          sessionId = newSessionId;
+          // 超时重试接着上一次跑，不从头再来（ADR-055）
+          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
+          if (resumed) {
+            sessionId = resumed;
+          } else {
+            const started = await adapter.start({ sliceId: id, prompt: bundlePath });
+            sessionId = started.sessionId;
+          }
           progressTimer = setInterval(() => {
             const e = Math.floor((Date.now() - startTime) / 1000);
             const mins = Math.floor(e / 60);
