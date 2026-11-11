@@ -1,8 +1,24 @@
 # Changelog
 
-## [0.5.0] — 2026-11-09
+## [0.5.0] — 2026-11-10
 
 ### Added
+- **Taking over an existing project now actually takes over** (ADR-040).
+  Managed files are tracked in three states — `generated` / `legacy` /
+  `manual` — instead of two. Files zelto generated *before* ADR-038 have no
+  marker line, so the hash comparison classified them as hand-written and the
+  takeover path stopped working: gate commands stayed generic, write-set rules
+  were not derived from the real modules, and root-level build manifests had no
+  rule at all, so an agent editing the top-level `CMakeLists.txt` was rejected
+  by the PreToolUse hook. `legacy` files are recognised by content signature
+  and rebuilt only when the old rule set is provably covered by the new one;
+  strategies that contain hand-written rules, or configurations with custom
+  gate commands, are left byte-for-byte untouched and reported. A deprecated
+  `anchors:` section no longer fails `policy validate` — it is reported as a
+  warning, and the old anchor is moved into `policy/lock.json` without being
+  overwritten, so a mismatch still surfaces. The migration is recorded as a
+  `project.policy_migrated` event (C4). **Breaking:** `initializeProject` is
+  now asynchronous, because it has to write that event.
 - **Five follow-ups to taking over an existing project** (ADR-039). The
   remaining gaps on the path a person actually walks: registering the current
   code as baseline slices now writes a `slice.baseline_registered` event (C4 —
