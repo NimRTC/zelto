@@ -402,6 +402,7 @@ export async function handleAgentFailure(
   const maxRetries = options?.maxRetries ?? 2;
 
   // Check if this stall class is auto-resolvable
+  let budgetExhausted = false;
   if (isAutoResolvable(stallClass)) {
     try {
       const slice = await store.read(id);
@@ -424,7 +425,8 @@ export async function handleAgentFailure(
       }
 
       // Max retries exhausted — fall through to stall
-      console.log(`  ⚠️ Auto-retry exhausted (${maxRetries}/${maxRetries}) — stalling`);
+      budgetExhausted = true;
+      console.log(`  ⚠️ Auto-retry exhausted (${currentRetries}/${maxRetries}) — stalling`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ⚠️ Could not check retry state: ${msg}`);
@@ -447,6 +449,15 @@ export async function handleAgentFailure(
   console.log(`  ╚${border}╝\n`);
   if (rollback.reverted) {
     console.log(`  切片已退回 frozen —— 修好问题后直接重跑: zelto run ${id}\n`);
+  }
+  // 预算耗尽要说清 —— 不说，人重跑后才发现「第一次失败就停机」，
+  // 而那时候已经白跑了一轮 agent（ADR-052）
+  if (budgetExhausted) {
+    console.log(
+      `  ⚠️ 自动重试预算已用尽（${maxRetries}/${maxRetries}）—— 不重置预算的话，` +
+        `下次失败会直接停机`,
+    );
+    console.log(`     恢复自动重试: zelto resume ${id} --reset-retry\n`);
   }
 
   return { action: 'stall' };

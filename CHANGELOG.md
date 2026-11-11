@@ -38,6 +38,26 @@
   still alive and still holds the reservation.
 
 ### Fixed
+- **The auto-retry budget can now be reset — but only on purpose** (ADR-052).
+  `stall.autoResolved` is a slice-level counter that only goes up, and
+  `resume` never cleared it. So a slice that had exhausted its automatic
+  retries, stalled, been fixed by a person and re-run would find the counter
+  still at `maxRetries` — **the first failure would stall it again, with no
+  automatic retry at all**. The person saw "I fixed the environment, I
+  re-ran it"; what actually happened was "I re-ran it, and the automatic
+  retry was gone". ADR-047 fixed the slice getting stranded in `running`,
+  which is what made this reachable at all — before that the slice could
+  never run a second time, so the semantics had never been triggered.
+  `zelto resume <id> --reset-retry` now resets it explicitly. It is
+  deliberately not automatic: clearing it silently would mean "re-running
+  once makes the budget infinite", trading one real problem for another.
+  The budget exists to stop zelto burning money on a broken slice, but the
+  person owns the environment, and environment failures are exactly the
+  kind a person can fix. The default `resume` behaviour is unchanged. The
+  exhausted budget is now visible where the decision gets made —
+  `zelto stall <id>` says `EXHAUSTED (2/2)`, `zelto resume` warns before
+  you re-run, and the stall notification says the next failure will stall
+  immediately unless you reset it.
 - **The acceptance skeleton is now inside the write-set** (ADR-046). zelto
   generated an acceptance file full of `test.todo` placeholders (ADR-034),
   required it to contain real assertions (ADR-033: "todos and skips do not

@@ -750,6 +750,15 @@ register('stall', async (args) => {
         console.log(`Stall class:    ${slice.stall.class}`);
         console.log(`Auto-resolved:  ${slice.stall.autoResolved}`);
         console.log(`Gate retries:   ${slice.stall.gateRetries}`);
+        // 预算耗尽要在这里就说清 —— 否则人 resume 完才发现「第一次失败就停机」
+        // （ADR-052）
+        const maxRetries = loadConfig().agent.maxRetries ?? 2;
+        if (slice.stall.autoResolved >= maxRetries) {
+          console.log(
+            `Retry budget:   EXHAUSTED (${slice.stall.autoResolved}/${maxRetries}) —— 重跑后第一次失败就会停机`,
+          );
+          console.log(`  恢复自动重试：zelto resume ${id} --reset-retry`);
+        }
       } else {
         console.log('Stall:  (auto-resolved, no active stall)');
       }
@@ -791,12 +800,13 @@ register('stall', async (args) => {
 register('resume', async (args) => {
   const [id] = args;
   if (!id || id.startsWith('--')) {
-    console.error('Usage: zelto resume <slice-id> [--skip] [--abandon]');
+    console.error('Usage: zelto resume <slice-id> [--skip] [--abandon] [--reset-retry]');
     return 1;
   }
 
   const skip = args.includes('--skip');
   const abandon = args.includes('--abandon');
+  const resetRetry = args.includes('--reset-retry');
 
   try {
     await store.read(id);
@@ -807,21 +817,52 @@ register('resume', async (args) => {
 
   const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
+  // 重置自动重试预算前，先把当前用量说清楚 —— 人得知道自己在重置什么。
+  const before = await store.read(id);
+  const autoResolvedBefore = before.stall.autoResolved;
+
   try {
-    await scheduler.resume(id, { skip, abandon });
+    const result = await scheduler.resume(id, { skip, abandon, resetRetry });
+
+    // 顺序：先报预算，再报这次动作的结果。
+    // 「预算已重置」是这次动作**唯一**的效果，混在一堆话里容易被忽略。
+    if (resetRetry) {
+      if (result.retryBudgetReset) {
+        console.log(
+          `  自动重试预算已重置（${autoResolvedBefore} → 0）—— 本次重跑会重新获得自动重试`,
+        );
+      } else {
+        console.log('  自动重试预算本来就是 0，无需重置');
+      }
+    } else if (autoResolvedBefore > 0) {
+      // 预算已用尽却不重置 —— 人重跑后会发现「第一次失败就停机」，
+      // 而原因在这里。不说，等于让下一个 agent 轮次白跑。
+      const maxRetries = loadConfig().agent.maxRetries ?? 2;
+      if (autoResolvedBefore >= maxRetries) {
+        console.log(
+          `  ⚠️ 自动重试预算已用尽（${autoResolvedBefore}/${maxRetries}）—— 重跑后第一次失败就会停机`,
+        );
+        console.log(
+          `     修好问题后若要恢复自动重试：zelto resume ${id} --reset-retry`,
+        );
+      }
+    }
+
+    if (abandon) {
+      console.log(`zelto resume ${id} --abandon -- Slice abandoned`);
+    } else if (skip) {
+      console.log(`zelto resume ${id} --skip -- Stall resolved, slice not re-executed`);
+    } else if (before.stall.class !== null) {
+      console.log(`zelto resume ${id} -- Slice resumed for re-execution`);
+    }
+    // 没有停机可恢复、也没别的动作时，只报预算那一句就够了 ——
+    // 说「已恢复以便重跑」是假话（它本来就没停机）。
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Error: ${(err as Error).message}`);
+    console.error(`Error: ${msg}`);
     return 1;
   }
 
-  if (abandon) {
-    console.log(`zelto resume ${id} --abandon -- Slice abandoned`);
-  } else if (skip) {
-    console.log(`zelto resume ${id} --skip -- Stall resolved, slice not re-executed`);
-  } else {
-    console.log(`zelto resume ${id} -- Slice resumed for re-execution`);
-  }
   return 0;
 });
 

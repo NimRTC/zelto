@@ -161,7 +161,7 @@ interface SliceData {
   writes: string[];
   runs: SliceRun[];              // 运行记录：每次 agent 运行结束追加一条
   clarifyRounds?: number;        // 已走过的澄清轮次（单调递增）
-  stall: { class, autoResolved, gateRetries };
+  stall: { class, autoResolved, gateRetries };  // autoResolved = 已用掉的自动重试预算（ADR-052：只能由 `resume --reset-retry` 显式清零）
   createdAt: string;
   updatedAt: string;
 }

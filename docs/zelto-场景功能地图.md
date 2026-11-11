@@ -298,7 +298,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto summary` | 项目概况 | 通用 |
 | `zelto help [<cmd>]` | 帮助 / 查看特定命令帮助 | 通用 |
 | `zelto stall [id] [--auto-resolved]` | 列出 stalled slices / 查看详情 | 通用 |
-| `zelto resume <id> [--skip\|--abandon]` | 恢复 stalled slice | run |
+| `zelto resume <id> [--skip\|--abandon\|--reset-retry]` | 恢复 stalled slice；`--reset-retry` 显式重置自动重试预算（ADR-052） | run |
 | `zelto require <text>` | 用自然语言创建需求文档 | AI pipeline |
 | `zelto require list` | 列出所有需求 | AI pipeline |
 | `zelto require confirm <id>` | 确认需求 | AI pipeline |

@@ -326,27 +326,45 @@ export class Scheduler {
    * @param options - Resume options
    * @param options.skip - If true, mark the stall as resolved without re-execution
    * @param options.abandon - If true, abandon the slice instead of resuming
+   * @param options.resetRetry - If true, reset the auto-retry budget
+   *   (`stall.autoResolved`) back to 0 — see ADR-052
    */
   async resume(
     sliceId: string,
-    options: { skip?: boolean; abandon?: boolean },
-  ): Promise<void> {
+    options: { skip?: boolean; abandon?: boolean; resetRetry?: boolean },
+  ): Promise<{ retryBudgetReset: boolean }> {
     const slice = await this.store.read(sliceId);
 
-    if (slice.stall.class === null) {
+    // `--reset-retry` 独立于停机状态（ADR-052）。
+    //
+    // 为什么必须独立：预算重置的**时机**通常晚于 resume —— 人看到
+    // 「重跑后第一次失败就停机」的警告时，切片已经 resume 过了，
+    // 停机分类已经清掉。这时候再跑 `resume --reset-retry` 会撞上
+    // 「not stalled」—— 建议给的是一条走不通的命令。
+    //
+    // 所以：带 `--reset-retry` 时，即使没有停机分类也允许执行；
+    // 它做的只是把预算清零。
+    if (slice.stall.class === null && !options.resetRetry) {
       throw new Error(`Slice "${sliceId}" is not stalled`);
     }
 
     if (options.abandon) {
+      if (slice.stall.class === null) {
+        throw new Error(`Slice "${sliceId}" is not stalled`);
+      }
       await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
         resolution: 'manual_abandon',
         previousStallClass: slice.stall.class,
       });
       await this.store.transit(sliceId, 'ABANDON');
-      return;
+      return { retryBudgetReset: false };
     }
 
     const resolution = options.skip ? 'manual_skip' : 'manual_retry';
+
+    // 只有「恢复停机」才动状态。纯粹的重置预算不动状态 ——
+    // 切片可能正跑着（人只是想把预算腾出来），把它退成 frozen 是副作用。
+    const resumingStall = slice.stall.class !== null;
 
     // 先迁状态，再清分类。
     //
@@ -354,7 +372,7 @@ export class Scheduler {
     // 所以「先清分类再迁移」也不会把分类弄丢 —— 但反过来（先迁移再清）
     // 更稳：迁移失败（状态被改过）时分类还在，切片仍标记为「待人处理」，
     // 不会变成「什么都没发生」。
-    if (slice.state === 'running') {
+    if (resumingStall && slice.state === 'running') {
       try {
         await this.store.transit(sliceId, 'RUN_FINISH', 'zelto');
         await this.appendEvent(sliceId, 'slice.state.changed', 'zelto', {
@@ -365,10 +383,12 @@ export class Scheduler {
       }
     }
 
-    await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
-      resolution,
-      previousStallClass: slice.stall.class,
-    });
+    if (resumingStall) {
+      await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
+        resolution,
+        previousStallClass: slice.stall.class,
+      });
+    }
 
     // Clear stall info for retry or skip.
     //
@@ -376,8 +396,34 @@ export class Scheduler {
     // 而 `slice` 还是迁移前的那份快照 —— 直接写回去会把刚迁好的
     // 状态改回 `running`，正好把这次修复抵消掉。
     const current = await this.store.read(sliceId);
-    current.stall.class = null;
+    if (resumingStall) {
+      current.stall.class = null;
+    }
+
+    // 自动重试预算重置（ADR-052）——**只在人显式要求时**才做。
+    //
+    // 为什么需要它：`stall.autoResolved` 是切片级计数，只在自动重试时 +1，
+    // resume 不清它。于是「环境故障 → 自动重试耗尽 → 停机 → 人修好环境 →
+    // resume → run」之后，计数器还停在 maxRetries —— **第一次失败就直接停机**，
+    // 再也不自动重试了。这在 ADR-047 修好「卡在 running」之前根本触发不了
+    // （那时压根跑不了第二次），是那次修复顺带暴露出来的。
+    //
+    // 为什么必须显式而不能悄悄清：悄悄清 = 「重跑一次预算就无限」——
+    // zelto 会对同一片同一个失败无限重试，那是真问题。预算是有限的，
+    // 但**重置必须是人的动作**。
+    let retryBudgetReset = false;
+    if (options.resetRetry && current.stall.autoResolved > 0) {
+      await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
+        resolution: 'retry_budget_reset',
+        previousAutoResolved: current.stall.autoResolved,
+      });
+      current.stall.autoResolved = 0;
+      retryBudgetReset = true;
+    }
+
     await this.store.write(current);
+
+    return { retryBudgetReset };
   }
 
   /**
