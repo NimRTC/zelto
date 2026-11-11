@@ -69,6 +69,19 @@ export interface ExecutorAdapter {
   resume(sessionId: string, patch: string): Promise<{ sessionId: string }>;
 
   /**
+   * Continue the same agent conversation with **arbitrary** instructions.
+   *
+   * `resume()` is the question-loop path: its patch is "the human's answer",
+   * and the wording it builds assumes that. A retry after a timeout needs a
+   * different prompt ("continue where you left off"), so it gets its own
+   * entry point rather than bending `resume()`'s semantics (ADR-055).
+   *
+   * Optional: an adapter that cannot continue a conversation simply doesn't
+   * implement it, and the caller falls back to starting fresh.
+   */
+  continueSession?(sessionId: string, instructions: string): Promise<{ sessionId: string }>;
+
+  /**
    * Get the agent's output text for a session.
    *
    * Used to read the agent's final answer — e.g. to parse the question marker

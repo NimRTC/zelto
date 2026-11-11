@@ -17,10 +17,11 @@ import {
   readFileSync, writeFileSync, mkdtempSync, rmSync,
   existsSync, mkdirSync, readdirSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform } from 'node:os';
 import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../../core/ports/executor.js';
 import type { EventEnvelope } from '../../core/events/index.js';
 import { extractClaudeJson, parseClaudeUsage } from '../usage-parse.js';
+import { killProcessTree, killProcessTreeGracefully } from '../process-tree.js';
 
 // ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -312,6 +313,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
         cwd: workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         shell: true,
+        // POSIX 上把子进程放进独立进程组（ADR-055）：这样
+        // `killProcessTree` 才能用 `kill(-pid)` 一次干掉
+        // npx / node / agent 整条链，而不是只杀 shell。
+        // Windows 上这个标志会另开一个控制台窗口，所以只在 POSIX 开。
+        detached: platform() !== 'win32',
         env: {
           ...spawnEnv,
           ZELTO_BUNDLE: bundlePath,
@@ -407,11 +413,10 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       this.onOutput(sessionId, `\n[zelto: timeout after ${this.timeoutMs}ms]\n`);
     }
 
-    // Kill gracefully first, then force
-    session.child.kill('SIGTERM');
-    setTimeout(() => {
-      try { session.child.kill('SIGKILL'); } catch { /* already dead */ }
-    }, 3000);
+    // Kill the whole process tree — not just the shell wrapper (ADR-055).
+    // 只杀 shell 的话，agent 会变成孤儿继续跑：继续改文件、继续烧 token，
+    // 而 zelto 已经判了「失败」并准备重试 —— 两个 agent 抢同一批文件。
+    killProcessTreeGracefully(session.child.pid);
   }
 
   // ─── Exit Handling ─────────────────────────────────────────────────────────
@@ -437,7 +442,14 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data) {
       data.exitCode = exitCode;
-      data.status = exitCode === 0 ? 'completed' : 'failed';
+      // 超时是「超时」，不是「失败」（ADR-055）：被信号杀掉时 exitCode 是
+      // null，原来这里一律写成 failed，把「跑超时了」和「agent 报错退出」
+      // 混成同一件事 —— 前者重试有意义，后者往往没意义。
+      if (data.status === 'timeout') {
+        data.status = 'timeout';
+      } else {
+        data.status = exitCode === 0 ? 'completed' : 'failed';
+      }
       saveSession(data);
     }
 
@@ -478,6 +490,44 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       '',
       'Continue the work in this same session. If anything is still unclear, ask again using the question marker.',
     ].join('\n');
+
+    return this.spawn({
+      sessionId: newSessionId,
+      sliceId: data.sliceId,
+      instructions,
+      bundlePath: data.prompt,
+      retryCount: data.retryCount,
+      agentSessionId: data.agentSessionId,
+      resumeAgentSessionId: data.agentSessionId,
+      resumedFromZelto: sessionId,
+      cwd: data.cwd || this.cwd,
+      agentCommand: data.agentCommand || this.agentCommand,
+    });
+  }
+
+  /**
+   * Continue the same agent conversation with arbitrary instructions (ADR-055).
+   *
+   * 与 `resume()` 的区别只在**提示词**：resume 是问答回路（「你问的问题，
+   * 人这么答」），continueSession 是超时重试（「接着上次做」）。两者共用
+   * 同一条 `--resume` 通道 —— 同一个 agent 会话、同一份上下文、同一个
+   * worktree（写集预约不受影响）。
+   *
+   * 续跑与从头跑的区别很大：超时被杀时 agent 已经做掉的工作留在
+   * worktree 里，从头跑等于把那些工作重做一遍，还把上下文清零。
+   */
+  async continueSession(sessionId: string, instructions: string): Promise<{ sessionId: string }> {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    if (!data) {
+      throw new Error(`Session "${sessionId}" not found — cannot continue`);
+    }
+    if (!data.agentSessionId) {
+      throw new Error(
+        `Session "${sessionId}" has no agent-side session id — cannot continue the same conversation`,
+      );
+    }
+
+    const newSessionId = `claude-agent-${data.sliceId}-${Date.now()}-continue`;
 
     return this.spawn({
       sessionId: newSessionId,
@@ -572,9 +622,9 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     }
 
     session.child.kill('SIGTERM');
-    setTimeout(() => {
-      try { session.child.kill('SIGKILL'); } catch { /* already dead */ }
-    }, 5000);
+    // Kill the whole tree — the shell wrapper alone would leave the agent
+    // running as an orphan (ADR-055).
+    killProcessTreeGracefully(session.child.pid, 5000);
   }
 
   // ─── Events ────────────────────────────────────────────────────────────────
@@ -647,7 +697,6 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       session.child.on('error', () => checkExit(1));
     });
   }
-
   // ─── Session Status (query) ────────────────────────────────────────────────
 
   /** Get the status of a session from persistent storage */

@@ -448,6 +448,50 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   }
 
   /**
+   * Continue the same agent conversation with arbitrary instructions (ADR-055).
+   *
+   * SDK 适配器没有「同一个会话」的概念（见 `getAgentSessionId` 的说明），
+   * 所以它续的是**同一份工作区的上下文**，不是字面上的同一段对话：
+   * 提示词里带上上一轮的事件摘要，让 agent 知道「上次做到哪儿了」。
+   * 这比从头跑强：至少不用重新摸索已经摸清的东西。
+   */
+  async continueSession(sessionId: string, instructions: string): Promise<{ sessionId: string }> {
+    const existingEvents = this.sessionEvents.get(sessionId);
+    const contextSummary =
+      existingEvents && existingEvents.length > 0
+        ? `Previous run had ${existingEvents.length} events. Last event: ${existingEvents[existingEvents.length - 1]?.type}`
+        : 'No previous events found.';
+
+    const combinedPrompt = `${contextSummary}\n\n${instructions}`;
+
+    const abortController = new AbortController();
+    const warm = await startup({
+      options: {
+        cwd: this.cwd,
+        permissionMode: this.permissionMode,
+        abortController,
+      },
+    });
+
+    const gen = warm.query(combinedPrompt);
+    const newSessionId = `sdk-continue-${Date.now()}`;
+
+    this.sessions.set(newSessionId, {
+      sessionId: newSessionId,
+      startedAt: new Date().toISOString(),
+      abortController,
+      retryCount: 0,
+      exited: false,
+      exitCode: null,
+    });
+
+    const done = this.consumeGenerator(newSessionId, { sliceId: sessionId, prompt: combinedPrompt }, gen, 0).catch(() => {});
+    this.trackDrain(newSessionId, done);
+
+    return { sessionId: newSessionId };
+  }
+
+  /**
    * Get the agent's output text for a session.
    *
    * The SDK adapter keeps the full message history; the text messages make up
