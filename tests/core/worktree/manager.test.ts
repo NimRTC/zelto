@@ -121,3 +121,203 @@ describe('WorktreeManager — create / list / remove', () => {
     );
   });
 });
+
+// ─── ADR-044：worktree 里的 submodule ──────────────────────────────────────
+
+describe('WorktreeManager — submodules (ADR-044)', () => {
+  /**
+   * 建一个带「本地 submodule」的仓库：submodule 的源是一个本地 bare 仓库，
+   * 不需要网络。子模块路径用 `vendor/lib` 这种普通目录名，避免 git 2.49
+   * 对 `src/third_party/x/src` 这类嵌套路径的额外处理。
+   */
+  function makeRepoWithSubmodule(): { repo: string; subPath: string } {
+    const root = mkdtempSync(join(tmpdir(), 'zelto-wt-sub-'));
+    const subOrigin = join(root, 'sub-origin');
+    const subWork = join(root, 'sub-work');
+
+    // submodule 的源
+    mkdirSync(subOrigin, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: subOrigin, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: subOrigin });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: subOrigin });
+    writeFileSync(join(subOrigin, 'lib.txt'), 'vendored content\n');
+    execFileSync('git', ['add', '.'], { cwd: subOrigin });
+    execFileSync('git', ['commit', '-m', 'sub init'], { cwd: subOrigin });
+
+    // 主仓
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    execFileSync('git', ['config', 'protocol.file.allow', 'always'], { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), '# test\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', subOrigin, 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+    execFileSync('git', ['commit', '-m', 'add submodule'], { cwd: repo });
+
+    // 主仓里把 submodule 初始化出来（本地 objects 已就位）
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+
+    void subWork;
+    return { repo, subPath: 'vendor/lib' };
+  }
+
+  it('populates submodule content inside the new worktree', async () => {
+    const { repo, subPath } = makeRepoWithSubmodule();
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('with-sub');
+
+      // worktree 里 submodule 的源码树必须存在 —— 空目录会让配置阶段直接失败
+      assert.ok(
+        existsSync(join(info.path, subPath, 'lib.txt')),
+        'submodule content should be present in the worktree',
+      );
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(join(repo, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('reports which submodules were initialized and which were skipped', async () => {
+    const { repo, subPath } = makeRepoWithSubmodule();
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('report-sub');
+
+      const result = manager.syncSubmodules(info.path);
+
+      assert.deepEqual(result.initialized, [subPath]);
+      assert.deepEqual(result.skipped, []);
+    } finally {
+      rmSync(join(repo, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('skips submodules that are not populated in the main repo (no network fetch)', async () => {
+    const { repo } = makeRepoWithSubmodule();
+    try {
+      // 删掉主仓里的 submodule 工作树 —— 它不再是「本地已有 objects」
+      rmSync(join(repo, 'vendor', 'lib'), { recursive: true, force: true });
+
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('skip-sub');
+      const result = manager.syncSubmodules(info.path);
+
+      assert.deepEqual(result.initialized, []);
+      assert.deepEqual(result.skipped, ['vendor/lib']);
+    } finally {
+      rmSync(join(repo, '..'), { recursive: true, force: true });
+    }
+  });
+
+  it('does nothing when the repository has no .gitmodules', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'zelto-wt-nosub-'));
+    try {
+      const manager = new WorktreeManager(repo);
+      const result = manager.syncSubmodules(manager.pathFor('anything'));
+
+      assert.deepEqual(result.initialized, []);
+      assert.deepEqual(result.skipped, []);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('copies vendored submodule content that has no .git in the main repo', async () => {
+    // 有些工程把 submodule 的源码当普通文件提交（或者只拷了源码、
+    // 没保留 gitlink 关系）—— 主仓里没有 `.git`，但**有内容**。
+    //
+    // 这种情况下 worktree 里那个目录也必须是空的，但主仓里有内容可抄。
+    // 不抄的话，agent 会去网络上现拉 —— 离线环境里直接卡死。
+    const root = mkdtempSync(join(tmpdir(), 'zelto-wt-vendored-'));
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), '# test\n');
+
+    // 登记一个 submodule，但**不初始化**它 —— 只留一份普通文件内容
+    writeFileSync(
+      join(repo, '.gitmodules'),
+      '[submodule "vendor/lib"]\n\tpath = vendor/lib\n\turl = https://example.invalid/lib.git\n',
+    );
+    mkdirSync(join(repo, 'vendor', 'lib'), { recursive: true });
+    writeFileSync(join(repo, 'vendor', 'lib', 'lib.txt'), 'vendored content\n');
+
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('vendored-sub');
+
+      assert.ok(
+        existsSync(join(info.path, 'vendor', 'lib', 'lib.txt')),
+        'vendored content should be copied into the worktree',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('initializes a submodule whose .gitmodules name differs from its path', async () => {
+    // section 名（name）与落盘路径（path）不同时，配置键要用 name。
+    // 用错了键就会「改错 submodule」—— 表面上没报错，内容却没进来。
+    const root = mkdtempSync(join(tmpdir(), 'zelto-wt-subname-'));
+    const subOrigin = join(root, 'sub-origin');
+    mkdirSync(subOrigin, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: subOrigin, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: subOrigin });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: subOrigin });
+    writeFileSync(join(subOrigin, 'lib.txt'), 'vendored content\n');
+    execFileSync('git', ['add', '.'], { cwd: subOrigin });
+    execFileSync('git', ['commit', '-m', 'sub init'], { cwd: subOrigin });
+
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    execFileSync('git', ['config', 'protocol.file.allow', 'always'], { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), '# test\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', '--name', 'gtest-lib', subOrigin, 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+    execFileSync('git', ['commit', '-m', 'add submodule'], { cwd: repo });
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', 'vendor/lib'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('named-sub');
+
+      assert.ok(
+        existsSync(join(info.path, 'vendor', 'lib', 'lib.txt')),
+        'submodule content should be present even when name != path',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
