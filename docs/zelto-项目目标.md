@@ -436,6 +436,37 @@ D4 待定期间新增的 `files` 白名单与打包可用性验证，恰好是 n
 **未决的尾巴**：npm 上的 `zelto` 这个名字当时未被占用（查 registry 是 404），
 但**包名一旦发布就占住了，改名要另开一个包**。真名发布前建议再确认一次。
 
+**发布前最后一次确认（2026-11-10）**：`zelto` 仍未被占用（registry 返 404），
+包名可用。0.5.0 是**首次发布** —— npm 上此前没有任何 zelto 版本。
+
+### 0.5.0 的发布前置：凭据
+
+`release.yml` 的发布步骤用 `secrets.NPM_TOKEN`。**这个 secret 目前不存在**，
+所以打 tag 触发后，前面的校验/构建/lint/test/产物验证全过，
+最后一步 `npm publish` 报 `ENEEDAUTH` 退出（run 42949937978）。
+
+首次发布必须用 token，走不通 npm 的 Trusted Publishing（OIDC）——
+那条路要求包**已经存在**才能在 npmjs.com 上配受信发布者，而 `zelto` 还没发过。
+
+配置步骤（一次性，之后 token 可吊销）：
+
+1. 登录 npmjs.com → 右上角头像 → **Access Tokens** → **Generate New Token**
+   → 类型选 **Automation** → 勾选 **Publish**（只读权限不需要）
+2. 复制生成的 token（只显示一次）
+3. 存进仓库 secret：
+   ```
+   gh secret set NPM_TOKEN --repo NimRTC/zelto
+   ```
+   命令会提示粘贴值（输入不回显）
+4. 重新触发发布（**不需要再动 tag**）：
+   ```
+   gh workflow run release.yml --repo NimRTC/zelto -f dry-run=false
+   ```
+   或删掉 tag 重打。
+
+发出去之后建议回头把 npm 包设置里的 **Publishing access** 改成
+「Require two-factor authentication and disallow tokens」，只留 Trusted Publisher 一条路。
+
 ---
 
 ## 8. 不变量
