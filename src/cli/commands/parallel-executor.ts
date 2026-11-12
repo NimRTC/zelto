@@ -83,6 +83,13 @@ export interface ParallelExecutionOptions {
   affinity?: Map<string, string | null>;
   /** 组内排在本片之前的切片 id（按执行序）；缺省为空 */
   affinityPrevious?: Map<string, string[]>;
+  /**
+   * 切片基点覆盖（ADR-056 §3.3）。
+   *
+   * 版本里的切片基点来自**版本分支的 tip**，不是主仓 HEAD ——
+   * 否则同版本的切片看不到本版本其它切片的改动。
+   */
+  baseCommitOverride?: string | null;
 }
 
 export interface ParallelExecutionResult {
@@ -400,7 +407,9 @@ export async function executeSlicesParallel(
     // 不在 git 仓库里 → 无法隔离，退化为当前目录（与隔离功能出现之前的行为一致）
     let baseCommit: string | null = null;
     try {
-      const wt: WorktreeInfo | null = await ensureWorktree(st.id);
+      const wt: WorktreeInfo | null = await ensureWorktree(st.id, {
+        baseCommitOverride: options.baseCommitOverride ?? null,
+      });
       if (wt) {
         st.worktreePath = wt.path;
         baseCommit = wt.baseCommit;

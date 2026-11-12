@@ -24,6 +24,21 @@ export interface MergeExecutorOptions {
   events: EventStream;
   /** 主仓库根目录 */
   repoRoot?: string;
+  /**
+   * 合并目标工作目录（ADR-056 §3.3）。
+   *
+   * 缺省 = repoRoot，也就是「合进主仓当前检出的分支」——
+   * 改造前的行为，老调用方零改动。
+   *
+   * 合进版本分支时传版本工作目录；合进主干时传主仓。
+   */
+  targetDir?: string;
+  /**
+   * 合并目标的标识（写进事件 payload，便于审计）。
+   *
+   * 缺省 = 'main'。
+   */
+  targetLabel?: string;
   /** 输出回调 */
   log?: (message: string) => void;
 }
@@ -96,6 +111,18 @@ export function isMergedIntoHead(branch: string, repoRoot: string): boolean {
 }
 
 /**
+ * 分支是否已经合入指定 ref（ADR-056 §3.3）。
+ *
+ * 合进版本分支时，判据不能是「合入 HEAD」—— HEAD 是**主仓当前检出的分支**，
+ * 与版本分支无关。要判的是「这个切片的产物进了 version/<label> 没有」。
+ *
+ * ref 可以是分支名、tag 或 commit。
+ */
+export function isMergedIntoRef(branch: string, ref: string, repoRoot: string): boolean {
+  return git(['merge-base', '--is-ancestor', branch, ref], repoRoot).ok;
+}
+
+/**
  * 一次性列出仓库里所有本地分支。
  *
  * 为什么要批量版：逐个分支跑 `git rev-parse` 是 N 次子进程调用，
@@ -134,29 +161,37 @@ export function listMergedIntoHead(repoRoot: string): Set<string> {
 }
 
 /**
- * 基点是否已漂移：切片冻结之后主分支已经前进。
+ * 基点是否已漂移：切片冻结之后目标分支已经前进。
  *
- * 判据是「基点是否仍等于当前 HEAD」——主分支前进后 HEAD 与基点不再相同，
- * 此时切片分支不再包含主分支的新提交，fast-forward 不再可能，必须走合并提交。
+ * 判据是「基点是否仍等于目标 ref 的 commit」——目标分支前进后两者不再相同，
+ * 此时切片分支不再包含目标分支的新提交，fast-forward 不再可能，必须走合并提交。
  *
- * 注意不能用「base 是否还是 HEAD 的祖先」来判：主分支正常前进时 base 永远是
- * HEAD 的祖先，那样判据永远为假，`merge.stale_base` 就永远不会触发。
+ * 注意不能用「base 是否还是目标 ref 的祖先」来判：分支正常前进时 base 永远是
+ * 祖先，那样判据永远为假，`merge.stale_base` 就永远不会触发。
+ *
+ * @param baseCommit 切片基点
+ * @param repoRoot 仓库根
+ * @param targetRef 目标 ref（缺省 HEAD —— 主仓当前分支）
  */
-export function isStaleBase(baseCommit: string | null, repoRoot: string): boolean {
+export function isStaleBase(
+  baseCommit: string | null,
+  repoRoot: string,
+  targetRef: string = 'HEAD',
+): boolean {
   if (!baseCommit) return false;
   if (!commitExists(baseCommit, repoRoot)) return false;
-  const head = headCommit(repoRoot);
+  const head = refCommit(repoRoot, targetRef);
   if (!head) return false;
   return head !== baseCommit;
 }
 
 /**
- * 是否可以 fast-forward：当前 HEAD 是不是该分支的祖先。
+ * 是否可以 fast-forward：目标 ref 是不是该分支的祖先。
  *
- * HEAD 是分支的祖先 → 分支可以快进；否则两条历史已分叉。
+ * ref 是分支的祖先 → 分支可以快进；否则两条历史已分叉。
  */
-export function canFastForward(branch: string, repoRoot: string): boolean {
-  return git(['merge-base', '--is-ancestor', 'HEAD', branch], repoRoot).ok;
+export function canFastForward(branch: string, repoRoot: string, targetRef: string = 'HEAD'): boolean {
+  return git(['merge-base', '--is-ancestor', targetRef, branch], repoRoot).ok;
 }
 
 /** 列出当前处于冲突中的文件 */
@@ -172,6 +207,17 @@ function conflictedFiles(repoRoot: string): string[] {
 /** 当前 HEAD 的 commit 号 */
 function headCommit(repoRoot: string): string | null {
   const res = git(['rev-parse', 'HEAD'], repoRoot);
+  return res.ok ? res.stdout.trim() : null;
+}
+
+/**
+ * 指定 ref 的 commit 号（ADR-056 §3.3）。
+ *
+ * 缺省查 HEAD —— 与 `headCommit` 等价，但合并到版本分支时要查
+ * `refs/heads/version/<label>`。
+ */
+function refCommit(repoRoot: string, ref: string): string | null {
+  const res = git(['rev-parse', '--verify', `${ref}^{commit}`], repoRoot);
   return res.ok ? res.stdout.trim() : null;
 }
 
@@ -197,18 +243,25 @@ export async function executeMergePlan(
   const log = options.log ?? (() => {});
   const byId = new Map(slices.map((s) => [s.id, s]));
 
+  // 合并目标目录与目标 ref（ADR-056 §3.3）
+  // 缺省 = 主仓 + HEAD —— 与改造前完全一致。
+  const targetDir = options.targetDir ?? repoRoot;
+  const targetLabel = options.targetLabel ?? 'main';
+  // 目标 ref：合版本分支时是那个分支，合主干时是 HEAD（主仓当前检出）
+  const targetRef = targetLabel === 'main' ? 'HEAD' : `refs/heads/${targetLabel}`;
+
   const merged: string[] = [];
   const conflicts: MergeConflictReport[] = [];
   const staleBase: string[] = [];
 
-  // ── 前置守卫：主仓库工作区必须干净，否则合并会污染未提交改动 ──
+  // ── 前置守卫：目标工作区必须干净，否则合并会污染未提交改动 ──
   //
   // 例外：zelto 自己管理的规格文件（`specs/slices/**`）。
   // 守卫要拦的是「人改了代码还没提交」—— 合并会把分支上的改动带进主干，
   // 未提交的本地改动会被盖掉。规格文件不是代码：合并不会碰它，
   // 它是追溯链的出处，该入库但不该挡路。接管既有项目时基线规格是新建文件，
   // 人还没来得及提交 —— 把它算成「工作区不干净」，合并就永远过不去。
-  const status = git(['status', '--porcelain'], repoRoot);
+  const status = git(['status', '--porcelain'], targetDir);
   if (status.ok && status.stdout.trim().length > 0) {
     const entries = status.stdout
       .split('\n')
@@ -234,7 +287,7 @@ export async function executeMergePlan(
     if (dirty.length > 0) {
       // 列出具体是什么挡着 —— 只说「有未提交改动」的话，人得自己去找。
       const shown = dirty.slice(0, 10);
-      log('  ⚠️  主仓库工作区有未提交改动，已跳过自动合并。');
+      log('  ⚠️  目标工作区有未提交改动，已跳过自动合并。');
       for (const d of shown) log(`     ${d}`);
       if (dirty.length > 10) log('     …（只列前 10 条）');
       log('     先提交（git commit）或暂存（git stash）这些改动，再重新跑 zelto merge。');
@@ -254,6 +307,7 @@ export async function executeMergePlan(
       slices: plan.slices,
       strategy: plan.strategy,
       phases: phaseSummary,
+      target: targetLabel,
     });
   }
 
@@ -263,11 +317,22 @@ export async function executeMergePlan(
       log(`     手动合并：git merge ${phase.slices.map((id) => byId.get(id)?.branch ?? id).join(' ')}`);
       continue;
     }
-    await executePhase(phase, byId, repoRoot, log, options, merged, conflicts, staleBase);
+    await executePhase(
+      phase,
+      byId,
+      targetDir,
+      targetRef,
+      targetLabel,
+      log,
+      options,
+      merged,
+      conflicts,
+      staleBase,
+    );
   }
 
   // ── 记录完成 ──
-  const commit = headCommit(repoRoot);
+  const commit = refCommit(targetDir, targetRef) ?? headCommit(targetDir);
   for (const id of merged) {
     await options.events.append(id, 'merge.completed', 'zelto', {
       sliceId: id,
@@ -284,7 +349,9 @@ export async function executeMergePlan(
 async function executePhase(
   phase: MergePhase,
   byId: Map<string, MergeSliceInfo>,
-  repoRoot: string,
+  targetDir: string,
+  targetRef: string,
+  targetLabel: string,
   log: (message: string) => void,
   options: MergeExecutorOptions,
   merged: string[],
@@ -298,7 +365,7 @@ async function executePhase(
       continue;
     }
 
-    const branchExists = git(['rev-parse', '--verify', `refs/heads/${info.branch}`], repoRoot).ok;
+    const branchExists = git(['rev-parse', '--verify', `refs/heads/${info.branch}`], targetDir).ok;
     if (!branchExists) {
       log(`  ❌ ${id}: 分支 "${info.branch}" 不存在，无法合并。`);
       conflicts.push({ sliceId: id, files: [], message: `分支 "${info.branch}" 不存在` });
@@ -308,13 +375,14 @@ async function executePhase(
         files: [],
         resolution: 'failed',
         message: `分支 "${info.branch}" 不存在`,
+        target: targetLabel,
       });
       continue;
     }
 
-    // 基点漂移检测：base 不再是 HEAD 的祖先 → 主分支已前进
-    const stale = isStaleBase(info.baseCommit, repoRoot);
-    const ff = phase.strategy === 'sequential_ff' && !stale && canFastForward(info.branch, repoRoot);
+    // 基点漂移检测：base 不再等于目标 ref → 目标分支已前进（ADR-056 §3.3）
+    const stale = isStaleBase(info.baseCommit, targetDir, targetRef);
+    const ff = phase.strategy === 'sequential_ff' && !stale && canFastForward(info.branch, targetDir, targetRef);
     const useMergeCommit = phase.strategy === 'merge_commit' || !ff;
 
     if (stale) {
@@ -323,7 +391,8 @@ async function executePhase(
         sliceId: id,
         branch: info.branch,
         baseCommit: info.baseCommit,
-        reason: '切片基点不再是当前 HEAD 的祖先，fast-forward 不可用',
+        reason: '切片基点不再是目标分支的祖先，fast-forward 不可用',
+        target: targetLabel,
       });
       log(`  ℹ️  ${id}: 基点已漂移，改用合并提交（--no-ff）。`);
     } else if (!ff && phase.strategy === 'sequential_ff') {
@@ -334,11 +403,11 @@ async function executePhase(
       ? ['merge', '--no-ff', info.branch, '-m', `Merge slice ${id}\n\nRefs-Slice: ${id}`]
       : ['merge', '--ff-only', info.branch];
 
-    const res = git(args, repoRoot);
+    const res = git(args, targetDir);
     if (!res.ok) {
-      const files = conflictedFiles(repoRoot);
-      // 合并失败：先把主仓库恢复到合并前的状态
-      git(['merge', '--abort'], repoRoot);
+      const files = conflictedFiles(targetDir);
+      // 合并失败：先把目标工作区恢复到合并前的状态
+      git(['merge', '--abort'], targetDir);
 
       const message = res.stderr.trim() || res.stdout.trim() || '合并失败';
       await options.events.append(id, 'merge.conflict', 'zelto', {
@@ -347,9 +416,10 @@ async function executePhase(
         files,
         resolution: files.length > 0 ? 'conflict' : 'failed',
         message,
+        target: targetLabel,
       });
       conflicts.push({ sliceId: id, files, message });
-      log(`  ❌ ${id}: 合并失败，主分支已恢复原状。`);
+      log(`  ❌ ${id}: 合并失败，目标分支已恢复原状。`);
       log(`     ${message.split('\n')[0]}`);
       if (files.length > 0) {
         log('     冲突文件：');
@@ -366,8 +436,9 @@ async function executePhase(
       slices: [id],
       strategy: useMergeCommit ? 'merge_commit' : 'sequential_ff',
       branch: info.branch,
-      mergeCommit: headCommit(repoRoot),
+      mergeCommit: refCommit(targetDir, targetRef) ?? headCommit(targetDir),
+      target: targetLabel,
     });
-    log(`  ✅ ${id} 已合入（${useMergeCommit ? '合并提交' : 'fast-forward'}）`);
+    log(`  ✅ ${id} 已合入${targetLabel === 'main' ? '' : ` ${targetLabel}`}（${useMergeCommit ? '合并提交' : 'fast-forward'}）`);
   }
 }

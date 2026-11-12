@@ -860,8 +860,17 @@ export async function removeWorktree(sliceId: string, options: { force?: boolean
  * in the current directory (same behaviour as before isolation existed).
  *
  * Emits a `worktree.created` event (C4) when a new worktree is created.
+ *
+ * @param id 切片 id
+ * @param options.baseCommitOverride 基点覆盖（ADR-056 §3.3）。
+ *   版本里的切片基点来自**版本分支的 tip**，而不是主仓 HEAD ——
+ *   否则同版本的切片看不到本版本其它切片的改动。
+ *   传 null 表示不覆盖（用切片文件里已有的基点）。
  */
-export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
+export async function ensureWorktree(
+  id: string,
+  options: { baseCommitOverride?: string | null } = {},
+): Promise<WorktreeInfo | null> {
   const manager = worktreeManager();
   if (!manager.isGitRepo()) return null;
 
@@ -869,7 +878,7 @@ export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
 
   const existed = manager.exists(id);
   const info = await manager.create(id, {
-    baseCommit: slice.baseCommit ?? null,
+    baseCommit: options.baseCommitOverride ?? slice.baseCommit ?? null,
     specPath: slice.spec.path,
     acceptanceDir: slice.acceptance.dir,
   });
@@ -887,6 +896,7 @@ export async function ensureWorktree(id: string): Promise<WorktreeInfo | null> {
       path: info.relativePath,
       branch: info.branch,
       baseCommit: info.baseCommit,
+      kind: 'slice',
     });
   }
 

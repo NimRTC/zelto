@@ -643,17 +643,30 @@ zelto sign <id> --revoke → SignManager.revoke(id, 'human')
 
 ```
 zelto version start <ver>
+  Phase 0  版本工作目录：建 version/<ver> 分支 + .zelto/version-worktrees/<ver>/
+           基点：有前置版本 → 前置版本分支 tip；无 → 主干 HEAD（钉死后不重算）
   Phase 1  准备切片：建切片文件 → 写规格 → 冻结（哈希 + spec.frozen 事件）
   Phase 2  并行执行：executeSlicesParallel() —— 与 run --parallel 同一条路径
+           跨版本写集重叠 → 提示（默认不阻断，--strict 可硬拦）
   Phase 3  结果解读：全部通过 → 打印逐片签字命令；否则提示 --retry-failed
 
 zelto version deliver <ver>
-  第一步  前置条件：切片状态 completed + 分支已合入 HEAD（只读磁盘与 git）
-  第二步  版本级验收：在主仓跑 config.gate.commands（真实主干代码）
+  第一步  前置条件：切片状态 completed + 分支已合入版本分支（只读磁盘与 git）
+  第二步  架构护栏 + 契约演进检查：扫版本工作目录
+  第三步  版本级验收：在版本工作目录跑 config.gate.commands
   通过 → events.append('version.accepted') → 状态 integrated → delivered
+
+zelto version ship <ver>
+  把 version/<ver> 合入主仓当前分支（冲突则 --abort，主干保持原状）
+  之后打 tag（不可变锚点）+ 在主干重跑一次门禁（只提示，不阻断）
+  版本状态 → delivered
+
+zelto merge [--target version/<ver>]
+  切片产物合进版本分支（默认按归属解析；--target main 强制合主干）
 ```
 
-详见 `docs/adr-017-version-level-orchestration.md`。
+详见 `docs/adr-017-version-level-orchestration.md`、
+`docs/adr-056-version-level-branches.md`。
 
 ---
 

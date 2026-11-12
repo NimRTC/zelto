@@ -76,7 +76,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'policy', group: '治理与运行时', args: '<subcommand>', summary: '策略规则的增删查改与校验', detail: 'list, show, check, validate, add, remove, edit, lock（查看/更新策略哈希锚点）' },
   { name: 'reservation', group: '治理与运行时', args: '<subcommand> [slice-id]', summary: '写集预约的查看与释放', detail: 'list, active, show, release, reap' },
   { name: 'drift', group: '治理与运行时', args: '<slice-id>', summary: '检查切片与冻结基线之间的漂移', detail: '--json' },
-  { name: 'merge', group: '治理与运行时', args: '[id ...]', summary: '合并已签字的切片（不带 id 则合并全部待合切片；子命令 plan 只出计划）', detail: '--strategy, --dry-run, --push, --json' },
+  { name: 'merge', group: '治理与运行时', args: '[id ...]', summary: '合并已签字的切片（不带 id 则合并全部待合切片；子命令 plan 只出计划）', detail: '--strategy, --target, --plan, --dry-run, --push, --json' },
   { name: 'audit', group: '治理与运行时', args: '<slice-id>', summary: '查看切片的审计追踪', detail: '--json' },
   { name: 'hook', group: '治理与运行时', args: '', summary: '安装 / 卸载 git hooks', detail: '--install, --uninstall, --status' },
   { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
@@ -87,7 +87,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
   { name: 'design', group: 'AI 流水线', args: '<req-id>', summary: '从需求生成与细化设计', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
   { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, show <id>, confirm <id>, add-version <id> <d>' },
-  { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>' },
+  { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>, ship <ver>, cleanup <ver>' },
   { name: 'spec', group: 'AI 流水线', args: '<subcommand> <slice-id>', summary: '切片规格的草稿与确认：生成草稿 → 人确认后写进正式规格', detail: 'draft, show, confirm' },
   { name: 'pipeline', group: 'AI 流水线', args: 'status', summary: '需求→设计→计划→版本→切片 全链一览' },
 

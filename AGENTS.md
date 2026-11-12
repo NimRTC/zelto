@@ -58,6 +58,8 @@ zelto 控制并行 agent 进入高速开发（隔离 worktree + 写集守卫 + �
 ```
 src/
   core/        切片状态机·规格校验·policy·gate·stall·artifacts·events
+               version/  版本计划与分支归属（ADR-056）
+               worktree/ 切片执行目录 + 版本集成目录（ADR-056）
   adapters/    executor 适配器（v1 只有 claude-agent-sdk）
   llm/         通路 B（仅 clarify/spec/stall 可依赖）
   cli/         命令实现（与界面共用同一接口）
@@ -66,7 +68,12 @@ contracts/schemas/   JSON Schema 真源
 policy/              policy.yaml + fixtures/ + lock.json
 tests/acceptance/    验收测试骨架
 .zelto/             slices/ events/ locks/ config.yaml
+                   versions/（版本计划） version-worktrees/（版本集成目录）
 ```
+
+**多版本并行（ADR-056）**：版本是 git 的一等分支 `version/<label>`，
+切片产物合进版本分支而不是主干，主干由 `zelto version ship` 显式合入。
+`zelto merge` 默认按归属解析目标，`--target main` 强制合主干。
 
 ## 禁区（违反则 PR 直接打回）
 

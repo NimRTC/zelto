@@ -21,7 +21,15 @@ import { RevisionStore } from '../../core/review/index.js';
 import { designFacts, planFacts, requirementFacts, showDraft } from './draft-review.js';
 import { executeSlicesByPhase, printParallelSummary } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
-import { branchExists, isMergedIntoHead } from './merge-executor.js';
+import { branchExists, isMergedIntoHead, isMergedIntoRef } from './merge-executor.js';
+import {
+  branchOfVersion,
+  prepareVersionWorkspace,
+  formatCrossVersionConflicts,
+  detectCrossVersionConflictsFor,
+} from './version-runtime.js';
+import { worktreeManager } from './shared.js';
+import { resolveWriteSet } from './run-support.js';
 import { describeGuardKinds, loadWholeGraphGuard } from './arch-guard.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
@@ -49,6 +57,46 @@ function versionEventKey(versionLabel: string): string {
 }
 
 /**
+ * 收集各版本的写集（跨版本冲突检测用，ADR-056 §3.6）。
+ *
+ * 只收集 **in_progress** 的版本 —— 已交付的版本产物已经在主仓上了，
+ * 跟正在跑的版本冲突是「主干前进」的问题，不是「两个版本并行」的问题。
+ *
+ * 写集来自切片文件（`resolveWriteSet` 会把规格里的写集解析出来并写回）。
+ *
+ * @param planId 计划 id —— **重新读盘**而不是用内存里的副本。
+ *   `updateVersionStatus` 写的是盘，内存副本的 status 还是旧的
+ *   （本版本刚被设成 in_progress，内存里还是 planned），
+ *   用内存副本会把本版本自己过滤掉。
+ */
+async function collectVersionWriteSets(
+  planId: string,
+): Promise<Array<{ version: string; writes: string[] }>> {
+  const sliceStore = new SliceStore(SLICES_DIR);
+  const versionStore = new VersionStore(ZELTO_DIR);
+  const plan = await versionStore.read(planId);
+  const result: Array<{ version: string; writes: string[] }> = [];
+
+  for (const version of plan.versions) {
+    if (version.status !== 'in_progress') continue;
+    const writes = new Set<string>();
+    for (const sliceDef of version.slices) {
+      const slice = await sliceStore.read(sliceDef.id).catch(() => null);
+      if (!slice) continue;
+      const resolved = await resolveWriteSet(sliceDef.id, false);
+      for (const w of resolved.writes.length > 0 ? resolved.writes : slice.writes) {
+        writes.add(w);
+      }
+    }
+    if (writes.size > 0) {
+      result.push({ version: version.version, writes: [...writes].sort() });
+    }
+  }
+
+  return result;
+}
+
+/**
  * 草稿（需求 / 设计 / 版本计划）的事件归属键。
  *
  * 草稿不是切片，但草稿的每一次改动同样要留痕（C4）——
@@ -72,6 +120,7 @@ async function runVersionAcceptance(
   versionLabel: string,
   commands: Array<{ name: string; run: string }>,
   timeoutSec: number,
+  codeRoot: string = process.cwd(),
 ): Promise<{
   passed: boolean;
   results: Array<{ name: string; passed: boolean; code: number | null; output: string }>;
@@ -84,7 +133,7 @@ async function runVersionAcceptance(
     const outcome = await new Promise<{ code: number | null; output: string }>((resolve) => {
       exec(
         cmd.run,
-        { cwd: process.cwd(), timeout: timeoutSec * 1000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
+        { cwd: codeRoot, timeout: timeoutSec * 1000, maxBuffer: 10 * 1024 * 1024, windowsHide: true },
         (err, stdout, stderr) => {
           const code = err ? (typeof (err as { code?: unknown }).code === 'number' ? (err as { code: number }).code : 1) : 0;
           resolve({ code, output: `${stdout ?? ''}${stderr ?? ''}` });
@@ -117,7 +166,9 @@ async function runVersionAcceptance(
  *
  * 判据是纯计算：读文件、算差集。不调模型、不触网（C3）。
  */
-async function runContractEvolutionCheck(): Promise<{
+async function runContractEvolutionCheck(
+  codeRoot: string = process.cwd(),
+): Promise<{
   hasBaseline: boolean;
   breaking: number;
   details: string[];
@@ -126,7 +177,7 @@ async function runContractEvolutionCheck(): Promise<{
   const baseline = await store.read();
   if (!baseline) return { hasBaseline: false, breaking: 0, details: [] };
 
-  const dir = join(process.cwd(), 'contracts', 'schemas');
+  const dir = join(codeRoot, 'contracts', 'schemas');
   if (!existsSync(dir)) return { hasBaseline: true, breaking: 0, details: [] };
 
   const registry = new ContractRegistry(dir);
@@ -730,6 +781,20 @@ register('version', async (args) => {
   const subcmd = args[0];
   const f = getDefaultFormatter();
 
+  // zelto version ship —— 版本分支合入主干（ADR-056 §3.5）
+  //
+  // 独立显式动作：不与签字绑定，不自动合并。
+  if (subcmd === 'ship') {
+    const { handleVersionShip } = await import('./version-ship.js');
+    return handleVersionShip(args, f);
+  }
+
+  // zelto version cleanup —— 清理版本工作目录（分支与 tag 保留）
+  if (subcmd === 'cleanup') {
+    const { handleVersionCleanup } = await import('./version-ship.js');
+    return handleVersionCleanup(args, f);
+  }
+
   // zelto version status
   if (!subcmd || subcmd === 'status') {
     const versionStore = new VersionStore(ZELTO_DIR);
@@ -811,10 +876,21 @@ register('version', async (args) => {
       return 1;
     }
 
-    // ── 第一步：前置条件 —— 切片都已完成，且产物已合入主干 ──────────
-    // 「合入主干」由显式的 zelto merge 完成（ADR-018），zelto 不自己合。
-    // 这里只检查这件事是否真的发生了——分支没进 HEAD，版本就不可交付。
+    // ── 第一步：前置条件 —— 切片都已完成，且产物已合入版本分支 ──────
+    // 「合入」由显式的 zelto merge 完成（ADR-018），zelto 不自己合。
+    // 这里只检查这件事是否真的发生了——分支没进版本分支，版本就不可交付。
+    //
+    // ADR-056 §3.4：判据从「合入主干」改成「合入版本分支」。
+    // 版本分支存在 → 按版本分支判；不存在（老项目）→ 按主干判（向后兼容）。
     f.out(`── 版本级验收：${versionLabel} ──`);
+
+    const versionBranch = branchOfVersion(version);
+    const manager = worktreeManager();
+    const hasVersionBranch = manager.isGitRepo() && branchExists(versionBranch, process.cwd());
+    const versionWorktreeExists = manager.versionExists(versionLabel);
+
+    // 验收在哪个目录跑：版本工作目录（有这个目录时）；否则主仓（老项目）
+    const codeRoot = versionWorktreeExists ? manager.versionPathFor(versionLabel) : process.cwd();
 
     const sliceStore = new SliceStore(SLICES_DIR);
     const problems: string[] = [];
@@ -829,7 +905,14 @@ register('version', async (args) => {
         problems.push(`${s.id}：状态是 ${data.state}，还没到「已完成」`);
       }
       const branch = `slice/${s.id}`;
-      if (branchExists(branch, process.cwd()) && !isMergedIntoHead(branch, process.cwd())) {
+      if (!branchExists(branch, process.cwd())) continue;
+
+      if (hasVersionBranch) {
+        // 判「合入版本分支」—— 不是合入主干
+        if (!isMergedIntoRef(branch, `refs/heads/${versionBranch}`, process.cwd())) {
+          problems.push(`${s.id}：分支 ${branch} 还没合入 ${versionBranch}`);
+        }
+      } else if (!isMergedIntoHead(branch, process.cwd())) {
         problems.push(`${s.id}：分支 ${branch} 还没合入主干`);
       }
     }
@@ -843,10 +926,18 @@ register('version', async (args) => {
       return 1;
     }
 
+    if (hasVersionBranch) {
+      f.out(`   验收目录：${versionWorktreeExists ? manager.versionRelativePathFor(versionLabel) : '主仓（版本工作目录不存在）'}`);
+    }
+
     // ── 第二步：架构护栏（整图结论作为交付门，ADR-027 Q2）────────
-    // 判据是「合入主干之后的整体架构偏离」，扫主仓、读主仓的设计与 policy。
+    // 判据是「这个版本的整体架构偏离」，扫**版本工作目录**、读主仓的设计与 policy。
+    // ADR-056 §3.4：验收对象从「主干代码」改成「这个版本的代码状态」。
     // 无确认设计时跳过（老项目无感）；ask 只提示不拦，deny 才拦。
-    const archGuard = await loadWholeGraphGuard();
+    const archGuard = await loadWholeGraphGuard({
+      designRoot: process.cwd(),
+      scanRoot: codeRoot,
+    });
     if (archGuard) {
       if (archGuard.guard.blocked) {
         f.out('');
@@ -868,7 +959,7 @@ register('version', async (args) => {
     // 契约改坏了，别的程序读不懂 —— 这件事在「版本交付」这一层最该被拦住：
     // 交付是版本对外生效的边界，契约破坏留到交付之后才发现，代价已经出去了。
     // 没有基线时不判（老项目无感）；有基线且检出破坏 → 阻断交付。
-    const contractCheck = await runContractEvolutionCheck();
+    const contractCheck = await runContractEvolutionCheck(codeRoot);
     if (contractCheck.breaking > 0) {
       f.out('');
       f.out(`❌ 版本 ${versionLabel} 的契约演进检查未通过 —— 状态保持 in_progress`);
@@ -879,10 +970,15 @@ register('version', async (args) => {
       return 1;
     }
 
-    // ── 第三步：版本级验收 —— 在主仓跑项目自己的门禁命令 ──────────
-    // 判据是「合入主干之后的整体能不能过验收」，所以跑在主仓、跑真实代码。
+    // ── 第三步：版本级验收 —— 在版本工作目录跑项目自己的门禁命令 ────
+    // 判据是「这个版本的整体能不能过验收」，所以跑在版本工作目录、跑这个版本的代码。
     const cfg = loadConfig();
-    const acceptance = await runVersionAcceptance(versionLabel, cfg.gate.commands, cfg.gate.timeoutSec);
+    const acceptance = await runVersionAcceptance(
+      versionLabel,
+      cfg.gate.commands,
+      cfg.gate.timeoutSec,
+      codeRoot,
+    );
 
     if (!acceptance.passed) {
       f.out('');
@@ -1057,6 +1153,53 @@ register('version', async (args) => {
     f.out(`Starting version ${versionLabel} (${version.description})`);
     f.out(`Slices: ${version.slices.map((s) => s.id).join(', ')}`);
 
+    // ── Phase 0: 版本工作目录（ADR-056）─────────────────────────────
+    //
+    // 版本分支 `version/<label>` + 集成目录 `.zelto/version-worktrees/<label>/`。
+    // 这个版本里的切片从这里出发，产物也合回这里 —— 不碰主仓。
+    //
+    // 基点（D1-A + D2-A）：
+    // - 有前置版本 → 从前置版本的分支 tip（否则 dependsOn 是假的依赖）
+    // - 无前置版本 → 从主干 HEAD
+    // - 第一次确定后**钉死**进版本计划，之后不重算（基点可复现）
+    const versionBranch = branchOfVersion(version);
+    let versionBaseCommit: string | null = version.baseCommit ?? null;
+    let versionBaseSource = '版本计划里已钉死的基点';
+
+    if (!versionBaseCommit) {
+      const manager = worktreeManager();
+      if (manager.isGitRepo()) {
+        const workspace = await prepareVersionWorkspace(version, targetPlan, {
+          repoRoot: process.cwd(),
+          manager,
+        });
+        if (workspace.error) {
+          f.error('BLOCKED', workspace.error);
+          return 1;
+        }
+        versionBaseCommit = workspace.baseCommit;
+        versionBaseSource = workspace.baseSource;
+        if (workspace.dependencyNote) f.out(`  ${workspace.dependencyNote}`);
+        f.out(`  📂 版本分支 ${versionBranch}（基点：${versionBaseSource}）`);
+        f.out(`     工作目录 ${manager.versionRelativePathFor(versionLabel)}`);
+
+        // 基点钉死进版本计划 —— 之后重跑不再重算（ADR-056 D1-A）
+        version.baseCommit = versionBaseCommit;
+        await versionStore.save(targetPlan);
+        await events.append(versionEventKey(versionLabel), 'worktree.created', 'zelto', {
+          sliceId: versionLabel,
+          path: manager.versionRelativePathFor(versionLabel),
+          branch: versionBranch,
+          baseCommit: versionBaseCommit,
+          kind: 'version',
+        });
+      } else {
+        f.out('  ℹ️  不在 git 仓库中 —— 版本分支不可用，切片将在当前目录执行');
+      }
+    } else {
+      f.out(`  📂 版本分支 ${versionBranch}（基点已钉死：${versionBaseCommit}）`);
+    }
+
     await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'in_progress');
 
     const sliceStore = new SliceStore(SLICES_DIR);
@@ -1157,6 +1300,48 @@ register('version', async (args) => {
       return 1;
     }
 
+    // ── 跨版本冲突检测（ADR-056 §3.6 / D5-B）─────────────────────
+    //
+    // 两个版本是两个批次 —— 跨批次的冲突没人比。这里把本版本的写集
+    // 与其它 in_progress 版本比一比。
+    //
+    // **提示但不阻断**（D5-B）：跨版本判定是启发式的 —— 它挡得住
+    // 「两个版本都改 types.ts」，挡不住「一个版本改了语义、另一个按旧语义写」。
+    // 拿启发式判定硬阻断会误伤，与 ADR-019 把「整批 abort」改成
+    // 「降级为串行」是同一个思路。
+    //
+    // 另给 `--strict` 让想硬拦的人用。
+    //
+    // 位置：Phase 1 之后、Phase 2 之前 —— 「没有待执行切片」的早退也在
+    // 它后面，这样重跑一个已跑完的版本时冲突仍然会被报出来。
+    const crossConflicts = await detectCrossVersionConflictsFor(
+      versionLabel,
+      await collectVersionWriteSets(targetPlan.id),
+    );
+    if (crossConflicts.length > 0) {
+      const lines = formatCrossVersionConflicts(crossConflicts);
+      f.out('');
+      for (const line of lines) f.out(`  ${line}`);
+
+      if (args.includes('--strict')) {
+        f.error('BLOCKED', '检出跨版本冲突，--strict 模式下中止。');
+        await events.append(versionEventKey(versionLabel), 'artifact.conflict_detected', 'zelto', {
+          version: versionLabel,
+          conflicts: crossConflicts,
+          strict: true,
+        });
+        return 1;
+      }
+
+      await events.append(versionEventKey(versionLabel), 'artifact.conflict_detected', 'zelto', {
+        version: versionLabel,
+        conflicts: crossConflicts,
+        strict: false,
+      });
+      f.out('');
+      f.out('  ℹ️  继续执行（跨版本冲突默认只提示）。要硬拦加 --strict。');
+    }
+
     if (prepared.length === 0) {
       f.out('');
       f.out(`ℹ️  版本 ${versionLabel} 没有待执行的切片（全部已完成）`);
@@ -1196,6 +1381,7 @@ register('version', async (args) => {
       eventKey: `version-${versionLabel}`,
       affinity: plan.affinity,
       affinityPrevious: plan.affinityPrevious,
+      baseCommitOverride: versionBaseCommit,
     });
 
     if (result.aborted) {

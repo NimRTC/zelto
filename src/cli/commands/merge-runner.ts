@@ -12,7 +12,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { SignManager } from '../../core/gate/sign.js';
-import { branchExists, isMergedIntoHead, type MergeSliceInfo } from './merge-executor.js';
+import { branchExists, isMergedIntoHead, isMergedIntoRef, type MergeSliceInfo } from './merge-executor.js';
 import { store, events, ZELTO_DIR, worktreeManager, removeWorktree } from './shared.js';
 
 /**
@@ -159,15 +159,20 @@ export function worktreeHasChanges(sliceId: string): boolean {
 }
 
 /**
- * 收集所有「已签字但尚未合入主分支」的切片。
+ * 收集所有「已签字但尚未合入目标分支」的切片。
  *
  * 判据（全部来自文件与 git，不含内存状态）：
  * - 存在已批准的签字请求（`.zelto/locks/sign-*.json`，status=approved）
  * - 对应的 `slice/<id>` 分支存在
- * - 该分支尚未合入当前 HEAD，**或者** worktree 里还有未提交的产物
+ * - 该分支尚未合入目标分支，**或者** worktree 里还有未提交的产物
  *   （产物在合并前才提交，见 `worktreeHasChanges`）
+ *
+ * @param target 合并目标（ADR-056 §3.3）。缺省 = 主仓 HEAD —— 改造前的行为。
+ *   传版本分支时，「已合入」按那个分支判，不按 main 判。
  */
-export async function collectMergeCandidates(): Promise<MergeSliceInfo[]> {
+export async function collectMergeCandidates(
+  target?: { branch: string | null; dir: string },
+): Promise<MergeSliceInfo[]> {
   const signManager = new SignManager(ZELTO_DIR, events, store);
   const approved = await signManager.list('approved');
   const repoRoot = process.cwd();
@@ -177,9 +182,13 @@ export async function collectMergeCandidates(): Promise<MergeSliceInfo[]> {
     const manager = worktreeManager();
     const branch = manager.branchFor(req.sliceId);
     if (!branchExists(branch, repoRoot)) continue;
-    // 分支已合入 HEAD 且 worktree 干净 —— 确实合完了。
+
+    // 分支已合入目标 且 worktree 干净 —— 确实合完了。
     // 分支已合入但 worktree 还有改动 —— 产物没提交，得合。
-    if (isMergedIntoHead(branch, repoRoot) && !worktreeHasChanges(req.sliceId)) continue;
+    const mergedAlready = target?.branch
+      ? isMergedIntoRef(branch, `refs/heads/${target.branch}`, target.dir)
+      : isMergedIntoHead(branch, repoRoot);
+    if (mergedAlready && !worktreeHasChanges(req.sliceId)) continue;
 
     let baseCommit: string | null = null;
     try {
@@ -199,13 +208,21 @@ export async function collectMergeCandidates(): Promise<MergeSliceInfo[]> {
  * 合并成功后清理 worktree 与分支。
  *
  * 清理失败只提示、不吞异常——分支还在，人还能自己收。
+ *
+ * @param ids 合入的切片 id
+ * @param targetBranch 合并目标分支（ADR-056 §3.3）。给了就按它判
+ *   「分支已合入」—— 合进版本分支时，HEAD 是主仓当前分支，
+ *   `git branch -d` 会因为「没合入 HEAD」而拒绝删。
  */
-export async function cleanupMergedSlices(ids: string[]): Promise<void> {
+export async function cleanupMergedSlices(
+  ids: string[],
+  targetBranch?: string | null,
+): Promise<void> {
   const manager = worktreeManager();
   for (const id of ids) {
     try {
       if (manager.exists(id)) {
-        // 强制删除：到这一步这个切片已经合进主干了，worktree 里剩下的
+        // 强制删除：到这一步这个切片已经合进目标分支了，worktree 里剩下的
         // 未跟踪文件是 zelto 自己放的托管文件（规格副本、约束包镜像），
         // 不是 agent 的产物 —— agent 的产物在合并前已经提交并合入。
         // 不带 force 的话 `git worktree remove` 会拒绝删，worktree 与
@@ -223,7 +240,15 @@ export async function cleanupMergedSlices(ids: string[]): Promise<void> {
       const { execSync } = await import('node:child_process');
       // worktree 删掉之后 git 才肯放分支；再 prune 一次清掉残留登记。
       execSync('git worktree prune', { cwd: process.cwd(), timeout: 5000, stdio: 'ignore' });
-      execSync(`git branch -d ${manager.branchFor(id)}`, { cwd: process.cwd(), timeout: 5000 });
+      if (targetBranch) {
+        // 合进版本分支时，`-d` 会以「没合入 HEAD」拒绝 —— 显式指定目标 ref。
+        execSync(`git branch -d ${manager.branchFor(id)} ${targetBranch}`, {
+          cwd: process.cwd(),
+          timeout: 5000,
+        });
+      } else {
+        execSync(`git branch -d ${manager.branchFor(id)}`, { cwd: process.cwd(), timeout: 5000 });
+      }
       console.log(`  ✅ Deleted branch "${manager.branchFor(id)}"`);
     } catch {
       console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}" (may have unmerged changes)`);

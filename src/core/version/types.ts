@@ -18,6 +18,12 @@ export interface Version {
   slices: VersionSlice[];
   integrationTestDir: string;
   status: VersionStatus;
+  /** 版本分支名；缺省派生为 `version/<label>` */
+  branch?: string;
+  /** 版本分支的基点 commit（建分支时的主干 HEAD） */
+  baseCommit?: string | null;
+  /** 版本 tag 名；缺省派生为 `v<label>`（ADR-056 D6） */
+  tag?: string;
 }
 
 export interface VersionPlan {

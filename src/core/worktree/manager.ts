@@ -11,8 +11,25 @@ import { join, relative, isAbsolute } from 'node:path';
 /** worktree 根目录（相对仓库根） */
 export const WORKTREE_BASE_DIR = join('.zelto', 'worktrees');
 
+/**
+ * 版本工作目录 base（相对仓库根）。
+ *
+ * 刻意与 `WORKTREE_BASE_DIR` 分开（ADR-056 §3.1）：`list()` 按路径里的
+ * `.zelto/worktrees/` 标记反解 sliceId，版本目录混进去会被误认成切片
+ * worktree，进而被切片清理逻辑误删。另起一个 base 就不用改那个解析。
+ */
+export const VERSION_WORKTREE_BASE_DIR = join('.zelto', 'version-worktrees');
+
+/**
+ * 工作目录的种类。
+ *
+ * - `slice` —— 切片的执行目录（ADR-011），`.zelto/worktrees/<sliceId>`
+ * - `version` —— 版本的集成目录（ADR-056），`.zelto/version-worktrees/<label>`
+ */
+export type WorktreeKind = 'slice' | 'version';
+
 export interface WorktreeInfo {
-  /** 切片 id */
+  /** 切片 id（版本工作目录里是版本 label） */
   sliceId: string;
   /** worktree 绝对路径 */
   path: string;
@@ -22,6 +39,8 @@ export interface WorktreeInfo {
   branch: string;
   /** 建分支时的基点 commit */
   baseCommit: string | null;
+  /** 工作目录种类（ADR-056） */
+  kind: WorktreeKind;
 }
 
 export interface CreateWorktreeOptions {
@@ -86,6 +105,105 @@ export class WorktreeManager {
     return existsSync(this.pathFor(sliceId));
   }
 
+  // ─── 版本工作目录（ADR-056）───────────────────────────────────────────────
+
+  /**
+   * 版本工作目录的绝对路径。
+   *
+   * 与切片 worktree 分开落在 `.zelto/version-worktrees/<label>/`——
+   * 见 `VERSION_WORKTREE_BASE_DIR` 的说明。
+   */
+  versionPathFor(label: string): string {
+    return join(this.repoRoot, VERSION_WORKTREE_BASE_DIR, label);
+  }
+
+  /** 版本工作目录的相对仓库根路径 */
+  versionRelativePathFor(label: string): string {
+    return join(VERSION_WORKTREE_BASE_DIR, label);
+  }
+
+  /** 该版本是否已有工作目录 */
+  versionExists(label: string): boolean {
+    return existsSync(this.versionPathFor(label));
+  }
+
+  /**
+   * 创建（或复用）一个版本工作目录。
+   *
+   * 与切片 worktree 的区别（ADR-056 §3.1、§3.7）：
+   * - 分支是 `version/<label>`，不是 `slice/<id>`
+   * - 基点默认取**前置版本分支的 tip**（D2-A），否则取当前 HEAD
+   * - `node_modules` **不**链接主仓那一份 —— 多版本各自升级依赖时会打架
+   */
+  async createVersionWorktree(
+    label: string,
+    options: { branch: string; baseCommit?: string | null } = { branch: '' },
+  ): Promise<WorktreeInfo> {
+    const branch = options.branch;
+    const target = this.versionPathFor(label);
+    const relativePath = this.versionRelativePathFor(label);
+
+    if (existsSync(target)) {
+      return {
+        sliceId: label,
+        path: target,
+        relativePath,
+        branch,
+        baseCommit: this.currentCommit(target),
+        kind: 'version',
+      };
+    }
+
+    const baseCommit = options.baseCommit ?? this.headCommit();
+
+    mkdirSync(join(this.repoRoot, VERSION_WORKTREE_BASE_DIR), { recursive: true });
+
+    const branchExists = this.branchExists(branch);
+    const args = branchExists
+      ? ['worktree', 'add', target, branch]
+      : ['worktree', 'add', '-b', branch, target, baseCommit];
+
+    this.git(args, `创建版本工作目录失败: ${relativePath}`);
+
+    const info: WorktreeInfo = {
+      sliceId: label,
+      path: target,
+      relativePath,
+      branch,
+      baseCommit,
+      kind: 'version',
+    };
+
+    // 版本工作目录也要 submodule —— 否则门禁在缺 vendor 的目录里跑
+    this.syncSubmodules(target);
+    this.alignSubmodulesToMainRepo(target);
+
+    return info;
+  }
+
+  /**
+   * 移除版本工作目录。
+   *
+   * 与 `remove()` 一样先把 `node_modules` 连接摘掉 —— Windows 上路径过长
+   * 会让 `git worktree remove` 报 "Filename too long"。
+   */
+  async removeVersionWorktree(label: string, options: { force?: boolean } = {}): Promise<void> {
+    const target = this.versionPathFor(label);
+    if (!existsSync(target)) {
+      this.git(['worktree', 'prune'], '清理 worktree 登记失败');
+      return;
+    }
+
+    this.unlinkNodeModules(target);
+
+    const args = ['worktree', 'remove'];
+    if (options.force) args.push('--force');
+    args.push(target);
+
+    this.git(args, `移除版本工作目录失败: ${this.versionRelativePathFor(label)}`);
+    this.git(['worktree', 'prune'], '清理 worktree 登记失败');
+  }
+
   /**
    * 仓库根是否在 git 版本控制之下。
    *
@@ -121,6 +239,7 @@ export class WorktreeManager {
         relativePath: this.relativePathFor(sliceId),
         branch,
         baseCommit: this.currentCommit(target),
+        kind: 'slice',
       };
     }
 
@@ -141,6 +260,7 @@ export class WorktreeManager {
       relativePath: this.relativePathFor(sliceId),
       branch,
       baseCommit,
+      kind: 'slice',
     };
 
     this.syncContext(info, options);
@@ -374,14 +494,34 @@ export class WorktreeManager {
     const results: WorktreeInfo[] = [];
     let current: { path: string; branch: string; head: string } | null = null;
 
-    const marker = `/${WORKTREE_BASE_DIR.replace(/\\/g, '/')}/`;
+    const sliceMarker = `/${WORKTREE_BASE_DIR.replace(/\\/g, '/')}/`;
+    const versionMarker = `/${VERSION_WORKTREE_BASE_DIR.replace(/\\/g, '/')}/`;
 
     const flush = () => {
       if (!current) return;
       const normalized = current.path.replace(/\\/g, '/');
-      const idx = normalized.lastIndexOf(marker);
+
+      // 版本目录先判（它的路径里也含 "worktrees/"）
+      const versionIdx = normalized.lastIndexOf(versionMarker);
+      if (versionIdx !== -1) {
+        const label = normalized.slice(versionIdx + versionMarker.length);
+        if (label) {
+          results.push({
+            sliceId: label,
+            path: current.path,
+            relativePath: join(VERSION_WORKTREE_BASE_DIR, label),
+            branch: current.branch.replace('refs/heads/', ''),
+            baseCommit: current.head,
+            kind: 'version',
+          });
+        }
+        current = null;
+        return;
+      }
+
+      const idx = normalized.lastIndexOf(sliceMarker);
       if (idx !== -1) {
-        const sliceId = normalized.slice(idx + marker.length);
+        const sliceId = normalized.slice(idx + sliceMarker.length);
         if (sliceId) {
           results.push({
             sliceId,
@@ -389,6 +529,7 @@ export class WorktreeManager {
             relativePath: join(WORKTREE_BASE_DIR, sliceId),
             branch: current.branch.replace('refs/heads/', ''),
             baseCommit: current.head,
+            kind: 'slice',
           });
         }
       }

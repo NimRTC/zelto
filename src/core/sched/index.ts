@@ -37,3 +37,10 @@ export {
   hashFile,
   listFilesUnder,
 } from './audit.js';
+export {
+  type VersionWriteSet,
+  type CrossVersionConflict,
+  detectCrossVersionConflicts,
+  overlappingPaths,
+  versionsOverlap,
+} from './cross-version.js';
