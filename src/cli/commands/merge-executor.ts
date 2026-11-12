@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import type { EventStream } from '../../core/events/stream.js';
 import type { MergePhase, MergePlan } from '../../core/sched/merge.js';
 import { isZeltoManagedSpecPath } from '../../core/project/managed-paths.js';
+import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 
 /** 参与合并的切片信息 */
 export interface MergeSliceInfo {
@@ -256,11 +257,19 @@ export async function executeMergePlan(
 
   // ── 前置守卫：目标工作区必须干净，否则合并会污染未提交改动 ──
   //
-  // 例外：zelto 自己管理的规格文件（`specs/slices/**`）。
+  // 例外：zelto 自己管理的规格文件（`specs/slices/**`）与**验收骨架**
+  // （`tests/acceptance/**` 里还全是 `test.todo` 的文件）。
   // 守卫要拦的是「人改了代码还没提交」—— 合并会把分支上的改动带进主干，
   // 未提交的本地改动会被盖掉。规格文件不是代码：合并不会碰它，
   // 它是追溯链的出处，该入库但不该挡路。接管既有项目时基线规格是新建文件，
   // 人还没来得及提交 —— 把它算成「工作区不干净」，合并就永远过不去。
+  //
+  // 验收骨架同理（ADR-056 真实项目验证）：`zelto version start` 会给每个
+  // 切片生成骨架 → 主仓多出未跟踪的 `tests/acceptance/<id>/` →
+  // 之后每次 merge 都被这个守卫拦下。骨架是规格的可执行投影，不是代码。
+  //
+  // 但**只豁免还全是 todo 的骨架** —— agent 把 todo 改成真断言之后，
+  // 那份文件就是代码了（进了写集、参与门禁②），必须挡住。
   const status = git(['status', '--porcelain'], targetDir);
   if (status.ok && status.stdout.trim().length > 0) {
     const entries = status.stdout
@@ -270,18 +279,30 @@ export async function executeMergePlan(
 
     const dirty: string[] = [];
     const managedSpecs: string[] = [];
+    const managedSkeletons: string[] = [];
     for (const entry of entries) {
       // porcelain 格式：`XY <path>`（重命名时是 `XY <old> -> <new>`）
       const rawPath = entry.slice(3).trim();
       const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop()! : rawPath;
-      if (isZeltoManagedSpecPath(path)) managedSpecs.push(entry);
-      else dirty.push(entry);
+      if (isZeltoManagedSpecPath(path)) {
+        managedSpecs.push(entry);
+      } else if (isUntouchedAcceptanceSkeleton(path, targetDir)) {
+        managedSkeletons.push(entry);
+      } else {
+        dirty.push(entry);
+      }
     }
 
     if (managedSpecs.length > 0) {
       log(`  ℹ️  ${managedSpecs.length} 个 zelto 管理的规格文件未提交（不影响合并）：`);
       for (const m of managedSpecs.slice(0, 5)) log(`     ${m}`);
       if (managedSpecs.length > 5) log('     …');
+    }
+
+    if (managedSkeletons.length > 0) {
+      log(`  ℹ️  ${managedSkeletons.length} 个验收骨架未提交（不影响合并）：`);
+      for (const m of managedSkeletons.slice(0, 5)) log(`     ${m}`);
+      if (managedSkeletons.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {

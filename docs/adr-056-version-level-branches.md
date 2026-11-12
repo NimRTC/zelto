@@ -585,8 +585,10 @@ zelto 只做版本分支的命名约定，合并目标由人自己 checkout 后 
 | `src/cli/commands/version-runtime.ts` | 版本工作目录准备、基点计算、跨版本冲突呈现 |
 | `src/cli/commands/version-ship.ts` | `zelto version ship` / `version cleanup` |
 | `tests/adr-056-version-branches.test.ts` | ADR-056 判定测试（44 个） |
+| `tests/adr-056-real-project.test.ts` | 真实项目验证挖出的 bug 的回归测试（18 个） |
 | `scripts/verify-adr056.mjs` | 端到端验证脚本（版本分支 → ship） |
 | `scripts/verify-adr056-multiversion.mjs` | 多版本验收脚本（并行 / 依赖 / 冲突） |
+| `scripts/verify-adr056-nimrtc.mjs` | 真实项目验收脚本（nimrtc-zelto 副本） |
 | `docs/adr-056-version-level-branches.md` | 本文件 |
 
 ---
@@ -678,10 +680,59 @@ return detectCrossVersionConflicts(versions.filter((v) => v.version !== currentV
 
 修法：移到 Phase 1 之后、Phase 2 之前，早退也在它后面。
 
+### 坑 8：真实工程里才暴露的 6 个 bug
+
+见 §9「真实项目验证」。其中三个值得单独记：
+
+**坑 8a：验收骨架挡住一切合并**
+
+`zelto version start` 会给每个切片生成验收骨架
+（`tests/acceptance/<id>/acceptance.test.cjs`，ADR-034）。
+骨架落在**主仓**里 → 主仓多了未跟踪目录 → **之后每次 merge 与 ship
+都被「工作区必须干净」守卫拦下**。
+
+`version start` 生成骨架 → 之后什么都合不进去 —— 这是个闭环死锁。
+
+处置：豁免「还全是 todo 的骨架」。**只豁免纯 todo** ——
+agent 把 todo 改成真断言之后，那文件就是代码（进了写集、参与门禁②），
+合并会覆盖它，必须挡住。
+
+> 坑中坑：git 把未跟踪**目录**折叠成目录本身
+> （`?? tests/acceptance/v2-x/` 而不是逐个文件）。
+> 拿到的不是文件路径，读不到内容 → 判定失效。得按目录判：
+> 目录里每个骨架都得是纯 todo，且不能有别的测试文件。
+
+**坑 8b：跨版本与同批次的粒度要求不同**
+
+`detectArtifactConflicts`（同批次，ADR-012）按**工件名**分组 ——
+两个切片碰同一类工件就算冲突。`type-definitions` 这个名字指所有 `.hpp`。
+
+把 C++ 规则加进 `BUILTIN_MAPPINGS` 会怎样：
+「A 改 foo.hpp、B 改 bar.hpp」→ 同一个 `type-definitions` → **error**
+→ `batch.ts` 把它塞进 issues → **并行准入被阻断**。
+
+同批次的粒度是「碰同一类工件」，跨版本的粒度是「碰同一个文件」。
+两者的冲突定义不同，映射表也不能共用。
+
+处置：跨版本判定**按路径逐个定级**（每个重叠路径单独出一条），
+并给跨版本判定一张专属的 `CROSS_VERSION_MAPPINGS`。
+
+**坑 8c：`save(旧对象)` 覆盖 `updateVersionStatus` 写的状态**
+
+```ts
+await versionStore.updateVersionStatus(planId, label, 'delivered');  // 读盘→改→写盘
+version.tag = tag;
+await versionStore.save(targetPlan);   // ← targetPlan 是**旧对象**，status 还是 integrated
+```
+
+第二行把刚写进盘的 `delivered` 覆盖回了 `integrated`。
+症状：ship 完成了、tag 打了，状态却没变。
+
+修法：先在内存对象上改 tag 与 status，再一次性落盘。
+
 ---
 
 ## 9. 验证方式
-
 ### 单元测试（`tests/adr-056-version-branches.test.ts`，44 个，已实现）
 
 - ✅ 版本分支名派生：`version/<label>`，label 含特殊字符时的规范化
@@ -760,14 +811,63 @@ return detectCrossVersionConflicts(versions.filter((v) => v.version !== currentV
 
 ### 全量回归
 
-- 单元测试：**1678 通过 / 0 失败**（含新增的 44 个 ADR-056 测试）
+- 单元测试：**1696 通过 / 0 失败**（含新增的 44 + 18 个 ADR-056 测试）
 - `npm run lint`：通过
 - `npm run check:encoding`：通过
 - `npm run build`：通过
 
-### 还没做的
+### 真实项目验证（nimrtc-zelto，`scripts/verify-adr056-nimrtc.mjs`，已通过）
 
-- **真实项目验证**：nimrtc-zelto 上跑一遍 v1→v2 双版本
+在 nimrtc-zelto 的**克隆副本**上跑（不碰真实仓库）。
+真实计划：`v1 → v2 → v3` 依赖链，v1 与 v3 都写
+`net_feedback/aggregator.hpp` 与 `aggregator.cpp` —— 现成的跨版本重叠场景。
+
+| 断言 | 结果 |
+|---|---|
+| 真实计划里确实存在跨版本写集重叠 | ✅ |
+| C++ 头文件被判为 **error** 级（类型定义） | ✅ |
+| C++ 源文件被判为 api_contract 级 | ✅ |
+| 冲突按**具体路径**分别报出，不是笼统的「都动同一工件」 | ✅ |
+| `version/v1` 分支 + 版本工作目录建出来 | ✅ |
+| v3 因依赖 v2 未 integrated 被拦（ADR §3.2 依赖串行仍生效） | ✅ |
+| 被拦时不建分支、不建工作目录 | ✅ |
+| v1 的切片合进 `version/v1` | ✅ |
+| v2 的基点是 `version/v1` 的 tip | ✅ |
+| **v2 的工作目录看得见 v1 的改动**（依赖是真的） | ✅ |
+| 未跟踪的验收骨架被判为 zelto 管理的产物 | ✅ |
+| 骨架改成真断言后不再豁免 | ✅ |
+| ship 之后打上 `v1` tag、版本分支保留 | ✅ |
+| ship 之后版本状态 → `delivered` | ✅ |
+
+**这一轮在真实工程里挖出 6 个 bug**（合成环境与单元测试全都测不到）：
+
+| # | Bug | 后果 |
+|---|---|---|
+| 8 | C++ 头文件/源文件没有工件映射 | 「两个版本都改同一个 `.hpp`」降级成 warning，真冲突被当成提示 |
+| 9 | 跨版本冲突按**工件名**合并 | 「A 改 foo.hpp、B 改 bar.hpp」被说成「都动 type-definitions」—— 不是冲突，是碰巧同类 |
+| 10 | `version ship` 的工作区守卫没豁免 zelto 管理的规格文件 | ship 被自己的产物挡住（`merge` 早就豁免了，`ship` 漏了） |
+| 11 | 未跟踪的**验收骨架**挡住 merge 与 ship | `version start` 生成骨架 → 主仓变脏 → 之后每次合并都被拦。**这个最狠** |
+| 12 | `version ship` 里 `save(旧对象)` 覆盖了 `updateVersionStatus` 写的状态 | ship 完成了、tag 打了，状态却停在 `integrated` |
+| 13 | `version deliver` 一路设到 `delivered` | 验收一过就宣布交付，但版本分支还没进主干 —— 报出假的交付状态 |
+
+**处置**：
+
+- **8 + 9** 合并处理：新增 `CROSS_VERSION_MAPPINGS`（跨版本判定**专属**的映射表），
+  并把跨版本冲突判定改成**按路径逐个定级**。
+  > 为什么不加进 `artifact.ts` 的 `BUILTIN_MAPPINGS`：那张表是给同批次判定用的，
+  > 按**工件名**分组 —— 加进 C++ 规则会让「A 改 foo.hpp、B 改 bar.hpp」
+  > 被判成 error，**误伤本可以并行的两个切片**。
+  > 同批次与跨版本的粒度要求不同，所以分成两张表。
+- **10 + 11**：新增 `core/project/managed-acceptance.ts` —— 判定「验收文件还是不是
+  纯 todo 骨架」。**只豁免纯 todo**；agent 改成真断言之后那文件就是代码，必须挡住。
+  > 坑：git 把未跟踪**目录**折叠成目录本身（`?? tests/acceptance/v2-x/`），
+  > 拿到的不是文件路径 —— 得按目录判（目录里每个骨架都得是纯 todo，
+  > 且不能有别的测试文件）。
+- **12**：改成先在内存对象上改 tag 与 status，再一次性落盘。
+- **13**：`version deliver` 只到 `integrated`；`delivered` 由 `version ship` 独占
+  （ADR §3.5：「`delivered` = 已进主干」）。
+
+**回归测试**：`tests/adr-056-real-project.test.ts`（18 个）
 
 ---
 
@@ -807,8 +907,8 @@ D4-C 的「装后校验锁文件」实际落地为：
 
 ### 状态
 
-**已实现并通过全部自动化验证**（含多版本并行 / 依赖 / 跨版本冲突三项验收）。
-待补：真实项目（nimrtc-zelto）上跑一遍 v1→v2 双版本。
+**已实现并通过全部自动化验证** —— 含合成环境验收（多版本并行 / 依赖 / 跨版本冲突）
+与**真实项目验收**（nimrtc-zelto，6 个 bug 全部修掉并加了回归测试）。
 
 ### 实现中修掉的 bug（按严重度）
 
@@ -817,6 +917,12 @@ D4-C 的「装后校验锁文件」实际落地为：
 | 5 | 跨版本冲突检测永远检不出冲突（排除了当前版本，而比对是两两的） | **D5-B 整个功能形同虚设** |
 | 6 | 跨版本写集收集用内存副本，本版本自己被过滤掉 | 同上，第二次踩 |
 | 7 | 冲突检测位置在早退之后，重跑已完成的版本时不报 | 漏报 |
+| 11 | 未跟踪的**验收骨架**挡住 merge 与 ship | **真实项目里最狠的一个**：主仓永远合不进去 |
+| 12 | `version ship` 用旧对象覆盖了刚写的状态 | ship 完成了但状态没变 |
+| 13 | `version deliver` 越权宣布 delivered | 报出假的交付状态 |
+| 8 | C++ 头文件没有工件映射 | 真冲突降级成提示 |
+| 9 | 跨版本冲突按工件名合并 | 「碰巧同类」被说成冲突 |
+| 10 | `version ship` 没豁免 zelto 管理的规格文件 | ship 被自己的产物挡住 |
 | 1 | `--target` 的值被当成切片 id | `zelto merge --target` 完全不可用 |
 | 2 | 合进版本分支后切片分支删不掉 | 分支残留 |
 | 3 | 版本工作目录路径含 `worktrees` 子串，可能被误删 | 数据丢失风险 |

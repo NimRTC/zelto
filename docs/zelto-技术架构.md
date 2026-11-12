@@ -654,7 +654,8 @@ zelto version deliver <ver>
   第一步  前置条件：切片状态 completed + 分支已合入版本分支（只读磁盘与 git）
   第二步  架构护栏 + 契约演进检查：扫版本工作目录
   第三步  版本级验收：在版本工作目录跑 config.gate.commands
-  通过 → events.append('version.accepted') → 状态 integrated → delivered
+  通过 → events.append('version.accepted') → 状态 integrated
+  （**不到 delivered** —— delivered 的含义是「已进主干」，那是 ship 的活）
 
 zelto version ship <ver>
   把 version/<ver> 合入主仓当前分支（冲突则 --abort，主干保持原状）

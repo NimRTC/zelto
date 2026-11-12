@@ -1064,19 +1064,28 @@ register('version', async (args) => {
     await events.append(versionEventKey(versionLabel), 'version.accepted', 'zelto', {
       version: versionLabel,
       commands: acceptance.results.map((r) => ({ name: r.name, passed: r.passed })),
-    });
-
-    await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
-    await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'delivered');
-    await events.append(versionEventKey(versionLabel), 'version.delivered', 'zelto', {
-      version: versionLabel,
       slices: version.slices.map((s) => s.id),
     });
 
+    // 版本状态 → integrated
+    //
+    // **只到 integrated，不到 delivered**（ADR-056 §3.5）：
+    // `delivered` 的含义是「这个版本已经进了主干」——
+    // 只有 `zelto version ship` 合入主干之后才能给。
+    // `version deliver` 到此为止：切片已进版本分支、版本级验收已通过。
+    //
+    // 之前这里一路设到 delivered，等于「验收一过就宣布交付」——
+    // 但版本分支还没进主干，主干上根本没有这个版本。
+    // 那会让 `version status` 报出假的交付状态。
+    await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'integrated');
+
     f.out('');
-    f.out(`🚀 版本 ${versionLabel} 已交付`);
+    f.out(`✅ 版本 ${versionLabel} 验收通过（状态：integrated）`);
     f.out(`   ${version.description}`);
     f.out(`   切片：${version.slices.map((s) => s.id).join(', ')}`);
+    f.out('   版本分支已包含本版本全部切片产物，但**还没进主干**。');
+    f.out('   合入主干（显式动作，不与签字绑定）：');
+    f.out(`     zelto version ship ${versionLabel}`);
 
     const nextVersion = targetPlan.versions.find((v) => v.status === 'planned');
     if (nextVersion) {

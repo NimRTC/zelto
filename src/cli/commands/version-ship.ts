@@ -21,6 +21,8 @@ import { register, events, ZELTO_DIR, worktreeManager, loadConfig } from './shar
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
 import { branchOfVersion, versionBranchName, versionTagName } from '../../core/version/branch.js';
+import { isZeltoManagedSpecPath } from '../../core/project/managed-paths.js';
+import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import { branchExists } from './version-runtime.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 interface GitResult {
@@ -71,17 +73,55 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
   error: string | null;
 } {
   // 主干工作区必须干净
+  //
+  // 例外：zelto 自己管理的规格文件（`specs/slices/**`）与**验收骨架**
+  // （`tests/acceptance/**` 里还全是 `test.todo` 的文件）——
+  // 与 `zelto merge` 的守卫同一口径（ADR-039 §3.3、ADR-056 真实项目验证）。
+  // 守卫要拦的是「人改了代码还没提交」；规格文件与骨架都是追溯链的产物，
+  // 不是代码改动，不该挡住 ship。
+  //
+  // 验收目录里 agent 写的真断言**不豁免** —— 那是代码，合并会覆盖它。
   const status = git(['status', '--porcelain'], repoRoot);
   if (status.ok && status.stdout.trim().length > 0) {
-    const dirty = status.stdout
+    const entries = status.stdout
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
-    log('  ⚠️  主仓工作区有未提交改动，已跳过 ship：');
-    for (const d of dirty.slice(0, 10)) log(`     ${d}`);
-    if (dirty.length > 10) log('     …（只列前 10 条）');
-    log('     先提交或暂存这些改动，再重新跑 zelto version ship。');
-    return { ok: false, mergeCommit: null, conflicts: [], error: '主仓工作区不干净' };
+
+    const dirty: string[] = [];
+    const managedSpecs: string[] = [];
+    const managedSkeletons: string[] = [];
+    for (const entry of entries) {
+      const rawPath = entry.slice(3).trim();
+      const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop()! : rawPath;
+      if (isZeltoManagedSpecPath(path)) {
+        managedSpecs.push(entry);
+      } else if (isUntouchedAcceptanceSkeleton(path, repoRoot)) {
+        managedSkeletons.push(entry);
+      } else {
+        dirty.push(entry);
+      }
+    }
+
+    if (managedSpecs.length > 0) {
+      log(`  ℹ️  ${managedSpecs.length} 个 zelto 管理的规格文件未提交（不影响 ship）：`);
+      for (const m of managedSpecs.slice(0, 5)) log(`     ${m}`);
+      if (managedSpecs.length > 5) log('     …');
+    }
+
+    if (managedSkeletons.length > 0) {
+      log(`  ℹ️  ${managedSkeletons.length} 个验收骨架未提交（不影响 ship）：`);
+      for (const m of managedSkeletons.slice(0, 5)) log(`     ${m}`);
+      if (managedSkeletons.length > 5) log('     …');
+    }
+
+    if (dirty.length > 0) {
+      log('  ⚠️  主仓工作区有未提交改动，已跳过 ship：');
+      for (const d of dirty.slice(0, 10)) log(`     ${d}`);
+      if (dirty.length > 10) log('     …（只列前 10 条）');
+      log('     先提交或暂存这些改动，再重新跑 zelto version ship。');
+      return { ok: false, mergeCommit: null, conflicts: [], error: '主仓工作区不干净' };
+    }
   }
 
   const current = git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot);
@@ -269,8 +309,15 @@ export async function handleVersionShip(
   }
 
   // 版本状态 → delivered
-  await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'delivered');
-  version.tag = tag;
+  //
+  // 顺序要紧：先在**内存对象**上把 tag 写好，再落盘。
+  //
+  // 之前是先 `updateVersionStatus`（读盘 → 改 → 写盘），再 `save(targetPlan)`。
+  // 但 `targetPlan` 是**旧对象**（status 还是 integrated）——
+  // 后一次 save 把刚写进盘的 delivered 覆盖回了 integrated。
+  // 结果：ship 完成了、tag 打了，状态却停在 integrated。
+  version.tag = tagged ? tag : undefined;
+  version.status = 'delivered';
   await versionStore.save(targetPlan);
 
   await events.append(versionEventKey(versionLabel), 'version.delivered', 'zelto', {

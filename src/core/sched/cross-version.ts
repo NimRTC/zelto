@@ -24,6 +24,37 @@
 import { pathMatches, writeSetsOverlap } from './paths.js';
 import { mapPathToArtifacts, type ArtifactMapping, type ConflictSeverity } from './artifact.js';
 
+/**
+ * 跨版本判定专属的工件映射（ADR-056 真实项目验证补的）。
+ *
+ * 为什么单列一张表，不进 `artifact.ts` 的 `BUILTIN_MAPPINGS`：
+ *
+ * 1. **同批次与跨版本的粒度要求不同**。同批次判定（ADR-012）按**工件名**分组 ——
+ *    两个切片碰同一类工件就算冲突。那张表是给 TypeScript 工程写的，
+ *    加进 C++ 规则会让「A 改 foo.hpp、B 改 bar.hpp」被判成 error，
+ *    **误伤本可以并行的两个切片**。
+ *
+ * 2. **跨版本判定按路径**（见 `detectCrossVersionConflicts` 的说明）：
+ *    只有「两个版本动同一个文件」才是冲突。工件类别只用来给这条**具体的**
+ *    冲突定级。所以这里按**具体路径**分类，不需要粗粒度工件名。
+ *
+ * C++ 工程的头文件承担的是与 TS `types.ts` 同一件事 —— 对外暴露类型与接口。
+ * 不认它，「两个版本都改同一个 `.hpp`」这种真冲突就落进「(路径重叠)」的
+ * warning 级，被降级成了提示。
+ */
+export const CROSS_VERSION_MAPPINGS: ArtifactMapping[] = [
+  // C/C++ 头文件 = 类型与接口定义
+  { pattern: '**/*.hpp', artifact: 'cxx-header', category: 'type_definition' },
+  { pattern: '**/*.hh', artifact: 'cxx-header', category: 'type_definition' },
+  { pattern: '**/*.h', artifact: 'cxx-header', category: 'type_definition' },
+  { pattern: '**/*.hxx', artifact: 'cxx-header', category: 'type_definition' },
+
+  // C/C++ 源文件 = 实现
+  { pattern: '**/*.cpp', artifact: 'cxx-source', category: 'api_contract' },
+  { pattern: '**/*.cc', artifact: 'cxx-source', category: 'api_contract' },
+  { pattern: '**/*.cxx', artifact: 'cxx-source', category: 'api_contract' },
+];
+
 /** 一个版本的写集信息 */
 export interface VersionWriteSet {
   /** 版本 label */
@@ -96,6 +127,7 @@ export function detectCrossVersionConflicts(
   customMappings?: ArtifactMapping[],
 ): CrossVersionConflict[] {
   const conflicts: CrossVersionConflict[] = [];
+  const mappings = [...CROSS_VERSION_MAPPINGS, ...(customMappings ?? [])];
 
   for (let i = 0; i < versions.length; i++) {
     for (let j = i + 1; j < versions.length; j++) {
@@ -106,15 +138,22 @@ export function detectCrossVersionConflicts(
       if (paths.length === 0) continue;
 
       // 路径重叠 → 映射到工件 → 定级
-      const artifactMap = new Map<string, ArtifactMapping>();
+      //
+      // **按路径逐个映射**（不按工件名合并）：
+      // 工件名是**粗粒度**的（`type-definitions` 指所有 `.hpp`）。
+      // 若按工件名合并，两个版本改**不同**的头文件也会被并成一条
+      // 「都动 type-definitions」—— 那不是冲突，是「碰巧同类」。
+      //
+      // 跨版本判定的依据是**同一批文件**：两个版本动同一个文件才是冲突。
+      // 工件类别只用来给这条**具体的**冲突定级。
+      const byPath = new Map<string, ArtifactMapping[]>();
       for (const p of paths) {
-        for (const m of mapPathToArtifacts(p, customMappings)) {
-          if (!artifactMap.has(m.artifact)) artifactMap.set(m.artifact, m);
-        }
+        const found = mapPathToArtifacts(p, mappings);
+        if (found.length > 0) byPath.set(p, found);
       }
 
       // 一个都没映射到工件 —— 只有路径重叠，没有语义关联
-      if (artifactMap.size === 0) {
+      if (byPath.size === 0) {
         conflicts.push({
           artifact: '(路径重叠)',
           category: 'config',
@@ -129,18 +168,21 @@ export function detectCrossVersionConflicts(
         continue;
       }
 
-      for (const [artifact, mapping] of artifactMap) {
-        conflicts.push({
-          artifact,
-          category: mapping.category,
-          severity: severityForCategory(mapping.category),
-          versionA: a.version,
-          versionB: b.version,
-          paths,
-          description:
-            `版本 "${a.version}" 与 "${b.version}" 都动 "${artifact}"（${mapping.category}）` +
-            `：${paths.join(', ')}`,
-        });
+      // 每个重叠路径单独出一条冲突，按该路径的工件类别定级
+      for (const [p, pathMappings] of byPath) {
+        for (const mapping of pathMappings) {
+          conflicts.push({
+            artifact: mapping.artifact,
+            category: mapping.category,
+            severity: severityForCategory(mapping.category),
+            versionA: a.version,
+            versionB: b.version,
+            paths: [p],
+            description:
+              `版本 "${a.version}" 与 "${b.version}" 都动 "${mapping.artifact}"（${mapping.category}）` +
+              `：${p}`,
+          });
+        }
       }
     }
   }
