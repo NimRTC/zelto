@@ -795,6 +795,15 @@ register('version', async (args) => {
     return handleVersionCleanup(args, f);
   }
 
+  // zelto version adopt —— 给老版本补建版本分支（ADR-056 迁移）
+  //
+  // 老项目升级后版本已在跑（in_progress）但版本分支从不存在 →
+  // 没有这一步就永远 ship 不了。
+  if (subcmd === 'adopt') {
+    const { handleVersionAdopt } = await import('./version-adopt.js');
+    return handleVersionAdopt(args, f);
+  }
+
   // zelto version status
   if (!subcmd || subcmd === 'status') {
     const versionStore = new VersionStore(ZELTO_DIR);
@@ -1425,6 +1434,11 @@ register('version', async (args) => {
     return 0;
   }
 
-  f.error('USAGE', 'Usage: zelto version status | zelto version start <ver> [--plan <id>] [--auto] | zelto version deliver <ver> [--plan <id>]');
+  f.error(
+    'USAGE',
+    'Usage: zelto version status | zelto version start <ver> [--plan <id>] | ' +
+    'zelto version deliver <ver> [--plan <id>] | zelto version adopt <ver> [--plan <id>] | ' +
+    'zelto version ship <ver> [--plan <id>] | zelto version cleanup <ver>',
+  );
   return 1;
 });

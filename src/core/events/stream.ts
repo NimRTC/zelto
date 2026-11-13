@@ -70,6 +70,7 @@ export const EVENT_TYPES = [
   'artifact.conflict_detected',
   'version.accepted',
   'version.delivered',
+  'version.adopted',
   'draft.created',
   'draft.revised',
   'draft.confirmed',

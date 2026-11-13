@@ -565,10 +565,51 @@ zelto 只做版本分支的命名约定，合并目标由人自己 checkout 后 
    - 需要更新的脚本：`zelto merge <id>` 在有版本计划的项目里，
      要加 `--target main` 才能保持原语义
 2. **`version deliver` 的前置条件判据改变** —— 从「已合入 main」改成
-   「已合入版本分支」。**已有项目在升级后需要先跑一次 ship**
-   （否则版本永远交付不了）
+   「已合入版本分支」。**已有项目在升级后需要先补建版本分支**
+   （见下面「老项目迁移」）
 3. **`node_modules` 的链接目标变化**（若采纳 D4-C）——
    老 worktree 里的链接指向主仓，需要重建
+
+### 老项目迁移：`zelto version adopt`
+
+ADR-056 引入版本分支制度时，老项目**已经在跑版本**了：状态是 `in_progress`，
+切片产物早已合进主干，但**版本分支从不存在**（那时候还没有这个制度）。
+
+后果：**老项目永远无法 ship**。
+
+- `version start` 只在 `planned` 时建分支 → `in_progress` 会被拒
+- `version deliver` 走「分支不存在 → 按主干判」的兼容路径 → 能过
+- `version ship` 要求版本分支存在 → 报 NOT_FOUND ← **断在这里**
+
+所以要有一步显式的迁移动作：
+
+```bash
+zelto version adopt v1
+```
+
+它做三件事：
+
+1. 从**当前主干 HEAD** 建 `version/v1` 分支
+2. 建版本工作目录 `.zelto/version-worktrees/v1`
+3. 把基点钉死进版本计划，并标记 `adopted: true` + `adoptedAt`
+
+**基点为什么取「补建时刻」的主干 HEAD，而不是原始基点？**
+
+老项目**从来没有版本级基点**这个概念 —— 那是 ADR-056 引入的。硬造一个
+「原始基点」是假的精确：老项目的切片之间基点都不统一（有的切片
+`baseCommit` 是 `null`，不是 `null` 的还各不相同）。
+
+取当前主干 HEAD 的理由：
+
+- **内容是对的** —— 老项目的切片产物早已合进主干，从主干 HEAD 建的
+  版本分支天然包含它们 → 迁移后 ship 是干净的快进
+- **不假装精确** —— 计划里记 `adopted: true`，事后审计能看出
+  「这个基点是补建的，不是原始基点」。追溯链不撒谎
+- **可复现** —— 基点一旦钉死就不再重算（ADR-056 D1-A 的性质）
+
+`version start --retry-failed` 也能顺带建出分支，但那是**副作用**：
+命令名说的是「重跑失败的切片」，人不会想到它是迁移入口。所以有独立的
+`adopt` 命令。
 
 ### 没有改的东西
 
@@ -584,8 +625,11 @@ zelto 只做版本分支的命名约定，合并目标由人自己 checkout 后 
 | `src/core/worktree/dependencies.ts` | 版本工作目录的依赖隔离（D4-C） |
 | `src/cli/commands/version-runtime.ts` | 版本工作目录准备、基点计算、跨版本冲突呈现 |
 | `src/cli/commands/version-ship.ts` | `zelto version ship` / `version cleanup` |
+| `src/cli/commands/version-adopt.ts` | `zelto version adopt`（老项目补建版本分支） |
 | `tests/adr-056-version-branches.test.ts` | ADR-056 判定测试（44 个） |
 | `tests/adr-056-real-project.test.ts` | 真实项目验证挖出的 bug 的回归测试（18 个） |
+| `tests/adr-056-migration.test.ts` | 迁移路径的回归测试（porcelain 解析 / 状态豁免 / worktree 自愈） |
+| `tests/adr-056-adopt.test.ts` | `version adopt` 端到端（5 个） |
 | `scripts/verify-adr056.mjs` | 端到端验证脚本（版本分支 → ship） |
 | `scripts/verify-adr056-multiversion.mjs` | 多版本验收脚本（并行 / 依赖 / 冲突） |
 | `scripts/verify-adr056-nimrtc.mjs` | 真实项目验收脚本（nimrtc-zelto 副本） |
@@ -730,6 +774,78 @@ await versionStore.save(targetPlan);   // ← targetPlan 是**旧对象**，stat
 
 修法：先在内存对象上改 tag 与 status，再一次性落盘。
 
+### 坑 9：老项目迁移验证挖出的 4 个 bug
+
+老项目（nimrtc-zelto 的副本）升级到 ADR-056 后跑迁移链路，又挖出 4 个
+合成测试测不到的问题。
+
+**坑 9a：porcelain 路径解析吃掉首字符（既有的，影响所有路径豁免）**
+
+```ts
+// 错的写法
+const path = line.trim().slice(3);
+```
+
+porcelain 格式是 `XY <path>` —— 状态码**固定占两字符**。但先 `trim()`
+会把**行首那个空格**去掉，整行左移一位，于是 `slice(3)` 取到的是
+`zelto/slices/x.json` —— **路径的首字符被吃掉**。
+
+后果不是「路径多了一个字符」这么温和：所有基于路径的豁免
+（规格文件、验收骨架、zelto 状态）**在「已修改的文件」上全部失效**。
+
+**为什么一直没被发现**：未跟踪文件（`?? path`）没有行首空格，
+恰好不受影响 —— 而豁免场景绝大多数是未跟踪文件。
+
+修法：用 `core/sched/audit.ts` 里已有的 `parsePorcelainStatus`
+（它**先切状态码再 trim**，还额外解开 git 对非 ASCII 路径的 C 风格引号），
+两处守卫统一改用它。
+
+> 教训：同一个解析逻辑在两处各写一遍，就会有两处不一样的 bug。
+> 复用是对的 —— `parsePorcelainStatus` 早就在 `core/sched/audit.ts` 里了。
+
+**坑 9b：`.zelto/` 状态在有些项目里是签进 git 的**
+
+「工作区必须干净」守卫之前只豁免规格文件与验收骨架，理由是
+「`.zelto/` 在 .gitignore 里，不会出现在 porcelain 输出里」。
+
+**这个前提在真实项目上不成立** —— nimrtc-zelto 把 `.zelto/` 也签进了
+git（状态入库，方便跨机器同步）。于是 zelto 自己写的运行时状态
+（`updatedAt` 变动、stall 状态重置）以「未提交改动」的形式出现，
+把 merge 与 ship **全部拦下** —— 而那根本不是「人改了代码没提交」。
+
+修法：新增 `isZeltoStatePath` 豁免 `.zelto/` 下的文件，但**必须同时满足
+「待合分支没动这个路径」** —— 动了就会真冲突，必须拦。
+
+**坑 9c：worktree 目录被删后建不出来**
+
+人手动删掉工作目录、或上一次跑崩了留下半个目录时，git 的 worktree
+登记还在 → `git worktree add` 报：
+
+```
+fatal: '<path>' is a missing but already registered worktree
+```
+
+目录确实不存在（走「创建」路径），但 git 认为它还占着位置 ——
+**zelto 从此卡死在这个版本上**。老项目迁移尤其容易撞上（人手动清理目录）。
+
+修法：`addWorktree` 失败且报「already registered」→ `git worktree prune`
+清掉失效登记 → 重试一次。prune 只清**目录已不存在**的登记，
+不会误删活着的 worktree。切片与版本两类工作目录都修。
+
+**坑 9d：版本事件归属键写错**
+
+版本事件用 `version-<label>` 作归属键（ADR-017 §3.2），
+事件流按切片分目录 → `.zelto/events/version-v1/`。
+
+我第一版写成了 `version:v1` —— **冒号在 Windows 上是非法文件名字符**，
+`mkdir` 直接 ENOENT。
+
+症状很有欺骗性：分支建了、工作目录建了，**最后一步事件写入才炸**，
+整条命令退出码非零，看起来像「adopt 失败」，但分支其实已经建出来了。
+
+教训：事件归属键有既定约定（`version-<label>`），抄之前先看一眼
+ADR-017 §3.2。
+
 ---
 
 ## 9. 验证方式
@@ -809,13 +925,6 @@ await versionStore.save(targetPlan);   // ← targetPlan 是**旧对象**，stat
 | `--strict` 下没有继续执行切片 | ✅ |
 | 低风险重叠（docs 类别）提示了但不阻断 | ✅ |
 
-### 全量回归
-
-- 单元测试：**1696 通过 / 0 失败**（含新增的 44 + 18 个 ADR-056 测试）
-- `npm run lint`：通过
-- `npm run check:encoding`：通过
-- `npm run build`：通过
-
 ### 真实项目验证（nimrtc-zelto，`scripts/verify-adr056-nimrtc.mjs`，已通过）
 
 在 nimrtc-zelto 的**克隆副本**上跑（不碰真实仓库）。
@@ -868,6 +977,46 @@ await versionStore.save(targetPlan);   // ← targetPlan 是**旧对象**，stat
   （ADR §3.5：「`delivered` = 已进主干」）。
 
 **回归测试**：`tests/adr-056-real-project.test.ts`（18 个）
+
+### 老项目迁移验证（nimrtc-zelto 副本，已通过）
+
+老项目升级到 ADR-056 后的迁移链路。**这是 ADR §8 说的那个断链点**：
+版本已经在跑（`in_progress`），但版本分支从不存在 → `version ship`
+报 NOT_FOUND → **老项目永远无法交付**。
+
+验证链路：
+
+```
+1. 克隆 nimrtc-zelto（老项目：v1 已 in_progress，切片产物早已合进 main）
+2. zelto version adopt v1        → 补建 version/v1 分支 + 版本工作目录
+3. zelto version ship v1         → 合进主干 + 打 tag v1
+```
+
+| 断言 | 结果 |
+|---|---|
+| 迁移前 `version/v1` 分支不存在 | ✅ |
+| `version adopt` 建出了 `version/v1` 分支 | ✅ |
+| `version adopt` 建出了版本工作目录 | ✅ |
+| 基点钉死进版本计划 | ✅ |
+| 计划里标了 `adopted: true` + `adoptedAt`（审计能看出是补建的） | ✅ |
+| 写了 `version.adopted` 事件 | ✅ |
+| `version ship` 不再报 NOT_FOUND | ✅ |
+| ship 之后打上 `v1` tag | ✅ |
+| **ship 不再被 `.zelto/` 自己的运行时状态拦住** | ✅ |
+
+**这一轮又挖出 4 个 bug**（见「坑 9」）：其中**坑 9a（porcelain 路径解析）
+是既有的、且影响所有路径豁免** —— 只在「已修改的文件」上发作，
+所以一直没被发现。
+
+**回归测试**：`tests/adr-056-migration.test.ts`（14 个）+
+`tests/adr-056-adopt.test.ts`（5 个）
+
+### 全量回归（迁移验证后）
+
+- 单元测试：**1976 通过 / 0 失败**
+- `npm run lint`：通过
+- `npm run check:encoding`：通过
+- `npm run build`：通过
 
 ---
 

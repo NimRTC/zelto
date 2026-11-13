@@ -16,6 +16,34 @@
 /** zelto 管理的规格文件目录（相对仓库根） */
 export const MANAGED_SPEC_PREFIX = 'specs/slices/';
 
+/** zelto 运行时状态目录（相对仓库根） */
+export const ZELTO_STATE_PREFIX = '.zelto/';
+
+/**
+ * 这个路径是不是 zelto 的**运行时状态**（`.zelto/` 下的东西）？
+ *
+ * 为什么要单列（ADR-056 真实项目验证）：
+ *
+ * 上面的注释假设「`.zelto/` 在 .gitignore 里，不会出现在 porcelain 输出里」。
+ * **这个假设在真实项目上不成立** —— nimrtc-zelto 把 `.zelto/` 也**签进了
+ * git**（状态入库，方便跨机器同步）。于是 zelto 自己写的运行时状态
+ * （`updatedAt` 变动、stall 状态重置）会以「未提交改动」的形式出现，
+ * 把合并与 ship **全部拦下** —— 而这些根本不是「人改了代码没提交」。
+ *
+ * 但不能无脑豁免：如果**目标分支上同一个文件也变了**
+ * （比如版本分支上跑过切片、也更新了 `.zelto/slices/x.json`），
+ * 那合并会真冲突 —— 这种情况**必须拦**。
+ *
+ * 所以这里只回答「路径是不是 zelto 状态」，**「要不要豁免」由调用方
+ * 决定**（它才知道目标 ref 上该路径变没变）。
+ */
+export function isZeltoStatePath(path: string): boolean {
+  const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
+  if (normalized === '.zelto') return true;
+  return normalized.startsWith(ZELTO_STATE_PREFIX);
+}
+
+
 /**
  * 这个路径是不是 zelto 管理的规格文件？
  *

@@ -60,6 +60,55 @@ export function branchExists(branch: string, repoRoot: string): boolean {
   return git(['rev-parse', '--verify', `refs/heads/${branch}`], repoRoot).ok;
 }
 
+/**
+ * 这个路径在两个 ref 之间**有没有变化**？
+ *
+ * 用途（ADR-056 真实项目验证）：合并前的「工作区必须干净」守卫要判断
+ * 「这条未提交改动能不能豁免」。
+ *
+ * `.zelto/` 下的运行时状态在有些项目里是**签进 git** 的（状态入库，
+ * 跨机器同步）。zelto 自己写这些文件（`updatedAt` 变动、stall 重置），
+ * 它们会以「未提交改动」的形式出现 —— 但那不是「人改了代码没提交」。
+ *
+ * 豁免的前提是**合并不会碰它**：
+ * - 目标 ref 上同一个路径没变 → 合并不会碰 → 可以豁免
+ * - 目标 ref 上同一个路径变了 → 合并会真冲突 → **必须拦**
+ *
+ * 判定用 `git diff --name-only <from> <to> -- <path>`。
+ * 判定不出来（ref 不存在等）时**保守返回 true**（即「变了」）——
+ * 宁可多拦一次，不要让真冲突溜过去。
+ */
+export function pathDiffersBetweenRefs(
+  path: string,
+  fromRef: string,
+  toRef: string,
+  repoRoot: string,
+): boolean {
+  const res = git(['diff', '--name-only', fromRef, toRef, '--', path], repoRoot);
+  if (!res.ok) return true;
+  return res.stdout.trim().length > 0;
+}
+
+/**
+ * 这个路径在「目标 ref」与**任何一个待合分支**之间有没有变化？
+ *
+ * 只要有**一个**待合分支动了这个路径，合并就会碰它 → 必须拦。
+ * 全都没动 → 合并碰不到 → 可以豁免。
+ */
+export function pathDiffersFromAnyRef(
+  path: string,
+  targetRef: string,
+  candidateRefs: string[],
+  repoRoot: string,
+): boolean {
+  for (const ref of candidateRefs) {
+    if (pathDiffersBetweenRefs(path, targetRef, ref, repoRoot)) return true;
+  }
+  return false;
+}
+
+
+
 /** 取分支 tip */
 export function branchTip(branch: string, repoRoot: string): string | null {
   const res = git(['rev-parse', '--verify', `${branch}^{commit}`], repoRoot);

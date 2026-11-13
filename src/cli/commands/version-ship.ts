@@ -21,9 +21,13 @@ import { register, events, ZELTO_DIR, worktreeManager, loadConfig } from './shar
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
 import { branchOfVersion, versionBranchName, versionTagName } from '../../core/version/branch.js';
-import { isZeltoManagedSpecPath } from '../../core/project/managed-paths.js';
+import {
+  isZeltoManagedSpecPath,
+  isZeltoStatePath,
+} from '../../core/project/managed-paths.js';
+import { parsePorcelainStatus } from '../../core/sched/audit.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
-import { branchExists } from './version-runtime.js';
+import { branchExists, pathDiffersFromAnyRef } from './version-runtime.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 interface GitResult {
   ok: boolean;
@@ -87,17 +91,30 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
+    // ⚠️ 路径解析必须用 parsePorcelainStatus —— 先切状态码再 trim。
+    // `line.trim().slice(3)` 会吃掉行首空格、让路径首字符丢失，
+    // 导致豁免在「已修改的文件」上失效。
+    const paths = parsePorcelainStatus(status.stdout);
 
     const dirty: string[] = [];
     const managedSpecs: string[] = [];
     const managedSkeletons: string[] = [];
-    for (const entry of entries) {
-      const rawPath = entry.slice(3).trim();
-      const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop()! : rawPath;
+    const managedState: string[] = [];
+    // 来源分支（版本分支）—— 合并会碰到它的改动
+    const candidateRefs = [`refs/heads/${versionBranch}`];
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      const path = paths[i] ?? '';
       if (isZeltoManagedSpecPath(path)) {
         managedSpecs.push(entry);
       } else if (isUntouchedAcceptanceSkeleton(path, repoRoot)) {
         managedSkeletons.push(entry);
+      } else if (
+        isZeltoStatePath(path) &&
+        // 版本分支没动这个路径 → 合并碰不到 → 可豁免；动了就必须拦
+        !pathDiffersFromAnyRef(path, 'HEAD', candidateRefs, repoRoot)
+      ) {
+        managedState.push(entry);
       } else {
         dirty.push(entry);
       }
@@ -113,6 +130,12 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
       log(`  ℹ️  ${managedSkeletons.length} 个验收骨架未提交（不影响 ship）：`);
       for (const m of managedSkeletons.slice(0, 5)) log(`     ${m}`);
       if (managedSkeletons.length > 5) log('     …');
+    }
+
+    if (managedState.length > 0) {
+      log(`  ℹ️  ${managedState.length} 个 zelto 运行时状态未提交（不影响 ship）：`);
+      for (const m of managedState.slice(0, 5)) log(`     ${m}`);
+      if (managedState.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {

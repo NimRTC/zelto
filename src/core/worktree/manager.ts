@@ -163,7 +163,7 @@ export class WorktreeManager {
       ? ['worktree', 'add', target, branch]
       : ['worktree', 'add', '-b', branch, target, baseCommit];
 
-    this.git(args, `创建版本工作目录失败: ${relativePath}`);
+    this.addWorktree(args, `创建版本工作目录失败: ${relativePath}`);
 
     const info: WorktreeInfo = {
       sliceId: label,
@@ -252,7 +252,7 @@ export class WorktreeManager {
       ? ['worktree', 'add', target, branch]
       : ['worktree', 'add', '-b', branch, target, baseCommit];
 
-    this.git(args, '创建 worktree 失败');
+    this.addWorktree(args, '创建 worktree 失败');
 
     const info: WorktreeInfo = {
       sliceId,
@@ -704,6 +704,42 @@ export class WorktreeManager {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * `git worktree add`，带一次失效登记的自愈重试。
+   *
+   * 为什么需要（ADR-056 真实项目验证）：
+   *
+   * 人手动删掉工作目录、或上一次跑崩了留下半个目录时，git 的 worktree
+   * 登记还在 —— 下一次 `git worktree add` 直接报：
+   *
+   * ```
+   * fatal: '<path>' is a missing but already registered worktree
+   * ```
+   *
+   * 目录确实不存在（`existsSync` 为假 → 走「创建」路径），但 git 那边
+   * 认为它还占着位置，于是**永远建不出来**。zelto 从此卡死在这个版本上。
+   *
+   * 自愈：失败且报「already registered」→ `git worktree prune`
+   * 清掉失效登记 → 重试一次。
+   *
+   * prune 只清**目录已不存在**的登记（git 自己判定），
+   * 不会误删活着的 worktree。
+   */
+  private addWorktree(args: string[], errorMessage: string): void {
+    try {
+      this.git(args, errorMessage);
+      return;
+    } catch (err) {
+      const detail = err instanceof WorktreeError ? (err.stderr ?? '') : String(err);
+      if (!/already registered worktree|missing but already registered/i.test(detail)) {
+        throw err;
+      }
+      // 登记是失效的 —— prune 掉，再试一次
+      this.git(['worktree', 'prune'], undefined, true);
+      this.git(args, errorMessage);
     }
   }
 

@@ -46,7 +46,7 @@ zelto 是「一个人 + 一组 agent」做中大型项目时的**驾驶舱**，�
                                    ▼
                     ┌──────────────────────────────────────┐
                     │  core/events — append-only 事件流    │
-                    │  58 种事件 · 判定留痕 · 追溯的底座    │
+                    │  59 种事件 · 判定留痕 · 追溯的底座    │
                     └──────────────────────────────────────┘
 
      ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
@@ -187,7 +187,7 @@ interface EventEnvelope {
   runSeq: number;       // 单调递增
   slice: string;        // 切片 ID
   run: string | null;   // 运行 ID
-  type: EventType;      // 58 种之一
+  type: EventType;      // 59 种之一
   actor: string;        // 产生者
   payload: Record<string, unknown>;
 }
@@ -195,7 +195,7 @@ interface EventEnvelope {
 
 **存储**: `.zelto/events/<sliceId>/events.jsonl`
 
-**58 种事件类型**: 见场景功能地图 §5。事件类型的真源是
+**59 种事件类型**: 见场景功能地图 §5。事件类型的真源是
 `contracts/schemas/event-envelope.json` 的 enum —— 代码与契约不允许不一致。
 
 这份清单由 `stream.ts` 的 `EVENT_TYPES`（运行时数组）承载，`EventType` 联合类型派生自它，
@@ -312,7 +312,7 @@ class Scheduler {
 
 **文件**: `trail.ts`
 
-为 58 种事件各定义摘要生成器。支持：
+为 59 种事件各定义摘要生成器。支持：
 - `forSlice(sliceId)` — 获取结构化审计条目
 - `toText(sliceId)` — 生成可读文本报告
 - `latestEvent(sliceId, eventType)` — 获取最新事件
@@ -661,6 +661,12 @@ zelto version ship <ver>
   把 version/<ver> 合入主仓当前分支（冲突则 --abort，主干保持原状）
   之后打 tag（不可变锚点）+ 在主干重跑一次门禁（只提示，不阻断）
   版本状态 → delivered
+
+zelto version adopt <ver>
+  老项目迁移：版本已经在跑（in_progress）但版本分支从不存在 → 补建
+  从当前主干 HEAD 建 version/<ver> 分支 + 版本工作目录
+  基点钉死并标 adopted:true（审计能看出是补建的，不是原始基点）
+  详见 ADR-056 §8「老项目迁移」
 
 zelto merge [--target version/<ver>]
   切片产物合进版本分支（默认按归属解析；--target main 强制合主干）

@@ -9,8 +9,13 @@
 import { execFileSync } from 'node:child_process';
 import type { EventStream } from '../../core/events/stream.js';
 import type { MergePhase, MergePlan } from '../../core/sched/merge.js';
-import { isZeltoManagedSpecPath } from '../../core/project/managed-paths.js';
+import {
+  isZeltoManagedSpecPath,
+  isZeltoStatePath,
+} from '../../core/project/managed-paths.js';
+import { parsePorcelainStatus } from '../../core/sched/audit.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
+import { pathDiffersFromAnyRef } from './version-runtime.js';
 
 /** 参与合并的切片信息 */
 export interface MergeSliceInfo {
@@ -272,22 +277,39 @@ export async function executeMergePlan(
   // 那份文件就是代码了（进了写集、参与门禁②），必须挡住。
   const status = git(['status', '--porcelain'], targetDir);
   if (status.ok && status.stdout.trim().length > 0) {
+    // ⚠️ 路径解析必须用 parsePorcelainStatus —— 它先切掉状态码再 trim。
+    // 自己写 `line.trim().slice(3)` 会把**行首的那个空格**吃掉、整行左移一位，
+    // 于是路径的首字符丢失（` M .zelto/x.json` → `zelto/x.json`），
+    // 结果是所有路径豁免在「**已修改的文件**」上全部失效
+    // （未跟踪文件 `?? path` 没有行首空格，所以这个 bug 一直没被发现）。
     const entries = status.stdout
       .split('\n')
       .map((l) => l.trim())
       .filter(Boolean);
+    const paths = parsePorcelainStatus(status.stdout);
 
     const dirty: string[] = [];
     const managedSpecs: string[] = [];
     const managedSkeletons: string[] = [];
-    for (const entry of entries) {
-      // porcelain 格式：`XY <path>`（重命名时是 `XY <old> -> <new>`）
-      const rawPath = entry.slice(3).trim();
-      const path = rawPath.includes(' -> ') ? rawPath.split(' -> ').pop()! : rawPath;
+    const managedState: string[] = [];
+    // 待合分支（合并会碰到的来源）—— 用来判断 zelto 状态文件会不会被覆盖
+    const candidateRefs = plan.slices
+      .map((id) => byId.get(id)?.branch)
+      .filter((b): b is string => Boolean(b))
+      .map((b) => `refs/heads/${b}`);
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      const path = paths[i] ?? '';
       if (isZeltoManagedSpecPath(path)) {
         managedSpecs.push(entry);
       } else if (isUntouchedAcceptanceSkeleton(path, targetDir)) {
         managedSkeletons.push(entry);
+      } else if (
+        isZeltoStatePath(path) &&
+        // 只有「待合分支都没动这个路径」才豁免 —— 动了就会真冲突，必须拦
+        !pathDiffersFromAnyRef(path, targetRef, candidateRefs, repoRoot)
+      ) {
+        managedState.push(entry);
       } else {
         dirty.push(entry);
       }
@@ -303,6 +325,12 @@ export async function executeMergePlan(
       log(`  ℹ️  ${managedSkeletons.length} 个验收骨架未提交（不影响合并）：`);
       for (const m of managedSkeletons.slice(0, 5)) log(`     ${m}`);
       if (managedSkeletons.length > 5) log('     …');
+    }
+
+    if (managedState.length > 0) {
+      log(`  ℹ️  ${managedState.length} 个 zelto 运行时状态未提交（不影响合并）：`);
+      for (const m of managedState.slice(0, 5)) log(`     ${m}`);
+      if (managedState.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {

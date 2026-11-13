@@ -133,11 +133,15 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
   'artifact.conflict_detected': (e) =>
     `Artifact conflict: ${String(e.payload?.count ?? '?')} conflict(s) found`,
   'version.accepted': (e) =>
-    `Version ${String(e.payload?.version ?? '?')} accepted — version-level acceptance passed on main`,
+    `Version ${String(e.payload?.version ?? '?')} accepted — version-level acceptance passed`,
   'version.delivered': (e) =>
     `Version ${String(e.payload?.version ?? '?')} delivered — slices: ${String(
       Array.isArray(e.payload?.slices) ? (e.payload.slices as string[]).join(', ') : '',
     )}`,
+  'version.adopted': (e) =>
+    `Version ${String(e.payload?.version ?? '?')} adopted — version branch "${String(
+      e.payload?.branch ?? '?',
+    )}" created at base ${String(e.payload?.baseCommit ?? '?').slice(0, 8)} (ADR-056 migration)`,
   'draft.created': (e) =>
     `Draft created: ${String(e.payload?.kind ?? '?')} "${String(e.payload?.title ?? '')}" (${String(e.payload?.id ?? '?')})`,
   'draft.revised': (e) =>

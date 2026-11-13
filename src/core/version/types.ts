@@ -24,6 +24,20 @@ export interface Version {
   baseCommit?: string | null;
   /** 版本 tag 名；缺省派生为 `v<label>`（ADR-056 D6） */
   tag?: string;
+  /**
+   * 这个版本的分支是不是**补建**的（ADR-056 迁移）。
+   *
+   * 老项目升级到版本分支制度时，版本已经在跑（`in_progress`），
+   * 但版本分支从不存在 —— 得由 `zelto version adopt` 补建。
+   *
+   * 补建的基点是**补建时刻**的主干 HEAD，不是原始基点
+   * （老项目从来没有版本级基点这个概念）。
+   * 记这个标记是为了**事后审计能看出区别** ——
+   * 否则基点看起来跟原生的一样，追溯链会撒谎。
+   */
+  adopted?: boolean;
+  /** 补建时刻（ISO 时间） */
+  adoptedAt?: string;
 }
 
 export interface VersionPlan {
