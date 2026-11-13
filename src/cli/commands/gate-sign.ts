@@ -10,6 +10,7 @@ import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
 import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
 import { resolve } from 'node:path';
 import { readdir } from 'node:fs/promises';
+import { runSignReview } from './sign-review.js';
 
 // ─── gate ────────────────────────────────────────────────────────────────────
 
@@ -399,6 +400,18 @@ async function runSpecMdOnAllSlices(): Promise<number> {
 // ─── sign ────────────────────────────────────────────────────────────────────
 
 register('sign', async (args) => {
+  // `--review` 在参数解析最前分流（ADR-070 §4.1 / §5.4）：
+  // 它是 `sign` 的修饰符，不是新命令 —— 人从 review 跳到 approve 是同一条路径。
+  // 原有 `--approve/--reject/--revoke` 分支一字不动。
+  if (args.includes('--review')) {
+    const reviewId = args.find((a) => !a.startsWith('--'));
+    if (!reviewId) {
+      console.error('Usage: zelto sign --review <slice-id>');
+      return 1;
+    }
+    return runSignReview(reviewId, { json: args.includes('--json') });
+  }
+
   const [id, action] = args;
   if (!id || !action) {
     console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke] [--comment <text>]');
