@@ -108,7 +108,13 @@ interface GateResultPayloadLike {
  * 里名字含 `acceptance` 的命令（如 `acceptance-cli`）。回退扫描
  * `results[]`，有一条 passed 且 stdout 能解析出 `pass > 0`（复用
  * `parseTestRunnerStats`），即判 ran/passed；pass/total 从该命令的
- * stdout 解析（ADR-033/051 + v2-sign-review-fix）。
+ * stdout 解析（ADR-033/051 + v2-sign-review-fix + v3-sign-review-acceptance-spec）。
+ *
+ * 第三轮修复：`parseTestRunnerStats` 同时认 TAP（`# pass N`）与 spec
+ * 报告器（`ℹ pass N`）两种汇总行。真实 gate.result 事件里 stdout 被
+ * executor 截到前 500 字符，Node spec 报告器形态（`✔ … / ℹ pass N`）
+ * 没有 `# pass` 行 —— v2 回退只认 TAP，在真实流上解析不出 pass>0，
+ * 验收项保持 FAIL；v3 起 `ℹ` 前缀等价，真实流可解析出 pass>0。
  *
  * 没有 gate.result 事件 → 判「没跑过」。解析不到统计 → 按 0/0 ——
  * 查不到就是查不到，不冒充数字（ADR-059 哲学）。
@@ -151,8 +157,14 @@ function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['g
  * 回退路径：在 `gate.result.results[]` 里找名字含 `acceptance` 的命令。
  *
  * 判据只有一条：passed=true 且 stdout 能解析出 `pass > 0`（复用
- * `parseTestRunnerStats`）。找到就采用该命令解析出的 pass/total；
+ * `parseTestRunnerStats`）。汇总行两种形态都认：TAP `# pass N` 与
+ * spec 报告器 `ℹ pass N`。找到就采用该命令解析出的 pass/total；
  * 一条都找不到 → 没跑过（0/0）—— 不把「跑过但解析不到统计」冒充成通过。
+ *
+ * 行为变化与证据一致（不是静默翻转，v3-sign-review-acceptance-spec）：
+ * v1-sign-review-core 的 `acceptance-core` stdout 同样含 `ℹ pass 5` ——
+ * v2 解析不到所以保持 FAIL；v3 起可解析出 pass>0，该片同样判通过
+ * （其验收用例确实真跑了 5 条且全过）。
  */
 function collectAcceptanceFromResults(
   results: GateResultPayloadLike['results'],

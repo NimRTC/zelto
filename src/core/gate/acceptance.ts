@@ -272,14 +272,18 @@ export interface AcceptanceRunStats {
 /**
  * 从测试运行器的输出里读统计。
  *
- * 认 node 测试运行器的 TAP 汇总行（`# pass 3` / `# todo 2` / `# skipped 1`）。
- * 认不出就返回 `known: false` —— 不猜、不用正则硬凑一个结论。
+ * 认 node 测试运行器的两种汇总行，`#` 与 `ℹ` 前缀等价（v3-sign-review-acceptance-spec）：
+ *   - TAP / 默认 reporter：`# pass 3` / `# todo 2` / `# skipped 1`
+ *   - spec reporter：`ℹ pass 3` / `ℹ todo 2` / `ℹ skipped 1`
+ * 真实 gate.result 事件里 stdout 被截到前 500 字符，spec 报告器形态
+ * （`✔ … / ℹ pass N`）不含 `# pass` 行 —— v2 只认 TAP 所以漏判，v3 补上 `ℹ`。
+ * 其余语义不变：认不出就返回 `known: false` —— 不猜、不用正则硬凑一个结论。
  */
 export function parseTestRunnerStats(output: string): AcceptanceRunStats {
   const stats: AcceptanceRunStats = { pass: 0, fail: 0, todo: 0, skipped: 0, known: false };
 
   for (const line of output.split('\n')) {
-    const m = line.match(/^\s*#\s*(pass|fail|todo|skipped)\s+(\d+)\s*$/i);
+    const m = line.match(/^\s*(?:#|ℹ)\s*(pass|fail|todo|skipped)\s+(\d+)\s*$/i);
     if (!m) continue;
     const count = Number.parseInt(m[2], 10);
     if (Number.isNaN(count)) continue;
