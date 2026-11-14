@@ -177,9 +177,11 @@ const MISSING_EVENTS = [
 
 // regress-slice：镜像 v1-sign-review-core 的真实事件流。core 片本身没有
 // 切片级验收记录（acceptance 也是 skipped）；results 里的 acceptance-core
-// 跑过且 exitCode 0，但 stdout 是 node spec 报告器（✔ / ℹ 行），
-// parseTestRunnerStats 解析不出 pass>0 —— 回退不得把它误判成通过，
-// 验收项保持原判 FAIL。该片没有任何 policy.violation 事件 → 写集审计为空。
+// 跑过且 exitCode 0，stdout 是 node spec 报告器（✔ / ℹ 行）。
+// v2 落笔时 parseTestRunnerStats 只认 TAP（# pass），解析不出 pass>0 ——
+// 回退不得误判，验收保持 FAIL。v3 起 `ℹ pass` 等价（见 v3 验收标准 3），
+// 该 fixture 同样可解析出 pass>0（ℹ pass 5），于是判通过 —— 结论与证据一致，
+// 不是静默翻转。该片没有任何 policy.violation 事件 → 写集审计为空。
 const REG_SLICE = {
   id: 'regress-slice',
   title: 'Regress slice',
@@ -365,7 +367,7 @@ function byLabel(checks) {
 
 // ─── 验收标准 1 + 2：写集陈旧消解 + 验收项回退识别（fix-slice）────────────
 
-test('fix-slice（镜像 v1-sign-review-cli 真实流）：通过 gate 晚于 violation → writeSetAudit 清空；acceptance skipped 回退识别 acceptance-cli → 6/6，evaluate 第二、三项 ok', async () => {
+test('fix-slice: stale cleared, 6/6', async () => {
   const facts = await collectFactsFor('fix-slice');
 
   // 验收标准 1：最新 passed gate（17:30）晚于最新 violation（16:50）→ 越界已解决
@@ -386,7 +388,7 @@ test('fix-slice（镜像 v1-sign-review-cli 真实流）：通过 gate 晚于 vi
 
 // ─── 验收标准 2 的「缺失」分支：连 acceptance 字段都没有 ──────────────────────
 
-test('missing-slice：gate.result 无 acceptance 字段 → 同样回退识别 results 里的 acceptance 命令（3/3）', async () => {
+test('missing-slice: no acceptance field, 3/3', async () => {
   const facts = await collectFactsFor('missing-slice');
 
   assert.deepEqual(facts.writeSetAudit.violations, [], '无 violation 事件 → 空清单');
@@ -400,30 +402,31 @@ test('missing-slice：gate.result 无 acceptance 字段 → 同样回退识别 r
   assert.equal(by['改动在写集内'].ok, true, '写集项应为 ok（空清单）');
 });
 
-// ─── 验收标准 3 回归：v1-sign-review-core 不被回退误判成通过 ─────────────────
+// ─── 验收标准 3 回归（v3 起更新）：v1-sign-review-core 同样有可解析的验收证据 ──
 
-test('regress-slice（镜像 v1-sign-review-core 真实流）：acceptance-core 的 spec 报告器输出解析不出 pass → 验收保持 FAIL，violations 空，追溯 ok', async () => {
+test('regress-slice: ℹ pass 5 → pass', async () => {
   const facts = await collectFactsFor('regress-slice');
 
-  // 验收 FAIL 待定：core 片本身没有切片级验收记录，回退不得把「exitCode 0 但
-  // stdout 解析不出 pass>0」误判成通过
-  assert.equal(facts.gate.acceptanceRan, false, 'core 片应保持「没跑过」（回退不命中）');
-  assert.equal(facts.gate.acceptancePassed, false);
-  assert.equal(facts.gate.passCount, 0);
-  assert.equal(facts.gate.totalCount, 0);
+  // v3 起 `ℹ pass` 与 `# pass` 等价：core 片的 acceptance-core stdout 含
+  // `ℹ pass 5`，回退能解析出 pass>0 → 判 ran/passed（v3 验收标准 3 允许此翻转，
+  // 其验收用例确实真跑了 5 条且全过）。不是静默翻转 —— v3 注释已说明。
+  assert.equal(facts.gate.acceptanceRan, true, 'core 片 acceptance-core 可解析出 pass>0，应判 ran=true');
+  assert.equal(facts.gate.acceptancePassed, true);
+  assert.equal(facts.gate.passCount, 5);
+  assert.equal(facts.gate.totalCount, 5);
 
   // 无 violation 事件 → 空清单（验收标准 3）
   assert.deepEqual(facts.writeSetAudit.violations, [], '无 violation 事件的切片仍为空清单');
 
   const by = byLabel(evaluateSignChecks(facts));
   assert.equal(by['追溯链未断'].ok, true, '追溯 ok（trace 非空）');
-  assert.equal(by['验收真跑过本片'].ok, false, '验收项保持 FAIL，不被回退误判成通过');
+  assert.equal(by['验收真跑过本片'].ok, true, '验收项判通过（有可解析的验收证据）');
   assert.equal(by['改动在写集内'].ok, true, '写集项 ok（空清单）');
 });
 
 // ─── 验收标准 1 的负向控制：越界没有被证明解决时不得清空 ─────────────────────
 
-test('stale-slice（负向控制）：violation 之后只有 failed gate → violations 保留，写集项 FAIL', async () => {
+test('stale-slice: failed gate keeps violation', async () => {
   const facts = await collectFactsFor('stale-slice');
 
   assert.deepEqual(facts.writeSetAudit.violations, ['src/evil.ts'], '没有通过的 gate 跟着，越界记录必须保留（fail closed）');
@@ -434,7 +437,7 @@ test('stale-slice（负向控制）：violation 之后只有 failed gate → vio
 
 // ─── 验收标准 4：--json 可 parse；只读性与非 TTY 不变 ───────────────────────
 
-test('sign fix-slice --review --json：可被 JSON.parse，验收/写集两项 ok，facts.gate 6/6', () => {
+test('json fix-slice: parseable, 6/6', () => {
   const res = runCLI(['sign', 'fix-slice', '--review', '--json'], { cwd: sandbox });
   assert.equal(res.error, undefined, `CLI 启动失败：${res.error}`);
   assert.equal(res.status, 0, `--json 应退出 0，实际 ${res.status}：\n${res.stdout}${res.stderr}`);
@@ -455,7 +458,7 @@ test('sign fix-slice --review --json：可被 JSON.parse，验收/写集两项 o
   assert.equal(by['改动在写集内'].ok, true, '写集项应为 ok');
 });
 
-test('sign regress-slice --review --json：验收项 FAIL 保持、写集项 ok（回归不被 --json 破坏）', () => {
+test('json regress-slice: pass kept', () => {
   const res = runCLI(['sign', 'regress-slice', '--review', '--json'], { cwd: sandbox });
   assert.equal(res.error, undefined, `CLI 启动失败：${res.error}`);
   assert.equal(res.status, 0, `--json 应退出 0，实际 ${res.status}：\n${res.stdout}${res.stderr}`);
@@ -465,11 +468,11 @@ test('sign regress-slice --review --json：验收项 FAIL 保持、写集项 ok�
   assert.deepEqual(parsed.facts.writeSetAudit.violations, [], 'core 片写集审计为空');
 
   const by = byLabel(parsed.checks);
-  assert.equal(by['验收真跑过本片'].ok, false, 'core 片验收项应保持 FAIL');
+  assert.equal(by['验收真跑过本片'].ok, true, 'core 片 acceptance-core 可解析出 pass>0，验收项判通过（v3 起）');
   assert.equal(by['改动在写集内'].ok, true, '写集项 ok');
 });
 
-test('非 TTY 不挂死：管道/重定向下只打印、不提示确认', () => {
+test('非 TTY 不挂死', () => {
   // spawnSync + 8s 超时：stdin/stdout/stderr 全走管道（非 TTY）。
   // 若实现里去等人输入，进程会卡到超时被 kill → res.error / res.signal 非空 → 断言失败。
   const res = runCLI(['sign', 'fix-slice', '--review'], { cwd: sandbox, timeoutMs: 8000 });
@@ -480,7 +483,7 @@ test('非 TTY 不挂死：管道/重定向下只打印、不提示确认', () =>
   assert.ok(res.stdout.includes('验收（门禁②）'), '输出应含验收段');
 });
 
-test('只读性：--review 不写 .zelto/slices 与 .zelto/events 下任何文件、不追加任何事件', () => {
+test('只读性：不写文件不追加事件', () => {
   function snapshotDir(dir) {
     const out = {};
     function walk(d, rel) {

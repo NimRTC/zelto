@@ -321,7 +321,7 @@ function byLabel(checks) {
 
 // ─── 验收标准 1：parseTestRunnerStats 同时认 # 与 ℹ 前缀 ────────────────────
 
-test('parseTestRunnerStats 读得出 spec 报告器汇总行（ℹ pass 6），原有 # pass 形态不变', () => {
+test('parse ℹ pass 6, # pass kept', () => {
   const spec = parseTestRunnerStats('✔ a (1ms)\nℹ tests 6\nℹ pass 6\nℹ fail 0\n');
   assert.equal(spec.known, true, 'spec 报告器形态应能读出统计');
   assert.equal(spec.pass, 6, 'ℹ pass 6 应解析出 pass=6');
@@ -338,7 +338,7 @@ test('parseTestRunnerStats 读得出 spec 报告器汇总行（ℹ pass 6），�
   assert.equal(tap.skipped, 0);
 });
 
-test('parseTestRunnerStats 不误认测试行（✔/✖）与其它汇总键（tests/suites/cancelled），认不出仍 known:false', () => {
+test('parse ignores ✔/✖ and other keys', () => {
   // ✔ 开头的是用例结果行，不是汇总行；ℹ tests / ℹ suites / ℹ cancelled 是
   // 其它键，不是 pass/fail/todo/skipped —— 都不该计入统计
   const mixed = parseTestRunnerStats('✔ a (1ms)\n✖ b (2ms)\nℹ tests 6\nℹ suites 0\nℹ pass 6\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\n');
@@ -355,7 +355,7 @@ test('parseTestRunnerStats 不误认测试行（✔/✖）与其它汇总键（t
 
 // ─── 验收标准 2：v1-sign-review-cli 真实事件流 → 6/6，evaluate 二/三/四 ok ──
 
-test('cli-slice（镜像 v1-sign-review-cli 真实流）：回退识别 spec 报告器 stdout → ran/passed 且 6/6；evaluate 第二、三、四项 ok', async () => {
+test('cli-slice: spec reporter → 6/6', async () => {
   const facts = await collectFactsFor('cli-slice');
 
   // acceptance.status=skipped → 回退扫描 results[] 里名字含 acceptance 的命令
@@ -377,7 +377,7 @@ test('cli-slice（镜像 v1-sign-review-cli 真实流）：回退识别 spec 报
 
 // ─── 验收标准 3：v1-sign-review-core 真实事件流 → 结论与证据一致 ─────────────
 
-test('core-slice（镜像 v1-sign-review-core 真实流）：acceptance-core 含 ℹ pass 5 → 可解析出 pass>0，判通过（结论与证据一致，实现注释已说明）', async () => {
+test('core-slice: ℹ pass 5 → pass', async () => {
   const facts = await collectFactsFor('core-slice');
 
   // v2 时 `ℹ` 前缀解析不到 pass>0 → 验收保持 FAIL；v3 起可解析 → 该片同样
@@ -400,7 +400,7 @@ test('core-slice（镜像 v1-sign-review-core 真实流）：acceptance-core 含
 
 // ─── 验收标准 4：--json 可 parse；非 TTY 与只读性不变；tsc --noEmit 退出 0 ──
 
-test('sign cli-slice --review --json：可被 JSON.parse，facts.gate 6/6，验收/写集/产物三项 ok', () => {
+test('json cli-slice: parseable, 6/6', () => {
   const res = runCLI(['sign', 'cli-slice', '--review', '--json'], { cwd: sandbox });
   assert.equal(res.error, undefined, `CLI 启动失败：${res.error}`);
   assert.equal(res.status, 0, `--json 应退出 0，实际 ${res.status}：\n${res.stdout}${res.stderr}`);
@@ -423,7 +423,7 @@ test('sign cli-slice --review --json：可被 JSON.parse，facts.gate 6/6，验�
   assert.equal(by['产物真落地'].ok, true, '产物项应为 ok（git 沙箱内写集文件在 HEAD）');
 });
 
-test('非 TTY 不挂死：管道/重定向下只打印、不提示确认', () => {
+test('非 TTY 不挂死', () => {
   // spawnSync + 8s 超时：stdin/stdout/stderr 全走管道（非 TTY）。
   // 若实现里去等人输入，进程会卡到超时被 kill → res.error / res.signal 非空 → 断言失败。
   const res = runCLI(['sign', 'cli-slice', '--review'], { cwd: sandbox, timeoutMs: 8000 });
@@ -434,7 +434,7 @@ test('非 TTY 不挂死：管道/重定向下只打印、不提示确认', () =>
   assert.ok(res.stdout.includes('验收（门禁②）'), '输出应含验收段');
 });
 
-test('只读性：--review 不写 .zelto/slices 与 .zelto/events 下任何文件、不追加任何事件', () => {
+test('只读性：不写文件不追加事件', () => {
   function snapshotDir(dir) {
     const out = {};
     function walk(d, rel) {
@@ -466,7 +466,7 @@ test('只读性：--review 不写 .zelto/slices 与 .zelto/events 下任何文�
   assert.deepEqual(snapshotDir(eventsDir), beforeEvents, '.zelto/events 在 --review 后不应有任何新增/追加');
 });
 
-test('npx tsc --noEmit 退出码 0（类型检查干净）', () => {
+test('tsc --noEmit 干净', () => {
   // 用本地 typescript 的 bin（等价于 npx tsc），--noEmit 不写产物。
   // tsconfig.json 只覆盖 src/**，正是生产构建的类型面。
   const tscBin = join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc');
