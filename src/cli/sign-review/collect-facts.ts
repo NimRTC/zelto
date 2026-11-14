@@ -52,7 +52,7 @@ export async function collectSignReviewFacts(sliceId: string): Promise<SignRevie
     diff,
     cost: { totalUsd: sumBudget(budgetEvents) },
     stall: collectStallFacts(stallEvents),
-    writeSetAudit: collectWriteSetAudit(violationEvents),
+    writeSetAudit: collectWriteSetAudit(violationEvents, gateResultEvents),
     artifact,
   };
 }
@@ -83,6 +83,7 @@ function traceEntriesToStrings(items: unknown[] | undefined): string[] {
 
 /** `gate.result` 事件 payload 里用到的字段形态（与 core/gate/types.ts 对齐） */
 interface GateResultPayloadLike {
+  passed?: boolean;
   acceptance?: {
     status?: string;
     path?: string | null;
@@ -99,10 +100,18 @@ interface GateResultPayloadLike {
 /**
  * 从 `gate.result` 事件里取验收事实（ADR-033/051）。
  *
- * 没有 gate.result 事件、或事件 payload 没有 acceptance 字段 → 判「没跑过」。
- * passCount / totalCount 从 acceptance 命令的 stdout 里解析 TAP 汇总行
- * （复用 core/gate/acceptance.ts 的 parseTestRunnerStats）；解析不到就按
- * 0/0 —— 查不到就是查不到，不冒充数字（ADR-059 哲学）。
+ * 主路径：`acceptance.status` 明确给出结论（`passed` / `failed`）——
+ * 项目配了 `gate.acceptance` 段，切片级验收的结论直接可读。
+ *
+ * 回退路径（第二轮修复）：`acceptance.status` 为 `skipped` 或缺失时 ——
+ * 项目没配 `gate.acceptance` 段，真正跑过的验收是 `spec.gateCommands`
+ * 里名字含 `acceptance` 的命令（如 `acceptance-cli`）。回退扫描
+ * `results[]`，有一条 passed 且 stdout 能解析出 `pass > 0`（复用
+ * `parseTestRunnerStats`），即判 ran/passed；pass/total 从该命令的
+ * stdout 解析（ADR-033/051 + v2-sign-review-fix）。
+ *
+ * 没有 gate.result 事件 → 判「没跑过」。解析不到统计 → 按 0/0 ——
+ * 查不到就是查不到，不冒充数字（ADR-059 哲学）。
  */
 function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['gate'] {
   const latest = gateResultEvents.length > 0 ? gateResultEvents[gateResultEvents.length - 1] : null;
@@ -111,28 +120,61 @@ function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['g
   }
 
   const payload = latest.payload as GateResultPayloadLike;
-  const acceptance = payload.acceptance;
-  if (!acceptance) {
-    return { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 };
-  }
+  const status = payload.acceptance?.status;
 
-  const ran = acceptance.status !== 'skipped';
-  const passed = acceptance.status === 'passed';
+  // 主路径：显式验收配置给出了结论（passed / failed）
+  if (status === 'passed' || status === 'failed') {
+    const ran = true;
+    const passed = status === 'passed';
 
-  let passCount = 0;
-  let totalCount = 0;
-  if (Array.isArray(payload.results)) {
-    const accResult = payload.results.find((r) => r.command === 'acceptance');
-    if (accResult && typeof accResult.stdout === 'string') {
-      const stats = parseTestRunnerStats(accResult.stdout);
-      if (stats.known) {
-        passCount = stats.pass;
-        totalCount = stats.pass + stats.fail + stats.todo + stats.skipped;
+    let passCount = 0;
+    let totalCount = 0;
+    if (Array.isArray(payload.results)) {
+      const accResult = payload.results.find((r) => r.command === 'acceptance');
+      if (accResult && typeof accResult.stdout === 'string') {
+        const stats = parseTestRunnerStats(accResult.stdout);
+        if (stats.known) {
+          passCount = stats.pass;
+          totalCount = stats.pass + stats.fail + stats.todo + stats.skipped;
+        }
       }
     }
+
+    return { acceptanceRan: ran, acceptancePassed: passed, passCount, totalCount };
   }
 
-  return { acceptanceRan: ran, acceptancePassed: passed, passCount, totalCount };
+  // 回退路径：acceptance 缺失或 skipped —— 扫描 spec.gateCommands 的验收命令
+  return collectAcceptanceFromResults(payload.results);
+}
+
+/**
+ * 回退路径：在 `gate.result.results[]` 里找名字含 `acceptance` 的命令。
+ *
+ * 判据只有一条：passed=true 且 stdout 能解析出 `pass > 0`（复用
+ * `parseTestRunnerStats`）。找到就采用该命令解析出的 pass/total；
+ * 一条都找不到 → 没跑过（0/0）—— 不把「跑过但解析不到统计」冒充成通过。
+ */
+function collectAcceptanceFromResults(
+  results: GateResultPayloadLike['results'],
+): SignReviewFacts['gate'] {
+  if (!Array.isArray(results)) {
+    return { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 };
+  }
+  for (const r of results) {
+    if (typeof r.command !== 'string' || !r.command.includes('acceptance')) continue;
+    if (r.passed !== true) continue;
+    if (typeof r.stdout !== 'string') continue;
+    const stats = parseTestRunnerStats(r.stdout);
+    if (stats.known && stats.pass > 0) {
+      return {
+        acceptanceRan: true,
+        acceptancePassed: true,
+        passCount: stats.pass,
+        totalCount: stats.pass + stats.fail + stats.todo + stats.skipped,
+      };
+    }
+  }
+  return { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 };
 }
 
 // ─── cost ────────────────────────────────────────────────────────────────────
@@ -169,15 +211,40 @@ function collectStallFacts(stallEvents: EventEnvelope[]): SignReviewFacts['stall
  * 审计结论已经落在事件流里（runtime-guard.ts 的 reportAuditResult），
  * 控制面读事件即可，不重跑审计（ADR-070 §5.2）。没有 violation 事件 =
  * 没有记录到越界 = 空清单。
+ *
+ * 陈旧结论消解（第二轮修复）：越界之后可能扩了写集、重跑了门禁并最终
+ * 通过 —— 早先记下的越界就成了过时结论。判据：最新一条通过
+ * （passed=true）的 `gate.result` 事件时间晚于最新一条 `policy.violation`
+ * 事件，则越界已在扩写集/重跑后解决，violations 清空；否则保留原结论
+ * （fail closed —— 不知道解决没解决，就不替人撤销越界记录）。
  */
 function collectWriteSetAudit(
   violationEvents: EventEnvelope[],
+  gateResultEvents: EventEnvelope[],
 ): SignReviewFacts['writeSetAudit'] {
   if (violationEvents.length === 0) return { violations: [] };
-  const latest = violationEvents[violationEvents.length - 1];
-  const violations = latest.payload.violations;
+  const latestViolation = violationEvents[violationEvents.length - 1];
+
+  // 最新一条通过（passed=true）的 gate.result —— 按文件顺序取最后一条
+  let latestPassedGate: EventEnvelope | null = null;
+  for (const e of gateResultEvents) {
+    if (e.payload.passed === true) latestPassedGate = e;
+  }
+  if (latestPassedGate && isTimestampAfter(latestPassedGate.ts, latestViolation.ts)) {
+    return { violations: [] };
+  }
+
+  const violations = latestViolation.payload.violations;
   if (!Array.isArray(violations)) return { violations: [] };
   return { violations: violations.filter((v): v is string => typeof v === 'string') };
+}
+
+/** 两条 ISO 时间戳谁更晚。同格式 ISO 字符串比较已等价；解析失败退化字符串比较。 */
+function isTimestampAfter(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta > tb;
+  return a > b;
 }
 
 // ─── diff ────────────────────────────────────────────────────────────────────
