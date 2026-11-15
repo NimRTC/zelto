@@ -9,7 +9,7 @@ const COMMANDS = COMMAND_CATALOG.map((c) => c.name);
 
 const SUBCOMMANDS: Record<string, string[]> = {
   require: ['list', 'confirm', 'refine'],
-  design: ['list', 'confirm', 'refine'],
+  design: ['list', 'confirm', 'refine', 'patch'],
   plan: ['list', 'confirm', 'add-version'],
   version: ['status', 'start', 'deliver'],
   project: ['scan', 'init', 'design', 'slice', 'status'],

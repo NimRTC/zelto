@@ -397,6 +397,7 @@ register('design', async (args) => {
     f.out('       zelto design show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto design confirm <id>');
     f.out('       zelto design refine <id> <feedback>');
+    f.out('       zelto design patch <id> --module <name> --path <glob>   修正已确认设计的模块字段');
     return 1;
   }
 
@@ -505,6 +506,12 @@ register('design', async (args) => {
     f.out(`Run again: zelto design refine ${id} <more feedback>`);
     f.out(`Or confirm: zelto design confirm ${id}`);
     return 0;
+  }
+
+  if (subcmd === 'patch') {
+    // 确定性修正（不经 LLM）—— ADR-063
+    const { designPatch } = await import('./design-patch.js');
+    return designPatch(args.slice(1));
   }
 
   // zelto design <req-id>
