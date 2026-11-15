@@ -62,8 +62,22 @@ export interface MergeExecutionResult {
   conflicts: MergeConflictReport[];
   /** base 已漂移、因而改用合并提交的切片 id */
   staleBase: string[];
-  /** 是否因冲突而中止 */
+  /**
+   * 是否因冲突而中止
+   *
+   * **不只冲突**。工作区脏（未提交改动挡着）也是一种中止 ——
+   * 见 `abortReason`。早期版本这里只表示「冲突」，而工作区脏的守卫
+   * 返回 `aborted: false`，于是上层打印「✅ Merge complete (0 slices)」
+   * 并退出 0 —— **合并根本没发生，工具却说成功了**（实测缺陷 D-11）。
+   */
   aborted: boolean;
+  /**
+   * 中止原因（`aborted` 为 true 时有值）。
+   *
+   * 区分「冲突」与「工作区脏」：两者的排查方向完全不同 ——
+   * 前者要解冲突，后者要先提交或暂存。
+   */
+  abortReason?: string;
 }
 
 interface GitResult {
@@ -341,7 +355,21 @@ export async function executeMergePlan(
       if (dirty.length > 10) log('     …（只列前 10 条）');
       log('     先提交（git commit）或暂存（git stash）这些改动，再重新跑 zelto merge。');
       log('     签字已经过了，不用重新签。');
-      return { merged, conflicts, staleBase, aborted: false };
+      // D-11：这里必须算**中止**，不能返回 `aborted: false`。
+      //
+      // 合并一步都没做，但上层看到 aborted=false 就打印
+      // 「✅ Merge complete (0 slices)」并退出 0 —— 工具报告成功，
+      // 而产物根本没进目标分支。人会以为合完了，把时间花在下游上，
+      // 真正的问题（工作区脏）被一句「✅」盖住了。
+      //
+      // 更糟的是 `--push` 也会跟着跑 —— 推的是一条没变的分支。
+      return {
+        merged,
+        conflicts,
+        staleBase,
+        aborted: true,
+        abortReason: `目标工作区有未提交改动（${dirty.length} 项），已跳过合并`,
+      };
     }
   }
 

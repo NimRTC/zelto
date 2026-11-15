@@ -14,7 +14,7 @@ import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager } from './shared.js';
 import { SignManager } from '../../core/gate/sign.js';
 import { buildMergePlan } from './merge-plan.js';
-import { executeMergePlan, type MergeSliceInfo } from './merge-executor.js';
+import { executeMergePlan, branchExists, type MergeSliceInfo } from './merge-executor.js';
 import {
   collectMergeCandidates,
   commitPendingWorktrees,
@@ -285,6 +285,27 @@ register('merge', async (args) => {
     );
   }
 
+  // ── 两条路径的判据对齐（D-11 / ADR-059 §6）────────────────────
+  //
+  // 不带 id 的路径（`collectMergeCandidates`）会跳过「分支不存在」的切片。
+  // 带 id 的路径原先不查 —— 于是同一个切片，两条路径的处置不一致。
+  //
+  // 而且分支不存在时合并根本无从下手：计划会列出来，
+  // 执行阶段才发现合不了 —— 到那时已经跑了 `commitPendingWorktrees`（有副作用）。
+  //
+  // 所以在这里就拒掉，并说清楚是哪个切片缺分支。
+  const missingBranches = ids.filter((id) => !branchExists(`slice/${id}`, process.cwd()));
+  if (missingBranches.length > 0) {
+    console.error('❌ 以下切片没有对应的分支，无法合并：');
+    for (const id of missingBranches) {
+      console.error(`   - ${id}（缺分支 slice/${id}）`);
+    }
+    console.error('');
+    console.error('   分支通常在 `zelto run` 成功后创建。若切片已跑过，');
+    console.error('   先确认 worktree 还在：zelto slices');
+    return 1;
+  }
+
   // ADR-018 §3.2：分支必须先带上产物，否则合并进来的是空分支。
   await commitPendingWorktrees(ids);
 
@@ -370,7 +391,13 @@ register('merge', async (args) => {
 
   if (result.aborted) {
     console.log('');
-    console.log(`❌ Merge aborted — ${result.conflicts.length} slice(s) conflicted. The target branch was not modified.`);
+    // D-11：中止原因分两类 —— 冲突与「工作区脏」。排查方向完全不同，
+    // 而且「工作区脏」这条曾经被报成「✅ Merge complete」，是**假成功**。
+    if (result.abortReason) {
+      console.log(`❌ Merge aborted — ${result.abortReason}. The target branch was not modified.`);
+    } else {
+      console.log(`❌ Merge aborted — ${result.conflicts.length} slice(s) conflicted. The target branch was not modified.`);
+    }
     return 1;
   }
 
@@ -378,6 +405,13 @@ register('merge', async (args) => {
   await cleanupMergedSlices(result.merged, targetBranch);
 
   console.log('');
+  if (result.merged.length === 0) {
+    // 计划里有切片，但一个都没合进去 —— 这不是成功。
+    // 「✅ Merge complete (0 slices)」是假成功的话术（D-11）。
+    console.log(`⚠️  Merge finished but no slice was merged (${plan.phases.length} phases, 0 slices).`);
+    console.log(`   目标分支未被修改。`);
+    return 1;
+  }
   console.log(`✅ Merge complete (${plan.phases.length} phases, ${result.merged.length} slices)`);
 
   // ADR-018 §3.3：推送发生在合并之后，推的是合并结果。
