@@ -116,8 +116,18 @@ export function buildArchitectureReport(
   const allDeps = [...new Set(modules.flatMap((m) => m.dependencies))];
   const resolved = resolveDependencyNames(allDeps, modules, scan);
 
+  // ADR-065：**vendor 模块是外部边界，不是架构的一部分** ——
+  // 「用了第三方库」不是架构耦合，相关偏离一律不报。
+  //
+  // 具体说：
+  //   - A 声明依赖 vendor 模块 → 不报「缺失依赖」（第三方库当然存在）
+  //   - 代码里 A 依赖 vendor 模块 → 不报「未声明依赖」（那不是架构耦合）
+  const vendorModules = new Set(scan.vendorModules ?? []);
+
   const declaredPairs: Array<[string, string]> = [];
   for (const mod of modules) {
+    // vendor 模块自己的依赖声明不参与比对
+    if (vendorModules.has(mod.name)) continue;
     for (const dep of mod.dependencies) {
       const target = resolved.get(dep) ?? dep;
       if (!moduleNames.includes(target)) {
@@ -129,6 +139,8 @@ export function buildArchitectureReport(
         });
         continue;
       }
+      // 依赖目标是 vendor 模块 → 不是架构耦合，不比对
+      if (vendorModules.has(target)) continue;
       declaredPairs.push([mod.name, target]);
     }
   }
@@ -307,6 +319,8 @@ export function buildArchitectureReport(
       .filter((e) => e.from === mod.name)
       .map((e) => e.to)
       .sort(),
+    // ADR-065：vendor 模块标出来 —— 它的依赖不算架构耦合
+    ...(vendorModules.has(mod.name) ? { isVendor: true } : {}),
   }));
 
   // ─── 模块声明了但一个文件都没匹配上（ADR-062 §4.4）─────────────────────
@@ -318,6 +332,8 @@ export function buildArchitectureReport(
   // 不报出来的话，这个错误会一路飘到「依赖无法验证」里，
   // 人看到的是「src/dtls 验不了」，而真相是「src/dtls 根本不存在」。
   for (const mod of modules) {
+    // vendor 模块的文件被排除在归属之外 —— 它「0 个文件」是正常的
+    if (vendorModules.has(mod.name)) continue;
     const owned = (scan.moduleFiles.get(mod.name) ?? []).length;
     if (owned > 0) continue;
     deviations.push({
@@ -335,6 +351,8 @@ export function buildArchitectureReport(
     deviations,
     cycles,
     coverage: scan.coverage,
+    vendorDirs: scan.vendorDirs ?? [],
+    vendorModules: scan.vendorModules ?? [],
     // 「一致」= 没有任何硬偏离。软偏离（无法用 import 验证）不算不一致。
     ok: !deviations.some((d) => !SOFT_DEVIATIONS.has(d.kind)),
   };

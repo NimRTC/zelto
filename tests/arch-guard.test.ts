@@ -40,6 +40,9 @@ function makeReport(deviations: Deviation[]): ArchitectureReport {
     deviations,
     cycles: [],
     coverage: emptyCoverage(),
+    // ADR-065：vendor 边界（护栏判定不读，但类型要求有）
+    vendorDirs: [],
+    vendorModules: [],
     ok: false,
   };
 }
@@ -64,6 +67,8 @@ function emptyCoverage(): LangCoverage {
     unverifiableCodeFiles: 0,
     nonCodeFiles: 0,
     totalFiles: 0,
+    // ADR-065：vendor 文件数
+    vendorFiles: 0,
   };
 }
 

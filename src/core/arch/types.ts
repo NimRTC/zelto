@@ -163,6 +163,33 @@ export interface ScanResult {
    * 后者说「补判据或换工具」。
    */
   coverage: LangCoverage;
+  /**
+   * **vendor 目录**（外部代码的边界）—— ADR-065
+   *
+   * 相对项目根的路径前缀，如 `src/third_party`、`vendor`。
+   *
+   * 这些目录里是**引入的外部代码**，不是项目的架构。
+   * 它们的内部依赖结构不是人的设计决策，
+   * 把它们算进依赖图只会淹没真正的架构信号。
+   */
+  vendorDirs: string[];
+  /**
+   * vendor 目录里的文件（被排除在依赖图之外）
+   *
+   * 报告里要单独说清「有多少文件因为是 vendor 代码没参与验证」——
+   * 否则「已验证 N 个文件」会给人「整个项目都验过了」的错觉。
+   */
+  vendorFiles: string[];
+  /**
+   * **vendor 模块** —— 设计里声明了、但整个模块都是 vendor 目录的模块
+   *
+   * 真实项目里设计会写一个 `src/third_party` 模块，职责是「第三方库集成」。
+   * 这个模块**不是架构的一部分** —— 它是外部边界。
+   *
+   * 报告里要单独标出来：它的依赖不算「未声明依赖」，
+   * 它的文件数不算进「已验证」的总账。
+   */
+  vendorModules: string[];
 }
 
 /** 语言类别的可读名（报告用） */
@@ -206,6 +233,16 @@ export interface LangCoverage {
    * 总文件数
    */
   totalFiles: number;
+  /**
+   * vendor 目录里的文件数（ADR-065）
+   *
+   * 这些文件**没参与**依赖验证，但它们**不是**「这个工具没判据」——
+   * 它们是引入的外部代码，本来就不该算进架构。
+   *
+   * 单独计数是为了让报告能说清：
+   * 「已验证 47 个 C++ 文件（另有 4434 个在 vendor 目录里，不参与架构检查）」。
+   */
+  vendorFiles: number;
 }
 
 /** 偏离类型 */
@@ -251,6 +288,13 @@ export interface ArchitectureReport {
     verifiedFileCount: number;
     declaredDeps: string[];
     actualDeps: string[];
+    /**
+     * 这个模块是不是 **vendor 模块**（外部边界，不是架构的一部分）
+     *
+     * ADR-065：设计里常写一个 `src/third_party` 模块，职责是「第三方库集成」。
+     * 这个模块的依赖**不算**架构耦合。
+     */
+    isVendor?: boolean;
   }>;
   /** 设计里声明的依赖边 */
   declaredEdges: string[];
@@ -266,6 +310,16 @@ export interface ArchitectureReport {
    * 根本没被验证过的文件。
    */
   coverage: LangCoverage;
+  /**
+   * **vendor 目录**（ADR-065）—— 引入的外部代码的边界
+   *
+   * 报告里要单独说清：这些目录里的代码**没有参与**架构检查。
+   */
+  vendorDirs: string[];
+  /**
+   * **vendor 模块** —— 设计里声明的、但属于外部边界的模块
+   */
+  vendorModules: string[];
   /** 没有偏离为 true（软偏离不算） */
   ok: boolean;
 }

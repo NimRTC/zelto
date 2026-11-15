@@ -220,8 +220,10 @@ function renderReport(
       // 于是报告显示「14 个文件（0 源码）」，读起来像是
       // 「这个模块没有代码」。它有 14 个 `.cpp` / `.hpp`。
       const files = formatModuleFiles(mod.fileCount, mod.codeFileCount, mod.verifiedFileCount);
+      // ADR-065：vendor 模块标出来 —— 它是外部边界，不是架构的一部分
+      const vendorTag = mod.isVendor ? colors.dim('  [外部代码]') : '';
       out.push(
-        `    ${mod.name.padEnd(28)} ${files.padEnd(24)} 声明依赖: ${declared}  实际依赖: ${actual}`,
+        `    ${mod.name.padEnd(28)} ${files.padEnd(24)} 声明依赖: ${declared}  实际依赖: ${actual}${vendorTag}`,
       );
     }
   }
@@ -253,8 +255,12 @@ function renderReport(
   }
   if (coverage.unverifiableCodeFiles > 0) {
     out.push('');
+    // ADR-065：分母**排除** vendor 文件 ——
+    // 「只验证了 47/523 个文件」比「580/14439」诚实得多：
+    // 后者里 97% 是 vendor 代码，没参与验证也不该算进「没验过」。
+    const checkedTotal = coverage.totalFiles - coverage.vendorFiles;
     out.push(
-      `    ${colors.yellow('⚠')} 本次只验证了 ${coverage.verifiedFiles}/${coverage.totalFiles} 个文件的依赖关系。`,
+      `    ${colors.yellow('⚠')} 本次只验证了 ${coverage.verifiedFiles}/${checkedTotal} 个文件的依赖关系。`,
     );
     out.push(
       `      ${colors.dim(`${coverage.unverifiableCodeFiles} 个代码文件没有可用的依赖语义 —— 它们的依赖关系**没有被检查过**。`)}`,
@@ -262,6 +268,25 @@ function renderReport(
     out.push(
       `      ${colors.dim('上面的偏离只涉及已验证的部分；未验证部分的偏离本次查不出来。')}`,
     );
+  }
+  // ─── vendor 目录（ADR-065）────────────────────────────────────────────
+  //
+  // 这些目录里的代码**没有参与**架构检查 —— 但要**说清楚**，
+  // 否则「已验证 4481 个 C++ 文件」会给人「整个项目都验过了」的错觉。
+  if (report.vendorDirs.length > 0 || coverage.vendorFiles > 0) {
+    out.push('');
+    out.push(`  ${colors.bold('外部代码边界')}`);
+    for (const dir of report.vendorDirs) {
+      out.push(`    ${colors.dim('·')} ${colors.dim(dir)}`);
+    }
+    out.push(
+      `      ${colors.dim(`${coverage.vendorFiles} 个文件在 vendor 目录里 —— 引入的外部代码，不参与架构检查。`)}`,
+    );
+    if (report.vendorModules.length > 0) {
+      out.push(
+        `      ${colors.dim(`设计里的 vendor 模块：${report.vendorModules.join('、')} —— 它们的依赖不算架构耦合。`)}`,
+      );
+    }
   }
 
   // ─── 偏离 ────────────────────────────────────────────────────────────

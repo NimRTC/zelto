@@ -40,7 +40,13 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
       unverifiableCodeFiles: 0,
       nonCodeFiles: 0,
       totalFiles: 0,
+      // ADR-065：vendor 文件数
+      vendorFiles: 0,
     },
+    // ADR-065：vendor 边界
+    vendorDirs: [],
+    vendorFiles: [],
+    vendorModules: [],
   };
 }
 

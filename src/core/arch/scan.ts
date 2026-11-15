@@ -40,12 +40,26 @@ import type {
   ScannedFile,
 } from './types.js';
 
-/** 不扫的目录 */
+/**
+ * 不扫的目录
+ *
+ * `build` / `build2` / `build3` 这类**带序号的构建目录**要一起排除 ——
+ * 真实项目里有 `build2/`（CMake 的第二个构建树），
+ * 里面的 `CMakeFiles/CompilerIdC` 是编译器探测产物，
+ * 把它们算进「文件无归属」是纯噪音。
+ *
+ * 判据：目录名匹配 `build` + 数字后缀（`build`、`build2`、`build10`）。
+ */
 const SKIP_DIRS = new Set([
   'node_modules', '.git', '.zelto', 'dist', 'dist-test', 'build', 'out', 'coverage',
   '.next', '.nuxt', '__pycache__', '.venv', 'venv', 'target', '.cache', '.turbo',
   'worktrees', '.worktrees',
 ]);
+
+/** 是不是构建目录（`build` / `build2` / `build10` 这种带序号的） */
+function isBuildDir(name: string): boolean {
+  return /^build\d*$/.test(name);
+}
 
 /** 解析相对 import 时尝试的扩展名 */
 const RESOLVE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.py'];
@@ -78,7 +92,7 @@ export function collectAllFiles(root: string): string[] {
       return;
     }
     for (const entry of entries) {
-      if (SKIP_DIRS.has(entry)) continue;
+      if (SKIP_DIRS.has(entry) || isBuildDir(entry)) continue;
       const full = join(dir, entry);
       let isDir: boolean;
       try {
@@ -114,6 +128,87 @@ export function collectSourceFiles(root: string): string[] {
 const INCLUDE_ROOT_NAMES = new Set(['include', 'inc']);
 
 /**
+ * **vendor 目录**的目录名（ADR-065）
+ *
+ * 这些目录里放的是**引入的外部代码** —— 不是项目的架构。
+ *
+ * 真实项目实测（nimrtc-zelto）：`src/third_party` 里 11943 个文件、
+ * 4434 个代码文件，占全项目代码文件的 **97%**。
+ *
+ * 把它们算进依赖图的后果：
+ *   1. **淹没真正的信号** —— 5 条「未声明依赖 → src/third_party」
+ *      是噪音，掩盖了真正要看的偏离
+ *   2. **统计失真** —— 「已验证 4481 个 C++ 文件」听起来像整个项目都验过了，
+ *      实际上其中 97% 是 vendor 代码
+ *   3. **不是人的设计决策** —— opus 内部依赖 wolfssl，
+ *      这是 opus 的设计，不是这个项目的
+ *
+ * **但 vendor 代码本身仍要计入覆盖率**（见 `vendorFiles`）——
+ * 不然报告会说「这个项目只有 47 个 C++ 文件」，那更不真实。
+ */
+const VENDOR_DIR_NAMES = new Set([
+  'third_party',
+  'thirdparty',
+  'third-party',
+  'vendor',
+  'vendors',
+  'external',
+  'externals',
+  'deps',
+  '3rdparty',
+]);
+
+/**
+ * 发现项目里的 **vendor 目录**（相对项目根，正斜杠路径）。
+ *
+ * 判据是**目录名约定** —— 与 ADR-062 的 include 根同样的思路：
+ * 约定法只漏不错（漏了只是把 vendor 当普通模块，不产生假偏离）。
+ *
+ * **只认顶层的约定名**：`src/third_party` 认，
+ * `src/third_party/foo/src` 里再叫 `third_party` 的不认 ——
+ * 否则第三方库内部的目录结构也会被当成边界，规则就失控了。
+ */
+export function discoverVendorDirs(root: string): string[] {
+  const found = new Set<string>();
+
+  const walk = (dir: string, rel: string, depth: number): void => {
+    if (depth > 4) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry) || isBuildDir(entry)) continue;
+      const full = join(dir, entry);
+      let isDir: boolean;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      const childRel = rel ? `${rel}/${entry}` : entry;
+      if (VENDOR_DIR_NAMES.has(entry.toLowerCase())) {
+        found.add(childRel);
+        // vendor 目录**不再往下找** —— 第三方库内部的目录结构不是边界
+        continue;
+      }
+      walk(full, childRel, depth + 1);
+    }
+  };
+
+  walk(root, '', 0);
+  return [...found].sort();
+}
+
+/** 路径是否在某个 vendor 目录里 */
+export function isVendorPath(filePath: string, vendorDirs: string[]): boolean {
+  return vendorDirs.some((dir) => filePath === dir || filePath.startsWith(`${dir}/`));
+}
+
+/**
  * 发现项目里的 **include 根目录**（相对项目根，正斜杠路径）。
  *
  * ADR-062 §6：为什么用「约定」而不是解析 CMakeLists / BUILD？
@@ -145,7 +240,7 @@ export function discoverIncludeRoots(root: string): string[] {
       return;
     }
     for (const entry of entries) {
-      if (SKIP_DIRS.has(entry)) continue;
+      if (SKIP_DIRS.has(entry) || isBuildDir(entry)) continue;
       const full = join(dir, entry);
       let isDir: boolean;
       try {
@@ -233,6 +328,41 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   // 靠它才能解析到真实文件。
   const includeRoots = discoverIncludeRoots(root);
 
+  // vendor 目录（ADR-065）：引入的外部代码，不是项目的架构。
+  //
+  // **不扫它们的内部结构** —— 但**要计入覆盖率**（`vendorFiles`），
+  // 否则报告会说「这个项目只有 47 个 C++ 文件」，那更不真实。
+  const vendorDirs = discoverVendorDirs(root);
+  const vendorFiles = sourceFiles.filter((path) => isVendorPath(path, vendorDirs));
+  const projectSourceFiles = sourceFiles.filter((path) => !isVendorPath(path, vendorDirs));
+
+  /**
+   * **vendor 模块** —— 设计里声明了、但整个模块都是 vendor 目录的模块
+   *
+   * 判据：模块的**名字**本身就是 vendor 目录（或它的父目录），
+   * 或者模块声明的路径**全部**落在 vendor 目录里。
+   *
+   * 真实项目里设计会写 `### src/third_party`（职责：第三方库集成）。
+   * 这个模块是**外部边界**，不是架构的一部分：
+   *   - 别的模块依赖它 → 那是「用了第三方库」，不是架构耦合
+   *   - 它依赖别的模块 → 那是第三方库的设计，不是这个项目的
+   */
+  const vendorModules = modules
+    .filter((mod) => {
+      // 判据一：模块名落在 vendor 目录里（如 `src/third_party`）
+      if (isVendorPath(mod.name, vendorDirs)) return true;
+      // 判据二：模块声明的路径全部落在 vendor 目录里
+      if (mod.filePatterns.length === 0) return false;
+      return mod.filePatterns.every((pattern) => {
+        // 去掉 glob 后缀再比（`src/third_party/**/*` → `src/third_party`）
+        const bare = pattern.replace(/\/?\*+.*$/, '').replace(/\/$/, '');
+        return bare.length > 0 && isVendorPath(bare, vendorDirs);
+      });
+    })
+    .map((mod) => mod.name);
+
+  const vendorModuleSet = new Set(vendorModules);
+
   // ─── 第一遍：先定归属 ──────────────────────────────────────────────────
   // 归属必须先全部算完再算依赖 —— 否则「a 引用 b」这种边会因为
   // b 的文件还没扫到而被丢掉（文件是按字典序遍历的）。
@@ -249,6 +379,16 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
 
   for (const path of allFiles) {
     const lang = detectLang(path);
+
+    // ADR-065：vendor 文件**不参与模块图** ——
+    // 它的内部依赖不是这个项目的设计决策。
+    //
+    // 但它**仍然计入覆盖率**（`vendorFiles`）——
+    // 报告要能说清「多少文件没参与验证」，其中多少是 vendor。
+    if (isVendorPath(path, vendorDirs)) {
+      ownerOf.set(path, null);
+      continue;
+    }
 
     // 归属：命中的模块里，谁的**模式最具体**谁拿走这个文件。
     // 按声明顺序判会让 `src/core/**` 抢走 `src/core/audit/*.ts` 的文件，
@@ -367,6 +507,15 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
 
       if (!owner || !targetModule || owner === targetModule) continue;
 
+      // ADR-065：**vendor 模块不是架构的一部分** ——
+      // 「用了第三方库」不是架构耦合，不该进模块图。
+      //
+      // 目标侧是 vendor → 那是外部边界，不是项目内部的依赖
+      // 来源侧是 vendor → 那是第三方库内部的结构，不是这个项目的设计
+      const ownerIsVendor = vendorModuleSet.has(owner);
+      const targetIsVendor = vendorModuleSet.has(targetModule);
+      if (ownerIsVendor || targetIsVendor) continue;
+
       const key = `${owner}→${targetModule}`;
       const edge = edgeMap.get(key) ?? {
         from: owner,
@@ -423,7 +572,10 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     edges,
     unmapped,
     unresolved,
-    coverage: computeCoverage(allFiles, scanned),
+    coverage: computeCoverage(allFiles, scanned, vendorFiles),
+    vendorDirs,
+    vendorFiles,
+    vendorModules,
   };
 }
 
@@ -439,7 +591,11 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
  *   - **不产生依赖边的文件**（构建脚本 / 文档 / 配置）→ 这是**正常的**，
  *     混进「验不了」里会稀释掉真正重要的信息。
  */
-function computeCoverage(allFiles: string[], scanned: ScannedFile[]): LangCoverage {
+function computeCoverage(
+  allFiles: string[],
+  scanned: ScannedFile[],
+  vendorFiles: string[] = [],
+): LangCoverage {
   const counts = {} as Record<LangCategory, number>;
   // 注意：这里要**遍历数组本身**，不能用 `Object.keys(LANG_CATEGORY_KEYS)` ——
   // 那是数组的索引（"0".."9"），不是元素值。用错了会往 counts 里塞
@@ -448,7 +604,16 @@ function computeCoverage(allFiles: string[], scanned: ScannedFile[]): LangCovera
     counts[category] = 0;
   }
 
+  // ADR-065：vendor 文件**单独计数**，不混进各语言类别 ——
+  //
+  // 真实项目里 `src/third_party` 有 4434 个 C++ 文件，占全项目 C++ 的 97%。
+  // 混进「C / C++ 4481 个文件（依赖已验证）」里，读起来像
+  // 「这个项目的 C++ 代码验过了」—— 而实际上项目自己的 C++ 只有 47 个。
+  //
+  // 所以：各语言类别只数**项目自己的**文件，vendor 单独一行报。
+  const vendorSet = new Set(vendorFiles);
   for (const path of allFiles) {
+    if (vendorSet.has(path)) continue;
     const category = classifyLangCategory(path);
     counts[category] = (counts[category] ?? 0) + 1;
   }
@@ -476,6 +641,10 @@ function computeCoverage(allFiles: string[], scanned: ScannedFile[]): LangCovera
     unverifiableCodeFiles,
     nonCodeFiles,
     totalFiles: allFiles.length,
+    // ADR-065：vendor 文件**单独计数** ——
+    // 它们没参与验证，但它们**不是**「这个工具没判据」，
+    // 而是「这些是引入的外部代码，本来就不该算进架构」。
+    vendorFiles: vendorFiles.length,
   };
 }
 
