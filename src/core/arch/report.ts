@@ -146,22 +146,28 @@ export function buildArchitectureReport(
     // 实际上「代码里没有对应的 import」只是扫描器的盲区，
     // 不是架构问题。
     //
-    // 判据：目标模块的代码里，扫描器**读得懂**的比例够高吗？
+    // 判据：目标模块的**代码**里，扫描器**读得懂**的比例够高吗？
     // 比例低 → 这条依赖本来就不可能体现在 import 图里 →
     // 降为 unverifiable_dependency（软偏离，永不拦）。
-    const totalFiles = (scan.moduleFiles.get(to) ?? []).length;
-    const readableFiles = (scan.moduleCodeFiles.get(to) ?? []).length;
-    const readableRatio = totalFiles > 0 ? readableFiles / totalFiles : 1;
+    //
+    // ADR-061：分母是**代码文件数**，不是全部文件数。
+    //
+    // 原来的分母是 `moduleFiles`（全部文件，含文档/配置/构建脚本）。
+    // 一个模块里 80% 的文件是 README 和 CMakeLists.txt 时，
+    // 那个比例反映的是「文档多」，不是「代码读不懂」——
+    // 用它判断会把「代码读得懂」判成「读不懂」，
+    // 于是本该拦的 missing_dependency 被降级成软偏离。
+    const codeFiles = (scan.moduleCodeFiles.get(to) ?? []).length;
+    const verifiedFiles = (scan.moduleVerifiedFiles.get(to) ?? []).length;
+    // 没有代码文件 → 不是「读不懂」，是「没有代码可读」→ 不可验证
+    const readableRatio = codeFiles > 0 ? verifiedFiles / codeFiles : 0;
     const scannable = readableRatio >= 0.5;
 
     deviations.push({
       kind: targetHasCode && scannable ? 'missing_dependency' : 'unverifiable_dependency',
       from,
       to,
-      detail:
-        targetHasCode && scannable
-          ? '设计声明了依赖，代码里没有对应的 import'
-          : '目标模块没有源文件（契约 / 规格一类），无法用 import 验证',
+      detail: describeUnverifiable(targetHasCode, scannable, codeFiles, verifiedFiles),
     });
   }
 
@@ -215,7 +221,14 @@ export function buildArchitectureReport(
   const moduleSummaries = modules.map((mod) => ({
     name: mod.name,
     fileCount: (scan.moduleFiles.get(mod.name) ?? []).length,
+    // ADR-061：`codeFileCount` 数**所有**代码文件（不限语言），
+    // `verifiedFileCount` 数扫描器读得懂的。
+    //
+    // 原来只有一个字段，装的是「扫描器读得懂的文件」——
+    // 于是 C++ 模块在报告里显示「0 源码」。`.cpp` 就是源码，
+    // 只不过扫描器读不懂它的依赖语义。这两件事不能混。
     codeFileCount: (scan.moduleCodeFiles.get(mod.name) ?? []).length,
+    verifiedFileCount: (scan.moduleVerifiedFiles.get(mod.name) ?? []).length,
     declaredDeps: [
       ...new Set(
         mod.dependencies
@@ -240,6 +253,38 @@ export function buildArchitectureReport(
     // 「一致」= 没有任何硬偏离。软偏离（无法用 import 验证）不算不一致。
     ok: !deviations.some((d) => !SOFT_DEVIATIONS.has(d.kind)),
   };
+}
+
+/**
+ * 不可验证时的说明文案。
+ *
+ * ADR-061：原来只有一句话 ——「目标模块没有源文件（契约 / 规格一类），
+ * 无法用 import 验证」。但触发这条的原因有**三种**，排查方向完全不同：
+ *
+ *   1. 目标模块**根本没有代码** —— 契约/规格一类，确实无从验证
+ *   2. 目标模块**有代码，但扫描器读不懂** —— C++ / Go / Rust 项目
+ *      （`#include` / `use` 的语义还没实现）
+ *   3. 目标模块**有代码，也读得懂**，但读懂的比例低于 0.5
+ *
+ * 把三种混成一句话，等于让人对着错误的方向排查 ——
+ * 看到「没有源文件」会去找「是不是漏写了」，而真相是「语言不支持」。
+ */
+function describeUnverifiable(
+  targetHasCode: boolean,
+  scannable: boolean,
+  codeFiles: number,
+  verifiedFiles: number,
+): string {
+  if (targetHasCode && scannable) {
+    return '设计声明了依赖，代码里没有对应的 import';
+  }
+  if (!targetHasCode) {
+    return '目标模块没有代码文件（契约 / 规格一类），无法用 import 验证';
+  }
+  if (verifiedFiles === 0) {
+    return `目标模块有 ${codeFiles} 个代码文件，但扫描器读不懂它们（暂只支持 TypeScript / JavaScript 与 Python），无法用 import 验证`;
+  }
+  return `目标模块的 ${codeFiles} 个代码文件里只有 ${verifiedFiles} 个是扫描器读得懂的，未达到 0.5 的可读比例，无法用 import 验证`;
 }
 
 /**

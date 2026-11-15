@@ -8,6 +8,7 @@ export {
   classifyPythonSpecifier,
   classifySpecifier,
   detectLang,
+  isCodeLangCategory,
   isVerifiableLang,
   matchModuleBySpecifier,
   parseImports,

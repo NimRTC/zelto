@@ -115,6 +115,33 @@ function deviationColor(kind: string): (s: string) => string {
 }
 
 /**
+ * 模块概况里的文件数描述。
+ *
+ * ADR-061：三个数字分清三件事 ——
+ *   文件总数   —— 这个模块负责多少文件
+ *   代码文件数 —— 其中多少是**代码**（不限语言）
+ *   已验证数   —— 其中多少是扫描器读得懂的
+ *
+ * 关键是别把「代码文件数」写成「源码数」而只装扫描器读得懂的文件 ——
+ * 那样 C++ 模块会显示「0 源码」，读起来像「这个模块没有代码」。
+ */
+function formatModuleFiles(fileCount: number, codeFileCount: number, verifiedFileCount: number): string {
+  if (fileCount === 0) return '0 个文件';
+  if (codeFileCount === fileCount && verifiedFileCount === codeFileCount) {
+    return `${fileCount} 个文件`;
+  }
+  if (codeFileCount === fileCount) {
+    // 全是代码，但一部分验不了
+    return `${fileCount} 个文件（${verifiedFileCount} 已验证）`;
+  }
+  if (verifiedFileCount === codeFileCount) {
+    // 代码都验得了，其余是文档/配置/构建脚本
+    return `${fileCount} 个文件（${codeFileCount} 代码）`;
+  }
+  return `${fileCount} 个文件（${codeFileCount} 代码 / ${verifiedFileCount} 已验证）`;
+}
+
+/**
  * 这些语言类别是「代码」—— 它们的依赖关系**本该**被验证。
  *
  * 与之相对的是构建脚本 / 文档 / 配置 —— 那些文件不产生依赖边，
@@ -177,12 +204,16 @@ function renderReport(
     for (const mod of report.modules) {
       const declared = mod.declaredDeps.length > 0 ? mod.declaredDeps.join(', ') : '—';
       const actual = mod.actualDeps.length > 0 ? mod.actualDeps.join(', ') : '—';
-      const files =
-        mod.codeFileCount === mod.fileCount
-          ? `${mod.fileCount} 个文件`
-          : `${mod.fileCount} 个文件（${mod.codeFileCount} 源码）`;
+      // ADR-061：三个数字分清三件事 ——
+      //   文件总数 / 代码文件数 / 已验证文件数
+      //
+      // 原来只显示「N 个文件（M 源码）」，而那个 M 是
+      // 「扫描器读得懂的文件数」—— C++ 项目里恒为 0，
+      // 于是报告显示「14 个文件（0 源码）」，读起来像是
+      // 「这个模块没有代码」。它有 14 个 `.cpp` / `.hpp`。
+      const files = formatModuleFiles(mod.fileCount, mod.codeFileCount, mod.verifiedFileCount);
       out.push(
-        `    ${mod.name.padEnd(28)} ${files.padEnd(20)} 声明依赖: ${declared}  实际依赖: ${actual}`,
+        `    ${mod.name.padEnd(28)} ${files.padEnd(24)} 声明依赖: ${declared}  实际依赖: ${actual}`,
       );
     }
   }

@@ -153,6 +153,27 @@ export function isVerifiableLang(category: LangCategory): boolean {
 }
 
 /**
+ * 这个语言类别**是不是「代码」** —— 它的依赖关系本该被验证。
+ *
+ * 与之相对的是构建脚本 / 文档 / 配置 —— 那些文件不产生依赖边，
+ * 「没验」是正常的，不该混进「验不了」的警告里稀释掉重点。
+ *
+ * ADR-061：模块概况里的「代码文件数」用它判定 ——
+ * `.cpp` / `.hpp` 是代码（扫描器只是读不懂），
+ * `README.md` / `config.json` 不是代码。
+ */
+export function isCodeLangCategory(category: LangCategory): boolean {
+  return (
+    category === 'typescript' ||
+    category === 'python' ||
+    category === 'cpp' ||
+    category === 'go' ||
+    category === 'rust' ||
+    category === 'java'
+  );
+}
+
+/**
  * 抽出源码里的 import 说明符。
  *
  * TS/JS 覆盖：import ... from 'x'、import 'x'、export ... from 'x'、

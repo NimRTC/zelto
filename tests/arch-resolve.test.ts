@@ -18,6 +18,7 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
     files: [],
     moduleFiles: new Map(Object.entries(moduleFiles)),
     moduleCodeFiles: new Map(),
+    moduleVerifiedFiles: new Map(),
     edges: [],
     unmapped: [],
     unresolved: [],

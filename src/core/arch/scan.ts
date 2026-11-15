@@ -20,6 +20,7 @@ import { pathMatches } from '../sched/paths.js';
 import {
   classifyLangCategory,
   detectLang,
+  isCodeLangCategory,
   isVerifiableLang,
   matchModuleBySpecifier,
   parseImports,
@@ -121,9 +122,11 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   const scanned: ScannedFile[] = [];
   const moduleFiles = new Map<string, string[]>();
   const moduleCodeFiles = new Map<string, string[]>();
+  const moduleVerifiedFiles = new Map<string, string[]>();
   for (const mod of modules) {
     moduleFiles.set(mod.name, []);
     moduleCodeFiles.set(mod.name, []);
+    moduleVerifiedFiles.set(mod.name, []);
   }
 
   for (const path of allFiles) {
@@ -160,9 +163,23 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     }
 
     ownerOf.set(path, owner);
+
+    // 「代码文件」与「已验证文件」分开记（ADR-061）。
+    //
+    // 原来只有一个 `moduleCodeFiles`，装的是扫描器读得懂的文件 ——
+    // 于是 C++ 模块在报告里显示「0 源码」。`.cpp` / `.hpp` 就是源码，
+    // 只不过扫描器读不懂它的依赖语义。
+    //
+    // 现在：
+    //   moduleCodeFiles     —— 所有代码文件（不限语言）
+    //   moduleVerifiedFiles —— 扫描器读得懂的（参与了 import 图）
+    const category = classifyLangCategory(path);
+    const isCode = isCodeLangCategory(category);
+    if (isCode && owner) moduleCodeFiles.get(owner)?.push(path);
+
     if (lang) {
       scanned.push({ path, lang, module: owner, ambiguousWith });
-      if (owner) moduleCodeFiles.get(owner)?.push(path);
+      if (owner) moduleVerifiedFiles.get(owner)?.push(path);
     }
     if (owner) {
       moduleFiles.get(owner)?.push(path);
@@ -232,6 +249,7 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     files: scanned,
     moduleFiles,
     moduleCodeFiles,
+    moduleVerifiedFiles,
     edges,
     unmapped,
     unresolved,
@@ -291,7 +309,8 @@ function computeCoverage(allFiles: string[], scanned: ScannedFile[]): LangCovera
   };
 }
 
-/** 全部语言类别（顺序即报告里的顺序） */
+/**
+ * 全部语言类别（顺序即报告里的顺序） */
 const LANG_CATEGORY_KEYS: LangCategory[] = [
   'typescript',
   'python',
@@ -304,18 +323,6 @@ const LANG_CATEGORY_KEYS: LangCategory[] = [
   'config',
   'other',
 ];
-
-/** 这些类别是「代码」—— 它们的依赖关系本该被验证 */
-function isCodeLangCategory(category: LangCategory): boolean {
-  return (
-    category === 'typescript' ||
-    category === 'python' ||
-    category === 'cpp' ||
-    category === 'go' ||
-    category === 'rust' ||
-    category === 'java'
-  );
-}
 
 /**
  * 解析相对 import 指向的文件。

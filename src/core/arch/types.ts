@@ -76,8 +76,23 @@ export interface ScanResult {
   files: ScannedFile[];
   /** 模块名 → 该模块负责的全部文件（含契约、规格等非源文件） */
   moduleFiles: Map<string, string[]>;
-  /** 模块名 → 该模块负责的源文件 */
+  /**
+   * 模块名 → 该模块负责的**代码文件**（不限语言）
+   *
+   * ADR-061：这里原先只放扫描器读得懂的文件（TS/JS/Python），
+   * 于是 C++ 模块在报告里显示「0 源码」—— 而它明明有几十个 `.cpp`。
+   *
+   * 「源码」和「扫描器读得懂的源码」是**两件事**，
+   * 报告里要用两个字段分别表达。
+   */
   moduleCodeFiles: Map<string, string[]>;
+  /**
+   * 模块名 → 该模块里**已验证**（扫描器读得懂、参与了 import 图）的文件
+   *
+   * ADR-061 新增。`moduleCodeFiles.length - moduleVerifiedFiles.length`
+   * 就是这个模块「有代码但没验过」的部分。
+   */
+  moduleVerifiedFiles: Map<string, string[]>;
   /** 模块之间的实际依赖边 */
   edges: ModuleEdge[];
   /** 没有模块认领的源文件 */
@@ -165,8 +180,20 @@ export interface ArchitectureReport {
     name: string;
     /** 负责的文件总数 */
     fileCount: number;
-    /** 负责的源文件数 */
+    /**
+     * 负责的**代码文件**数（不限语言）
+     *
+     * ADR-061：原先这个字段只数扫描器读得懂的文件，
+     * 于是 C++ 模块显示「0 源码」。`.cpp` / `.hpp` 就是源码，
+     * 只不过扫描器读不懂。
+     */
     codeFileCount: number;
+    /**
+     * 负责的**已验证**文件数（扫描器读得懂、参与了 import 图）
+     *
+     * `codeFileCount - verifiedFileCount` = 有代码但没验过的部分。
+     */
+    verifiedFileCount: number;
     declaredDeps: string[];
     actualDeps: string[];
   }>;
