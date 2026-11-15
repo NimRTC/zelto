@@ -376,13 +376,42 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
       };
       if (!edge.files.includes(path)) edge.files.push(path);
       if (!edge.specifiers.includes(ref.specifier)) edge.specifiers.push(ref.specifier);
+
+      // ADR-064：条件编译的边**仍然算依赖**（开启特性时它就在），
+      // 但要记下条件 —— 报告里能说清「这条边只在开启 X 时存在」。
+      //
+      // 区分两种情况：
+      //   - 边同时有无条件的和条件的来源 → 不是「条件边」
+      //   - 边**只有**条件来源 → 「条件边」（conditionalOnly）
+      if (ref.cppCondition) {
+        edge.conditions ??= [];
+        if (!edge.conditions.includes(ref.cppCondition)) {
+          edge.conditions.push(ref.cppCondition);
+        }
+        edge.conditionalSources = (edge.conditionalSources ?? 0) + 1;
+      } else {
+        edge.unconditionalSources = (edge.unconditionalSources ?? 0) + 1;
+      }
+
       edgeMap.set(key, edge);
     }
   }
 
-  const edges = [...edgeMap.values()].sort(
-    (a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to),
-  );
+  const edges = [...edgeMap.values()]
+    .map((e): ModuleEdge => {
+      // 只有条件来源、且确实没有无条件来源 → 条件边
+      const hasUnconditional = (e.unconditionalSources ?? 0) > 0;
+      const hasConditional = (e.conditionalSources ?? 0) > 0;
+      if (hasConditional && !hasUnconditional) {
+        return { ...e, conditionalOnly: true };
+      }
+      if (hasConditional && hasUnconditional) {
+        // 混合边：整体不是条件边，但记下条件供参考
+        return { ...e, conditionalOnly: false };
+      }
+      return e;
+    })
+    .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
 
   const unmapped = scanned.filter((f) => f.module === null).map((f) => f.path);
 

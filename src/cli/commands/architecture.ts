@@ -105,6 +105,7 @@ const DEVIATION_LABEL: Record<string, string> = {
   unknown_module: '未知模块',
   unverifiable_dependency: '依赖无法验证',
   empty_module: '模块无文件',
+  conditional_dependency: '条件依赖',
   cycle: '依赖成环',
 };
 
@@ -115,6 +116,9 @@ function deviationColor(kind: string): (s: string) => string {
   // empty_module 是**设计侧**的问题（路径写错了）——
   // 用 yellow 而不是 dim：它需要人处理，但不该像 cycle 那样刺眼。
   if (kind === 'empty_module') return colors.yellow;
+  // conditional_dependency 是**提示**（这条边随构建配置变）——
+  // dim：它不是问题，只是让人知道真相。
+  if (kind === 'conditional_dependency') return colors.dim;
   return colors.dim;
 }
 

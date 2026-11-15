@@ -224,22 +224,112 @@ export function parseImports(source: string, lang: SourceLang): ImportRef[] {
  * 解析顺序的差别仍然要保留：
  *   - `""`：当前目录 → include 根
  *   - `<>`：include 根（**跳过当前目录**）
+ *
+ * ADR-064：**条件编译**里的 include 也会被解析，但要**标记**条件。
+ *
+ * **为什么条件边仍算依赖**：条件编译不是「这段代码不存在」，
+ * 而是「这段代码**在某些构建配置下**存在」。开启那个特性时，
+ * 这条依赖就在 —— 设计该声明就得声明。
+ * 所以条件边**不隐藏**，只标记（`cppCondition`），
+ * 让报告能说「这条边只在开启 X 时存在」。
+ *
+ * **include 守卫不是条件**：
+ *
+ * ```cpp
+ * #ifndef NIMRTC_ENGINE_ENGINE_HPP
+ * #define NIMRTC_ENGINE_ENGINE_HPP
+ * #include <chrono>     ← 一直生效，不是条件依赖
+ * #endif
+ * ```
+ *
+ * 守卫**永远为真**（下一行就把宏定义了）。把它当条件，
+ * 会把绝大多数头文件里的 include 都标成「条件依赖」——
+ * 真实项目实测：431 条 include 在守卫内，249 条在真条件内。
+ * 不区分的话，标记就全是噪音。
  */
 function parseCppIncludes(source: string): ImportRef[] {
   const refs: ImportRef[] = [];
   const pattern = /^[ \t]*#[ \t]*include[ \t]*([<"])([^>"]+)[>"]/gm;
+
+  // 先找出所有条件编译块 —— include 再逐条比对落在哪些块里
+  const blocks = findCppConditionalBlocks(source);
+
   for (const match of source.matchAll(pattern)) {
     const specifier = match[2];
     if (!specifier) continue;
+
+    const line = lineOf(source, match.index ?? 0);
+
+    // 落在真条件块里（守卫不算 —— 守卫永远为真）
+    const active = blocks.filter(
+      (b) => !b.isGuard && b.startLine < line && line < b.endLine,
+    );
+
     refs.push({
       specifier,
       // 两种都要解析 —— 尖括号也可能是项目内部头文件（见上）
       kind: 'relative',
       cppBracket: match[1] as '<' | '"',
-      line: lineOf(source, match.index ?? 0),
+      line,
+      ...(active.length > 0
+        ? { cppCondition: active.map((b) => b.condition).join(' && ') }
+        : {}),
     });
   }
+
   return dedupe(refs);
+}
+
+/**
+ * 找出源码里所有条件编译块的范围。
+ *
+ * 判据（确定性）：
+ *   - `#ifndef X` **紧跟** `#define X` → **include 守卫**（永远为真）
+ *   - `#ifdef X` / `#ifndef X` 单独出现 → **真条件编译**
+ *   - `#if <表达式>` → 真条件编译
+ *
+ * 嵌套的 `#if` 也要管 —— 守卫可以套在真条件里（反过来也行）。
+ */
+export function findCppConditionalBlocks(
+  source: string,
+): Array<{ startLine: number; endLine: number; condition: string; isGuard: boolean }> {
+  const lines = source.split('\n');
+  const stack: Array<{ startLine: number; condition: string; isGuard: boolean }> = [];
+  const blocks: Array<{ startLine: number; endLine: number; condition: string; isGuard: boolean }> = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+
+    const ifndef = t.match(/^#\s*ifndef\s+(\w+)/);
+    const ifdef = t.match(/^#\s*ifdef\s+(\w+)/);
+    const ifMatch = t.match(/^#\s*if\s+(.+)$/);
+
+    if (ifndef || ifdef || ifMatch) {
+      const condition = ifndef ? ifndef[1] : ifdef ? ifdef[1] : ifMatch![1].trim();
+      // include 守卫：`#ifndef X` 紧跟 `#define X`
+      let isGuard = false;
+      if (ifndef) {
+        const next = (lines[i + 1] ?? '').trim();
+        isGuard = new RegExp(`^#\\s*define\\s+${ifndef[1]}\\b`).test(next);
+      }
+      stack.push({ startLine: i + 1, condition, isGuard });
+      continue;
+    }
+
+    if (/^#\s*endif\b/.test(t)) {
+      const top = stack.pop();
+      if (top) {
+        blocks.push({
+          startLine: top.startLine,
+          endLine: i + 1,
+          condition: top.condition,
+          isGuard: top.isGuard,
+        });
+      }
+    }
+  }
+
+  return blocks;
 }
 
 function parseTsImports(source: string): ImportRef[] {  const refs: ImportRef[] = [];

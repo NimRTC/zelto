@@ -64,6 +64,20 @@ export interface ImportRef {
    * 所以这不是「内部 vs 外部」的标记，只影响搜索顺序。
    */
   cppBracket?: '<' | '"';
+  /**
+   * C/C++ 专有：这条 include 处在**真条件编译**块里
+   *
+   * 值是条件表达式（如 `defined(_WIN32)`、
+   * `defined(NIMRTC_PLUGINS_AMF_ON) && defined(_WIN32)`）。
+   * 没条件时是 undefined。
+   *
+   * **include 守卫不算条件** —— `#ifndef FOO_HPP` / `#define FOO_HPP`
+   * 永远为真，里面的 include 一直生效。守卫不标这里。
+   *
+   * ADR-064：条件编译里的 include **仍然是真依赖** ——
+   * 开启那个特性时它就在。所以这里只**标记**，不隐藏。
+   */
+  cppCondition?: string;
 }
 
 /** 扫出来的一个源文件 */
@@ -85,6 +99,28 @@ export interface ModuleEdge {
   files: string[];
   /** 涉及的说明符 */
   specifiers: string[];
+  /**
+   * 这条边**只**由条件编译产生吗？
+   *
+   * true  = 开启对应特性时才有这条边（其它构建配置下不存在）
+   * false = 无条件就有这条边
+   * undefined = 边里没有条件编译的成分（TS / Python —— 无条件编译概念）
+   *
+   * ADR-064：条件边**仍然是依赖** —— 开启特性时它就在，
+   * 设计该声明就得声明。所以这里只标记，报告里给个提示，
+   * 不当违规。
+   */
+  conditionalOnly?: boolean;
+  /** 条件边的条件表达式（去重后） */
+  conditions?: string[];
+  /**
+   * 内部计数：这条边有多少来源是**无条件**的 / **有条件**的
+   *
+   * 判定 `conditionalOnly` 用它们 —— 一条边可能同时有两类来源
+   *（比如某个头文件无条件 include 了 A，另一个文件在 `#ifdef` 里 include 了 A）。
+   */
+  unconditionalSources?: number;
+  conditionalSources?: number;
 }
 
 /** 扫描结果 */
@@ -181,6 +217,7 @@ export type DeviationKind =
   | 'unknown_module'            // 依赖指向的模块在设计里根本不存在
   | 'unverifiable_dependency'   // 目标模块没有源文件，无法用 import 验证
   | 'empty_module'              // 模块声明了，但一个文件都没匹配上（ADR-062 §4.4）
+  | 'conditional_dependency'    // 这条依赖只在条件编译下存在（ADR-064）
   | 'cycle';                    // 实际依赖成环
 
 /** 一条偏离 */

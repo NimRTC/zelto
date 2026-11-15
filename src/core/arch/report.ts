@@ -55,8 +55,17 @@ import type {
  * 模块声明了但一个文件都没匹配上，这是**设计侧的问题**
  * （文件路径写错了 / 目录还没建），不是代码违反了架构。
  * 硬拦会挡住「设计还没写完」的正常推进。
+ *
+ * ADR-064：`conditional_dependency` 也是软偏离 ——
+ * 这条边只在条件编译下存在。它**仍然是依赖**（开启特性时就在），
+ * 所以该声明还得声明；但它不构成「代码违反了架构」——
+ * 它只是让人知道「这条边会随构建配置变」。
  */
-const SOFT_DEVIATIONS = new Set<DeviationKind>(['unverifiable_dependency', 'empty_module']);
+const SOFT_DEVIATIONS = new Set<DeviationKind>([
+  'unverifiable_dependency',
+  'empty_module',
+  'conditional_dependency',
+]);
 
 /**
  * 生成架构报告。
@@ -229,6 +238,49 @@ export function buildArchitectureReport(
       to: cycle.join(' → '),
       detail: `实际依赖成环：${cycle.join(' → ')}`,
     });
+  }
+
+  // ─── 条件编译产生的依赖（ADR-064）──────────────────────────────────────
+  //
+  // **条件边仍然是依赖** —— 开启那个特性时它就在，设计该声明就得声明。
+  // 所以这里**不报「未声明依赖」**，只提示一句「这条边有条件成分」。
+  //
+  // 为什么值得单独说：
+  //   1. 读者看到一条边时，会默认「所有构建配置下都有这条边」。
+  //      条件成分打破了这个默认 —— 换一套构建配置，依赖图就变了。
+  //   2. 条件边是**特性开关的痕迹** —— 比如「h264 模块依赖 plugins，
+  //      但有一部分只在开了 AMF/DXVA/QSV 时才这样依赖」。
+  //
+  // 分两种情况说清楚：
+  //   - **纯条件**：整条边都来自条件编译 —— 换构建配置这条边会消失
+  //   - **混合**：边有无条件来源，也有条件来源 —— 边一直在，但有额外的条件路径
+  //
+  // **软偏离**：它不违反任何设计约束，只是让人知道真相。
+  for (const edge of crossEdges) {
+    const hasConditional = (edge.conditionalSources ?? 0) > 0;
+    if (!hasConditional) continue;
+    const conditions = edge.conditions ?? [];
+    const condText = conditions.length > 0 ? conditions.join('、') : '未知条件';
+
+    if (edge.conditionalOnly) {
+      deviations.push({
+        kind: 'conditional_dependency',
+        from: edge.from,
+        to: edge.to,
+        detail:
+          `这条依赖**只在条件编译下存在**（${condText}）—— ` +
+          `关闭对应特性时这条边不存在（${edge.files.slice(0, 2).join(', ')}${edge.files.length > 2 ? ' …' : ''}）`,
+      });
+    } else {
+      deviations.push({
+        kind: 'conditional_dependency',
+        from: edge.from,
+        to: edge.to,
+        detail:
+          `这条依赖有**条件成分**（${condText}）—— ` +
+          `依赖本身一直存在，但有 ${edge.conditionalSources} 处来源只在特定构建配置下生效`,
+      });
+    }
   }
 
   // ─── 每个模块的概况 ────────────────────────────────────────────────────
