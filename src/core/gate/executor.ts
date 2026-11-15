@@ -12,6 +12,7 @@ import {
   DEFAULT_ACCEPTANCE_BUILD_DIR,
   DEFAULT_ACCEPTANCE_COMMAND,
   buildAcceptanceCommand,
+  classifyAcceptanceFailure,
   missingTargetOutcome,
   parseTestRunnerStats,
   resolveAcceptance,
@@ -285,13 +286,27 @@ export class GateExecutor {
 
     // 退出码 0 不等于「验收通过」：全是 todo/skip 的验收文件也会退出 0
     // （ADR-034 的验收骨架就是这么写的）。这里补一层「真跑过用例」的判定。
+    const stats = parseTestRunnerStats(`${result.stdout}\n${result.stderr}`);
     if (outcome.status === 'passed') {
-      const stats = parseTestRunnerStats(`${result.stdout}\n${result.stderr}`);
       const verdict = verifyAcceptanceRanTests(stats);
       if (!verdict.ok && verdict.reason) {
         outcome.status = 'failed';
-        outcome.reason = verdict.reason;
+        // D-8：把失败类别写进 reason —— 「没写断言」与「断言写错了」
+        // 的修法完全不同（前者要写测试，后者要改实现）。
+        const label =
+          verdict.kind === 'no-assertions'
+            ? '验收文件里全是 test.todo 占位符 —— 一条断言都没写'
+            : verdict.kind === 'all-skipped'
+              ? '验收用例全部被跳过 —— 一条断言都没执行'
+              : '验收文件是空的 —— 一条断言都没有';
+        outcome.reason = `【${label}】\n${verdict.reason}`;
       }
+    } else {
+      // D-8：命令失败也要分类 —— 「断言不成立」与「命令跑不起来」
+      // 指向完全不同的排查方向。
+      const failure = classifyAcceptanceFailure(stats);
+      const detail = outcome.reason ?? '';
+      outcome.reason = `【${failure.label}】\n${detail}`;
     }
 
     await this.appendEvent(slice.id, 'gate.result', actor, {

@@ -121,6 +121,64 @@ export function hashSpecFile(specPath: string): string | null {
   }
 }
 
+// ─── Option Parsing ──────────────────────────────────────────────────────────
+
+/**
+ * 读取一个「带值选项」的值。
+ *
+ * 为什么需要这个（实测缺陷 D-2）：
+ *
+ *   `args.includes('--agent') ? args[args.indexOf('--agent') + 1] : fallback`
+ *
+ * 这种写法在 `--agent` 是**最后一个参数**时，`args[index + 1]` 是
+ * `undefined` —— 值没给，却把 `undefined` 当成了「用户指定的值」传下去。
+ * 后果是 `Agent: undefined` 被打印出来，`checkAgentAvailable(undefined)`
+ * 拿着 undefined 去检查，而真正的兜底（配置里的默认 agent）根本没被用上。
+ *
+ * 演练里之所以没炸，是因为 `createExecutorAdapter` 对 undefined 又兜了一层
+ * 回退到 `cfg.agent.command` —— **兜底掩盖了 bug**，征兆只剩日志里的
+ * `Agent: undefined`。
+ *
+ * 本函数的口径：
+ * - 选项不存在 → 返回 fallback
+ * - 选项存在但**后面没有值** → 返回 fallback（并让调用方能识别出「值缺失」）
+ * - 选项存在且有值 → 返回该值
+ *
+ * @param args 参数数组
+ * @param name 选项名（如 `--agent`）
+ * @param fallback 选项缺失时的回退值
+ */
+export function optionValue(
+  args: string[],
+  name: string,
+  fallback: string,
+): string {
+  const idx = args.indexOf(name);
+  if (idx < 0) return fallback;
+  const value = args[idx + 1];
+  // 值缺失，或下一个 token 其实是另一个选项 → 当没给
+  if (value === undefined || value.startsWith('--')) return fallback;
+  return value;
+}
+
+/**
+ * `optionValue` 的「严格」变体：选项给了但没值时返回 null。
+ *
+ * 用于「值缺失要报错」的场景 —— 比如 `--agent` 给了名字但后面是别的选项，
+ * 人多半是想传名字，只是打漏了；这时静默回退到默认 agent 会让人以为
+ * 自己指定生效了。
+ */
+export function optionValueStrict(
+  args: string[],
+  name: string,
+): string | undefined {
+  const idx = args.indexOf(name);
+  if (idx < 0) return undefined;
+  const value = args[idx + 1];
+  if (value === undefined || value.startsWith('--')) return undefined;
+  return value;
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 export interface ZeltoConfig {

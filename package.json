@@ -14,7 +14,7 @@
     "zelto-hook": "dist/hook/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/clean-dist.mjs && tsc",
     "check:encoding": "node scripts/check-encoding.mjs",
     "check:credentials": "node scripts/scan-credentials.mjs",
     "dev": "tsc --watch",

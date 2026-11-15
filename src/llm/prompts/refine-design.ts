@@ -1,4 +1,4 @@
-// Design refinement prompt template — for iterative multi-turn editing
+﻿// Design refinement prompt template — for iterative multi-turn editing
 
 export const REFINE_DESIGN_PROMPT = `你是一个高级软件架构师。用户正在迭代完善一份技术设计文档。
 
@@ -14,7 +14,10 @@ export const REFINE_DESIGN_PROMPT = `你是一个高级软件架构师。用户�
 
 请按以下格式输出完整的更新版（不要只输出改动部分）：
 
-# 设计标题
+# <设计标题>
+
+（上面的「<设计标题>」是一份**占位符**，请替换成这份设计真正的标题 ——
+  根据内容归纳一个具体标题，不要原样保留占位符文字。）
 
 ## 技术选型
 - 语言/框架

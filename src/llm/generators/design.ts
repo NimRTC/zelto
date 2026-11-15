@@ -5,6 +5,7 @@ import type { DesignDoc } from '../../core/design/types.js';
 import { parseDesignModules } from '../../core/design/parse.js';
 import { DESIGN_PROMPT } from '../prompts/design.js';
 import { REFINE_DESIGN_PROMPT } from '../prompts/refine-design.js';
+import { isPlaceholderTitle, fallbackTitleFrom } from './placeholder-title.js';
 
 export async function generateDesign(
   llm: LlmAdapter,
@@ -56,7 +57,22 @@ function parseDesignResponse(
 ): Pick<DesignDoc, 'title' | 'body' | 'modules'> {
   // Extract title
   const titleMatch = content.match(/^#\s+(.+)/m);
-  const title = titleMatch ? titleMatch[1].trim() : 'Untitled Design';
+  const rawTitle = titleMatch ? titleMatch[1].trim() : '';
+
+  // D-3：占位符标题不算标题（模型有时会原样照抄提示词模板的「# 设计标题」）。
+  //
+  // 与需求侧同口径：
+  // - 有 heading 且不是占位符 → 用它
+  // - 有 heading 但内容是占位符 → 从正文里捞一句像标题的话顶上
+  // - 根本没有 heading → 承认没标题（'Untitled Design'）
+  let title = '';
+  if (titleMatch && !isPlaceholderTitle(rawTitle)) {
+    title = rawTitle;
+  } else if (titleMatch) {
+    title = fallbackTitleFrom(content) ?? 'Untitled Design';
+  } else {
+    title = 'Untitled Design';
+  }
 
   // 模块声明的解析口径与「项目基线设计」那条路径共用一份（core/design/parse.ts）
   const modules = parseDesignModules(content);

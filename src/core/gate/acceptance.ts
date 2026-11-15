@@ -303,10 +303,15 @@ export function parseTestRunnerStats(output: string): AcceptanceRunStats {
  * 「一个用例都没跑」当成「验收通过」。骨架存在 ≠ 验收通过。
  *
  * 判定只有一条：**没有任何一条用例真正执行过** → 没验证。
+ *
+ * 失败分类（D-8）：门禁②的失败信息要能区分「没写断言」与「断言写错了」——
+ * 两者的修法完全不同（前者要写测试，后者要改实现）。
  */
 export function verifyAcceptanceRanTests(stats: AcceptanceRunStats): {
   ok: boolean;
   reason: string | null;
+  /** 失败类别，供上层区分呈现 */
+  kind?: 'no-assertions' | 'all-skipped' | 'empty';
 } {
   if (!stats.known) {
     return { ok: true, reason: null }; // 读不出统计 → 不做判断
@@ -319,12 +324,42 @@ export function verifyAcceptanceRanTests(stats: AcceptanceRunStats): {
   if (stats.todo > 0 || stats.skipped > 0) {
     return {
       ok: false,
+      kind: stats.todo > 0 ? 'no-assertions' : 'all-skipped',
       reason: `验收文件里没有一条用例真正执行过（pass 0 / todo ${stats.todo} / skipped ${stats.skipped}）—— todo 与 skip 不算验证`,
     };
   }
 
   return {
     ok: false,
+    kind: 'empty',
     reason: '验收命令跑完了，但没有任何用例被执行（pass 0）—— 验收文件是空的或全被跳过',
   };
+}
+
+/**
+ * 验收命令**失败**（退出码非 0）时，把失败归类。
+ *
+ * D-8：门禁②的失败信息不该长得都一样。
+ *
+ * - `assertion-failed` —— 有用例跑了、但断言不成立 → **实现**的问题
+ * - `command-failed` —— 命令本身跑不起来（编译错、找不到文件）→ **环境 / 构建**的问题
+ * - `unknown` —— 读不出统计
+ *
+ * 判据：`fail > 0` 且 `pass > 0` → 断言失败；`fail > 0` 且 `pass === 0` →
+ * 全挂（可能是实现完全不对，也可能是用例本身坏掉）；统计读不出 → 命令失败。
+ */
+export function classifyAcceptanceFailure(stats: AcceptanceRunStats): {
+  kind: 'assertion-failed' | 'all-failed' | 'command-failed';
+  label: string;
+} {
+  if (!stats.known) {
+    return { kind: 'command-failed', label: '验收命令执行失败（读不出测试统计）' };
+  }
+  if (stats.fail > 0 && stats.pass > 0) {
+    return { kind: 'assertion-failed', label: '验收断言不成立（有用例通过，也有用例失败）' };
+  }
+  if (stats.fail > 0) {
+    return { kind: 'all-failed', label: '验收用例全部失败（一条都没通过）' };
+  }
+  return { kind: 'command-failed', label: '验收命令执行失败' };
 }

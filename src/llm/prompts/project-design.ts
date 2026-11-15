@@ -1,4 +1,4 @@
-// Project design prompt — reverse-engineer design docs from existing codebase
+﻿// Project design prompt — reverse-engineer design docs from existing codebase
 
 export const PROJECT_DESIGN_PROMPT = `你是一个高级软件架构师。以下是一个已有工程的项目扫描结果，请根据它的目录结构和模块信息，生成一份技术设计文档。
 
@@ -9,7 +9,10 @@ export const PROJECT_DESIGN_PROMPT = `你是一个高级软件架构师。以下
 
 请按以下格式输出：
 
-# 设计标题
+# <设计标题>
+
+（上面的「<设计标题>」是一份**占位符**，请替换成这份设计真正的标题 ——
+  根据内容归纳一个具体标题，不要原样保留占位符文字。）
 
 ## 项目概述
 用一段话描述这个项目是做什么的。

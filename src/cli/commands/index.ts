@@ -36,6 +36,78 @@ import './architecture.js';
 import './slice-spec.js';
 import './contract.js';
 
+/**
+ * 近形命令别名 —— 常见拼错 / 复数形式的直达表。
+ *
+ * 实测缺陷 D-5：`zelto requirement list`（`require` 的复数）不是已注册命令，
+ * 于是掉进了 **LLM 自然语言路由** —— 返回一段「需求似乎不够明确」的提示。
+ * 人会以为自己拼错了命令，或者以为工具没听懂。
+ *
+ * 实际上命令名是 `zelto require list`。这类错误**不该动用 LLM**：
+ * LLM 路由的成本是「调一次模型」，而它给出的答案还比一条明确的提示更糟
+ * —— 它让人以为工具「懂了但没找到」，而不是「命令名不对」。
+ *
+ * 所以：近形命令先查这张表，命中就直接执行对应的真命令；
+ * 不命中才交给 LLM 路由。
+ *
+ * 键是小写的完整命令词；值是真命令名。
+ */
+const COMMAND_ALIASES: Record<string, string> = {
+  // requirement / requirements → require
+  requirement: 'require',
+  requirements: 'require',
+  req: 'require',
+  reqs: 'require',
+  // design / designs → design（design 本身就是命令名，留作示例）
+  designs: 'design',
+  // plan / plans → plan
+  plans: 'plan',
+  // slice / slices（slices 已是命令名）
+  slice: 'slices',
+  // spec / specs → spec 相关命令
+  specs: 'spec',
+  // version / versions → version
+  versions: 'version',
+  // merge / merging
+  merging: 'merge',
+  // sign / signing
+  signing: 'sign',
+  // gate / gating
+  gating: 'gate',
+  // check / checking
+  checking: 'check',
+  // freeze / freezing
+  freezing: 'freeze',
+  // run / runs
+  runs: 'run',
+  // create / creates
+  creates: 'create',
+  // show / shows
+  shows: 'show',
+  // list / lists
+  lists: 'list',
+  // status / statuses
+  statuses: 'status',
+  // audit / audits
+  audits: 'audit',
+  // events / event
+  event: 'events',
+  // trace / traces
+  traces: 'trace',
+  // policy / policies
+  policies: 'policy',
+  // dashboard / dashboards
+  dashboards: 'dashboard',
+  // snapshot / snapshots
+  snapshots: 'snapshot',
+  // artifact / artifacts
+  artifacts: 'artifact',
+  // batch / batches
+  batches: 'batch',
+  // config / configs
+  configs: 'config',
+};
+
 export async function runCLI(argv: string[]): Promise<number> {
   // ─── Parse global flags ──────────────────────────────────────────────────
   const formatIdx = argv.indexOf('--format');
@@ -77,7 +149,12 @@ export async function runCLI(argv: string[]): Promise<number> {
     return commands.help?.(rest) ?? 0;
   }
 
-  const handler = commands[cmd];
+  // 近形命令别名（D-5）：`requirement` → `require` 这类拼法先查表，
+  // 命中就直接跑真命令 —— 不该为「命令名拼错」付一次 LLM 调用的代价。
+  const alias = COMMAND_ALIASES[cmd.toLowerCase()];
+  const resolvedCmd = alias && commands[alias] ? alias : cmd;
+
+  const handler = commands[resolvedCmd];
   if (!handler) {
     // Unknown command — try LLM-powered natural language routing
     const llm = createLlmFromConfig('llm-router', 'cli');

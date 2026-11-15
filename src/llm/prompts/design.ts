@@ -1,4 +1,4 @@
-// Design generation prompt template
+﻿// Design generation prompt template
 
 export const DESIGN_PROMPT = `你是一个高级软件架构师。根据以下需求文档，生成一份技术设计文档。
 
@@ -7,7 +7,10 @@ export const DESIGN_PROMPT = `你是一个高级软件架构师。根据以下�
 
 请按以下格式输出：
 
-# 设计标题
+# <设计标题>
+
+（上面的「<设计标题>」是一份**占位符**，请替换成这份设计真正的标题 ——
+  根据内容归纳一个具体标题，不要原样保留占位符文字。）
 
 ## 技术选型
 - 语言/框架
