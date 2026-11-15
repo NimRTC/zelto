@@ -78,6 +78,92 @@ function looksLikePath(text: string): boolean {
 }
 
 /**
+ * 从规格 Markdown 中提取**全文提到过的**文件路径。
+ *
+ * 与 `parseScopePaths` 的区别：
+ * - `parseScopePaths` 只看「范围」章节，取的是**写集**
+ * - 这个函数看**全文**，取的是「规格提到要动哪些文件」
+ *
+ * 为什么需要后者：实测缺陷 D-4 —— 规格的「需求」章节里写着
+ * 「`src/engine/CMakeLists.txt` 如需登记新 `.cpp` 文件，只加一行」，
+ * 但「范围」章节（= 写集）里没有这个文件。写集守卫（C9）**正确地**
+ * 拦住了 agent 改它，于是 agent 建了新 `.cpp` 却无法登记，链接期才炸：
+ *
+ *     error LNK2019: 无法解析的外部符号 "nimrtc::engine::build_rtp_packet(...)"
+ *
+ * 规格说要改 + 写集不允许改 —— 这个矛盾本来在冻结时就能看出来，
+ * 但没有任何一道闸门做这个比对。**该写的东西没被授权**，要靠人先看出来。
+ *
+ * 提取规则：
+ * - 反引号包裹的、看起来像路径的（`src/engine/CMakeLists.txt`）
+ * - 行内出现的、看起来像路径的（src/engine/CMakeLists.txt）
+ * - 排除 URL、排除以 `-` / `*` 开头的 glob 片段、排除绝对路径
+ *
+ * 「看起来像路径」的判据与 `looksLikePath` 一致：含路径分隔符，
+ * 或带已知代码/文档扩展名。
+ *
+ * @param content 规格文件全文
+ * @returns 提到的路径列表（去重，保持出现顺序）
+ */
+export function parseMentionedPaths(content: string): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+
+  // 反引号包裹的优先 —— 这是规格里写路径的规范形式
+  const backticked = /`([^`\n]+)`/g;
+  let m: RegExpExecArray | null;
+  while ((m = backticked.exec(content)) !== null) {
+    const candidate = m[1].trim();
+    if (!looksLikePath(candidate)) continue;
+    const normalized = normalizeMentionedPath(candidate);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+
+  // 行内裸路径：只认带已知扩展名的（`src/foo.cpp`），避免把散文当成路径
+  const inline = /\b([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|toml|md|hpp|h|hh|cc|cpp|cxx|c|h|py|sh|txt|cfg|ini|cmake|gradle|mod|sum))\b/g;
+  while ((m = inline.exec(content)) !== null) {
+    const candidate = m[1];
+    const normalized = normalizeMentionedPath(candidate);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+
+  return paths;
+}
+
+/**
+ * 归一化规格里提到的路径。
+ *
+ * 排除：
+ * - 空路径
+ * - URL（`https://example.com/x.ts` 的 host 部分会漏进裸路径匹配）
+ * - 绝对路径（`/usr/include/x.hpp`、`C:\foo\bar.cpp`）
+ * - 带 glob 通配的片段（`**` 之类，不是具体文件）
+ */
+function normalizeMentionedPath(raw: string): string | null {
+  let p = raw.trim();
+  if (!p) return null;
+  // 去掉尾部标点
+  p = p.replace(/[.,;:)]+$/, '');
+  if (!p) return null;
+  // URL
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p)) return null;
+  // 绝对路径
+  if (p.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(p)) return null;
+  // 含 glob 通配
+  if (p.includes('*') || p.includes('?')) return null;
+  // 相对前缀 `./` 归一
+  if (p.startsWith('./')) p = p.slice(2);
+  if (!p) return null;
+  return p;
+}
+
+/**
  * 从规格 Markdown 中解析「前置切片 / Prerequisites」章节下的切片 id 列表。
  *
  * 识别的章节标题：包含「前置」「prerequisite」「depends」（大小写不敏感）。

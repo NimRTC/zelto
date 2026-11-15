@@ -50,15 +50,15 @@ import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
-import { parseScopePaths, parseAcceptanceCriteria } from '../../core/spec/scope.js';
-import { evaluateWriteSet } from '../../core/spec/write-set.js';
+import { parseScopePaths, parseAcceptanceCriteria, parseMentionedPaths } from '../../core/spec/scope.js';
+import { evaluateWriteSet, evaluateWriteSetCoverage } from '../../core/spec/write-set.js';
 import { judgeTrace, traceCountsOf, blockingViolations, advisoryViolations } from '../../core/trace/index.js';
 import { validateDeterministic } from '../../core/spec/deterministic/validator.js';
 import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
 import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 import { register } from './shared.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -922,6 +922,56 @@ register('freeze', async (args) => {
       await store.write(slice);
     }
 
+    // ── D-4：规格提到的文件必须在写集里 ────────────────────────────
+    //
+    // 「规格说要改 + 写集不允许改」这个矛盾，在冻结时就能看出来 ——
+    // 写集守卫（C9）会正确地拦住 agent，但代价是 agent 建了新文件
+    // 却无法登记，链接期才炸（LNK2019）。
+    //
+    // 实测案例（nimrtc D1）：规格需求 6 写着
+    // 「`src/engine/CMakeLists.txt` 如需登记新 `.cpp` 文件，只加一行」，
+    // 但写集里没有这个文件。
+    //
+    // 判据是纯文件解析（C3）：解析规格全文提到的路径，比对写集覆盖。
+    //
+    // 比对的是**有效写集**，不是 `slice.writes`：
+    // 写集有三级来源（`slice.writes` → 规格「范围」章节 → 目录探测），
+    // 切片没显式给 `--writes` 时写集要从规格里推。只看 `slice.writes`
+    // 会把「写集由规格推导出来」的正常切片误判成缺授权。
+    const effectiveWrites = await resolveWriteSet(id, false).then(
+      (r) => r.writes,
+      () => slice.writes,
+    );
+    const coverage = evaluateWriteSetCoverage(parseMentionedPaths(specContent), effectiveWrites);
+    if (coverage.uncovered.length > 0) {
+      const details = coverage.uncovered.map(
+        (p) => `规格提到「${p}」，但它不在写集里 —— agent 改不了它`,
+      );
+      await events.append(id, 'spec.checked', 'cli', {
+        sliceId: id,
+        issues: details.length,
+        passed: false,
+        details,
+        phase: 'freeze',
+      });
+      const advice = [
+        `  把这些文件加进写集： zelto set ${id} --field writes --value "<路径>"`,
+        `  或改规格：不要提这些文件（或在「范围」章节声明它们）`,
+      ].join('\n');
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, success: false,
+          error: `规格与写集不一致，拒绝冻结：${details.join('；')}`,
+          issues: coverage.uncovered,
+        }));
+      } else {
+        console.error(`zelto freeze ${id} — ❌ 规格与写集不一致，拒绝冻结`);
+        for (const d of details) console.error(`  - ${d}`);
+        console.error(advice);
+      }
+      return 1;
+    }
+
     if (gate.blocking.length > 0) {
       const details = gate.blocking.map((v) => v.message);
       await events.append(id, 'spec.checked', 'cli', {
@@ -1118,13 +1168,15 @@ register('run', async (args) => {
 
     const cfg = loadConfig();
     const agentCmd = cfg.agent.command;
-    const agentName = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : agentCmd;
+    // D-2：`--agent` 没给值时回退到配置里的默认 agent，
+    // 而不是把 undefined 当成「用户指定的值」传下去。
+    const agentName = optionValue(args, '--agent', agentCmd);
 
     console.log(`  Agent:         ${agentName}`);
     console.log(`  Bundle:        ${bundlePath}`);
     console.log('');
 
-    const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+    const adapterType = optionValueStrict(args, '--adapter');
 
     // Check agent availability before starting
     try {
@@ -1390,10 +1442,11 @@ async function runParallel(args: string[]): Promise<number> {
     return 1;
   }
 
-  const agentIdx = args.indexOf('--agent');
-  const agentName = agentIdx >= 0 ? args[agentIdx + 1] : undefined;
-  const adapterIdx = args.indexOf('--adapter');
-  const adapterType = adapterIdx >= 0 ? args[adapterIdx + 1] : undefined;
+  // D-2：`--agent` / `--adapter` 没给值时不能把 undefined 当成值传下去。
+  // 并行路径的 undefined 会被 createExecutorAdapter 的兜底接住，
+  // 但日志里会出现 `Agent: undefined` —— 征兆比 bug 本身更早出现。
+  const agentName = optionValueStrict(args, '--agent');
+  const adapterType = optionValueStrict(args, '--adapter');
 
   // 排阶段（G-1 + G-2）：依赖分层 + 写集冲突降级
   const plan = await buildExecutionPlan(ids, args);
@@ -1628,8 +1681,8 @@ register('start', async (args) => {
     write(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
     const cfg = loadConfig();
-    const agentCmd = args.includes('--agent') ? args[args.indexOf('--agent') + 1] : cfg.agent.command;
-    const agentName = agentCmd;
+    // D-2：同上 —— `--agent` 没给值时回退到默认 agent。
+    const agentName = optionValue(args, '--agent', cfg.agent.command);
 
     console.log(`  Agent:         ${agentName}`);
 
@@ -1645,7 +1698,7 @@ register('start', async (args) => {
       // skip check
     }
 
-    const adapterType = args.includes('--adapter') ? args[args.indexOf('--adapter') + 1] : undefined;
+    const adapterType = optionValueStrict(args, '--adapter');
     const sliceForTimeout = await store.read(id);
     let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
     let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });

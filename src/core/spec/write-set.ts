@@ -304,3 +304,56 @@ export function resolveWriteSetPath(pattern: string, projectRoot: string = proce
 export function writeSetDirname(pattern: string): string {
   return dirname(pattern);
 }
+
+/**
+ * 写集覆盖判据的结果。
+ *
+ * D-4：「规格说要改 + 写集不允许改」这个矛盾，应该在**冻结时**暴露，
+ * 而不是等到 agent 撞上写集守卫、在链接期才发现。
+ */
+export interface WriteSetCoverageResult {
+  /** 规格提到、但写集覆盖不到的路径 —— 这些是「该写但没被授权」的文件 */
+  uncovered: string[];
+  /** 写集里有、但规格没提到的路径 —— 通常无害（agent 自选的写集） */
+  extra: string[];
+}
+
+/**
+ * 规格提到的文件是否都被写集覆盖。
+ *
+ * 判据用「写集是否覆盖该路径」而不是「路径是否字面等于写集条目」——
+ * 写集常写成 glob（`src/engine/src/**`）或目录（`src/engine/src/`），
+ * 字面比较会把大量实际覆盖的情况误报成未覆盖。
+ *
+ * @param mentioned 规格里提到的路径（`parseMentionedPaths` 的输出）
+ * @param writes 写集路径列表
+ */
+export function evaluateWriteSetCoverage(
+  mentioned: string[],
+  writes: string[],
+): WriteSetCoverageResult {
+  const uncovered: string[] = [];
+  const extra: string[] = [];
+
+  for (const path of mentioned) {
+    if (!isInWriteSet(path, writes)) {
+      uncovered.push(path);
+    }
+  }
+
+  // extra：写集里的具体路径（不含 glob）在规格里没被提到
+  const mentionedSet = new Set(mentioned.map(toPosix));
+  for (const raw of writes) {
+    const pattern = toPosix(raw.trim());
+    if (!pattern) continue;
+    if (pattern.includes('*') || pattern.includes('?')) continue;
+    const normalized = pattern.replace(/\/$/, '');
+    if (normalized.endsWith('/')) continue;
+    if (mentionedSet.has(normalized)) continue;
+    // 写集条目若被规格提到的某个路径前缀覆盖，也不算 extra
+    const covered = mentioned.some((p) => normalized.startsWith(`${p}/`));
+    if (!covered) extra.push(pattern);
+  }
+
+  return { uncovered, extra };
+}
