@@ -21,6 +21,25 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
     edges: [],
     unmapped: [],
     unresolved: [],
+    coverage: {
+      counts: {
+        typescript: 0,
+        python: 0,
+        cpp: 0,
+        go: 0,
+        rust: 0,
+        java: 0,
+        build: 0,
+        doc: 0,
+        config: 0,
+        other: 0,
+      },
+      verifiable: [],
+      verifiedFiles: 0,
+      unverifiableCodeFiles: 0,
+      nonCodeFiles: 0,
+      totalFiles: 0,
+    },
   };
 }
 

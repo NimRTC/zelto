@@ -38,6 +38,121 @@ export function detectLang(filePath: string): SourceLang | null {
 }
 
 /**
+ * 文件的**语言类别** —— 比 `detectLang` 粗，用于报告「哪些文件验不了」。
+ *
+ * 为什么要与 `detectLang` 分开：`detectLang` 回答「这个文件能不能参与
+ * import 图」（能扫就返回语言），而这里回答「这个文件属于哪一类语言」。
+ *
+ * 后者覆盖**所有**文件类型（包括扫不了的），这样报告才能说清
+ * 「377 个 C++ 文件没能验证依赖」—— 而不是让人从「无法验证」的
+ * 数量里自己推断。
+ *
+ * ADR-060 §4 方案 A：把「验不了」变成一句明说的话。
+ */
+export type LangCategory =
+  | 'typescript'    // TS / JS —— 有 import 语义，已支持
+  | 'python'        // Python —— 有 import 语义，已支持
+  | 'cpp'           // C / C++ —— 有 include 语义，**尚未支持**
+  | 'go'            // Go —— 有 import 语义，尚未支持
+  | 'rust'          // Rust —— 有 use/mod 语义，尚未支持
+  | 'java'          // Java / Kotlin —— 有 import 语义，尚未支持
+  | 'build'         // 构建脚本 —— 不产生模块依赖边
+  | 'doc'           // 文档 —— 不产生模块依赖边
+  | 'config'        // 配置文件 —— 不产生模块依赖边
+  | 'other';        // 其余
+
+/** 文件扩展名 → 语言类别 */
+const LANG_BY_EXTENSION: Record<string, LangCategory> = {
+  // TypeScript / JavaScript
+  ts: 'typescript', tsx: 'typescript', mts: 'typescript', cts: 'typescript',
+  js: 'typescript', jsx: 'typescript', mjs: 'typescript', cjs: 'typescript',
+  // Python
+  py: 'python', pyi: 'python',
+  // C / C++
+  c: 'cpp', h: 'cpp', cc: 'cpp', cpp: 'cpp', cxx: 'cpp',
+  hpp: 'cpp', hh: 'cpp', hxx: 'cpp', ipp: 'cpp', inl: 'cpp',
+  m: 'cpp', mm: 'cpp',
+  // Go
+  go: 'go',
+  // Rust
+  rs: 'rust',
+  // Java / Kotlin
+  java: 'java', kt: 'java', kts: 'java',
+  // 构建脚本
+  cmake: 'build', mk: 'build', bzl: 'build', bazel: 'build', ninja: 'build',
+  gyp: 'build', gypi: 'build', gradle: 'build',
+  // 文档
+  md: 'doc', mdx: 'doc', rst: 'doc', adoc: 'doc', txt: 'doc',
+  // 配置
+  json: 'config', jsonc: 'config', json5: 'config',
+  yaml: 'config', yml: 'config', toml: 'config', ini: 'config', cfg: 'config',
+  conf: 'config', env: 'config', properties: 'config',
+  xml: 'config', lock: 'config', sum: 'config', mod: 'config',
+};
+
+/**
+ * 特殊文件名 → 语言类别。
+ *
+ * 这些文件的扩展名会误导分类：
+ *   `CMakeLists.txt` —— 扩展名 `.txt`（文档类），实际是构建脚本
+ *   `Makefile`      —— 没有扩展名
+ *   `Dockerfile`    —— 没有扩展名
+ */
+const LANG_BY_FILENAME: Record<string, LangCategory> = {
+  makefile: 'build',
+  gnumakefile: 'build',
+  bsdmakefile: 'build',
+  dockerfile: 'build',
+  containerfile: 'build',
+  cmakelists: 'build',
+  'cmakelists.txt': 'build',
+  meson: 'build',
+  'meson.build': 'build',
+  'build.gradle': 'build',
+  'settings.gradle': 'build',
+  license: 'doc',
+  'license.md': 'doc',
+  readme: 'doc',
+  'readme.md': 'doc',
+  changelog: 'doc',
+  'changelog.md': 'doc',
+};
+
+/**
+ * 判定一个文件属于哪一类语言。
+ *
+ * @param filePath 相对项目根的路径
+ * @returns 语言类别；识别不出返回 'other'
+ */
+export function classifyLangCategory(filePath: string): LangCategory {
+  const lower = filePath.toLowerCase();
+  const base = lower.slice(lower.lastIndexOf('/') + 1);
+
+  // 特殊文件名优先于扩展名 ——
+  // `CMakeLists.txt` 的扩展名是 `.txt`（文档类），但它其实是构建脚本。
+  // 先判扩展名会把它归错类。
+  const byName = LANG_BY_FILENAME[base];
+  if (byName) return byName;
+
+  const dot = lower.lastIndexOf('.');
+  if (dot > 0) {
+    const ext = lower.slice(dot + 1);
+    const byExt = LANG_BY_EXTENSION[ext];
+    if (byExt) return byExt;
+  }
+  return 'other';
+}
+
+/**
+ * 这个语言类别**能不能参与依赖验证**。
+ *
+ * 只有已实现 import 解析的语言才算。
+ */
+export function isVerifiableLang(category: LangCategory): boolean {
+  return category === 'typescript' || category === 'python';
+}
+
+/**
  * 抽出源码里的 import 说明符。
  *
  * TS/JS 覆盖：import ... from 'x'、import 'x'、export ... from 'x'、

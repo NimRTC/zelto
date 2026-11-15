@@ -62,6 +62,53 @@ export function parseScopePaths(content: string): string[] {
 }
 
 /**
+ * 已知代码 / 文档 / 配置文件扩展名 —— **唯一真源**。
+ *
+ * 为什么要集中成一处：之前有**两份**扩展名清单
+ * （`looksLikePath` 一份、`parseMentionedPaths` 的行内正则一份），
+ * 两份会漂移 —— 一份加了 `cmake`，另一份没加，于是同一个文件
+ * 「反引号里能认出来、行内裸写认不出来」。
+ *
+ * 覆盖：脚本 / 编译 / 文档 / 数据 / 声明 / 样式 / 标记。
+ */
+const KNOWN_EXTENSIONS = [
+  // 脚本与模块
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'mts', 'cts',
+  // 数据与配置
+  'json', 'jsonc', 'json5', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'env', 'properties',
+  'xml', 'plist', 'lock', 'sum', 'mod',
+  // 文档
+  'md', 'mdx', 'txt', 'rst', 'adoc', 'csv', 'tsv',
+  // C / C++ / 其它系统语言
+  'c', 'h', 'cc', 'cpp', 'cxx', 'hpp', 'hh', 'hxx', 'ipp', 'inl', 'm', 'mm',
+  // 脚本语言
+  'py', 'pyi', 'rb', 'go', 'rs', 'java', 'kt', 'kts', 'swift', 'php', 'pl', 'lua', 'sh', 'bash', 'zsh', 'ps1', 'bat', 'cmd',
+  // 样式与标记
+  'css', 'scss', 'less', 'html', 'htm', 'vue', 'svelte', 'astro',
+  // 构建与配置
+  'cmake', 'gradle', 'gyp', 'gypi', 'mk', 'bazel', 'bzl', 'ninja',
+  // 图形与资源
+  'svg', 'png', 'jpg', 'jpeg', 'gif', 'ico', 'wasm',
+];
+
+/**
+ * 无扩展名的常见文件 —— 靠**文件名**识别。
+ *
+ * 这些文件没有扩展名，靠扩展名白名单永远认不出来：
+ * `Makefile`、`Dockerfile`、`CMakeLists.txt`（这个有扩展名但不在常见清单里）、
+ * `LICENSE`、`README`。
+ *
+ * 为什么要单列：`Makefile` 与 `Dockerfile` 在 C++ / Go 项目里是
+ * **最常被规格点名的文件**（改依赖、改构建都要动它们），
+ * 而 D-4 的判据正是「规格点名了但写集没覆盖」——
+ * 认不出这两个文件，这道闸门就在最该拦的地方漏了。
+ */
+const KNOWN_EXTENSIONLESS_FILENAMES = [
+  'makefile', 'gnumakefile', 'dockerfile', 'license', 'licence', 'readme', 'changelog',
+  'contributing', 'codeowners', 'notice', 'authors', 'copying', 'install', 'news',
+];
+
+/**
  * 一条平路径条目**看起来像路径**吗？
  *
  * 「范围」章节里不只有路径，还有散文式的说明条目（`- 读配置文件`）。
@@ -69,12 +116,41 @@ export function parseScopePaths(content: string): string[] {
  *
  * 判据（满足其一即算路径）：
  *  - 含路径分隔符 `/`（含开头的 `./`）；
- *  - 扩展名属于常见的代码/文档/配置类型。
+ *  - 扩展名属于 `KNOWN_EXTENSIONS`；
+ *  - 文件名（无扩展名部分）属于 `KNOWN_EXTENSIONLESS_FILENAMES`。
  */
 function looksLikePath(text: string): boolean {
   if (!text) return false;
   if (text.includes('/')) return true;
-  return /\.(ts|tsx|js|mjs|cjs|json|ya?ml|toml|md|hpp|h|cc|cpp|cxx|py|sh|txt|cfg|ini)$/i.test(text);
+  return hasKnownExtension(text) || hasKnownExtensionlessName(text);
+}
+
+/**
+ * 扩展名是否在已知清单里。
+ *
+ * 大小写不敏感：`CMakeLists.TXT` 与 `CMakeLists.txt` 都要认。
+ */
+function hasKnownExtension(text: string): boolean {
+  const dot = text.lastIndexOf('.');
+  if (dot <= 0) return false;
+  const ext = text.slice(dot + 1).toLowerCase();
+  return KNOWN_EXTENSIONS.includes(ext);
+}
+
+/**
+ * 无扩展名的文件名是否在已知清单里。
+ *
+ * 只看 basename —— `build/Makefile` 的 basename 是 `Makefile`。
+ */
+function hasKnownExtensionlessName(text: string): boolean {
+  const base = text.slice(text.lastIndexOf('/') + 1).trim().toLowerCase();
+  if (!base) return false;
+  // 带扩展名的不走这条判据（由 hasKnownExtension 管）
+  if (base.includes('.')) {
+    // `CMakeLists.txt` 这种「名字里带点但扩展名不是代码类」的另算
+    return KNOWN_EXTENSIONLESS_FILENAMES.includes(base);
+  }
+  return KNOWN_EXTENSIONLESS_FILENAMES.includes(base);
 }
 
 /**
@@ -122,9 +198,39 @@ export function parseMentionedPaths(content: string): string[] {
     paths.push(normalized);
   }
 
-  // 行内裸路径：只认带已知扩展名的（`src/foo.cpp`），避免把散文当成路径
-  const inline = /\b([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*\.(?:ts|tsx|js|mjs|cjs|json|ya?ml|toml|md|hpp|h|hh|cc|cpp|cxx|c|h|py|sh|txt|cfg|ini|cmake|gradle|mod|sum))\b/g;
+  // 行内裸路径：只认带已知扩展名的（`src/foo.cpp`），避免把散文当成路径。
+  //
+  // 扩展名清单与 `looksLikePath` **同源**（`KNOWN_EXTENSIONS`）——
+  // 之前这里是另一份手抄的清单，两份会漂移。
+  //
+  // **前置断言**解决两类误抓：
+  // - URL 的 host 段：`example.com/docs/guide.md` → 前面是 `://`，
+  //   用 `(?<![/:\\w])` 排除（`:` 与 `/` 都在排除集里）
+  // - 绝对路径：`/usr/include/x.hpp` → 前面是 `/`；`C:\foo\bar.cpp` → 前面是 `:`
+  const extPattern = KNOWN_EXTENSIONS.map((e) => e.replace('.', '\\.')).join('|');
+  const inline = new RegExp(
+    `(?<![/:\\\\\\w.])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\\.(?:${extPattern}))(?![A-Za-z0-9_.-])`,
+    'gi',
+  );
   while ((m = inline.exec(content)) !== null) {
+    const candidate = m[1];
+    const normalized = normalizeMentionedPath(candidate);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+
+  // 行内裸的**无扩展名文件**（`Makefile`、`Dockerfile`）——
+  // 这些在 C++ / Go 项目里最常被规格点名，却完全没有扩展名可认。
+  //
+  // 前置断言同样排除 URL host 与绝对路径。
+  const namePattern = KNOWN_EXTENSIONLESS_FILENAMES.join('|');
+  const extensionless = new RegExp(
+    `(?<![/:\\\\\\w.])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*/(?:${namePattern})|(?<![/:\\\\\\w.])(?:${namePattern}))(?![A-Za-z0-9_.-])`,
+    'gi',
+  );
+  while ((m = extensionless.exec(content)) !== null) {
     const candidate = m[1];
     const normalized = normalizeMentionedPath(candidate);
     if (!normalized) continue;

@@ -22,6 +22,24 @@ export interface ModuleSpec {
 /** 源码语言 */
 export type SourceLang = 'ts' | 'python';
 
+/**
+ * 语言类别（报告用，比 `SourceLang` 粗）。
+ *
+ * 覆盖**所有**文件类型 —— 包括扫不了的，这样报告才能说清
+ * 「哪些文件没能验证」。
+ */
+export type LangCategory =
+  | 'typescript'
+  | 'python'
+  | 'cpp'
+  | 'go'
+  | 'rust'
+  | 'java'
+  | 'build'
+  | 'doc'
+  | 'config'
+  | 'other';
+
 /** 一条 import 引用 */
 export interface ImportRef {
   /** 原始说明符，如 './db'、'@app/db'、'os' */
@@ -66,6 +84,60 @@ export interface ScanResult {
   unmapped: string[];
   /** 相对路径解析不到目标文件的 import */
   unresolved: Array<{ file: string; specifier: string }>;
+  /**
+   * 语言覆盖面 —— 本次扫描**能验证什么、不能验证什么**。
+   *
+   * ADR-060 §4 方案 A：没有它，`arch check` 在 C++ 项目上会输出
+   * 「无法验证若干项」，看起来像「项目有点小问题」，
+   * 而真相是「**这个工具在这个项目上没有判据**」。
+   *
+   * 这两件事对人的行动含义完全不同 —— 前者说「去修」，
+   * 后者说「补判据或换工具」。
+   */
+  coverage: LangCoverage;
+}
+
+/** 语言类别的可读名（报告用） */
+export const LANG_CATEGORY_LABELS: Record<LangCategory, string> = {
+  typescript: 'TypeScript / JavaScript',
+  python: 'Python',
+  cpp: 'C / C++',
+  go: 'Go',
+  rust: 'Rust',
+  java: 'Java / Kotlin',
+  build: '构建脚本',
+  doc: '文档',
+  config: '配置文件',
+  other: '其它文件',
+};
+
+/** 语言覆盖面 */
+export interface LangCoverage {
+  /** 每种语言类别的文件数 */
+  counts: Record<LangCategory, number>;
+  /**
+   * 能参与依赖验证的语言类别（已实现 import 解析）。
+   *
+   * 这些类别之外的代码文件，其依赖关系**没有被验证过**。
+   */
+  verifiable: LangCategory[];
+  /**
+   * 参与了 import 图的文件数
+   */
+  verifiedFiles: number;
+  /**
+   * 属于「代码类」但无法参与验证的文件数
+   * （即 C++ / Go / Rust / Java 这些 —— 它们是代码，但不是「不产生依赖边」的东西）
+   */
+  unverifiableCodeFiles: number;
+  /**
+   * 不产生模块依赖边的文件数（构建脚本 / 文档 / 配置）
+   */
+  nonCodeFiles: number;
+  /**
+   * 总文件数
+   */
+  totalFiles: number;
 }
 
 /** 偏离类型 */
@@ -105,6 +177,13 @@ export interface ArchitectureReport {
   deviations: Deviation[];
   /** 实际依赖里的环 */
   cycles: string[][];
+  /**
+   * 语言覆盖面 —— 本次扫描能验证什么、不能验证什么。
+   *
+   * ADR-060 §4 方案 A：没有它，「无偏离」的结论会覆盖
+   * 根本没被验证过的文件。
+   */
+  coverage: LangCoverage;
   /** 没有偏离为 true（软偏离不算） */
   ok: boolean;
 }

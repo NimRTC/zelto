@@ -17,14 +17,27 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { pathMatches } from '../sched/paths.js';
-import { detectLang, matchModuleBySpecifier, parseImports } from './imports.js';
+import {
+  classifyLangCategory,
+  detectLang,
+  isVerifiableLang,
+  matchModuleBySpecifier,
+  parseImports,
+} from './imports.js';
 import {
   compareSpecificity,
   normalizeModuleSpecs,
   patternSpecificity,
   type PatternSpecificity,
 } from './normalize.js';
-import type { ModuleEdge, ModuleSpec, ScanResult, ScannedFile } from './types.js';
+import type {
+  LangCategory,
+  LangCoverage,
+  ModuleEdge,
+  ModuleSpec,
+  ScanResult,
+  ScannedFile,
+} from './types.js';
 
 /** 不扫的目录 */
 const SKIP_DIRS = new Set([
@@ -222,7 +235,86 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     edges,
     unmapped,
     unresolved,
+    coverage: computeCoverage(allFiles, scanned),
   };
+}
+
+/**
+ * 统计本次扫描的**语言覆盖面**。
+ *
+ * ADR-060 §4 方案 A：`arch check` 必须诚实地说出「哪些文件验过、哪些没验过」。
+ *
+ * 关键区分：
+ *   - **代码类但验不了**（C++ / Go / Rust / Java）→ 这是「**没有判据**」，
+ *     要显式报出来，因为它让人以为「项目有小问题」，
+ *     而真相是「这个工具在这个项目上没有判据」。
+ *   - **不产生依赖边的文件**（构建脚本 / 文档 / 配置）→ 这是**正常的**，
+ *     混进「验不了」里会稀释掉真正重要的信息。
+ */
+function computeCoverage(allFiles: string[], scanned: ScannedFile[]): LangCoverage {
+  const counts = {} as Record<LangCategory, number>;
+  // 注意：这里要**遍历数组本身**，不能用 `Object.keys(LANG_CATEGORY_KEYS)` ——
+  // 那是数组的索引（"0".."9"），不是元素值。用错了会往 counts 里塞
+  // 一堆 "0".."9" 的假键。
+  for (const category of LANG_CATEGORY_KEYS) {
+    counts[category] = 0;
+  }
+
+  for (const path of allFiles) {
+    const category = classifyLangCategory(path);
+    counts[category] = (counts[category] ?? 0) + 1;
+  }
+
+  // 已参与 import 图的类别 —— 这些就是「有判据」的
+  const verifiable = LANG_CATEGORY_KEYS.filter((category) => {
+    if (!isVerifiableLang(category)) return false;
+    return scanned.some((f) => classifyLangCategory(f.path) === category);
+  });
+
+  // 代码类但验不了的：C++ / Go / Rust / Java
+  const unverifiableCodeFiles = LANG_CATEGORY_KEYS.filter((category) =>
+    isCodeLangCategory(category) && !isVerifiableLang(category),
+  ).reduce((sum, category) => sum + (counts[category] ?? 0), 0);
+
+  // 不产生依赖边的：构建脚本 / 文档 / 配置 / 其它
+  const nonCodeFiles = LANG_CATEGORY_KEYS.filter(
+    (category) => !isCodeLangCategory(category),
+  ).reduce((sum, category) => sum + (counts[category] ?? 0), 0);
+
+  return {
+    counts,
+    verifiable,
+    verifiedFiles: scanned.length,
+    unverifiableCodeFiles,
+    nonCodeFiles,
+    totalFiles: allFiles.length,
+  };
+}
+
+/** 全部语言类别（顺序即报告里的顺序） */
+const LANG_CATEGORY_KEYS: LangCategory[] = [
+  'typescript',
+  'python',
+  'cpp',
+  'go',
+  'rust',
+  'java',
+  'build',
+  'doc',
+  'config',
+  'other',
+];
+
+/** 这些类别是「代码」—— 它们的依赖关系本该被验证 */
+function isCodeLangCategory(category: LangCategory): boolean {
+  return (
+    category === 'typescript' ||
+    category === 'python' ||
+    category === 'cpp' ||
+    category === 'go' ||
+    category === 'rust' ||
+    category === 'java'
+  );
 }
 
 /**

@@ -4,11 +4,14 @@
 // 差出来的东西是架构腐化的证据，怎么处置由人决定（这一层不拦人）。
 
 export {
+  classifyLangCategory,
   classifyPythonSpecifier,
   classifySpecifier,
   detectLang,
+  isVerifiableLang,
   matchModuleBySpecifier,
   parseImports,
+  type LangCategory,
 } from './imports.js';
 
 export {
@@ -38,6 +41,12 @@ export {
   relevantModuleNames,
 } from './guard.js';
 export type { GuardKindResult, GuardRule, GuardVerdict } from './guard.js';
+
+export {
+  LANG_CATEGORY_LABELS,
+  type LangCategory as ArchLangCategory,
+  type LangCoverage,
+} from './types.js';
 
 export type {
   ArchitectureReport,

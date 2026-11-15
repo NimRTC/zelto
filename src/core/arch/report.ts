@@ -236,6 +236,7 @@ export function buildArchitectureReport(
     actualEdges: crossEdges.map((e) => edgeKey(e.from, e.to)).sort(),
     deviations,
     cycles,
+    coverage: scan.coverage,
     // 「一致」= 没有任何硬偏离。软偏离（无法用 import 验证）不算不一致。
     ok: !deviations.some((d) => !SOFT_DEVIATIONS.has(d.kind)),
   };

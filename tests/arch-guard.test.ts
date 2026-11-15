@@ -20,6 +20,7 @@ import {
   type ArchitectureReport,
   type Deviation,
   type GuardRule,
+  type LangCoverage,
   type ModuleSpec,
 } from '../src/core/arch/index.js';
 import {
@@ -32,7 +33,38 @@ import { validatePolicyConfig } from '../src/core/policy/validator.js';
 
 /** 最小的空报告骨架，只填要测的偏离 */
 function makeReport(deviations: Deviation[]): ArchitectureReport {
-  return { modules: [], declaredEdges: [], actualEdges: [], deviations, cycles: [], ok: false };
+  return {
+    modules: [],
+    declaredEdges: [],
+    actualEdges: [],
+    deviations,
+    cycles: [],
+    coverage: emptyCoverage(),
+    ok: false,
+  };
+}
+
+/** 空覆盖面 —— 护栏判定不读它，但类型要求有 */
+function emptyCoverage(): LangCoverage {
+  return {
+    counts: {
+      typescript: 0,
+      python: 0,
+      cpp: 0,
+      go: 0,
+      rust: 0,
+      java: 0,
+      build: 0,
+      doc: 0,
+      config: 0,
+      other: 0,
+    },
+    verifiable: [],
+    verifiedFiles: 0,
+    unverifiableCodeFiles: 0,
+    nonCodeFiles: 0,
+    totalFiles: 0,
+  };
 }
 
 function dev(kind: Deviation['kind'], from = 'a', to = 'b'): Deviation {

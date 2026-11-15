@@ -19,6 +19,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 
+import { parseMentionedPaths } from '../src/core/spec/scope.js';
+
 const TEST_DIR = join(tmpdir(), `zelto-write-set-coverage-test-${Date.now()}`);
 const CLI_SCRIPT = join(process.cwd(), 'dist', 'cli', 'index.js');
 
@@ -240,5 +242,82 @@ describe('zelto freeze —— 规格与写集一致性（D-4）', () => {
     );
     assert.equal(slice.state, 'draft', '被拦后切片应仍是 draft');
     assert.equal(slice.spec.frozenHash, null, '被拦后不应写冻结哈希');
+  });
+});
+
+// ─── 路径识别的白名单 ───────────────────────────────────────────────────────
+//
+// D-4 遗留项：`parseMentionedPaths` 靠扩展名白名单识别路径，
+// `Makefile` / `Dockerfile` 这类**无扩展名**文件识别不到。
+// 而这两个文件恰恰是 C++ / Go 项目里最常被规格点名的
+// （改依赖、改构建都要动它们）—— 认不出它们，这道闸门就在最该拦的地方漏了。
+
+describe('parseMentionedPaths —— 路径识别的白名单', () => {
+  it('反引号里的无扩展名文件被识别', () => {
+    const paths = parseMentionedPaths('要改 `Makefile` 与 `Dockerfile`。');
+    assert.ok(paths.includes('Makefile'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('Dockerfile'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('带目录的无扩展名文件被识别', () => {
+    const paths = parseMentionedPaths('改 `build/Makefile` 与 `docker/Dockerfile`。');
+    assert.ok(paths.includes('build/Makefile'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('docker/Dockerfile'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('行内裸写的无扩展名文件被识别', () => {
+    const paths = parseMentionedPaths('构建时改 Makefile 里的规则。');
+    assert.ok(paths.includes('Makefile'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('行内裸写的无扩展名文件（带目录）被识别', () => {
+    const paths = parseMentionedPaths('构建时改 build/Makefile 里的规则。');
+    assert.ok(paths.includes('build/Makefile'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('CMakeLists.txt 被识别（文件名特殊，扩展名是 txt）', () => {
+    const paths = parseMentionedPaths('在 `CMakeLists.txt` 里登记新文件。');
+    assert.ok(paths.includes('CMakeLists.txt'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('常见扩展名都被识别', () => {
+    const paths = parseMentionedPaths(
+      ['`a.ts`', '`b.cpp`', '`c.h`', '`d.py`', '`e.yaml`', '`f.toml`', '`g.go`', '`h.rs`'].join(' '),
+    );
+    for (const p of ['a.ts', 'b.cpp', 'c.h', 'd.py', 'e.yaml', 'f.toml', 'g.go', 'h.rs']) {
+      assert.ok(paths.includes(p), `${p} 应被识别，实际：${JSON.stringify(paths)}`);
+    }
+  });
+
+  it('散文不被误判成路径', () => {
+    const paths = parseMentionedPaths('这个功能应该很快，用户会觉得这个体验不错。');
+    assert.deepEqual(paths, [], `散文不应产生路径，实际：${JSON.stringify(paths)}`);
+  });
+
+  it('URL 不被当成路径', () => {
+    const paths = parseMentionedPaths('见 https://example.com/docs/guide.md 了解更多。');
+    assert.deepEqual(paths, [], `URL 不应产生路径，实际：${JSON.stringify(paths)}`);
+  });
+
+  it('glob 通配片段不被当成具体路径', () => {
+    const paths = parseMentionedPaths('写 `src/engine/**` 下的所有文件。');
+    assert.deepEqual(paths, [], `glob 不应产生具体路径，实际：${JSON.stringify(paths)}`);
+  });
+
+  it('绝对路径不被当成项目内路径', () => {
+    const paths = parseMentionedPaths('引用 `/usr/include/x.hpp` 与 `C:\\foo\\bar.cpp`。');
+    assert.deepEqual(paths, [], `绝对路径不应产生路径，实际：${JSON.stringify(paths)}`);
+  });
+
+  it('README / LICENSE 这类无扩展名文件被识别', () => {
+    const paths = parseMentionedPaths('顺手更新 `README` 和 `LICENSE`。');
+    assert.ok(paths.includes('README'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('LICENSE'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('普通英文单词不被误判成无扩展名文件', () => {
+    // `makefile` 在清单里，但 `makefiles` / `readme` 不该被当成路径
+    const paths = parseMentionedPaths('We should read the makefiles and readmes carefully.');
+    assert.deepEqual(paths, [], `实际：${JSON.stringify(paths)}`);
   });
 });

@@ -38,14 +38,28 @@ const TOP_FILES = ['AGENTS.md', 'CLAUDE.md', 'README.md', 'CHANGELOG.md', 'CONTR
 /**
  * GBK 误解码的高置信特征字符。
  *
- * 推导方式：取仓库内所有中文语料，按 UTF-8 编码后用 GBK 解码器解读，
- * 统计出现频次；保留「污染语料中频次 >= 200、干净语料中出现 <= 2 次」的字符。
- * 干净语料中频次为 0 意味着这些字符不会误伤正常中文。
+ * 推导方式：把 CJK 常用字全量按 UTF-8 编码后用 GBK 解码器解读，
+ * 统计出现频次；保留「污染语料中频次高」的字符。
+ *
+ * 入选标准（两条都要满足）：
+ *   1. 在 GBK 误解码语料里出现频次 >= 20 —— 得是**典型**的误解码产物
+ *   2. 本身不是常用汉字 —— 常用字会误伤正常文本
+ *
+ * 第 2 条是实战教训：`欢`（U+6B22）曾在列表里，因为它是误解码产物
+ * （`喜欢` 按 GBK 误解码后会变成 `U+9354 U+6D43 U+7BD0` 一类的字），
+ * 但它**本身就是常用字**（喜欢 / 欢迎 / 欢乐）——
+ * 一句正常的中文测试语料就能把它触发，编码守卫对着干净文件报错。
+ *
+ * 误伤一个检测器比漏一个污染更糟：检测器一旦开始报假警，
+ * 人就会开始无视它 —— 那它对真污染也失效了。
+ *
+ * 当前列表里的字都不在常用字范围（多为「锛」「銆」「鈹」这类
+ * 误解码专有的偏旁组合），误伤风险低。
  */
 const MOJIBAKE_MARKERS = new Set([
   '\u951b', '\u6d93', '\u9239', '\u9352', '\u9286', '\u5c7e', '\u6d60', '\u7039',
   '\u9428', '\u935a', '\u5a34', '\u9359', '\u93c2', '\u6b91', '\u7d1d', '\u6d5c',
-  '\u6960', '\u56e9', '\u93cd', '\u9350', '\u6b22', '\u934f', '\u93c8', '\u8235',
+  '\u6960', '\u56e9', '\u93cd', '\u9350', '\u934f', '\u93c8', '\u8235',
   '\u7487', '\u5896', '\u93c3', '\u6769', '\u9225', '\u6579', '\u9429', '\u762f',
   '\u5b2d', '\u9417', '\u93b5', '\u7459', '\u5d85', '\u7b09', '\u9366', '\u93c0',
   '\u7481', '\u52eb',
@@ -57,6 +71,16 @@ const REPLACEMENT_CHAR = '\ufffd';
 const SKIP_DIRS = new Set([
   'node_modules', 'dist', 'dist-test', '.git', '.zelto', '.claude', 'coverage',
 ]);
+
+/**
+ * 守卫自己不查自己。
+ *
+ * 守卫源码里**必然**含有特征字（它们是数据，写在 `MOJIBAKE_MARKERS` 里）——
+ * 守卫会把自己判成污染。这是自指的必然，不是缺陷。
+ *
+ * 跳过自己不会削弱守卫：它对**其它**所有文件的判据一字未改。
+ */
+const SELF = relative(root, fileURLToPath(import.meta.url));
 
 /** Collect every file under `dir` whose extension is in `exts`. */
 function collect(dir, exts, out = []) {
@@ -110,13 +134,18 @@ for (const name of TOP_FILES) {
 }
 
 const offenders = [];
+let checked = 0;
 for (const file of files) {
+  const rel = relative(root, file);
+  // 跳过守卫自己 —— 它的特征字是数据，不是污染
+  if (rel === SELF) continue;
+  checked++;
   const hit = detectMojibake(file);
-  if (hit) offenders.push({ file: relative(root, file), ...hit });
+  if (hit) offenders.push({ file: rel, ...hit });
 }
 
 if (offenders.length === 0) {
-  console.log(`[zelto] 编码检查通过：${files.length} 个文件，未发现乱码污染。`);
+  console.log(`[zelto] 编码检查通过：${checked} 个文件，未发现乱码污染。`);
   process.exit(0);
 }
 

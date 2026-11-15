@@ -28,11 +28,13 @@ import {
   buildArchitectureReport,
   buildArchRelaxSnippet,
   judgeArchGuard,
+  LANG_CATEGORY_LABELS,
   scanArchitecture,
   type ArchitectureReport,
   type Deviation,
   type GuardRule,
   type GuardVerdict,
+  type LangCategory,
   type ModuleSpec,
 } from '../../core/arch/index.js';
 import { register } from './shared.js';
@@ -113,6 +115,23 @@ function deviationColor(kind: string): (s: string) => string {
 }
 
 /**
+ * 这些语言类别是「代码」—— 它们的依赖关系**本该**被验证。
+ *
+ * 与之相对的是构建脚本 / 文档 / 配置 —— 那些文件不产生依赖边，
+ * 「没验」是正常的，不该混进「验不了」的警告里稀释掉重点。
+ */
+function isCodeLang(category: LangCategory): boolean {
+  return (
+    category === 'typescript' ||
+    category === 'python' ||
+    category === 'cpp' ||
+    category === 'go' ||
+    category === 'rust' ||
+    category === 'java'
+  );
+}
+
+/**
  * 把「文件无归属」按目录聚合成一行。
  *
  * 一个没被认领的目录往往意味着「设计漏了这个目录」，
@@ -166,6 +185,44 @@ function renderReport(
         `    ${mod.name.padEnd(28)} ${files.padEnd(20)} 声明依赖: ${declared}  实际依赖: ${actual}`,
       );
     }
+  }
+
+  // ─── 语言覆盖面（ADR-060 §4 方案 A）───────────────────────────────
+  //
+  // 这一段的作用是**诚实**。
+  //
+  // 没有它，`arch check` 在一个 C++ 项目上会输出「✔ 没有偏离」或
+  // 「⚠️ N 项无法验证」—— 后者看起来像「项目有点小问题」，
+  // 而真相是「**这个工具在这个项目上没有判据**」。
+  //
+  // 这两件事对人的行动含义完全不同：前者说「去修一下」，
+  // 后者说「补判据或换工具」。
+  const coverage = report.coverage;
+  out.push('');
+  out.push(`  ${colors.bold('扫描覆盖')}`);
+  for (const [category, count] of Object.entries(coverage.counts)) {
+    if (count === 0) continue;
+    const label = LANG_CATEGORY_LABELS[category as LangCategory] ?? category;
+    const verifiable = coverage.verifiable.includes(category as LangCategory);
+    if (verifiable) {
+      out.push(`    ${colors.green('✔')} ${label.padEnd(24)} ${String(count).padStart(5)} 个文件 ${colors.dim('（依赖已验证）')}`);
+    } else if (isCodeLang(category as LangCategory)) {
+      out.push(`    ${colors.yellow('⚠')} ${label.padEnd(24)} ${String(count).padStart(5)} 个文件 ${colors.dim('（代码 —— 无 import 语义，依赖未验证）')}`);
+    } else {
+      out.push(`    ${colors.dim('·')} ${colors.dim(label.padEnd(24))} ${colors.dim(String(count).padStart(5))} 个文件 ${colors.dim('（不产生依赖边）')}`);
+    }
+  }
+  if (coverage.unverifiableCodeFiles > 0) {
+    out.push('');
+    out.push(
+      `    ${colors.yellow('⚠')} 本次只验证了 ${coverage.verifiedFiles}/${coverage.totalFiles} 个文件的依赖关系。`,
+    );
+    out.push(
+      `      ${colors.dim(`${coverage.unverifiableCodeFiles} 个代码文件没有可用的依赖语义 —— 它们的依赖关系**没有被检查过**。`)}`,
+    );
+    out.push(
+      `      ${colors.dim('上面的偏离只涉及已验证的部分；未验证部分的偏离本次查不出来。')}`,
+    );
   }
 
   // ─── 偏离 ────────────────────────────────────────────────────────────
