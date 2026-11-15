@@ -183,6 +183,53 @@ if (ownerIsVendor || targetIsVendor) continue;
 
 `counts` 只数**项目自己的**文件；vendor 单独走 `vendorFiles`。
 
+**关键实现细节**：vendor 文件按**语言类别**分，不是按「是不是源文件」。
+
+```ts
+const vendorFiles = allFiles.filter((path) => isVendorPath(path, vendorDirs));
+```
+
+如果按源文件筛（`detectLang(path) !== null`），**vendor 里的 Rust 文件会漏出去** ——
+因为扫描器读不懂 Rust（`detectLang` 对 `.rs` 返回 `null`）。
+
+真实项目里 `src/third_party` 有 **76 个 Rust 文件**（wolfssl 66 + msquic 10）。
+漏出去的后果：报告里冒出「⚠ Rust 76 个文件（依赖未验证）」——
+但它们在 vendor 里，**根本不参与架构检查**。
+
+按语言类别分之后，真实项目的覆盖率变成：
+
+```
+  扫描覆盖
+    ✔ TypeScript / JavaScript     12 个文件 （依赖已验证）
+    ✔ Python                      73 个文件 （依赖已验证）
+    ✔ C / C++                    493 个文件 （依赖已验证）
+    · 构建脚本                       102 个文件 （不产生依赖边）
+    · 文档                           137 个文件 （不产生依赖边）
+    · 配置文件                        30 个文件 （不产生依赖边）
+    · 其它文件                        79 个文件 （不产生依赖边）
+
+  外部代码边界
+    · src/third_party
+      11943 个文件在 vendor 目录里 —— 引入的外部代码，不参与架构检查。
+```
+
+**「⚠ 只验证了 N/M」的警告消失了** —— 项目自己的代码**全部**验证过了。
+这不是「工具没判据」，是真的验完了。
+
+---
+
+## 4.5 一个连带的结论：Rust 依赖解析**不急了**
+
+ADR-060 §4 方案 B/C 提到要补 Go / Rust 的依赖解析。
+但实测发现：**真实项目里唯一的 76 个 Rust 文件全在 `src/third_party`** ——
+项目自己的 Rust 代码是 **0 个**。
+
+**所以「Rust 76 个文件的依赖解析」这个遗留项，实际上不存在** ——
+那是 vendor 代码的依赖，不是这个项目的架构。
+
+真要补 Rust 解析，得先遇到一个**有自己 Rust 代码**的项目。
+本 ADR 顺带把这个遗留项消掉了。
+
 ---
 
 ## 5. 真实项目验证
@@ -233,7 +280,9 @@ if (ownerIsVendor || targetIsVendor) continue;
 - 报告带上 vendor 目录与模块
 
 **覆盖率**
+
 - C++ 文件数不含 vendor
+- **vendor 里的「扫描器读不懂」的语言（Rust）也不算「没验证」**
 
 **反向**
 - 没有 vendor 目录时行为不变

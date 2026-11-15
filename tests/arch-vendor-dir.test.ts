@@ -159,6 +159,31 @@ describe('ADR-065：vendor 目录是外部边界', () => {
       assert.equal(cppCount, 2, 'vendor 的 C++ 文件不该混进语言类别计数');
       assert.equal(scan.coverage.vendorFiles, 3);
     });
+
+    it('vendor 里的**扫描器读不懂**的语言也不算「没验证」', () => {
+      // 真实项目：src/third_party 里有 76 个 Rust 文件（wolfssl / msquic）。
+      // 扫描器读不懂 Rust —— 但它们在 vendor 里，**根本不参与架构检查**，
+      // 所以不该报成「76 个代码文件没验证」。
+      //
+      // 关键：vendor 文件按**语言类别**分，不按「是不是源文件」——
+      // 只筛源文件的话，Rust 会漏出去（detectLang 对 Rust 返回 null）。
+      const VENDOR_RUST_DIR = mkdtempSync(join(tmpdir(), 'zelto-arch-vendor-rust-'));
+      try {
+        const rsFile = join(VENDOR_RUST_DIR, 'src/third_party/wolfssl/src/lib.rs');
+        mkdirSync(join(rsFile, '..'), { recursive: true });
+        writeFileSync(rsFile, 'pub fn f() {}\n', 'utf-8');
+
+        const scan = scanArchitecture(VENDOR_RUST_DIR, [
+          { name: 'src/core', description: '核心', filePatterns: ['src/core/**/*'], dependencies: [] },
+        ]);
+
+        assert.equal(scan.coverage.counts.rust, 0, 'vendor 的 Rust 不该进语言类别计数');
+        assert.equal(scan.coverage.unverifiableCodeFiles, 0, 'vendor 的 Rust 不该算「没验证的代码」');
+        assert.equal(scan.coverage.vendorFiles, 1);
+      } finally {
+        rmSync(VENDOR_RUST_DIR, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('反向：没有 vendor 目录时行为不变', () => {

@@ -333,7 +333,13 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   // **不扫它们的内部结构** —— 但**要计入覆盖率**（`vendorFiles`），
   // 否则报告会说「这个项目只有 47 个 C++ 文件」，那更不真实。
   const vendorDirs = discoverVendorDirs(root);
-  const vendorFiles = sourceFiles.filter((path) => isVendorPath(path, vendorDirs));
+  // ADR-065：vendor 文件按**语言类别**分出来，而不是按「是不是源文件」——
+  //
+  // Rust / Go / Java 扫描器读不懂，但它们**仍然要在覆盖率里有个交代**。
+  // 只筛「源文件」的话，vendor 里的 Rust 文件会漏出去，
+  // 于是报告里冒出「76 个 Rust 文件没验证」—— 而它们在 vendor 里，
+  // 根本不参与架构检查。
+  const vendorFiles = allFiles.filter((path) => isVendorPath(path, vendorDirs));
   const projectSourceFiles = sourceFiles.filter((path) => !isVendorPath(path, vendorDirs));
 
   /**
