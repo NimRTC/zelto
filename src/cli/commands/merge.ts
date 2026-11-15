@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { formatMergePlan } from '../../core/sched/merge.js';
 import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager } from './shared.js';
+import { SignManager } from '../../core/gate/sign.js';
 import { buildMergePlan } from './merge-plan.js';
 import { executeMergePlan, type MergeSliceInfo } from './merge-executor.js';
 import {
@@ -187,9 +188,6 @@ register('merge', async (args) => {
   for (const id of ids) {
     try {
       const slice = await store.read(id);
-      if (slice.state !== 'frozen' && slice.state !== 'completed') {
-        console.warn(`  ⚠️  ${id}: state is "${slice.state}", expected "frozen" or "completed"`);
-      }
       slices.set(id, slice);
       mergeInfos.push({
         id,
@@ -203,6 +201,36 @@ register('merge', async (args) => {
 
   if (notFound.length > 0) {
     console.error(`Slice(s) not found: ${notFound.join(', ')}`);
+    return 1;
+  }
+
+  // ── ADR-018 §3.1：签字门 ───────────────────────────────────────────
+  //
+  // 合并的前提是「这片签过字」。不带 id 的路径靠
+  // `collectMergeCandidates` 过滤（它只收 approved 的签字请求），
+  // 但**显式给 id 的路径是直连**——只要 id 存在就直接往下走。
+  //
+  // 实测缺陷 D-6：`zelto merge <id> --plan <plan-id>` 在切片尚未签字时
+  // 直接提交并合并了。`--plan` 只是「归属消歧」的透传参数（ADR-056 §3.2），
+  // 却被当成了「这条路径已验证过」的信号。
+  //
+  // 所以这里无条件校验：没有任何一片有 approved 的签字请求 → 拒绝合并。
+  // 判据只读 `.zelto/locks/sign-*.json`（文件状态，C1），不调模型（C3）。
+  const signManager = new SignManager(ZELTO_DIR, events, store);
+  const approvedSigns = await signManager.list('approved');
+  const approvedSliceIds = new Set(approvedSigns.map((r) => r.sliceId));
+
+  const unapproved = ids.filter((id) => !approvedSliceIds.has(id));
+  if (unapproved.length > 0) {
+    console.error('❌ 以下切片没有已批准的签字，不能合并（ADR-018：签字与合并必须分开执行）：');
+    for (const id of unapproved) {
+      const slice = slices.get(id);
+      const state = slice?.state ?? '未知';
+      console.error(`   - ${id}（状态：${state}）`);
+    }
+    console.error('');
+    console.error('   先签字：zelto sign <id> --approve');
+    console.error('   再合并：zelto merge <id>');
     return 1;
   }
 
