@@ -31,6 +31,7 @@ import {
   patternSpecificity,
   type PatternSpecificity,
 } from './normalize.js';
+import { isTestFile } from './test-files.js';
 import type {
   LangCategory,
   LangCoverage,
@@ -377,10 +378,12 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   const moduleFiles = new Map<string, string[]>();
   const moduleCodeFiles = new Map<string, string[]>();
   const moduleVerifiedFiles = new Map<string, string[]>();
+  const moduleProductionFiles = new Map<string, string[]>();
   for (const mod of modules) {
     moduleFiles.set(mod.name, []);
     moduleCodeFiles.set(mod.name, []);
     moduleVerifiedFiles.set(mod.name, []);
+    moduleProductionFiles.set(mod.name, []);
   }
 
   for (const path of allFiles) {
@@ -439,14 +442,20 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     //   moduleVerifiedFiles —— 扫描器读得懂的（参与了 import 图）
     const category = classifyLangCategory(path);
     const isCode = isCodeLangCategory(category);
+    const isTest = isTestFile(path);
     if (isCode && owner) moduleCodeFiles.get(owner)?.push(path);
 
     if (lang) {
-      scanned.push({ path, lang, module: owner, ambiguousWith });
+      scanned.push({ path, lang, module: owner, ambiguousWith, isTest });
       if (owner) moduleVerifiedFiles.get(owner)?.push(path);
     }
     if (owner) {
       moduleFiles.get(owner)?.push(path);
+      // ADR-066：**生产代码文件**单独记一份 ——
+      // 一个模块如果**全是**测试文件，它在依赖图里就不产生任何边，
+      // 于是它声明的依赖会全部报「缺失依赖」—— 假阳性。
+      // 用这份清单判断「这个模块有没有生产代码」。
+      if (!isTest) moduleProductionFiles.get(owner)?.push(path);
     }
   }
 
@@ -458,6 +467,19 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   for (const file of scanned) {
     const path = file.path;
     const owner = file.module;
+
+    // ADR-066：**测试文件不产生依赖边** ——
+    // 测试引用被测对象是测试的本职，不构成架构耦合。
+    //
+    // 真实证据（nimrtc-zelto 实战演练）：
+    //   `src/plugins/tests/test_zero_copy_surface_path.cpp` 包含
+    //   video_frame 模块的公开头 —— 这一行伪造出
+    //   `src/plugins → src/modules` 边，进而伪造出两个「依赖成环」，
+    //   并让「修这个违反的切片」自己被该违反拦住（死锁）。
+    //
+    // 测试文件**仍然归属到模块**、计入文件数与覆盖统计 ——
+    // 只是不成为依赖边的来源。
+    if (isTestFile(path)) continue;
 
     let source: string;
     try {
@@ -575,6 +597,7 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     moduleFiles,
     moduleCodeFiles,
     moduleVerifiedFiles,
+    moduleProductionFiles,
     edges,
     unmapped,
     unresolved,
@@ -617,9 +640,15 @@ function computeCoverage(
   // 「这个项目的 C++ 代码验过了」—— 而实际上项目自己的 C++ 只有 47 个。
   //
   // 所以：各语言类别只数**项目自己的**文件，vendor 单独一行报。
+  //
+  // ADR-066：**测试文件也单独计数** —— 理由同上：
+  // 测试文件不参与依赖验证（它们不产生依赖边），
+  // 混进分母会让「覆盖率」失真。
   const vendorSet = new Set(vendorFiles);
+  const testSet = new Set(scanned.filter((f) => f.isTest).map((f) => f.path));
   for (const path of allFiles) {
     if (vendorSet.has(path)) continue;
+    if (testSet.has(path)) continue;
     const category = classifyLangCategory(path);
     counts[category] = (counts[category] ?? 0) + 1;
   }
@@ -643,7 +672,9 @@ function computeCoverage(
   return {
     counts,
     verifiable,
-    verifiedFiles: scanned.length,
+    // ADR-066：`verifiedFiles` 只数**生产代码**里参与 import 图的文件 ——
+    // 测试文件不产生依赖边，算进来会虚报「验证了这么多」。
+    verifiedFiles: scanned.filter((f) => !f.isTest).length,
     unverifiableCodeFiles,
     nonCodeFiles,
     totalFiles: allFiles.length,
@@ -651,6 +682,10 @@ function computeCoverage(
     // 它们没参与验证，但它们**不是**「这个工具没判据」，
     // 而是「这些是引入的外部代码，本来就不该算进架构」。
     vendorFiles: vendorFiles.length,
+    // ADR-066：测试文件**单独计数** ——
+    // 它们没参与验证，但它们**不是**「这个工具没判据」，
+    // 而是「这些是测试，不构成架构耦合」。
+    testFiles: testSet.size,
   };
 }
 

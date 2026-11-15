@@ -258,7 +258,11 @@ function renderReport(
     // ADR-065：分母**排除** vendor 文件 ——
     // 「只验证了 47/523 个文件」比「580/14439」诚实得多：
     // 后者里 97% 是 vendor 代码，没参与验证也不该算进「没验过」。
-    const checkedTotal = coverage.totalFiles - coverage.vendorFiles;
+    //
+    // ADR-066：分母**也排除**测试文件 ——
+    // 测试文件不产生依赖边（测试引用被测对象是测试的本职），
+    // 算进「没验过」会让覆盖率失真。
+    const checkedTotal = coverage.totalFiles - coverage.vendorFiles - coverage.testFiles;
     out.push(
       `    ${colors.yellow('⚠')} 本次只验证了 ${coverage.verifiedFiles}/${checkedTotal} 个文件的依赖关系。`,
     );
@@ -267,6 +271,17 @@ function renderReport(
     );
     out.push(
       `      ${colors.dim('上面的偏离只涉及已验证的部分；未验证部分的偏离本次查不出来。')}`,
+    );
+  }
+  // ─── 测试文件（ADR-066）───────────────────────────────────────────────
+  //
+  // 测试文件**不参与**依赖验证 —— 它们不产生依赖边。
+  // 但要**说清楚**，否则「已验证 47 个 C++ 文件」会给人错觉。
+  if (coverage.testFiles > 0) {
+    out.push('');
+    out.push(`  ${colors.bold('测试代码')}`);
+    out.push(
+      `    ${colors.dim('·')} ${colors.dim(`${coverage.testFiles} 个测试文件不参与架构检查 —— 测试引用被测对象是测试的本职，不构成架构耦合。`)}`,
     );
   }
   // ─── vendor 目录（ADR-065）────────────────────────────────────────────

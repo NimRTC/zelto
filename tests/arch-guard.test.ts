@@ -69,6 +69,8 @@ function emptyCoverage(): LangCoverage {
     totalFiles: 0,
     // ADR-065：vendor 文件数
     vendorFiles: 0,
+    // ADR-066：测试文件数
+    testFiles: 0,
   };
 }
 

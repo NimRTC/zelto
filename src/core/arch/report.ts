@@ -164,6 +164,22 @@ export function buildArchitectureReport(
     const hit = actualEdges.some((edge) => covers(from, to, edge));
     if (hit) continue;
 
+    // ADR-066：**来源模块全是测试文件** → 它的依赖不参与架构检查。
+    //
+    // 测试模块（`tests/`）在依赖图里没有边 —— 因为测试文件不产生边。
+    // 它声明的依赖（"tests 依赖 src/core"）在**生产架构**里没有意义：
+    // 那说的是测试怎么用生产代码，不是模块之间的耦合。
+    //
+    // 不跳过的话，每个测试模块的每条声明依赖都会报「缺失依赖」——
+    // 假阳性，而且量不小（一个测试模块声明 4 个依赖就是 4 条）。
+    const fromProductionFiles = (scan.moduleProductionFiles.get(from) ?? []).length;
+    if (fromProductionFiles === 0) continue;
+
+    // 同理：目标模块**全是测试文件** → 这条依赖指向的不是生产架构。
+    const toProductionFiles = (scan.moduleProductionFiles.get(to) ?? []).length;
+    const toIsTestOnly = toProductionFiles === 0 && (scan.moduleCodeFiles.get(to) ?? []).length > 0;
+    if (toIsTestOnly) continue;
+
     const targetHasCode = (scan.moduleCodeFiles.get(to) ?? []).length > 0;
     // 「目标模块有代码」不等于「这条依赖能用 import 图表达」。
     //

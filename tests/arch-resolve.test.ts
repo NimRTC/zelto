@@ -19,6 +19,7 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
     moduleFiles: new Map(Object.entries(moduleFiles)),
     moduleCodeFiles: new Map(),
     moduleVerifiedFiles: new Map(),
+    moduleProductionFiles: new Map(),
     edges: [],
     unmapped: [],
     unresolved: [],
@@ -42,6 +43,8 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
       totalFiles: 0,
       // ADR-065：vendor 文件数
       vendorFiles: 0,
+      // ADR-066：测试文件数
+      testFiles: 0,
     },
     // ADR-065：vendor 边界
     vendorDirs: [],
