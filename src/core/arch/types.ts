@@ -19,8 +19,13 @@ export interface ModuleSpec {
   dependencies: string[];
 }
 
-/** 源码语言 */
-export type SourceLang = 'ts' | 'python';
+/**
+ * 源码语言（**能参与 import 图**的语言）
+ *
+ * ADR-062：新增 `'cpp'` —— C / C++ 的依赖表达是 `#include`，
+ * 语义上接近「相对路径 + include 根目录搜索」。
+ */
+export type SourceLang = 'ts' | 'python' | 'cpp';
 
 /**
  * 语言类别（报告用，比 `SourceLang` 粗）。
@@ -163,6 +168,7 @@ export type DeviationKind =
   | 'unmapped_file'             // 有文件没有模块认领
   | 'unknown_module'            // 依赖指向的模块在设计里根本不存在
   | 'unverifiable_dependency'   // 目标模块没有源文件，无法用 import 验证
+  | 'empty_module'              // 模块声明了，但一个文件都没匹配上（ADR-062 §4.4）
   | 'cycle';                    // 实际依赖成环
 
 /** 一条偏离 */

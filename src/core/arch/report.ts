@@ -48,8 +48,15 @@ import type {
   ScanResult,
 } from './types.js';
 
-/** 不影响「是否一致」结论的偏离类型 */
-const SOFT_DEVIATIONS = new Set<DeviationKind>(['unverifiable_dependency']);
+/**
+ * 不影响「是否一致」结论的偏离类型。
+ *
+ * ADR-062 §4.4：`empty_module` 也是软偏离 ——
+ * 模块声明了但一个文件都没匹配上，这是**设计侧的问题**
+ * （文件路径写错了 / 目录还没建），不是代码违反了架构。
+ * 硬拦会挡住「设计还没写完」的正常推进。
+ */
+const SOFT_DEVIATIONS = new Set<DeviationKind>(['unverifiable_dependency', 'empty_module']);
 
 /**
  * 生成架构报告。
@@ -242,6 +249,25 @@ export function buildArchitectureReport(
       .map((e) => e.to)
       .sort(),
   }));
+
+  // ─── 模块声明了但一个文件都没匹配上（ADR-062 §4.4）─────────────────────
+  //
+  // 真实项目里踩到的：设计声明 `src/dtls`，代码实际在 `src/modules/dtls/`。
+  // 于是 `src/dtls` 匹配到 0 个文件，报告里显示「src/dtls  0 个文件」——
+  // 看着像个正常的空模块，实际是**设计里的路径写错了**。
+  //
+  // 不报出来的话，这个错误会一路飘到「依赖无法验证」里，
+  // 人看到的是「src/dtls 验不了」，而真相是「src/dtls 根本不存在」。
+  for (const mod of modules) {
+    const owned = (scan.moduleFiles.get(mod.name) ?? []).length;
+    if (owned > 0) continue;
+    deviations.push({
+      kind: 'empty_module',
+      from: mod.name,
+      to: mod.name,
+      detail: `模块 "${mod.name}" 声明了文件路径，但一个文件都没匹配上（${mod.filePatterns.join('、') || '没有声明路径'}）—— 路径写错了，或目录还不存在`,
+    });
+  }
 
   return {
     modules: moduleSummaries,

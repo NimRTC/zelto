@@ -106,6 +106,114 @@ export function collectSourceFiles(root: string): string[] {
 }
 
 /**
+ * include 根目录的目录名（ADR-062 §3.4）
+ *
+ * C++ 世界的惯例：`include/` 放公共头文件，源码目录里的
+ * 头文件通过「当前目录优先」找到。真实项目实测 44/44 命中。
+ */
+const INCLUDE_ROOT_NAMES = new Set(['include', 'inc']);
+
+/**
+ * 发现项目里的 **include 根目录**（相对项目根，正斜杠路径）。
+ *
+ * ADR-062 §6：为什么用「约定」而不是解析 CMakeLists / BUILD？
+ *
+ * | | 约定法 | 解析构建系统 |
+ * |---|---|---|
+ * | 覆盖率 | 44/44（真实项目） | ~100% |
+ * | 假边风险 | **零**（只漏不错） | 有（解析错就假边） |
+ * | core/ 复杂度 | 低 | 高（要实现半个构建系统） |
+ *
+ * **核心权衡：假边比漏边严重得多。**
+ * 一条解析错的 include 会产生假的模块依赖边，进而报假的架构偏离 ——
+ * 而假的偏离会让人去改对的代码。
+ *
+ * 所以这里宁可漏（表现为「这条依赖验不了」，方向安全），
+ * 也不猜（猜错 = 假偏离）。
+ *
+ * **顺序**：按路径字典序 —— include 根的理论顺序（编译器的 `-I` 顺序）
+ * 我们是猜的，字典序至少是确定的、可复现的（C3）。
+ */
+export function discoverIncludeRoots(root: string): string[] {
+  const roots = new Set<string>();
+
+  const walk = (dir: string, rel: string): void => {
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry)) continue;
+      const full = join(dir, entry);
+      let isDir: boolean;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      const childRel = rel ? `${rel}/${entry}` : entry;
+      if (INCLUDE_ROOT_NAMES.has(entry.toLowerCase())) {
+        roots.add(childRel);
+        // include 根下面还可能有嵌套的 include 根，继续往下找
+      }
+      walk(full, childRel);
+    }
+  };
+
+  walk(root, '');
+  return [...roots].sort();
+}
+
+/**
+ * 解析 C/C++ 的 `#include "..."`。
+ *
+ * ADR-062 §3.1：两种形态，两套候选策略。
+ *
+ * 1. **带目录**（`nimrtc/core/registry.hpp`）
+ *    —— 相对于引用文件所在目录，再试所有 include 根
+ * 2. **裸文件名**（`engine_impl.hpp`）
+ *    —— 先试引用文件所在目录（这是 `#include "..."` 的规范行为），
+ *    再试所有 include 根
+ *
+ * 真实项目实测：108 条引号 include 里 72 条是裸文件名、36 条带目录，
+ * **两种形态并存**，所以两种策略都要有。
+ */
+export function resolveCppInclude(
+  fromFile: string,
+  specifier: string,
+  fileSet: Set<string>,
+  includeRoots: string[],
+): string | null {
+  const baseDir = fromFile.includes('/') ? fromFile.slice(0, fromFile.lastIndexOf('/')) : '';
+  const candidates: string[] = [];
+
+  // 相对引用文件所在目录
+  candidates.push(normalizePosix(joinPosix(baseDir, specifier)));
+
+  // 相对每个 include 根
+  for (const root of includeRoots) {
+    candidates.push(normalizePosix(joinPosix(root, specifier)));
+  }
+
+  // 头文件可能省略扩展名（`#include "foo"` → `foo.hpp`）
+  for (const candidate of candidates) {
+    if (fileSet.has(candidate)) return candidate;
+    if (!candidate.includes('.')) {
+      for (const ext of CPP_RESOLVE_EXTENSIONS) {
+        if (fileSet.has(candidate + ext)) return candidate + ext;
+      }
+    }
+  }
+  return null;
+}
+
+/** C/C++ 头文件在省略扩展名时尝试的后缀 */
+const CPP_RESOLVE_EXTENSIONS = ['.hpp', '.h', '.hh', '.hxx', '.ipp', '.inl', '.c', '.cc', '.cpp'];
+
+/**
  * 扫描项目，算出模块之间的实际依赖边。
  */
 export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanResult {
@@ -114,6 +222,10 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   const allFiles = collectAllFiles(root);
   const sourceFiles = allFiles.filter((path) => detectLang(path) !== null);
   const fileSet = new Set(sourceFiles);
+
+  // include 根目录（ADR-062）：C++ 的 `#include "nimrtc/core/x.hpp"`
+  // 靠它才能解析到真实文件。
+  const includeRoots = discoverIncludeRoots(root);
 
   // ─── 第一遍：先定归属 ──────────────────────────────────────────────────
   // 归属必须先全部算完再算依赖 —— 否则「a 引用 b」这种边会因为
@@ -205,7 +317,20 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     for (const ref of parseImports(source, file.lang)) {
       let targetModule: string | null = null;
 
-      if (ref.kind === 'relative') {
+      if (file.lang === 'cpp') {
+        // C++ 的 `#include "..."` —— 项目内依赖（系统头已在解析时归为 builtin）
+        const resolved = resolveCppInclude(path, ref.specifier, fileSet, includeRoots);
+        if (!resolved) {
+          unresolved.push({ file: path, specifier: ref.specifier });
+          continue;
+        }
+        const targetModuleOwner = ownerOf.get(resolved) ?? null;
+        if (!targetModuleOwner) {
+          // 目标文件不在任何模块里 —— 记成未认领，不算模块依赖
+          continue;
+        }
+        targetModule = targetModuleOwner;
+      } else if (ref.kind === 'relative') {
         const resolved = resolveRelative(path, ref.specifier, fileSet);
         if (!resolved) {
           unresolved.push({ file: path, specifier: ref.specifier });

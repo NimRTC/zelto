@@ -104,10 +104,11 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     assert.equal(classifyLangCategory('src/a.json'), 'config');
   });
 
-  it('可验证性：只有 TS/JS 与 Python 目前有判据', () => {
+  it('可验证性：TS/JS、Python 与 C/C++ 目前有判据', () => {
     assert.equal(isVerifiableLang('typescript'), true);
     assert.equal(isVerifiableLang('python'), true);
-    assert.equal(isVerifiableLang('cpp'), false);
+    // ADR-062：C/C++ 的 `#include` 语义已支持
+    assert.equal(isVerifiableLang('cpp'), true);
     assert.equal(isVerifiableLang('go'), false);
     assert.equal(isVerifiableLang('rust'), false);
     assert.equal(isVerifiableLang('build'), false);
@@ -119,12 +120,12 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     const scan = scanArchitecture(TEST_DIR, MODULES);
     const coverage = scan.coverage;
 
-    // 验过：1 个 ts + 1 个 py
-    assert.equal(coverage.verifiedFiles, 2, `实际：${coverage.verifiedFiles}`);
-    assert.deepEqual(coverage.verifiable, ['typescript', 'python']);
+    // 验过：1 个 ts + 1 个 py + 2 个 C++（ADR-062 起 C++ 也验了）
+    assert.equal(coverage.verifiedFiles, 4, `实际：${coverage.verifiedFiles}`);
+    assert.deepEqual(coverage.verifiable, ['typescript', 'python', 'cpp']);
 
-    // 验不了的代码：C++ (2) + Go (1) + Rust (1)
-    assert.equal(coverage.unverifiableCodeFiles, 4, `实际：${coverage.unverifiableCodeFiles}`);
+    // 验不了的代码：Go (1) + Rust (1) —— C++ 已移出这一类
+    assert.equal(coverage.unverifiableCodeFiles, 2, `实际：${coverage.unverifiableCodeFiles}`);
     assert.equal(coverage.counts.cpp, 2);
     assert.equal(coverage.counts.go, 1);
     assert.equal(coverage.counts.rust, 1);
@@ -138,10 +139,10 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     assert.equal(coverage.totalFiles, 9, `实际：${coverage.totalFiles}`);
   });
 
-  it('C++ 文件不参与 import 图（这正是「验不了」的含义）', () => {
+  it('C++ 文件参与 import 图（ADR-062 起有判据了）', () => {
     const scan = scanArchitecture(TEST_DIR, MODULES);
     const cppFiles = scan.files.filter((f) => f.path.endsWith('.cpp') || f.path.endsWith('.hpp'));
-    assert.equal(cppFiles.length, 0, 'C++ 文件不该出现在参与 import 图的文件里');
+    assert.equal(cppFiles.length, 2, `C++ 文件应参与 import 图，实际 ${cppFiles.length} 个`);
   });
 
   it('覆盖面统计是确定的（同样输入两次结果相同）', () => {

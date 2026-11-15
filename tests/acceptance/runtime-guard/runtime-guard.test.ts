@@ -222,7 +222,17 @@ describe('acceptance: runtime-guard', { concurrency: false }, () => {
     assert.equal(run.code, 1, `run should exit 1 (write-set violation): ${run.stdout}\n${run.stderr}`);
 
     // 1. hook 的判定：写集内放行、写集外拦下
-    assert.ok(existsSync(RESULT_FILE), 'the fake agent should have recorded hook decisions');
+    //
+    // 注意断言顺序：先查 `RESULT_FILE` 存在，再看内容。
+    //
+    // 这里带上 run 的输出做诊断信息 —— 假 agent 没跑起来时，
+    // 「result 文件不存在」本身**不说明任何原因**，
+    // 可能是 hook 没装上、agent 启动失败、git 锁竞争…
+    // 把 run 的 stdout/stderr 附上，下次偶发失败能直接看出是哪一步断的。
+    assert.ok(
+      existsSync(RESULT_FILE),
+      `the fake agent should have recorded hook decisions\n--- run stdout ---\n${run.stdout}\n--- run stderr ---\n${run.stderr}`,
+    );
     const decisions = JSON.parse(readFileSync(RESULT_FILE, 'utf-8')) as {
       inside?: { hookSpecificOutput?: { permissionDecision?: string } };
       outside?: { hookSpecificOutput?: { permissionDecision?: string } };

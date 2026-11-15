@@ -104,6 +104,7 @@ const DEVIATION_LABEL: Record<string, string> = {
   unmapped_file: '文件无归属',
   unknown_module: '未知模块',
   unverifiable_dependency: '依赖无法验证',
+  empty_module: '模块无文件',
   cycle: '依赖成环',
 };
 
@@ -111,6 +112,9 @@ function deviationColor(kind: string): (s: string) => string {
   if (kind === 'cycle' || kind === 'unknown_module') return colors.red;
   if (kind === 'undeclared_dependency' || kind === 'missing_dependency') return colors.yellow;
   if (kind === 'unverifiable_dependency') return colors.dim;
+  // empty_module 是**设计侧**的问题（路径写错了）——
+  // 用 yellow 而不是 dim：它需要人处理，但不该像 cycle 那样刺眼。
+  if (kind === 'empty_module') return colors.yellow;
   return colors.dim;
 }
 

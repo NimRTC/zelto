@@ -28,14 +28,25 @@ const PYTHON_STDLIB = new Set([
 
 /**
  * 判定源码语言。识别不了就返回 null（不扫）。
+ *
+ * ADR-062：C / C++ 也参与 import 图（`#include` 语义）。
+ * 头文件（`.h` / `.hpp`）同样要算 —— C++ 项目里头文件占相当比例
+ * （真实项目 `src/core` 的 13 个代码文件里 10 个是 `.hpp`）。
  */
 export function detectLang(filePath: string): SourceLang | null {
   const lower = filePath.toLowerCase();
   if (lower.endsWith('.ts') || lower.endsWith('.tsx') || lower.endsWith('.mts') || lower.endsWith('.cts')) return 'ts';
   if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) return 'ts';
   if (lower.endsWith('.py')) return 'python';
+  if (CPP_EXTENSIONS.has(lower.slice(lower.lastIndexOf('.')))) return 'cpp';
   return null;
 }
+
+/** C / C++ 的扩展名（小写，含点） */
+const CPP_EXTENSIONS = new Set([
+  '.c', '.h', '.cc', '.cpp', '.cxx', '.ccc',
+  '.hpp', '.hh', '.hxx', '.h++', '.ipp', '.tpp', '.inl',
+]);
 
 /**
  * 文件的**语言类别** —— 比 `detectLang` 粗，用于报告「哪些文件验不了」。
@@ -147,9 +158,11 @@ export function classifyLangCategory(filePath: string): LangCategory {
  * 这个语言类别**能不能参与依赖验证**。
  *
  * 只有已实现 import 解析的语言才算。
+ *
+ * ADR-062：C/C++ 也算 —— `#include` 语义已支持。
  */
 export function isVerifiableLang(category: LangCategory): boolean {
-  return category === 'typescript' || category === 'python';
+  return category === 'typescript' || category === 'python' || category === 'cpp';
 }
 
 /**
@@ -179,10 +192,43 @@ export function isCodeLangCategory(category: LangCategory): boolean {
  * TS/JS 覆盖：import ... from 'x'、import 'x'、export ... from 'x'、
  * require('x')、动态 import('x')。
  * Python 覆盖：from a.b import c、import a.b。
+ * C/C++ 覆盖（ADR-062）：#include "x"（项目内）、#include <x>（系统头）。
  */
 export function parseImports(source: string, lang: SourceLang): ImportRef[] {
   if (lang === 'python') return parsePythonImports(source);
+  if (lang === 'cpp') return parseCppIncludes(source);
   return parseTsImports(source);
+}
+
+/**
+ * C/C++ 的 `#include` 解析。
+ *
+ * 两种形态，语义完全不同：
+ *
+ *   `#include "foo.hpp"`  —— **项目内**依赖，要解析成模块边
+ *   `#include <mutex>`    —— **系统头**，不属于本项目，不产生边
+ *
+ * 这个区分是关键：`<...>` 全是系统头（标准库 / 第三方库），
+ * 如果把它们也当成项目依赖，每个 `.cpp` 都会连到「系统」，
+ * 整张图变成噪声。
+ *
+ * 注意 `#include` 可以在**任何位置**（不只在文件头）——
+ * 条件编译块里也有，所以不锚定行首。
+ */
+function parseCppIncludes(source: string): ImportRef[] {
+  const refs: ImportRef[] = [];
+  const pattern = /^[ \t]*#[ \t]*include[ \t]*([<"])([^>"]+)[>"]/gm;
+  for (const match of source.matchAll(pattern)) {
+    const specifier = match[2];
+    if (!specifier) continue;
+    refs.push({
+      specifier,
+      // 系统头 = 外部依赖（跟 TS 的 builtin / package 同类，不进模块图）
+      kind: match[1] === '<' ? 'builtin' : 'relative',
+      line: lineOf(source, match.index ?? 0),
+    });
+  }
+  return dedupe(refs);
 }
 
 function parseTsImports(source: string): ImportRef[] {  const refs: ImportRef[] = [];
