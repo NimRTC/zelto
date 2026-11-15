@@ -572,6 +572,20 @@ function buildPolicyYaml(projectMap: ProjectMap): string {
 const GITIGNORE_ENTRIES = [
   // zelto 状态目录：切片、事件、锁、会话、worktree、看板产物
   '.zelto/',
+  // 策略哈希锚点（C5，ADR-039）。
+  //
+  // 为什么必须忽略：它落在 `policy/**` 里，而 `policy/**` 是**保护域**
+  // —— git hook 会拒绝任何对它的写入（含 git add）。于是这个文件
+  // 既提交不了、又不是被 ignore 的，就永远以「未提交改动」的形态
+  // 出现在 `git status --porcelain` 里。
+  //
+  // 后果不是不好看：合并 / ship 的守卫（主仓工作区必须干净）会
+  // **永远**判为不干净，于是任何项目一旦被 zelto 接管，
+  // `zelto merge` 与 `zelto version ship` 就再也过不去。
+  //
+  // 锚点本来就是本机状态（锚定的是「我本地这份 policy.yaml」），
+  // 不该入库 —— 策略入库、锚点不入库，正是 ADR-039 要的分离。
+  'policy/lock.json',
 ];
 
 /**

@@ -137,13 +137,31 @@ export function buildArchitectureReport(
     if (hit) continue;
 
     const targetHasCode = (scan.moduleCodeFiles.get(to) ?? []).length > 0;
+    // 「目标模块有代码」不等于「这条依赖能用 import 图表达」。
+    //
+    // 扫描器只认 TS/JS 与 Python。C++ 项目里模块依赖靠 #include，
+    // 扫不到；如果目标模块里恰好混着几个扫描器认得的脚本
+    // （比如 third_party 里的 googletest Python 测试），
+    // 就会被判成 missing_dependency（硬偏离，deny）——
+    // 实际上「代码里没有对应的 import」只是扫描器的盲区，
+    // 不是架构问题。
+    //
+    // 判据：目标模块的代码里，扫描器**读得懂**的比例够高吗？
+    // 比例低 → 这条依赖本来就不可能体现在 import 图里 →
+    // 降为 unverifiable_dependency（软偏离，永不拦）。
+    const totalFiles = (scan.moduleFiles.get(to) ?? []).length;
+    const readableFiles = (scan.moduleCodeFiles.get(to) ?? []).length;
+    const readableRatio = totalFiles > 0 ? readableFiles / totalFiles : 1;
+    const scannable = readableRatio >= 0.5;
+
     deviations.push({
-      kind: targetHasCode ? 'missing_dependency' : 'unverifiable_dependency',
+      kind: targetHasCode && scannable ? 'missing_dependency' : 'unverifiable_dependency',
       from,
       to,
-      detail: targetHasCode
-        ? '设计声明了依赖，代码里没有对应的 import'
-        : '目标模块没有源文件（契约 / 规格一类），无法用 import 验证',
+      detail:
+        targetHasCode && scannable
+          ? '设计声明了依赖，代码里没有对应的 import'
+          : '目标模块没有源文件（契约 / 规格一类），无法用 import 验证',
     });
   }
 

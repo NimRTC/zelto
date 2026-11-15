@@ -903,11 +903,19 @@ register('version', async (args) => {
 
     const sliceStore = new SliceStore(SLICES_DIR);
     const problems: string[] = [];
+    // 被放弃的切片不阻塞版本交付，但要显式列出来 —— 不能静默吞掉
+    // 「这个版本少了哪几片」。这与 report-analyzer 对版本进度的
+    // 口径一致（completed || abandoned 算已了结）。
+    const abandonedSlices: string[] = [];
 
     for (const s of version.slices) {
       const data = await sliceStore.read(s.id).catch(() => null);
       if (!data) {
         problems.push(`${s.id}：切片不存在`);
+        continue;
+      }
+      if (data.state === 'abandoned') {
+        abandonedSlices.push(s.id);
         continue;
       }
       if (data.state !== 'completed') {
@@ -924,6 +932,11 @@ register('version', async (args) => {
       } else if (!isMergedIntoHead(branch, process.cwd())) {
         problems.push(`${s.id}：分支 ${branch} 还没合入主干`);
       }
+    }
+
+    if (abandonedSlices.length > 0) {
+      f.out(`   ⚠️ 本版本有 ${abandonedSlices.length} 个切片被放弃（不阻塞交付）：`);
+      for (const id of abandonedSlices) f.out(`      - ${id}`);
     }
 
     if (problems.length > 0) {
