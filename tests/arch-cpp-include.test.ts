@@ -60,6 +60,8 @@ describe('ADR-062：C++ 的 include 解析', () => {
       [
         '#include "engine_impl.hpp"',
         '#include "nimrtc/core/registry.hpp"',
+        // 尖括号指向**项目内部**头文件 —— 真实项目里这种用法占尖括号 include 的 40%
+        '#include <nimrtc/core/registry.hpp>',
         '#include <mutex>',
         '#include <vector>',
         '',
@@ -122,15 +124,62 @@ describe('ADR-062：C++ 的 include 解析', () => {
       // include 根下是 nimrtc/core/registry.hpp，不是直接的 registry.hpp
       assert.equal(resolved, null, 'include 根下没有裸的 registry.hpp');
     });
+
+    it('尖括号**跳过**当前目录（只搜 include 根）', () => {
+      const scan = scanArchitecture(TEST_DIR, MODULES);
+      const fileSet = new Set(scan.files.map((f) => f.path));
+
+      // `engine_impl.hpp` 在引用文件同目录 —— 引号能找到，尖括号找不到
+      const quoted = resolveCppInclude(
+        'src/engine/src/engine.cpp',
+        'engine_impl.hpp',
+        fileSet,
+        ['src/core/include'],
+        '"',
+      );
+      assert.equal(quoted, 'src/engine/src/engine_impl.hpp', '引号：当前目录优先');
+
+      const angled = resolveCppInclude(
+        'src/engine/src/engine.cpp',
+        'engine_impl.hpp',
+        fileSet,
+        ['src/core/include'],
+        '<',
+      );
+      assert.equal(angled, null, '尖括号：跳过当前目录');
+    });
+
+    it('尖括号能找到 include 根下的项目头文件', () => {
+      const scan = scanArchitecture(TEST_DIR, MODULES);
+      const fileSet = new Set(scan.files.map((f) => f.path));
+      const resolved = resolveCppInclude(
+        'src/engine/src/engine.cpp',
+        'nimrtc/core/registry.hpp',
+        fileSet,
+        ['src/core/include'],
+        '<',
+      );
+      assert.equal(resolved, 'src/core/include/nimrtc/core/registry.hpp');
+    });
   });
 
-  describe('系统头被排除', () => {
-    it('#include <...> 归为 builtin（不进模块图）', () => {
-      const refs = parseImports('#include <mutex>\n#include <vector>\n', 'cpp');
+  describe('尖括号与引号的区别', () => {
+    it('#include <...> 也要解析（尖括号可能是项目内部头文件）', () => {
+      // ADR-062 §3.2（修正）：尖括号**不等于**系统头。
+      // 真实项目实测：2716 条尖括号 include 里 1081 条是项目内部的。
+      // 所以两种括号都要解析，只是搜索顺序不同。
+      const refs = parseImports('#include <mutex>\n#include <nimrtc/core/x.hpp>\n', 'cpp');
       assert.equal(refs.length, 2);
       for (const ref of refs) {
-        assert.equal(ref.kind, 'builtin', `<${ref.specifier}> 应是 builtin`);
+        assert.equal(ref.kind, 'relative', `<${ref.specifier}> 也该尝试解析`);
       }
+    });
+
+    it('括号类型被记下来（决定搜索顺序）', () => {
+      const refs = parseImports('#include <mutex>\n#include "foo.hpp"\n', 'cpp');
+      assert.equal(refs.length, 2);
+      assert.equal(refs[0].cppBracket, '<');
+      assert.equal(refs[1].cppBracket, '"');
     });
 
     it('#include "..." 归为 relative（进模块图）', () => {
@@ -145,6 +194,14 @@ describe('ADR-062：C++ 的 include 解析', () => {
       for (const edge of scan.edges) {
         assert.notEqual(edge.to, 'system', '系统头不该成为模块');
       }
+    });
+
+    it('尖括号 include 指向项目内部头文件时，产生跨模块边', () => {
+      // 这是 ADR-062 §3.2 修正的核心场景：
+      // `<nimrtc/core/registry.hpp>` 是项目内部的，但用了尖括号。
+      const scan = scanArchitecture(TEST_DIR, MODULES);
+      const edge = scan.edges.find((e) => e.from === 'src/engine' && e.to === 'src/core');
+      assert.ok(edge, '尖括号 include 也应产生跨模块边');
     });
   });
 

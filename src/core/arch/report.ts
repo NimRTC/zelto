@@ -174,7 +174,14 @@ export function buildArchitectureReport(
       kind: targetHasCode && scannable ? 'missing_dependency' : 'unverifiable_dependency',
       from,
       to,
-      detail: describeUnverifiable(targetHasCode, scannable, codeFiles, verifiedFiles),
+      detail: describeUnverifiable(
+        targetHasCode,
+        scannable,
+        codeFiles,
+        verifiedFiles,
+        // 来源模块一个代码文件都没匹配上 → 真正的原因在这里
+        (scan.moduleCodeFiles.get(from) ?? []).length,
+      ),
     });
   }
 
@@ -294,14 +301,28 @@ export function buildArchitectureReport(
  *
  * 把三种混成一句话，等于让人对着错误的方向排查 ——
  * 看到「没有源文件」会去找「是不是漏写了」，而真相是「语言不支持」。
+ *
+ * ADR-062 §4.4 补充了第 4 种：**来源模块自己没认领到代码文件**。
+ * 真实项目里 `src/log` 的设计路径是 `src/log/*`，
+ * 而代码在 `src/log/src/log.cpp` —— 模块只认领到了 CMakeLists.txt。
+ * 于是 `src/log → src/core` 的依赖**真实存在**（log.cpp include 了
+ * `nimrtc/core/log.hpp`），但因为源文件没被认领，扫不到这条边，
+ * 报成了「缺失依赖」—— **诊断指错了地方**。
  */
 function describeUnverifiable(
   targetHasCode: boolean,
   scannable: boolean,
   codeFiles: number,
   verifiedFiles: number,
+  fromCodeFiles: number,
 ): string {
   if (targetHasCode && scannable) {
+    // 目标模块读得懂，但没找到对应的边 —— 两种原因：
+    //   a) 依赖真的不存在（设计说了但代码没做）
+    //   b) 来源模块没认领到代码文件（依赖真实存在，但扫不到）
+    if (fromCodeFiles === 0) {
+      return '来源模块没有匹配到任何代码文件 —— 依赖可能真实存在但扫不到（先查来源模块的文件路径对不对）';
+    }
     return '设计声明了依赖，代码里没有对应的 import';
   }
   if (!targetHasCode) {

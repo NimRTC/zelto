@@ -203,17 +203,27 @@ export function parseImports(source: string, lang: SourceLang): ImportRef[] {
 /**
  * C/C++ 的 `#include` 解析。
  *
- * 两种形态，语义完全不同：
+ * ADR-062 §3.2（修正后）：**`<>` 与 `""` 的区别不是「内部 vs 外部」**，
+ * 而是「**搜索顺序的约定**」：
  *
- *   `#include "foo.hpp"`  —— **项目内**依赖，要解析成模块边
- *   `#include <mutex>`    —— **系统头**，不属于本项目，不产生边
+ *   `#include "foo.hpp"`  —— 先搜引用文件所在目录，再搜 `-I` 列表
+ *   `#include <foo.hpp>`  —— 直接搜 `-I` 列表（跳过当前目录）
  *
- * 这个区分是关键：`<...>` 全是系统头（标准库 / 第三方库），
- * 如果把它们也当成项目依赖，每个 `.cpp` 都会连到「系统」，
- * 整张图变成噪声。
+ * 两者**都能指向项目内部的公共头文件**。
+ * 真实项目实测：2716 条尖括号 include 里，**1081 条是项目内部的**
+ * （`nimrtc/core/api_version.hpp` 150 次、`nimrtc/core/log.hpp` 79 次……）——
+ * 占 40%。
  *
- * 注意 `#include` 可以在**任何位置**（不只在文件头）——
- * 条件编译块里也有，所以不锚定行首。
+ * 所以**不能**按尖括号一律排除。那会漏掉 1081 条真实依赖。
+ *
+ * 真正的判据是「**这个文件在不在项目的 include 根里**」——
+ * 那要等解析阶段才知道（见 `resolveCppInclude`）。
+ * 这里把两种都标成 `relative`（= 需要解析），
+ * 解析阶段找不到的才是外部依赖。
+ *
+ * 解析顺序的差别仍然要保留：
+ *   - `""`：当前目录 → include 根
+ *   - `<>`：include 根（**跳过当前目录**）
  */
 function parseCppIncludes(source: string): ImportRef[] {
   const refs: ImportRef[] = [];
@@ -223,8 +233,9 @@ function parseCppIncludes(source: string): ImportRef[] {
     if (!specifier) continue;
     refs.push({
       specifier,
-      // 系统头 = 外部依赖（跟 TS 的 builtin / package 同类，不进模块图）
-      kind: match[1] === '<' ? 'builtin' : 'relative',
+      // 两种都要解析 —— 尖括号也可能是项目内部头文件（见上）
+      kind: 'relative',
+      cppBracket: match[1] as '<' | '"',
       line: lineOf(source, match.index ?? 0),
     });
   }

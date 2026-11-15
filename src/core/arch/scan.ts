@@ -168,32 +168,38 @@ export function discoverIncludeRoots(root: string): string[] {
 }
 
 /**
- * 解析 C/C++ 的 `#include "..."`。
+ * 解析 C/C++ 的 `#include`。
  *
- * ADR-062 §3.1：两种形态，两套候选策略。
+ * ADR-062 §3.1 / §3.2（修正）：两种括号，两套候选策略。
  *
- * 1. **带目录**（`nimrtc/core/registry.hpp`）
- *    —— 相对于引用文件所在目录，再试所有 include 根
- * 2. **裸文件名**（`engine_impl.hpp`）
- *    —— 先试引用文件所在目录（这是 `#include "..."` 的规范行为），
+ * 1. **引号**（`nimrtc/core/registry.hpp`）
+ *    —— 相对引用文件所在目录，再试所有 include 根
+ * 2. **尖括号**（`<nimrtc/core/registry.hpp>`）
+ *    —— **只**试 include 根（跳过当前目录，这是 `<>` 的规范行为）
+ * 3. **裸文件名**（`engine_impl.hpp`，引号形式）
+ *    —— 先试引用文件所在目录（`#include "..."` 的规范行为），
  *    再试所有 include 根
  *
  * 真实项目实测：108 条引号 include 里 72 条是裸文件名、36 条带目录，
- * **两种形态并存**，所以两种策略都要有。
+ * **两种形态并存**；另有 2716 条尖括号 include，其中 **1081 条是项目内部的**
+ * —— 所以尖括号**不能**一律当系统头排除。
  */
 export function resolveCppInclude(
   fromFile: string,
   specifier: string,
   fileSet: Set<string>,
   includeRoots: string[],
+  bracket: '<' | '"' = '"',
 ): string | null {
   const baseDir = fromFile.includes('/') ? fromFile.slice(0, fromFile.lastIndexOf('/')) : '';
   const candidates: string[] = [];
 
-  // 相对引用文件所在目录
-  candidates.push(normalizePosix(joinPosix(baseDir, specifier)));
+  // 引号形式先试引用文件所在目录；尖括号跳过（C++ 规范行为）
+  if (bracket === '"') {
+    candidates.push(normalizePosix(joinPosix(baseDir, specifier)));
+  }
 
-  // 相对每个 include 根
+  // 再试每个 include 根
   for (const root of includeRoots) {
     candidates.push(normalizePosix(joinPosix(root, specifier)));
   }
@@ -318,10 +324,20 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
       let targetModule: string | null = null;
 
       if (file.lang === 'cpp') {
-        // C++ 的 `#include "..."` —— 项目内依赖（系统头已在解析时归为 builtin）
-        const resolved = resolveCppInclude(path, ref.specifier, fileSet, includeRoots);
+        // C++ 的 `#include` —— 项目内依赖
+        //
+        // ADR-062 §3.2（修正）：尖括号**也可能是**项目内部头文件
+        //（真实项目 1081 条），所以两种都要解析；
+        // 解析不到的自然就是外部依赖（系统头 / 第三方库），不进模块图。
+        const resolved = resolveCppInclude(
+          path,
+          ref.specifier,
+          fileSet,
+          includeRoots,
+          ref.cppBracket ?? '"',
+        );
         if (!resolved) {
-          unresolved.push({ file: path, specifier: ref.specifier });
+          // 解析不到 = 外部依赖（系统头）—— 不算「未解析」，只是不进模块图
           continue;
         }
         const targetModuleOwner = ownerOf.get(resolved) ?? null;

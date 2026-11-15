@@ -52,6 +52,18 @@ export interface ImportRef {
   kind: 'relative' | 'package' | 'builtin';
   /** 1 基行号 */
   line: number;
+  /**
+   * C/C++ 专有：尖括号（`<>`）还是引号（`""`）
+   *
+   * 决定**搜索顺序**：
+   *   - `""` → 当前目录 → include 根
+   *   - `<>` → include 根（跳过当前目录）
+   *
+   * ADR-062 §3.2（修正）：两者**都能**指向项目内部头文件 ——
+   * 真实项目里 1081 条尖括号 include 是项目内部的。
+   * 所以这不是「内部 vs 外部」的标记，只影响搜索顺序。
+   */
+  cppBracket?: '<' | '"';
 }
 
 /** 扫出来的一个源文件 */

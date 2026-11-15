@@ -149,3 +149,94 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     // （修复前：2/10 = 0.2 < 0.5 → 误判为读不懂 → 漏放）
   });
 });
+
+describe('ADR-062 §4.5：来源模块没认领到代码文件时，诊断要指向真正的原因', () => {
+  const LOG_MODULES: ModuleSpec[] = [
+    { name: 'src/core', description: '', filePatterns: ['src/core/**'], dependencies: [] },
+    {
+      // 路径只写一层 → 代码在 src/log/src/log.cpp 认领不到
+      name: 'src/log',
+      description: '',
+      filePatterns: ['src/log/*'],
+      dependencies: ['src/core'],
+    },
+  ];
+
+  const LOG_DIR = join(tmpdir(), `zelto-arch-log-${Date.now()}`);
+
+  before(async () => {
+    await mkdir(join(LOG_DIR, 'src', 'core'), { recursive: true });
+    await mkdir(join(LOG_DIR, 'src', 'log', 'src'), { recursive: true });
+    await writeFile(join(LOG_DIR, 'src', 'core', 'a.ts'), 'export const a = 1;\n', 'utf-8');
+    await writeFile(join(LOG_DIR, 'src', 'log', 'CMakeLists.txt'), 'add_library(log)\n', 'utf-8');
+    await writeFile(
+      join(LOG_DIR, 'src', 'log', 'src', 'log.cpp'),
+      // C++ 语法：用尖括号 include 项目的公共头文件
+      '#include <nimrtc/core/a.hpp>\n',
+      'utf-8',
+    );
+    // 项目公共头文件放在 include 根下
+    await mkdir(join(LOG_DIR, 'src', 'core', 'include', 'nimrtc', 'core'), { recursive: true });
+    await writeFile(
+      join(LOG_DIR, 'src', 'core', 'include', 'nimrtc', 'core', 'a.hpp'),
+      '#pragma once\n',
+      'utf-8',
+    );
+  });
+
+  after(async () => {
+    await rm(LOG_DIR, { recursive: true, force: true });
+  });
+
+  it('来源模块没匹配到代码文件时，说明指向「来源模块的路径」', () => {
+    const scan = scanArchitecture(LOG_DIR, LOG_MODULES);
+    const report = buildArchitectureReport(LOG_MODULES, scan);
+
+    // src/log 只认领到 CMakeLists.txt，没认领到 log.cpp
+    const log = report.modules.find((m) => m.name === 'src/log');
+    assert.ok(log);
+    assert.equal(log.codeFileCount, 0, 'src/log 应该一个代码文件都没认领到');
+
+    const dev = report.deviations.find(
+      (d) => d.kind === 'missing_dependency' && d.from === 'src/log' && d.to === 'src/core',
+    );
+    assert.ok(dev, `应有 missing_dependency，实际：${JSON.stringify(report.deviations)}`);
+    // 依赖真实存在（log.cpp import 了 core），但因为源文件没被认领，扫不到
+    // → 说明必须指向「来源模块的路径不对」，而不是「代码里没有对应的 import」
+    assert.ok(
+      dev.detail.includes('来源模块'),
+      `说明应指向来源模块，实际：${dev.detail}`,
+    );
+    assert.ok(
+      !dev.detail.includes('代码里没有对应的 import'),
+      `不该说「代码里没有对应的 import」—— 依赖真实存在，实际：${dev.detail}`,
+    );
+  });
+
+  it('来源模块有代码文件时，说明保持原样', () => {
+    // 用同一个目录，但模块声明成能认领到代码文件的样子
+    const OK_MODULES: ModuleSpec[] = [
+      { name: 'src/core', description: '', filePatterns: ['src/core/**'], dependencies: [] },
+      {
+        // 路径写两层 → 认领到 src/log/src/log.cpp
+        name: 'src/log',
+        description: '',
+        filePatterns: ['src/log/*', 'src/log/**/*'],
+        dependencies: ['src/core'],
+      },
+    ];
+
+    const scan = scanArchitecture(LOG_DIR, OK_MODULES);
+    const report = buildArchitectureReport(OK_MODULES, scan);
+
+    const log = report.modules.find((m) => m.name === 'src/log');
+    assert.ok(log);
+    assert.ok(log.codeFileCount > 0, 'src/log 应该认领到代码文件');
+
+    // 现在依赖扫得到了 → 不该有 missing_dependency
+    const dev = report.deviations.find(
+      (d) => d.kind === 'missing_dependency' && d.from === 'src/log' && d.to === 'src/core',
+    );
+    assert.equal(dev, undefined, '认领到代码文件后，依赖就扫得到了，不该再报缺失');
+  });
+});
