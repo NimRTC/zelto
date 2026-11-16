@@ -638,6 +638,28 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   /**
    * Get exit code promise for a session.
    * Supports retry: if exit code != 0 and retries remain, auto-restarts.
+   *
+   * **超时不走这里的内部重试**（ADR-055 决策 C，实测缺陷 D-25）。
+   *
+   * 原来的做法：非零退出 → 适配器内部 `startWithRetry` → 用**原始 bundle**
+   * + **新的 agentSessionId** 重启。那是从头再来 —— agent 的上下文被清零，
+   * 它已经摸清的东西（改到一半的代码、跑了一半的测试、读过的一堆源码）
+   * 全部作废，正是 ADR-055 明确要避免的事。
+   *
+   * 而且它把 CLI 层的续跑逻辑**短路**了：适配器内部已经把重试链走完
+   * （实测跑到 `-retry-2`），`core-slice.ts` 里的 `continueSession`
+   * （真正的 ADR-055 续跑）根本没机会执行。
+   *
+   * **怎么认出「这是超时」**：不能用退出码 —— Windows 上 `taskkill` 杀掉
+   * 进程树后，shell 包装返回的是**非零码**（1），不是 null。实测：
+   * 超时的 exitCode 是 1，与「agent 自己报错退出」在退出码上**完全一样**。
+   *
+   * 唯一可靠的信号是适配器**自己**记的 `status === 'timeout'` ——
+   * `handleTimeout` 在杀进程树之前就写好了（ADR-055 决策 B）。
+   *
+   * 超时交回 CLI 层之后，那里的 `resumeForRetry` 会用
+   * `--resume <agentSessionId>` 续同一个会话。非零退出码（agent 逻辑崩了）
+   * 仍然走内部重试 —— 那重来一遍是合理的。
    */
   waitForExit(sessionId: string): Promise<number | null> {
     const session = this.sessions.get(sessionId);
@@ -658,9 +680,17 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
           return;
         }
 
+        const data = loadSession(sessionId);
+
+        // 超时 → 不在这里重试。交给 CLI 层走 ADR-055 的续跑路径
+        // （`continueSession`）—— 见上面那段说明。
+        if (data?.status === 'timeout') {
+          resolve(code);
+          return;
+        }
+
         // Check if we should retry
         if (code !== null && code !== 0 && session.retryCount < this.maxRetries) {
-          const data = loadSession(sessionId);
           if (!data || !data.prompt) {
             resolve(code);
             return;

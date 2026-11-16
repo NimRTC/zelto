@@ -222,3 +222,146 @@ describe('ADR-055 · 重试接着同一个 agent 会话跑', () => {
     );
   });
 });
+
+// ─── D-25：超时的重试不许在适配器内部「从头再来」────────────────────────────
+//
+// 病灶（2026-11-16，nimrtc-zelto 的 v1-rtcpprocessor 实测）：
+//
+//   agent 跑了 30 分钟被超时杀掉 → 适配器**内部**用原始 bundle +
+//   **新的 agentSessionId** 重启 → agent 的上下文被清零，
+//   它已经摸清的东西（改到一半的代码、跑了一半的测试）全部作废。
+//
+//   这正是 ADR-055 决策 C 要避免的事，而且它把 CLI 层的续跑逻辑
+//   （`continueSession`）**短路**了 —— 适配器内部已经把重试链走完。
+//
+// 判据：**超时的退出码是 null，被杀掉的进程不该触发内部重试**。
+// 内部重试留给「agent 自己报错退出」（非零退出码）—— 那通常是逻辑崩了。
+
+describe('D-25 · 超时不触发适配器内部的从头重试', () => {
+  const TEST_DIR_2 = join(tmpdir(), `zelto-d025-test-${Date.now()}`);
+
+  before(async () => {
+    await mkdir(TEST_DIR_2, { recursive: true });
+  });
+
+  after(async () => {
+    await rm(TEST_DIR_2, { recursive: true, force: true });
+  });
+
+  it('超时的退出码不是 0（退出码分不出超时 —— 判据得用 status）', async () => {
+    const node = `"${process.execPath}"`;
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "setTimeout(()=>{}, 60000)"`,
+      cwd: TEST_DIR_2,
+      timeoutMs: 800,
+      maxRetries: 2,
+    });
+
+    const { sessionId } = await adapter.start({ sliceId: 'd025-exitcode', prompt: 'bundle' });
+    const exitCode = await adapter.waitForExit(sessionId);
+
+    // Windows 上 `taskkill` 杀进程树后，shell 包装返回的是**非零码**（1），
+    // 不是 null —— 所以「退出码是 null 就算超时」这条路走不通。
+    // 这正是 D-25 的病灶：适配器把超时当成了「agent 报错退出」，内部重试。
+    assert.notEqual(exitCode, 0, '超时的退出码不该是 0');
+
+    const status = adapter.getSessionStatus(sessionId);
+    assert.equal(status?.status, 'timeout', '会话状态必须是 timeout —— 这是唯一可靠的超时信号');
+  });
+
+  it('超时后适配器没有偷偷起第二个 agent（会话数不变）', async () => {
+    const node = `"${process.execPath}"`;
+    // sliceId 带时间戳 —— 会话文件是累积的，不能拿绝对数量做判据
+    const sliceId = `d025-nohidden-${Date.now()}`;
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "setTimeout(()=>{}, 60000)"`,
+      cwd: TEST_DIR_2,
+      timeoutMs: 800,
+      maxRetries: 2,
+    });
+
+    const before = adapter.listSliceSessions(sliceId).length;
+
+    const { sessionId } = await adapter.start({ sliceId, prompt: 'bundle' });
+    await adapter.waitForExit(sessionId);
+
+    // 内部重试会起一个 `-retry-N` 后缀的新会话。
+    // 断言这个切片只留下**一个**会话 —— 超时不该在适配器内部起新 agent。
+    const sessions = adapter.listSliceSessions(sliceId);
+    assert.equal(
+      sessions.length - before,
+      1,
+      `超时后只应有一个会话（内部重试会起第二个：${JSON.stringify(sessions.map((s) => s.sessionId))}）`,
+    );
+  });
+
+  it('agent 报错退出（failed）仍会起内部重试 —— 与超时的行为必须不同', async () => {
+    const node = `"${process.execPath}"`;
+    const sliceId = `d025-internal-retry-${Date.now()}`;
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "process.exit(1)"`,
+      cwd: TEST_DIR_2,
+      timeoutMs: 30_000,
+      maxRetries: 1,
+    });
+
+    const before = adapter.listSliceSessions(sliceId).length;
+
+    const { sessionId } = await adapter.start({ sliceId, prompt: 'bundle' });
+    await adapter.waitForExit(sessionId);
+
+    const sessions = adapter.listSliceSessions(sliceId);
+    assert.equal(
+      sessions.length - before,
+      2,
+      `agent 报错退出应该起内部重试（1 次重试 = 2 个会话）：${JSON.stringify(sessions.map((s) => s.sessionId))}`,
+    );
+  });
+
+  it('超时后 CLI 层能续同一个 agent 会话（ADR-055 决策 C 真的生效）', async () => {
+    const node = `"${process.execPath}"`;
+    const sliceId = 'd025-continue';
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "setTimeout(()=>{}, 60000)"`,
+      cwd: TEST_DIR_2,
+      timeoutMs: 800,
+      maxRetries: 2,
+    });
+
+    const { sessionId } = await adapter.start({ sliceId, prompt: 'bundle' });
+    await adapter.waitForExit(sessionId);
+
+    const agentSessionId = adapter.getAgentSessionId(sessionId);
+    assert.ok(agentSessionId, '超时前应该已经产生了 agent 会话 id');
+
+    // 续跑：复用同一个 agent 会话 id —— 这才是「接着跑」而不是「重跑」
+    const { sessionId: continuedId } = await adapter.continueSession(sessionId, '继续完成这个切片。');
+    assert.equal(
+      adapter.getAgentSessionId(continuedId),
+      agentSessionId,
+      '续跑必须复用同一个 agent 会话 id',
+    );
+    await adapter.waitForExit(continuedId);
+  });
+
+  it('非零退出码仍然走内部重试（agent 逻辑崩了，重来一遍合理）', async () => {
+    // 退出码 1 —— 与超时的区别在于会话状态是 failed 而不是 timeout
+    const node = `"${process.execPath}"`;
+    const sliceId = 'd025-nonzero';
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "process.exit(1)"`,
+      cwd: TEST_DIR_2,
+      timeoutMs: 30_000,
+      maxRetries: 1,
+    });
+
+    const { sessionId } = await adapter.start({ sliceId, prompt: 'bundle' });
+    const exitCode = await adapter.waitForExit(sessionId);
+
+    assert.notEqual(exitCode, null, '非零退出码不该是 null');
+    assert.notEqual(exitCode, 0, '非零退出码不该是 0');
+
+    const status = adapter.getSessionStatus(sessionId);
+    assert.equal(status?.status, 'failed', 'agent 报错退出的状态是 failed，不是 timeout');
+  });
+});
