@@ -33,6 +33,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { validateRule } from '../../../core/policy/validator.js';
 import {
   appendToSection,
+  hasSection,
   removeSectionEntry,
   updateSectionEntryFields,
 } from '../../../core/policy/section-editor.js';
@@ -176,6 +177,23 @@ export function removePolicyRule(options: RemoveOptions): RemoveHandlerResult {
     };
   }
 
+  // 段缺失 → 不能报告成功（D-31）。
+  //
+  // 解析器认得这条规则（`parsePolicyYaml` 用 trim，BOM 安全），
+  // 但分段编辑器可能找不到段（两种判据不一致）。
+  // 这时 `removeSectionEntry` 会原样返回 —— 文件没变。
+  // 必须在这里挡住，**不能让命令报「✓ removed」而文件没动**。
+  if (!hasSection(yaml, 'rules')) {
+    return {
+      success: false,
+      ruleId,
+      message:
+        `Cannot locate the "rules:" section in policy/policy.yaml — ` +
+        `the file may be malformed or start with a byte-order mark. Nothing was changed.`,
+      totalRulesAfter: current.length,
+    };
+  }
+
   const updated = removeSectionEntry(yaml, 'rules', 'id', ruleId);
   writePolicyYaml(updated);
 
@@ -280,6 +298,23 @@ export function editPolicyRule(options: EditOptions): EditHandlerResult {
   if (priority !== undefined) fields.priority = String(priority);
   if (path !== undefined) matchFields.path = path;
   if (operation !== undefined) matchFields.operation = operation;
+
+  // 段缺失 → 不能报告成功（D-31）。
+  //
+  // 解析器认得这条规则（`parsePolicyYaml` 用 trim，BOM 安全），
+  // 但分段编辑器可能找不到段（两种判据不一致）。
+  // 这时 `updateSectionEntryFields` 会原样返回 —— 文件没变。
+  // 必须在这里挡住，**不能让命令报「✓ updated」而文件没动**。
+  if (!hasSection(yaml, 'rules')) {
+    return {
+      success: false,
+      ruleId,
+      message:
+        `Cannot locate the "rules:" section in policy/policy.yaml — ` +
+        `the file may be malformed or start with a byte-order mark. Nothing was changed.`,
+      changes: {},
+    };
+  }
 
   const updated = updateSectionEntryFields(
     yaml,

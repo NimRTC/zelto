@@ -352,3 +352,84 @@ describe('zelto policy validate --update', () => {
     assert.equal(parsed.anchor.status, 'reanchored');
   });
 });
+
+// ─── D-31：带 BOM 的 policy.yaml —— 段标题判据被打穿（静默失败）─────────────
+//
+// 根因：`findSection` 判定段标题用的是「trim 后相等 **且** 长度相等」。
+// JS 的 `trim()` 会把 BOM（U+FEFF）当空白去掉，所以 `trim() === 'rules:'` 成立；
+// 但 `lines[i].length` 比标题多 1 → 长度判据不成立 → **整段找不到**。
+//
+// 后果（比 D-30 更隐蔽）：命令**报告成功**，文件一个字节没变。
+// D-30 是「抹掉了不该抹的」，D-31 是「什么都没做却说你做了」。
+//
+// BOM 在 Windows 上很常见：PowerShell 5.1 的 `Set-Content -Encoding UTF8`、
+// 记事本、部分编辑器都会写 BOM。
+
+describe('D-31：带 BOM 的 policy.yaml 不再静默失败', () => {
+  /** 写一个带 BOM 的 policy.yaml */
+  function writePolicyWithBom(content: string): void {
+    writeFileSync(join(workDir, 'policy', 'policy.yaml'), `\uFEFF${content}`, 'utf-8');
+  }
+
+  beforeEach(() => {
+    writePolicyWithBom(REAL_SHAPED_POLICY);
+  });
+
+  it('policy edit 真的改了文件（不是只报成功）', async () => {
+    const { code } = await runCommand('policy', 'edit', 'keep-me', '--action', 'deny');
+    assert.equal(code, 0);
+    assert.ok(readPolicy().includes('action: deny'), 'edit 报告成功但文件没变');
+  });
+
+  it('policy remove 真的删掉了规则（不是只报成功）', async () => {
+    const { code } = await runCommand('policy', 'remove', 'keep-me');
+    assert.equal(code, 0);
+    assert.ok(!readPolicy().includes('id: keep-me'), 'remove 报告成功但规则还在');
+  });
+
+  it('policy arch edit 真的改了文件', async () => {
+    const { code } = await runCommand('policy', 'arch', 'edit', 'cycle', '--action', 'deny');
+    assert.equal(code, 0);
+    assert.ok(readPolicy().includes('action: deny'), 'arch edit 报告成功但文件没变');
+  });
+
+  it('policy arch remove 真的删掉了护栏规则', async () => {
+    const { code } = await runCommand('policy', 'arch', 'remove', 'cycle');
+    assert.equal(code, 0);
+    assert.ok(!readPolicy().includes('kind: cycle'), 'arch remove 报告成功但规则还在');
+  });
+
+  it('policy arch list 能读出带 BOM 的 arch: 段', async () => {
+    const { stdout, code } = await runCommand('policy', 'arch', 'list');
+    assert.equal(code, 0);
+    assert.ok(stdout.includes('cycle'), `实际输出：${stdout}`);
+  });
+
+  it('policy arch add 不产生重复的 arch: 段', async () => {
+    await runCommand('policy', 'arch', 'add', 'unmapped_file', '--action', 'ask', '--basis', 'policy.yaml#arch');
+    const content = readPolicy();
+    const occurrences = content.split('arch:').length - 1;
+    assert.equal(occurrences, 1, `arch: 段出现了 ${occurrences} 次 —— 段没被识别，追加了一个新的`);
+  });
+
+  it('policy remove 不抹掉带 BOM 的 arch: 段', async () => {
+    await runCommand('policy', 'remove', 'keep-me');
+    const content = readPolicy();
+    assert.ok(content.includes('kind: cycle'), 'arch: 段被抹掉了');
+  });
+
+  it('BOM 不会被写回时丢掉（编辑不改文件编码标记）', async () => {
+    await runCommand('policy', 'edit', 'keep-me', '--action', 'deny');
+    const raw = readFileSync(join(workDir, 'policy', 'policy.yaml'), 'utf-8');
+    assert.ok(raw.startsWith('\uFEFF'), 'BOM 被抹掉了 —— 文件编码标记不该被工具改');
+  });
+
+  it('段缺失时命令报错而不是报告成功（静默失败防线）', async () => {
+    // 造一个「解析器认得、但分段编辑器认不出」的文件：
+    // rules: 被缩进（它就不在顶层了）
+    writePolicy('anchors:\n  policy: "sha256:init"\n');
+    const { code } = await runCommand('policy', 'remove', 'keep-me');
+    // 规则本来就不存在 → 报「找不到」而不是「已删除」
+    assert.notEqual(code, 0, '找不到规则时不该返回 0');
+  });
+});

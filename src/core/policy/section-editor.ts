@@ -47,6 +47,63 @@ export interface EntryRange {
 }
 
 /**
+ * 这一行是不是某段的标题行。
+ *
+ * 判定：「去掉 BOM 后的整行 == 标题」。
+ *
+ * 为什么不直接用 `line.trim() === header`（ADR-068 D-31）：
+ * 那会把**缩进过的 `rules:`** 也当成顶层段标题 —— 它其实是上一段某条目里的
+ * 一个键（`match:` 块下面不该有 `rules:`，但现实里什么都有）。
+ *
+ * 为什么不沿用「trim 后相等 **且** 长度相等」（原实现）：
+ * 长度相等这个判据会被 BOM 打穿：
+ *
+ * ```yaml
+ * \uFEFFrules:
+ *   - id: x
+ * ```
+ *
+ * JS 的 `trim()` 会把 BOM（U+FEFF）当空白去掉（它属于 WhiteSpace），
+ * 所以 `trim() === 'rules:'` 成立；但 `lines[i].length` 比标题多 1 →
+ * 长度判据不成立 → **整段找不到**。
+ *
+ * 后果是「静默失败」：`policy edit` / `policy remove` / `policy arch *`
+ * 全部找不到 `rules:` / `arch:` 段，命令却报告成功 —— 人以为改完了，
+ * 文件一个字节没变。这正是 D-30 那类缺陷的同一族：
+ * **工具报告成功、实际什么都没做**。
+ *
+ * BOM 在 Windows 上很常见（PowerShell 5.1 的 `Set-Content -Encoding UTF8`、
+ * 记事本、部分编辑器）。仓库里已有同类处理（core/design/store.ts、
+ * core/version/branch.ts 都是 `replace(/^\uFEFF/, '')`）。
+ *
+ * 行尾空白容错：YAML 允许 `rules:   `，原实现（长度相等）会漏掉它，
+ * 这里一并放过。
+ */
+function isSectionHeaderLine(line: string, header: string): boolean {
+  const stripped = line.replace(/^\uFEFF/, '').replace(/\s+$/, '');
+  return stripped === header;
+}
+
+/**
+ * 某一段在 YAML 里存不存在。
+ *
+ * 存在的意义不是「查询」——是**让编辑路径能区分两件事**：
+ *
+ *   - 段真的不在 → 这是「新增」场景，追加即可
+ *   - 段在但**没找到** → 这不正常，命令必须报错而不是报告成功
+ *
+ * D-31 的教训：段找不到时，`removeSectionEntry` / `updateSectionEntryFields`
+ * 会**原样返回**（`if (!entry) return yaml`）—— 文件没变，但调用方
+ * 照样返回 `success: true`。人看到「✓ Rule removed」，
+ * 实际上文件一个字节没动。
+ *
+ * 所以编辑路径必须**先确认段在**，再动手。
+ */
+export function hasSection(yaml: string, section: SectionName): boolean {
+  return findSection(yaml, section) !== null;
+}
+
+/**
  * 找出某一段在 YAML 里的起止行号（0 基，左闭右开）。
  *
  * @returns `{ start, end }`：`start` 是 `rules:` 那一行本身，
@@ -59,13 +116,12 @@ export function findSection(yaml: string, section: SectionName): { start: number
 
   let start = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === header && lines[i].length === header.length) {
+    if (isSectionHeaderLine(lines[i], header)) {
       start = i;
       break;
     }
   }
   if (start === -1) return null;
-
   // 找下一个顶层键（顶格、非空、非注释的行）
   let nextKey = -1;
   for (let i = start + 1; i < lines.length; i++) {

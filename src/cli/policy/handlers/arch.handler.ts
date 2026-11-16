@@ -28,6 +28,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { validateArchGuardRule } from '../../../core/policy/validator.js';
 import {
   appendToSection,
+  hasSection,
   listSectionEntries,
   removeSectionEntry,
   replaceSectionEntry,
@@ -168,6 +169,21 @@ export function editArchGuard(options: ArchEditOptions): ArchHandlerResult {
   }
 
   // 文本级替换那一条 —— 位置不变，其它内容不动
+  //
+  // 段缺失 → 不能报告成功（D-31）。
+  // `replaceSectionEntry` 找不到条目时原样返回 —— 文件没变，
+  // 但命令会报「✓ 已更新」。必须在这里挡住。
+  if (!hasSection(yaml, 'arch')) {
+    errors.push({
+      message:
+        `Cannot locate the "arch:" section in policy/policy.yaml — ` +
+        `the file may be malformed or start with a byte-order mark. Nothing was changed.`,
+      code: 'E_SECTION_NOT_FOUND',
+      path: 'arch',
+    });
+    return { success: false, kind, errors, arch: current, anchorNeedsUpdate: false };
+  }
+
   const updatedYaml = replaceSectionEntry(
     yaml,
     'arch',
@@ -210,6 +226,26 @@ export function removeArchGuard(kind: string): ArchHandlerResult {
   }
 
   const updatedYaml = removeSectionEntry(yaml, 'arch', 'kind', kind);
+
+  // 段缺失 → 不能报告成功（D-31）
+  if (!hasSection(yaml, 'arch')) {
+    return {
+      success: false,
+      kind,
+      errors: [
+        {
+          message:
+            `Cannot locate the "arch:" section in policy/policy.yaml — ` +
+            `the file may be malformed or start with a byte-order mark. Nothing was changed.`,
+          code: 'E_SECTION_NOT_FOUND',
+          path: 'arch',
+        },
+      ],
+      arch: current,
+      anchorNeedsUpdate: false,
+    };
+  }
+
   writePolicyYaml(updatedYaml);
 
   return {
