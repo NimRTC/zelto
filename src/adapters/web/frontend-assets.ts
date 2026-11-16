@@ -336,6 +336,24 @@ async function viewOverview(target) {
   for (const st of states) cards.appendChild(card(s.byState[st], st));
   target.appendChild(cards);
 
+  // ── 成本（ADR-072 §6：概况含「成本」）────────────────────────────
+  target.appendChild(el('h2', null, '成本'));
+  const cost = el('dl', 'kv');
+  const ckv = function (k, v) {
+    cost.appendChild(el('dt', null, k));
+    cost.appendChild(el('dd', null, v));
+  };
+  ckv('已花费', formatUsd(s.spentUsd));
+  // 上限可能是「不限」（ADR-035 §3.6：budgetLimitUsd: 0 = 不限）。
+  // 不限时服务端给 null + unlimited:true —— 不能显示成「$null」。
+  ckv('预算上限', s.unlimited ? '不限' : formatUsd(s.limitUsd));
+  if (s.exhausted) {
+    ckv('状态', el('span', 'notice bad', '已超支'));
+  } else if (typeof s.spendRatio === 'number') {
+    ckv('占比', Math.round(s.spendRatio * 100) + '%');
+  }
+  target.appendChild(cost);
+
   target.appendChild(el('h2', null, '待签字'));
   if (!s.pendingSigns || s.pendingSigns.length === 0) {
     target.appendChild(el('p', 'muted', '没有待签字的切片。'));
@@ -367,7 +385,7 @@ async function viewSlices(target) {
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
   target.appendChild(table(
-    ['切片', '标题', '状态', '追溯(需/契/测)', '写集', '运行', '更新'],
+    ['切片', '标题', '状态', '追溯(需/契/测)', '写集', '运行', '花费', '更新'],
     slices.map(function (s) {
       return {
         onClick: function () { showSliceDetail(s.id); },
@@ -375,14 +393,33 @@ async function viewSlices(target) {
           s.id,
           s.title,
           stateBadge(s.state),
-          s.trace.requirements + '/' + s.trace.contracts + '/' + s.trace.tests,
+          traceCounts(s.trace),
           String(s.writeCount),
           s.runCount === 0 ? '—' : (s.lastRunOk ? '✅ ' + s.runCount : '❌ ' + s.runCount),
+          formatUsd(s.spentUsd),
           new Date(s.updatedAt).toLocaleString()
         ]
       };
     })
   ));
+}
+
+/**
+ * 追溯计数 —— 列表页显示「需/契/测」三个数字。
+ *
+ * 明细（具体是哪几个 REQ / 契约 / 测试）不在这里展开 ——
+ * 列表页塞不下，也不该塞（那会让人没法扫读）。
+ * 但**明细是可查的**：点进详情页看完整追溯链。
+ */
+function traceCounts(trace) {
+  const c = (trace && trace.counts) || { requirements: 0, contracts: 0, tests: 0 };
+  return c.requirements + '/' + c.contracts + '/' + c.tests;
+}
+
+/** 金额格式化 —— 保留 4 位小数（成本通常很小）。 */
+function formatUsd(v) {
+  if (typeof v !== 'number' || !isFinite(v)) return '—';
+  return '$' + v.toFixed(4);
 }
 
 async function viewSigns(target) {
@@ -468,7 +505,10 @@ async function showSliceDetail(id, forSign) {
     if (!allOk) {
       main.appendChild(el('p', 'notice bad', '有确认项未通过 —— 服务端也会拒绝签字。'));
     }
-    btn.addEventListener('click', function () { doApprove(id, btn); });
+    // 把这四项传给服务端 —— 当「人确认过了」的凭据。
+    // 服务端不信任内容（自己重算），但「有没有带」是信号：
+    // 没带就说明人没在页面上看过这四项（ADR-072 §5.2）。
+    btn.addEventListener('click', function () { doApprove(id, btn, d.checks); });
     main.appendChild(btn);
   }
 
@@ -508,9 +548,39 @@ async function showSliceDetail(id, forSign) {
   } catch (err) {
     main.appendChild(el('p', 'muted', '事件加载失败：' + err.message));
   }
+
+  // ── 审计 ────────────────────────────────────────────────────────────
+  //
+  // ADR-072 §1 摘要里驾驶舱含「审计」，§6 端点表也列了
+  // GET /api/slices/:id/audit —— 但之前前端从没调用过它。
+  // 端点实现了却没人用，等于没实现（ADR-010 §5.4 详情页的「📋 审计」按钮）。
+  main.appendChild(el('h2', null, '审计'));
+  try {
+    const audit = await apiGet('/api/slices/' + encodeURIComponent(id) + '/audit');
+    const entries = (audit && audit.entries) || [];
+    if (entries.length === 0) {
+      main.appendChild(el('p', 'muted', '没有审计记录。'));
+    } else {
+      main.appendChild(table(
+        ['序号', '时间', '事件', '摘要'],
+        entries.map(function (e) {
+          return {
+            cells: [
+              String(e.seq),
+              new Date(e.timestamp).toLocaleString(),
+              e.eventType,
+              e.summary
+            ]
+          };
+        })
+      ));
+    }
+  } catch (err) {
+    main.appendChild(el('p', 'muted', '审计加载失败：' + friendlyError(err)));
+  }
 }
 
-async function doApprove(sliceId, btn) {
+async function doApprove(sliceId, btn, checks) {
   btn.disabled = true;
   btn.textContent = '签字中…';
 
@@ -524,7 +594,12 @@ async function doApprove(sliceId, btn) {
     return;
   }
 
-  const res = await apiPost('/api/sign-requests/' + encodeURIComponent(req.id) + '/approve', {});
+  // 必须带上四项确认项 —— 服务端拿它当「人确认过了」的凭据。
+  // 服务端不信任内容（自己重算一遍），但「有没有带」本身是信号。
+  const res = await apiPost(
+    '/api/sign-requests/' + encodeURIComponent(req.id) + '/approve',
+    { checks: checks || [] }
+  );
   if (res.ok && res.body && res.body.ok) {
     // 提示必须在视图切换**之后**追加 —— 切换会 clear(main)，
     // 追加在前面的话提示会被一起清掉，人点了按钮却什么都没看到

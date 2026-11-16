@@ -157,6 +157,7 @@ export class WebServer {
       query: url.searchParams,
       api: this.api,
       repoRoot: this.repoRoot,
+      body: req.method === 'POST' ? await readJsonBody(req) : undefined,
     };
 
     const router = createWebRouter();
@@ -187,6 +188,42 @@ export class WebServer {
     const b = Buffer.from(this.token);
     if (a.length !== b.length) return false;
     return timingSafeEqual(a, b);
+  }
+}
+
+/**
+ * 读 POST 的 JSON 请求体。
+ *
+ * 上限 1MB —— 不设上限的话，一个巨大的 body 能把内存吃光。
+ * 超限直接截断并当作「解析不出来」处理（返回 undefined），
+ * 不抛异常 —— 让上层的业务校验去拒绝（缺凭据 → 拒绝签字），
+ * 比在传输层抛 500 更合语义。
+ *
+ * 解析失败返回 undefined 而不是抛错：同上，
+ * 「body 不是合法 JSON」应当由签字流程报「缺少确认项凭据」，
+ * 那才是人看得懂的话。
+ */
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const MAX_BYTES = 1024 * 1024;
+  const chunks: Buffer[] = [];
+  let size = 0;
+
+  try {
+    for await (const chunk of req) {
+      const buf = chunk as Buffer;
+      size += buf.length;
+      if (size > MAX_BYTES) return undefined;
+      chunks.push(buf);
+    }
+  } catch {
+    return undefined;
+  }
+
+  if (chunks.length === 0) return undefined;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+  } catch {
+    return undefined;
   }
 }
 

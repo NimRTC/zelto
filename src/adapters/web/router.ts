@@ -27,6 +27,8 @@ export interface WebContext {
   query: URLSearchParams;
   api: WebApi;
   repoRoot: string;
+  /** POST 的 JSON 请求体（已解析；非 POST 时为 undefined） */
+  body?: unknown;
 }
 
 export interface WebRouter {
@@ -78,10 +80,18 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '签字请求 id 非法' });
       return;
     }
-    const result = await api.approveSign(signId);
+    // 把前端传来的「人确认过了这四项」凭据传给 api 层。
+    // 内容不作数（服务端自己重算），但「有没有带」是信号 —— 见 api.ts。
+    const body = ctx.body as { checks?: unknown } | undefined;
+    const result = await api.approveSign(signId, body?.checks);
     if (!result.ok) {
       // 409 —— 请求本身合法，但**前置条件不满足**（确认项没过 / 状态不对）
-      sendJson(res, 409, { error: result.reason, checks: result.checks });
+      //
+      // 同时给 error 与 reason 两个字段：
+      // - error 是 HTTP 语义（前端 `res.body.error || res.body.reason`）
+      // - reason 是 api 层的结果字段（保持契约一致）
+      // 两个都给，是为了让前端与测试都不必猜该读哪个。
+      sendJson(res, 409, { error: result.reason, reason: result.reason, checks: result.checks });
       return;
     }
     sendJson(res, 200, {

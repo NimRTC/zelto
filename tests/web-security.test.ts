@@ -75,6 +75,18 @@ async function readSessionToken(): Promise<string> {
   return m[1];
 }
 
+/**
+ * 「人确认过了这四项」的凭据 —— 四项全 ok。
+ *
+ * 内容**不作数**（服务端自己重算），只验形状。
+ */
+const FOUR_OK_CHECKS = [
+  { label: '追溯链未断', ok: true, evidence: 'x', adrRef: 'y' },
+  { label: '验收真跑过本片', ok: true, evidence: 'x', adrRef: 'y' },
+  { label: '改动在写集内', ok: true, evidence: 'x', adrRef: 'y' },
+  { label: '产物真落地', ok: true, evidence: 'x', adrRef: 'y' },
+];
+
 /** 造一个切片状态文件 */
 async function writeSlice(
   id: string,
@@ -364,7 +376,7 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     const res = await req(`/api/sign-requests/${signId}/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
-      body: '{}',
+      body: JSON.stringify({ checks: FOUR_OK_CHECKS }),
     });
 
     assert.equal(res.status, 200, `四项全绿应当放行，实际：${res.status} ${res.raw}`);
@@ -386,13 +398,90 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     const res = await req(`/api/sign-requests/${signId}/approve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
-      body: '{}',
+      body: JSON.stringify({ checks: FOUR_OK_CHECKS }),
     });
     assert.equal(res.status, 409, `已批准的请求不该再批准，实际：${res.status}`);
   });
 
-  // ── ④ 路径穿越 ────────────────────────────────────────────────────────
+  // ── ③b 「先看后签」的凭据（ADR-072 §5.2）─────────────────────────
+  //
+  // ADR-072 §5.2 原文：
+  //   「POST 必须带四项判定结果，且四项全 ok 才执行签字」
+  //   「只把前端传的当作『人确认过了这四项』的凭据」
+  //
+  // 「四项全 ok」由**服务端重算**保证（上面的测试已经守）；
+  // 这一组守的是另一半：**必须带**。
+  //
+  // 为什么「带」本身有意义：
+  // 服务端不信任前端传的内容（自己重算），所以内容真假不影响安全。
+  // 但「有没有带」是一个**流程信号** —— 没带就说明人没在页面上
+  // 看过那四项（或者有人绕过前端直接调 API）。
+  // 两种情况都不该被签字。
 
+  it('签字：不带确认项凭据必须被拒（人没确认过就不能签）', async () => {
+    await writeSlice('no-ack-slice');
+    await writePassingGateEvent('no-ack-slice');
+    const signId = await writePendingSign('no-ack-slice');
+    const token = await readSessionToken();
+
+    // body 里没有 checks —— 模拟「绕过前端直接调 API」
+    const res = await req(`/api/sign-requests/${signId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
+      body: '{}',
+    });
+
+    assert.equal(res.status, 409, `缺凭据必须被拒，实际：${res.status} ${res.raw}`);
+    assert.match(res.body.reason, /确认项凭据/, `拒绝理由要说清是缺凭据，实际：${res.body.reason}`);
+
+    const check = JSON.parse(
+      await readFile(join(TEST_DIR, '.zelto', 'locks', `${signId}.json`), 'utf-8'),
+    );
+    assert.equal(check.status, 'pending', '被拒后签字状态不该变');
+  });
+
+  it('签字：确认项凭据不足四项必须被拒', async () => {
+    await writeSlice('few-ack-slice');
+    await writePassingGateEvent('few-ack-slice');
+    const signId = await writePendingSign('few-ack-slice');
+    const token = await readSessionToken();
+
+    const res = await req(`/api/sign-requests/${signId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
+      body: JSON.stringify({ checks: FOUR_OK_CHECKS.slice(0, 2) }),
+    });
+
+    assert.equal(res.status, 409, `凭据不足四项必须被拒，实际：${res.status} ${res.raw}`);
+    assert.match(res.body.reason, /至少要有 4 项/, `理由要说清缺了几项，实际：${res.body.reason}`);
+  });
+
+  it('签字：凭据里有一项没过也允许提交（人看到了失败项也算确认过）', async () => {
+    await writeSlice('mixed-ack-slice');
+    await writePassingGateEvent('mixed-ack-slice');
+    const signId = await writePendingSign('mixed-ack-slice');
+    const token = await readSessionToken();
+
+    // 前端报「有一项没过」—— 这是**有效凭据**（人确实看到了）。
+    // 放不放行由服务端重算决定，不在这里判断。
+    const res = await req(`/api/sign-requests/${signId}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
+      body: JSON.stringify({
+        checks: [
+          { label: '追溯链未断', ok: true, evidence: 'x', adrRef: 'y' },
+          { label: '验收真跑过本片', ok: false, evidence: '没过', adrRef: 'y' },
+          { label: '改动在写集内', ok: true, evidence: 'x', adrRef: 'y' },
+          { label: '产物真落地', ok: true, evidence: 'x', adrRef: 'y' },
+        ],
+      }),
+    });
+
+    // 服务端重算的结果才是准的 —— 这片服务端算出四项全绿 → 放行
+    assert.equal(res.status, 200, `服务端重算全绿就放行，实际：${res.status} ${res.raw}`);
+  });
+
+  // ── ④ 路径穿越 ────────────────────────────────────────────────────────
   it('路径穿越：带 ../ 的 id 被拒（400），不落到文件上', async () => {
     const res = await req('/api/slices/..%2F..%2Fetc%2Fpasswd');
     assert.equal(res.status, 400, `穿越 id 必须被拒，实际：${res.status} ${res.raw}`);
@@ -453,6 +542,75 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
 
     const global = await req('/api/events?limit=10');
     assert.equal(global.status, 200);
+  });
+
+  // ── 文档对照：ADR-072 明确要求但之前没实现的 ────────────────────────
+  //
+  // 这一组守的是「文档写了、代码里没有」的缺口。
+  // 三个缺口都是在「对照 ADR 逐条核」时发现的（不是测出来的）：
+  //
+  //   1. `/api/slices/:id/audit` 端点实现了，但**前端从不调用** ——
+  //      ADR-072 §1 摘要与 §6 端点表都列了「审计」，
+  //      而 ADR-010 §5.4 详情页设计的「📋 审计」按钮没人能用。
+  //      「端点实现了却没人用」= 没实现。
+  //   2. `POST /approve` 必须带四项判定结果作为「人确认过了」的凭据
+  //      （§5.2）—— 之前前端传的是空对象。
+  //   3. `/api/slices` 要含「追溯」明细、`/api/summary` 要含「成本」（§6）
+  //      —— 之前追溯只给条目数，summary 完全没有成本。
+
+  it('缺口一：前端必须真的调用审计端点（端点实现了却没人用 = 没实现）', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+    assert.ok(
+      html.includes('/audit'),
+      '前端必须调用 /api/slices/:id/audit —— ADR-072 §1/§6 都列了审计',
+    );
+  });
+
+  it('缺口一：审计端点返回的形状前端能渲染（seq/timestamp/eventType/summary）', async () => {
+    await writeSlice('audit-shape-slice');
+    const audit = await req('/api/slices/audit-shape-slice/audit');
+    assert.equal(audit.status, 200);
+    assert.ok(Array.isArray(audit.body.entries), '审计必须有 entries 数组');
+    // 形状契约 —— 前端按这几个字段渲染，字段名变了前端就白屏
+    for (const e of audit.body.entries) {
+      assert.ok('seq' in e, '审计条目必须有 seq');
+      assert.ok('timestamp' in e, '审计条目必须有 timestamp');
+      assert.ok('eventType' in e, '审计条目必须有 eventType');
+      assert.ok('summary' in e, '审计条目必须有 summary');
+    }
+  });
+
+  it('缺口三：切片总览带追溯明细（不只是条目数）', async () => {
+    await writeSlice('trace-detail-slice');
+    const list = await req('/api/slices');
+    const row = list.body.find((s: any) => s.id === 'trace-detail-slice');
+    assert.ok(row, '列表里应当有这片');
+    assert.ok(Array.isArray(row.trace.requirements), '追溯需求必须是数组（明细），不是数字');
+    assert.ok(Array.isArray(row.trace.contracts), '追溯契约必须是数组');
+    assert.ok(Array.isArray(row.trace.tests), '追溯测试必须是数组');
+    assert.ok(row.trace.counts, '同时保留计数 —— 列表页排版用');
+    // 明细里应当真的有内容（writeSlice 造的是 req-1 / test-1）
+    assert.ok(
+      row.trace.requirements.includes('req-1'),
+      `追溯明细里应当有 req-1，实际：${JSON.stringify(row.trace.requirements)}`,
+    );
+  });
+
+  it('缺口三：概况含成本（已花费 / 上限 / 是否超支）', async () => {
+    const summary = await req('/api/summary');
+    assert.equal(summary.status, 200);
+    assert.equal(typeof summary.body.spentUsd, 'number', '概况必须有已花费金额');
+    assert.ok('limitUsd' in summary.body, '概况必须有预算上限');
+    assert.equal(typeof summary.body.unlimited, 'boolean', '概况必须标明是否「不限」');
+    assert.equal(typeof summary.body.exhausted, 'boolean', '概况必须标明是否超支');
+    // 「不限」时 limitUsd 必须是 null 而不是 Infinity ——
+    // JSON.stringify(Infinity) === 'null'，前端会显示成 $null
+    if (summary.body.unlimited) {
+      assert.equal(summary.body.limitUsd, null, '不限时上限应是 null');
+    } else {
+      assert.equal(typeof summary.body.limitUsd, 'number');
+    }
   });
 
   it('首页：有 token、有导航、没有外链资源（不触网）', async () => {
