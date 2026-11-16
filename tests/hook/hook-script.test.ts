@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hookScript } from '../../src/cli/commands/hook-install.js';
 
-const HOOK_BINARY = join(process.cwd(), 'dist', 'hook', 'index.js');
+const HOOK_MODULE_DIR = join(process.cwd(), 'dist', 'hook');
 
 /**
  * 找一个能执行 POSIX shell 的可执行文件；找不到就返回 null。
@@ -63,7 +63,7 @@ function posixPath(path: string): string {
  * **一个静默失败的守卫比没有守卫更糟**：它让人以为门禁在。
  */
 function copyHookModuleTree(repo: string): void {
-  const srcDir = join(process.cwd(), 'dist', 'hook');
+  const srcDir = HOOK_MODULE_DIR;
   const dstDir = join(repo, 'dist', 'hook');
   mkdirSync(dstDir, { recursive: true });
   for (const entry of readdirSync(srcDir)) {
