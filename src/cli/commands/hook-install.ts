@@ -271,6 +271,22 @@ if [ ! -f "\$NODE_BIN" ]; then
   NODE_BIN="node"
 fi
 
+# --- 这次提交是谁发起的（D-24）---
+#
+# 保护域防的是 **agent**：agent 不许改策略（改了策略就等于解除了对自己的约束）。
+# 但**人必须能改策略** —— C5 的配套流程是「人改 policy/policy.yaml →
+# zelto policy lock --update 重新锚定」，拦掉人的提交会让这条流程走不通。
+#
+# 判据：zelto 起 agent 时注入 ZELTO_SLICE_ID / ZELTO_SESSION_ID，
+# agent 派生的 git 进程会继承；人从终端直接提交时没有这些标记。
+#
+# 这个标记是**可判定的事实**（读环境变量），而不是「猜是谁按的按钮」。
+if [ -n "\${ZELTO_SLICE_ID:-}" ] || [ -n "\${ZELTO_SESSION_ID:-}" ] || [ -n "\${ZELTO_AGENT_SESSION_ID:-}" ]; then
+  HARNESS="git-agent"
+else
+  HARNESS="git-human"
+fi
+
 ${condition}
 if [ \$? -ne 0 ]; then
   FILES="${name === 'pre-commit' ? '$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)' : '$(git -c core.quotePath=false diff --name-only @{push}.. 2>/dev/null || git -c core.quotePath=false diff --name-only HEAD~1..)'}"
@@ -284,7 +300,7 @@ if [ \$? -ne 0 ]; then
 
   while IFS= read -r file; do
     if [ -n "$file" ]; then
-      RESULT=\$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"git\\"}" | "\$NODE_BIN" "\$ZELTO_HOOK" 2>/dev/null)
+      RESULT=\$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"\$HARNESS\\"}" | "\$NODE_BIN" "\$ZELTO_HOOK" 2>/dev/null)
       DECISION=\$(echo "\$RESULT" | grep -o '"decision":"[^"]*"' | head -1 | cut -d'"' -f4)
       RULE=\$(echo "\$RESULT" | grep -o '"matched_rule":"[^"]*"' | head -1 | cut -d'"' -f4)
       if [ "\$DECISION" = "deny" ] && [ "\$RULE" != "default" ]; then

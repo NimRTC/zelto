@@ -45,19 +45,61 @@ export function hashPolicy(content: string): string {
   return `sha256:${createHash('sha256').update(content).digest('hex')}`;
 }
 
+/**
+ * 保护域对「谁」的约束不同（D-24）。
+ *
+ * C5 说「保护域硬编码、不可被任何策略规则覆盖」—— 保护域防的是 **agent**。
+ * 但**人必须能改策略**：C5 的配套流程是「人改 `policy/policy.yaml` →
+ * `zelto policy lock --update` 重新锚定」，拦掉人的提交会让这条流程走不通。
+ *
+ * 判据由**调用方**给出（git hook 脚本看提交那一刻的环境变量，
+ * 判出 `git-agent` / `git-human`）。本函数只做一件事：
+ * 把「这是不是 agent 发起的」翻译成「保护域拦不拦」。
+ *
+ * **未知一律从严**（fail closed）：判成「人」等于给保护域开后门。
+ */
+export function isAgentContext(harness?: string): boolean {
+  return harness !== 'git-human' && harness !== 'human';
+}
+
+/**
+ * 判定一次策略决定。
+ *
+ * @param agentContext 这次请求是不是**agent 发起的**。
+ *   默认 `true`（按 agent 口径判定，最严）——
+ *   诊断类命令（`zelto policy check` / `zelto hook <path>`）问的是
+ *   「这个路径受不受保护」，答案是「受保护」才有意义；
+ *   只有真正执行拦截的 git hook 才按实际发起方区分。
+ */
 export function evaluatePolicy(
   config: PolicyConfig,
   path: string,
   operation: string,
   policyVersion: string,
+  agentContext: boolean = true,
 ): PolicyDecision {
   // 1. Check protected domain first (0a/0b) — highest priority, hardcoded
   if (isProtectedPath(path) && operation === 'write') {
+    // agent → 一律 deny（C5 的本意：agent 不许解除对自己的约束）
+    // 人 → 放行，但 guidance 说清改完策略要重新锚定
+    if (!agentContext) {
+      return {
+        decision: 'allow',
+        ruleId: 'protected:human',
+        basis: 'AGENTS.md#禁区',
+        guidance:
+          `Path "${path}" is in the protected domain. ` +
+          `Humans may change it directly; if you changed policy/policy.yaml, ` +
+          `re-anchor it with \`zelto policy lock --update\`. ` +
+          `Agent-originated changes are always denied.`,
+        policyVersion,
+      };
+    }
     return {
       decision: 'deny',
       ruleId: 'protected:0b',
       basis: 'AGENTS.md#禁区',
-      guidance: `Path "${path}" is in the protected domain and cannot be modified.`,
+      guidance: `Path "${path}" is in the protected domain and cannot be modified by an agent.`,
       policyVersion,
     };
   }

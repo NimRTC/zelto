@@ -98,6 +98,84 @@ describe('zelto-hook', () => {
     assert.equal(output.matched_rule, 'protected:0b');
   });
 
+  // ─── D-24：保护域拦的是 agent，不是人 ─────────────────────────────────────
+  //
+  // C5 说「保护域硬编码、不可被任何策略规则覆盖」—— 保护域防的是 **agent**。
+  // 但**人必须能改策略**：C5 的配套流程是「人改 policy/policy.yaml →
+  // zelto policy lock --update 重新锚定」。原来 hook 不区分谁在提交，
+  // 结果人的提交也被拦，逼人用 `--no-verify` 绕过。
+  //
+  // 判据由 git hook 脚本给出（它看提交那一刻的环境变量）。
+
+  it('agent 提交保护域 → 拦截', async () => {
+    const output = await runHook({
+      path: 'policy/policy.yaml',
+      operation: 'write',
+      harness: 'git-agent',
+    }) as any;
+
+    assert.equal(output.decision, 'deny');
+    assert.equal(output.matched_rule, 'protected:0b');
+  });
+
+  it('人提交保护域 → 放行（并提示重新锚定）', async () => {
+    const output = await runHook({
+      path: 'policy/policy.yaml',
+      operation: 'write',
+      harness: 'git-human',
+    }) as any;
+
+    assert.equal(output.decision, 'allow');
+    assert.equal(output.matched_rule, 'protected:human');
+    assert.ok(
+      String(output.guidance).includes('policy lock --update'),
+      `放行时必须提示重新锚定，实际：${output.guidance}`,
+    );
+  });
+
+  it('人提交 .zelto/ → 也放行（同一个保护域，同一套口径）', async () => {
+    const output = await runHook({
+      path: '.zelto/slices/011.json',
+      operation: 'write',
+      harness: 'git-human',
+    }) as any;
+
+    assert.equal(output.decision, 'allow');
+  });
+
+  it('未知 harness → 按 agent 口径拦截（fail closed，不能开后门）', async () => {
+    // 判成「人」等于给保护域开一个后门：任何填错 harness 的调用都能改策略。
+    const output = await runHook({
+      path: 'policy/policy.yaml',
+      operation: 'write',
+      harness: 'some-unknown-tool',
+    }) as any;
+
+    assert.equal(output.decision, 'deny');
+    assert.equal(output.matched_rule, 'protected:0b');
+  });
+
+  it('harness 缺省 → 也按 agent 口径拦截', async () => {
+    const output = await runHook({
+      path: 'policy/policy.yaml',
+      operation: 'write',
+    }) as any;
+
+    assert.equal(output.decision, 'deny');
+  });
+
+  it('人提交保护域时，普通文件仍然按策略判定（放行保护域不放行一切）', async () => {
+    const output = await runHook({
+      path: 'config.json',
+      operation: 'write',
+      harness: 'git-human',
+    }) as any;
+
+    // `config.json` 被显式 deny —— 人提交也不例外
+    assert.equal(output.decision, 'deny');
+    assert.equal(output.matched_rule, 'deny-config');
+  });
+
   it('denies path escape', async () => {
     const output = await runHook({
       path: '../outside/file.txt',

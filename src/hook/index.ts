@@ -39,19 +39,58 @@ interface PolicyDecision {
   policyVersion: string;
 }
 
+/**
+ * 这次请求是不是 **agent 发起的**。
+ *
+ * **harness 字段是唯一判据**（D-24）：
+ *
+ * - `git-human` / `human` → 人的提交 → 保护域放行
+ * - 其它任何值 → 按 agent 口径 → 保护域拦截
+ *
+ * **为什么「未知 harness」按 agent 处理**：hook 协议里 harness 是必填字段，
+ * 但值域是开放的（`claude-code` / `git` / `test-harness` / …）。
+ * 把未知值判成「人」等于给保护域开了一个后门 —— 任何填错 harness 的调用
+ * 都能改策略。**未知一律从严**，这是 fail closed 的直接应用。
+ *
+ * 真正的区分在 **git hook 脚本**里做（`src/cli/commands/hook-install.ts`）：
+ * 它看提交那一刻的环境变量（zelto 起 agent 时注入 `ZELTO_SLICE_ID` 等），
+ * 判出 `git-agent` 还是 `git-human` 再传进来。那是可判定的**事实**，
+ * 不是「猜是谁按的按钮」（C3）。
+ */
+export function isAgentContext(harness?: string): boolean {
+  return harness !== 'git-human' && harness !== 'human';
+}
+
 function evaluatePolicy(
   config: PolicyConfig,
   path: string,
   operation: string,
   policyVersion: string,
+  agentContext: boolean,
 ): PolicyDecision {
   // 1. Protected domain
+  //
+  // agent 上下文 → 一律 deny（C5 的本意：agent 不许解除对自己的约束）
+  // 人的提交 → 放行，但**改策略本身要留痕**（见 guidance）
   if (isProtectedPath(path) && operation === 'write') {
+    if (!agentContext) {
+      return {
+        decision: 'allow',
+        ruleId: 'protected:human',
+        basis: 'AGENTS.md#禁区',
+        guidance:
+          `Path "${path}" is in the protected domain. ` +
+          `Humans may change it directly; if you changed policy/policy.yaml, ` +
+          `re-anchor it with \`zelto policy lock --update\`. ` +
+          `Agent-originated changes are always denied.`,
+        policyVersion,
+      };
+    }
     return {
       decision: 'deny',
       ruleId: 'protected:0b',
       basis: 'AGENTS.md#禁区',
-      guidance: `Path "${path}" is in the protected domain and cannot be modified.`,
+      guidance: `Path "${path}" is in the protected domain and cannot be modified by an agent.`,
       policyVersion,
     };
   }
@@ -205,7 +244,13 @@ function main() {
       const config = parsePolicyYaml(policyContent);
 
       // Evaluate
-      const result = evaluatePolicy(config, input.path, input.operation, policyVersion);
+      const result = evaluatePolicy(
+        config,
+        input.path,
+        input.operation,
+        policyVersion,
+        isAgentContext(input.harness),
+      );
 
       const output: HookOutput = {
         decision: result.decision,

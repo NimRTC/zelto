@@ -63,6 +63,16 @@ export async function buildAddPaths(sliceId: string): Promise<string[]> {
  *
  * ADR-011 §3.6 —— worktree 装着 agent 的改动，主工作区从不被直接触碰，
  * 主仓库的当前分支也不会被切走。
+ *
+ * **提交的是 agent 的产物，所以按 agent 口径判定**（D-24）：
+ * 环境里显式注入 `ZELTO_SLICE_ID` / `ZELTO_SESSION_ID`，
+ * 让 pre-commit hook 知道「这次提交的内容来自 agent」——
+ * 保护域对它仍然生效。
+ *
+ * 不这么做会怎样：合并流程跑在**人的 shell** 里（没有 agent 标记），
+ * hook 按「人提交」放行 → agent 越界改的保护域文件借合并流程进了主干。
+ * 写集审计（ADR-014 §5）本来就能拦住越界写入，但那是**运行后**的兜底；
+ * 这里多一道**提交时**的判据，两道独立。
  */
 export async function commitWorktreeChanges(sliceId: string, worktreePath: string): Promise<void> {
   const { execSync } = await import('node:child_process');
@@ -83,7 +93,18 @@ export async function commitWorktreeChanges(sliceId: string, worktreePath: strin
 Auto-commit from zelto run
 
 Refs-Slice: ${sliceId}"`,
-      { cwd: worktreePath, timeout: 15000 },
+      {
+        cwd: worktreePath,
+        timeout: 15000,
+        // 按 agent 口径判定（D-24）：提交的是 agent 的产物，
+        // 保护域对它仍然生效。合并流程跑在人的 shell 里，
+        // 不标记就会被当成「人提交」而放行。
+        env: {
+          ...process.env,
+          ZELTO_SLICE_ID: sliceId,
+          ZELTO_SESSION_ID: `merge-${sliceId}`,
+        },
+      },
     );
     console.log(`  ✅ Committed in worktree branch "${branch}"`);
   } catch {
