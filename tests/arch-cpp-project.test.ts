@@ -13,6 +13,10 @@
 // 所以这些用例改用 **Go / Rust** 作为「有代码但验不了」的代表 ——
 // 「代码」与「已验证」必须分开这一点不变。
 //
+// 注：ADR-069 起 Go / Rust 也参与 import 图了（`import` / `use` 语义已支持），
+// 所以「有代码但验不了」的代表改成 **Java / Kotlin** ——
+// 那块盲区还没补上。
+//
 // C3: 纯计算，不调模型、不触网
 
 import { describe, it, before, after } from 'node:test';
@@ -41,9 +45,10 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     await mkdir(join(TEST_DIR, 'src', 'core'), { recursive: true });
     await mkdir(join(TEST_DIR, 'src', 'engine'), { recursive: true });
 
-    // src/core —— Go / Rust 代码（扫描器读不懂）+ 文档 + 配置
-    await writeFile(join(TEST_DIR, 'src', 'core', 'api.go'), 'package core\n', 'utf-8');
-    await writeFile(join(TEST_DIR, 'src', 'core', 'lib.rs'), 'pub fn f() {}\n', 'utf-8');
+    // src/core —— Java 代码（扫描器读不懂）+ 文档 + 配置
+    //
+    // ADR-069 起 Go / Rust 都验得了，所以「有代码但验不了」的代表换成 Java。
+    await writeFile(join(TEST_DIR, 'src', 'core', 'Api.java'), 'package core;\n', 'utf-8');
     await writeFile(join(TEST_DIR, 'src', 'core', 'README.md'), '# core\n', 'utf-8');
     await writeFile(join(TEST_DIR, 'src', 'core', 'config.json'), '{}\n', 'utf-8');
 
@@ -63,16 +68,16 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     await rm(TEST_DIR, { recursive: true, force: true });
   });
 
-  it('D-13：代码文件数不限语言，Go/Rust 都算代码', () => {
+  it('D-13：代码文件数不限语言，Java 也算代码', () => {
     const scan = scanArchitecture(TEST_DIR, MODULES);
     const report = buildArchitectureReport(MODULES, scan);
 
     const core = report.modules.find((m) => m.name === 'src/core');
     assert.ok(core, '应该有 src/core 模块');
 
-    // src/core 有 4 个文件：2 个代码（.go + .rs）+ 1 个文档 + 1 个配置
-    assert.equal(core.fileCount, 4, 'src/core 的总文件数');
-    assert.equal(core.codeFileCount, 2, 'Go 与 Rust 都算「代码」');
+    // src/core 有 3 个文件：1 个代码（.java）+ 1 个文档 + 1 个配置
+    assert.equal(core.fileCount, 3, 'src/core 的总文件数');
+    assert.equal(core.codeFileCount, 1, 'Java 也算「代码」');
   });
 
   it('D-13：已验证文件数只数扫描器读得懂的', () => {
@@ -82,9 +87,11 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     const core = report.modules.find((m) => m.name === 'src/core');
     assert.ok(core);
 
-    // 修复前：codeFileCount = 0 → 报告显示「4 个文件（0 源码）」
-    //         —— 读起来像「这个模块没有代码」。它有 2 个 Go/Rust 代码文件。
-    assert.equal(core.verifiedFileCount, 0, 'Go/Rust 扫描器读不懂');
+    // Java 的依赖语义还没支持 → 扫描器读不懂 → 不计入「已验证」。
+    //
+    // 这个断言原来锁的是「Go/Rust 读不懂」—— 那是在 ADR-069 之前的**事实**，
+    // 不是永远成立的不变量。现在 Go/Rust 验得了，Java 还没有。
+    assert.equal(core.verifiedFileCount, 0, 'Java 扫描器还读不懂');
     assert.ok(
       core.codeFileCount > core.verifiedFileCount,
       '「代码」与「已验证」必须是两个数 —— 否则报告会显示误导性的「0 源码」',
@@ -108,8 +115,8 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     // src/engine → src/core 声明了依赖，但目标模块的代码扫描器都读不懂
     // → unverifiable_dependency（软偏离，永不拦）
     //
-    // 注意：src/core 有 4 个文件但只有 2 个代码文件。
-    // 修复前分母用全部文件（4），修复后用代码文件（2）——
+    // 注意：src/core 有 3 个文件但只有 1 个代码文件。
+    // 修复前分母用全部文件，修复后用代码文件——
     // 两种算法这里都判为不可读懂，所以结果一样。
     // 分母差异在「代码占比高的模块」上才显形（见下一个用例的说明）。
     const dev = report.deviations.find(
@@ -123,10 +130,10 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     const report = buildArchitectureReport(MODULES, scan);
 
     // src/engine 是纯 TS（1 个代码文件，0 个非代码文件）
-    // src/core 是 Go/Rust（2 个代码文件 + 2 个非代码文件）
+    // src/core 是 Java（1 个代码文件 + 2 个非代码文件）
     //
-    // 如果分母用全部文件，src/core 的可读比例 = 0/4 = 0
-    // 如果分母用代码文件，比例 = 0/2 = 0 —— 两者都是 0。
+    // 如果分母用全部文件，src/core 的可读比例 = 0/3 = 0
+    // 如果分母用代码文件，比例 = 0/1 = 0 —— 两者都是 0。
     //
     // 真正的分叉在**有部分可读**的模块：
     // 一个模块 10 个 TS 文件 + 90 个 README，

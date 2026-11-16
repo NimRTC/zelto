@@ -32,6 +32,8 @@ const PYTHON_STDLIB = new Set([
  * ADR-062：C / C++ 也参与 import 图（`#include` 语义）。
  * 头文件（`.h` / `.hpp`）同样要算 —— C++ 项目里头文件占相当比例
  * （真实项目 `src/core` 的 13 个代码文件里 10 个是 `.hpp`）。
+ *
+ * ADR-069：Go（`.go`）与 Rust（`.rs`）也参与。
  */
 export function detectLang(filePath: string): SourceLang | null {
   const lower = filePath.toLowerCase();
@@ -39,6 +41,8 @@ export function detectLang(filePath: string): SourceLang | null {
   if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) return 'ts';
   if (lower.endsWith('.py')) return 'python';
   if (CPP_EXTENSIONS.has(lower.slice(lower.lastIndexOf('.')))) return 'cpp';
+  if (lower.endsWith('.go')) return 'go';
+  if (lower.endsWith('.rs')) return 'rust';
   return null;
 }
 
@@ -160,9 +164,16 @@ export function classifyLangCategory(filePath: string): LangCategory {
  * 只有已实现 import 解析的语言才算。
  *
  * ADR-062：C/C++ 也算 —— `#include` 语义已支持。
+ * ADR-069：Go / Rust 也算 —— `import` / `use` 语义已支持。
  */
 export function isVerifiableLang(category: LangCategory): boolean {
-  return category === 'typescript' || category === 'python' || category === 'cpp';
+  return (
+    category === 'typescript' ||
+    category === 'python' ||
+    category === 'cpp' ||
+    category === 'go' ||
+    category === 'rust'
+  );
 }
 
 /**
@@ -193,10 +204,14 @@ export function isCodeLangCategory(category: LangCategory): boolean {
  * require('x')、动态 import('x')。
  * Python 覆盖：from a.b import c、import a.b。
  * C/C++ 覆盖（ADR-062）：#include "x"（项目内）、#include <x>（系统头）。
+ * Go 覆盖（ADR-069）：import "x"、import ( ... ) 块、带别名的 import。
+ * Rust 覆盖（ADR-069）：use ...;、extern crate ...;。
  */
 export function parseImports(source: string, lang: SourceLang): ImportRef[] {
   if (lang === 'python') return parsePythonImports(source);
   if (lang === 'cpp') return parseCppIncludes(source);
+  if (lang === 'go') return parseGoImports(source);
+  if (lang === 'rust') return parseRustImports(source);
   return parseTsImports(source);
 }
 
@@ -272,7 +287,11 @@ function parseCppIncludes(source: string): ImportRef[] {
       cppBracket: match[1] as '<' | '"',
       line,
       ...(active.length > 0
-        ? { cppCondition: active.map((b) => b.condition).join(' && ') }
+        ? {
+            cppCondition: active.map((b) => b.condition).join(' && '),
+            // ADR-069：同时填通用字段（报告层优先读它）
+            condition: active.map((b) => b.condition).join(' && '),
+          }
         : {}),
     });
   }
@@ -330,6 +349,299 @@ export function findCppConditionalBlocks(
   }
 
   return blocks;
+}
+
+// ─── Go（ADR-069）─────────────────────────────────────────────────────
+
+/**
+ * Go 的 import 解析。
+ *
+ * Go 的 import 只有两种形态：
+ *
+ * ```go
+ * import "fmt"                        // 单行
+ * import (                            // 块
+ *     "fmt"
+ *     alias "github.com/foo/bar"
+ *     _ "embed"
+ * )
+ * ```
+ *
+ * **别名与空导入不影响路径**：`alias "x/y"` 的依赖就是 `x/y`。
+ * 别名是**本地名字**，不是依赖路径的一部分。
+ *
+ * **Go 没有相对 import** —— 路径总是模块路径或标准库名。
+ * 这一点让 Go 的解析比 C++ 简单得多：不需要「相对引用文件目录」那一路。
+ *
+ * **条件编译**（ADR-069 §3.3）：`//go:build` 注释在文件**顶部**，
+ * 覆盖**整个文件**。所以文件内所有 import 都带这个条件标记。
+ */
+function parseGoImports(source: string): ImportRef[] {
+  const refs: ImportRef[] = [];
+
+  // 文件顶部的构建约束
+  const buildTag = findGoBuildTag(source);
+
+  // ① import "path"
+  const singlePattern = /^[ \t]*import[ \t]+(?:[A-Za-z_.][\w.]*[ \t]+)?["]([^"]+)["]/gm;
+  for (const match of source.matchAll(singlePattern)) {
+    const specifier = match[1];
+    if (!specifier) continue;
+    refs.push({
+      specifier,
+      kind: classifyGoSpecifier(specifier),
+      line: lineOf(source, match.index ?? 0),
+      ...(buildTag ? { condition: buildTag } : {}),
+    });
+  }
+
+  // ② import ( ... ) 块
+  const blockPattern = /^[ \t]*import[ \t]*\(([\s\S]*?)\)/gm;
+  for (const match of source.matchAll(blockPattern)) {
+    const body = match[1] ?? '';
+    const bodyStart = (match.index ?? 0) + match[0].indexOf('(') + 1;
+    const bodyLine = lineOf(source, bodyStart);
+
+    for (const lineMatch of body.matchAll(/["]([^"]+)["]/g)) {
+      const specifier = lineMatch[1];
+      if (!specifier) continue;
+      refs.push({
+        specifier,
+        kind: classifyGoSpecifier(specifier),
+        line: bodyLine,
+        ...(buildTag ? { condition: buildTag } : {}),
+      });
+    }
+  }
+
+  return dedupe(refs);
+}
+
+/**
+ * 找出 Go 文件顶部的构建约束。
+ *
+ * Go 官方规范：约束注释必须在 package 子句**之前**，
+ * 且只能出现在文件顶部。
+ *
+ * 两种格式都认：
+ * ```go
+ * //go:build linux && amd64     // 新格式（Go 1.17+）
+ * // +build linux,amd64          // 旧格式
+ * ```
+ */
+export function findGoBuildTag(source: string): string | null {
+  const lines = source.split('\n');
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    // 只看文件顶部：遇到非注释行就停
+    if (!trimmed.startsWith('//')) {
+      // `package` 子句之前允许有注释块；非注释行说明约束区结束
+      break;
+    }
+    if (trimmed.startsWith('//go:build')) {
+      return trimmed.slice('//go:build'.length).trim();
+    }
+    if (trimmed.startsWith('// +build')) {
+      return trimmed.slice('// +build'.length).trim();
+    }
+  }
+  return null;
+}
+
+/** Go 标准库（够用的那一批） */
+const GO_STDLIB = new Set([
+  'bufio', 'bytes', 'context', 'crypto', 'database', 'encoding', 'errors',
+  'expvar', 'flag', 'fmt', 'go', 'hash', 'html', 'image', 'index', 'io',
+  'log', 'math', 'mime', 'net', 'os', 'path', 'plugin', 'reflect', 'regexp',
+  'runtime', 'sort', 'strconv', 'strings', 'sync', 'syscall', 'testing',
+  'text', 'time', 'unicode', 'unsafe',
+]);
+
+/**
+ * 归类 Go 说明符。
+ *
+ * Go **没有相对 import** —— 路径总是模块路径或标准库名。
+ * 以 `.` / `..` 开头的路径在 Go 里不合法，当作外部依赖处理。
+ */
+export function classifyGoSpecifier(specifier: string): ImportRef['kind'] {
+  const base = specifier.split('/')[0];
+  if (GO_STDLIB.has(base)) return 'builtin';
+  // `net/http` 这类标准库子包 —— 第一段是标准库名
+  if (GO_STDLIB.has(base)) return 'builtin';
+  return 'package';
+}
+
+// ─── Rust（ADR-069）────────────────────────────────────────────────────
+
+/**
+ * Rust 的依赖解析。
+ *
+ * 覆盖四种表达里**产生依赖边**的三种：
+ *
+ * ```rust
+ * use std::collections::HashMap;   // ① 标准库
+ * use crate::core::registry;       // ① crate 内部
+ * use super::parent;               // ① 父模块
+ * use self::sibling;               // ① 同级
+ * use crate::foo as bar;           // ① 带别名
+ * use crate::{a, b::c};            // ① 嵌套花括号
+ * extern crate serde;              // ② 外部 crate
+ * mod submodule;                   // ③ mod 声明 —— **不产生依赖边**
+ * ```
+ *
+ * **`mod` 不产生依赖边**（ADR-069 §3.2）：它不是「引用」而是「声明」——
+ * `mod submodule;` 指的是同目录的 `submodule.rs`，
+ * 那是「这个文件属于那个模块」，不是「这个模块依赖那个模块」。
+ *
+ * **条件编译**：`#[cfg(...)]` 挂在 item 上，只影响那一个 item。
+ */
+function parseRustImports(source: string): ImportRef[] {
+  const refs: ImportRef[] = [];
+  const lines = source.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // ① `#[cfg(...)]` 属性 —— 记住它，紧跟的下一个 item 带这个条件
+    const cfgMatch = trimmed.match(/^#!?\[cfg\(([^)]*)\)\]/);
+    if (cfgMatch) {
+      // 找紧跟的下一个 item
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() === '') j++;
+      if (j < lines.length) {
+        const condition = cfgMatch[1].trim();
+        const item = parseRustUseLine(lines[j], j + 1);
+        if (item) {
+          for (const ref of item) {
+            refs.push({ ...ref, condition });
+          }
+          i = j; // 跳过已处理的 item
+        }
+      }
+      continue;
+    }
+
+    // ② `use ...;` / `pub use ...;`
+    if (/^(pub\s+)?use\s+/.test(trimmed)) {
+      refs.push(...parseRustUseLine(line, i + 1));
+      continue;
+    }
+
+    // ③ `extern crate serde;`
+    const externMatch = trimmed.match(/^(?:pub\s+)?extern\s+crate\s+([A-Za-z_][\w]*)/);
+    if (externMatch) {
+      const specifier = externMatch[1];
+      refs.push({
+        specifier,
+        kind: classifyRustSpecifier(specifier),
+        line: i + 1,
+      });
+    }
+  }
+
+  return dedupe(refs);
+}
+
+/**
+ * 解析一行 `use` 语句，产出 0..n 条依赖。
+ *
+ * 要处理的形态：
+ * - `use crate::core::registry;`      → 一条
+ * - `use crate::foo as bar;`          → 一条（别名不是路径的一部分）
+ * - `use crate::{a, b::c};`           → 两条
+ * - `use crate::{a, b::{c, d}};`      → 递归展开
+ * - `pub use crate::x::Y;`            → 一条（re-export 也是依赖）
+ */
+export function parseRustUseLine(line: string, lineNumber: number): ImportRef[] {
+  const trimmed = line.trim();
+  if (!/^(pub\s+)?use\s+/.test(trimmed)) return [];
+
+  // 去掉 `use` / `pub use` 前缀
+  let body = trimmed.replace(/^(pub\s+)?use\s+/, '');
+  // 去掉行尾的分号
+  body = body.replace(/;?\s*$/, '');
+  // 去掉别名（`as bar`）—— 别名是本地名字，不是路径
+  body = body.replace(/\s+as\s+[A-Za-z_][\w]*$/, '');
+
+  const specs = expandRustUsePath(body);
+
+  return specs.map((specifier) => ({
+    specifier,
+    kind: classifyRustSpecifier(specifier),
+    line: lineNumber,
+  }));
+}
+
+/**
+ * 展开 `use` 的路径 —— 把嵌套花括号拆成多条完整路径。
+ *
+ * ```
+ * crate::{a, b::c}      → crate::a, crate::b::c
+ * crate::{a, b::{c, d}} → crate::a, crate::b::c, crate::b::d
+ * ```
+ */
+export function expandRustUsePath(body: string): string[] {
+  const braceStart = body.indexOf('{');
+  if (braceStart === -1) return [body.trim()];
+
+  const prefix = body.slice(0, braceStart).replace(/::$/, '');
+  const inner = body.slice(braceStart + 1, body.lastIndexOf('}'));
+
+  const results: string[] = [];
+  for (const part of splitTopLevel(inner)) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const expanded = expandRustUsePath(trimmed);
+    for (const item of expanded) {
+      results.push(prefix ? `${prefix}::${item}` : item);
+    }
+  }
+  return results;
+}
+
+/**
+ * 按顶层逗号切分（忽略花括号与尖括号里的逗号）。
+ */
+function splitTopLevel(text: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const ch of text) {
+    if (ch === '{' || ch === '<' || ch === '(') depth++;
+    if (ch === '}' || ch === '>' || ch === ')') depth--;
+
+    if (ch === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) parts.push(current);
+  return parts;
+}
+
+/** Rust 标准库前缀 */
+const RUST_STDLIB_PREFIXES = ['std', 'core', 'alloc', 'proc_macro', 'test'];
+
+/**
+ * 归类 Rust 说明符。
+ *
+ * - `crate::` / `self::` / `super::` → 项目内部（`relative`）
+ * - `std::` / `core::` / `alloc::` → 标准库（`builtin`）
+ * - 其它 → 外部 crate（`package`）
+ */
+export function classifyRustSpecifier(specifier: string): ImportRef['kind'] {
+  if (specifier.startsWith('crate::') || specifier.startsWith('self::') || specifier.startsWith('super::')) {
+    return 'relative';
+  }
+  const base = specifier.split('::')[0];
+  if (RUST_STDLIB_PREFIXES.includes(base)) return 'builtin';
+  return 'package';
 }
 
 function parseTsImports(source: string): ImportRef[] {  const refs: ImportRef[] = [];

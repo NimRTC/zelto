@@ -24,8 +24,12 @@ export interface ModuleSpec {
  *
  * ADR-062：新增 `'cpp'` —— C / C++ 的依赖表达是 `#include`，
  * 语义上接近「相对路径 + include 根目录搜索」。
+ *
+ * ADR-069：新增 `'go'` 与 `'rust'` ——
+ * Go 的依赖表达是 `import "..."`（模块路径，无相对路径），
+ * Rust 的是 `use ...;` / `extern crate ...;`（crate 内部路径）。
  */
-export type SourceLang = 'ts' | 'python' | 'cpp';
+export type SourceLang = 'ts' | 'python' | 'cpp' | 'go' | 'rust';
 
 /**
  * 语言类别（报告用，比 `SourceLang` 粗）。
@@ -78,6 +82,19 @@ export interface ImportRef {
    * 开启那个特性时它就在。所以这里只**标记**，不隐藏。
    */
   cppCondition?: string;
+  /**
+   * **通用**条件标记（ADR-069）
+   *
+   * 条件编译块里的依赖**仍然是依赖** —— 开启那个特性时它就在。
+   * 所以这里只**标记**，不隐藏。
+   *
+   * C++ 解析器同时填 `cppCondition` 与 `condition`（保持向后兼容）；
+   * Go / Rust 只填 `condition`。
+   *
+   * 值是条件表达式（如 `defined(_WIN32)`、`linux && amd64`、
+   * `target_os = "linux"`）。
+   */
+  condition?: string;
 }
 
 /** 扫出来的一个源文件 */

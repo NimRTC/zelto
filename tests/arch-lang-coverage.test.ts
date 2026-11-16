@@ -51,15 +51,10 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
       '#pragma once\n',
       'utf-8',
     );
-    // Go / Rust —— 同样尚未支持
+    // Java / Kotlin —— 尚未支持（ADR-069 只覆盖了 Go / Rust）
     await writeFile(
-      join(TEST_DIR, 'src', 'engine', 'main.go'),
-      'package main\n',
-      'utf-8',
-    );
-    await writeFile(
-      join(TEST_DIR, 'src', 'engine', 'lib.rs'),
-      'pub fn f() {}\n',
+      join(TEST_DIR, 'src', 'engine', 'Main.java'),
+      'public class Main {}\n',
       'utf-8',
     );
     // 非代码文件 —— 不产生依赖边，不该混进「验不了」的警告里
@@ -104,13 +99,16 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     assert.equal(classifyLangCategory('src/a.json'), 'config');
   });
 
-  it('可验证性：TS/JS、Python 与 C/C++ 目前有判据', () => {
+  it('可验证性：TS/JS、Python、C/C++、Go、Rust 目前有判据', () => {
     assert.equal(isVerifiableLang('typescript'), true);
     assert.equal(isVerifiableLang('python'), true);
     // ADR-062：C/C++ 的 `#include` 语义已支持
     assert.equal(isVerifiableLang('cpp'), true);
-    assert.equal(isVerifiableLang('go'), false);
-    assert.equal(isVerifiableLang('rust'), false);
+    // ADR-069：Go 的 `import` / Rust 的 `use` 语义已支持
+    assert.equal(isVerifiableLang('go'), true);
+    assert.equal(isVerifiableLang('rust'), true);
+    // Java / Kotlin 还没做
+    assert.equal(isVerifiableLang('java'), false);
     assert.equal(isVerifiableLang('build'), false);
     assert.equal(isVerifiableLang('doc'), false);
     assert.equal(isVerifiableLang('config'), false);
@@ -124,11 +122,10 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     assert.equal(coverage.verifiedFiles, 4, `实际：${coverage.verifiedFiles}`);
     assert.deepEqual(coverage.verifiable, ['typescript', 'python', 'cpp']);
 
-    // 验不了的代码：Go (1) + Rust (1) —— C++ 已移出这一类
-    assert.equal(coverage.unverifiableCodeFiles, 2, `实际：${coverage.unverifiableCodeFiles}`);
+    // 验不了的代码：Java (1) —— Go/Rust 已移出这一类（ADR-069）
+    assert.equal(coverage.unverifiableCodeFiles, 1, `实际：${coverage.unverifiableCodeFiles}`);
     assert.equal(coverage.counts.cpp, 2);
-    assert.equal(coverage.counts.go, 1);
-    assert.equal(coverage.counts.rust, 1);
+    assert.equal(coverage.counts.java, 1);
 
     // 不产生依赖边：Makefile + README.md + config.json
     assert.equal(coverage.nonCodeFiles, 3, `实际：${coverage.nonCodeFiles}`);
@@ -136,7 +133,7 @@ describe('ADR-060 §4：架构扫描的语言覆盖面', () => {
     assert.equal(coverage.counts.doc, 1);
     assert.equal(coverage.counts.config, 1);
 
-    assert.equal(coverage.totalFiles, 9, `实际：${coverage.totalFiles}`);
+    assert.equal(coverage.totalFiles, 8, `实际：${coverage.totalFiles}`);
   });
 
   it('C++ 文件参与 import 图（ADR-062 起有判据了）', () => {

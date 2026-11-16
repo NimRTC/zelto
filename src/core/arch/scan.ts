@@ -14,7 +14,7 @@
 // C3: 纯计算，不调模型、不触网
 // C6: core/ 内，不依赖 adapters/
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
 import { pathMatches } from '../sched/paths.js';
 import {
@@ -315,6 +315,194 @@ export function resolveCppInclude(
 /** C/C++ 头文件在省略扩展名时尝试的后缀 */
 const CPP_RESOLVE_EXTENSIONS = ['.hpp', '.h', '.hh', '.hxx', '.ipp', '.inl', '.c', '.cc', '.cpp'];
 
+// ─── Go / Rust 的解析（ADR-069）─────────────────────────────────────────
+
+/**
+ * 找出 Go 模块的**模块路径**（`go.mod` 的第一行）。
+ *
+ * ```
+ * module github.com/foo/bar
+ * ```
+ *
+ * **只读 module path 一行**（ADR-069 §3.1）——
+ * `require` / `replace` / `exclude` 的语义复杂（模块图、版本选择），
+ * 而我们只需要「哪个 import 路径算项目内部」。
+ * 其余一律当外部依赖 —— **宁可漏，不猜**（同 ADR-062 §7 的权衡）。
+ *
+ * @returns 模块路径；找不到 `go.mod` 或没有 module 行时返回 null
+ */
+export function findGoModulePath(root: string): string | null {
+  const goModPath = join(root, 'go.mod');
+  if (!existsSync(goModPath)) return null;
+
+  try {
+    const content = readFileSync(goModPath, 'utf-8');
+    for (const raw of content.split('\n')) {
+      const line = raw.trim();
+      if (line === '' || line.startsWith('//')) continue;
+      const m = line.match(/^module\s+(\S+)/);
+      if (m) return m[1];
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/**
+ * 解析 Go 的 import 路径 → 项目内部的**包目录路径**。
+ *
+ * Go 的 import 路径**没有文件系统对应关系** —— 它是模块路径。
+ * 判据（约定法，ADR-069 §3.1）：
+ *
+ * 1. import 路径以 `go.mod` 的 module path 开头 → **项目内部**
+ *    去掉前缀后得到「包目录路径」
+ * 2. 否则 → 外部依赖，不进模块图
+ *
+ * @returns 包目录路径（如 `internal/core`）；外部依赖返回 null
+ */
+export function resolveGoImport(
+  specifier: string,
+  goModulePath: string | null,
+): string | null {
+  if (!goModulePath) return null;
+  if (!specifier.startsWith(goModulePath)) return null;
+
+  const rest = specifier.slice(goModulePath.length).replace(/^\/+/, '');
+  // 正好是模块根（如 `github.com/foo/bar`）→ 根目录
+  return rest === '' ? '.' : rest;
+}
+
+/**
+ * 找出 Rust 的 **crate 根目录**（含 `Cargo.toml` 的目录）。
+ *
+ * ADR-069 §3.2：crate 根 = 含 `Cargo.toml` 的目录，
+ * 它的 `src/` 就是模块树的起点。
+ *
+ * 多个 `Cargo.toml`（workspace）时取**最浅**的那个（workspace 顶层）。
+ *
+ * @returns 相对项目根的 crate 根目录（项目根时是空串）；找不到返回 null
+ */
+export function findCargoRoot(root: string): string | null {
+  if (existsSync(join(root, 'Cargo.toml'))) return '';
+
+  const candidates: Array<{ rel: string; depth: number }> = [];
+
+  const walk = (dir: string, rel: string, depth: number): void => {
+    if (depth > 4) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (SKIP_DIRS.has(entry) || isBuildDir(entry)) continue;
+      const full = join(dir, entry);
+      let isDir: boolean;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (!isDir) continue;
+      const childRel = rel ? `${rel}/${entry}` : entry;
+      if (existsSync(join(full, 'Cargo.toml'))) {
+        candidates.push({ rel: childRel, depth: depth + 1 });
+      }
+      walk(full, childRel, depth + 1);
+    }
+  };
+
+  walk(root, '', 0);
+
+  if (candidates.length === 0) return null;
+  // 最浅的优先（workspace 顶层）；同深度按路径字典序（确定性，C3）
+  candidates.sort((a, b) => a.depth - b.depth || a.rel.localeCompare(b.rel));
+  return candidates[0].rel;
+}
+
+/**
+ * 解析 Rust 的 `use` 路径。
+ *
+ * Rust 的模块树由文件路径决定：
+ *
+ * ```
+ * src/
+ *   main.rs        ← crate 根
+ *   core/
+ *     registry.rs  ← crate::core::registry
+ * ```
+ *
+ * `crate::core::registry` → 找 `src/core/registry.rs` 或 `src/core/registry/mod.rs`。
+ *
+ * `super::` / `self::` 相对于**当前文件**的模块位置 ——
+ * 解析需要当前文件的模块层级，判不准时**宁可漏**（ADR-069 §6 的已知局限）。
+ *
+ * @returns 解析到的文件路径（相对项目根）；解析不到返回 null
+ */
+export function resolveRustImport(
+  specifier: string,
+  fileSet: Set<string>,
+  cargoRoot: string | null,
+): string | null {
+  // crate 根相对于项目根，可能是空串（crate 就在项目根）
+  const srcRoots = cargoRoot === null ? ['src', ''] : [cargoRoot === '' ? 'src' : `${cargoRoot}/src`];
+
+  // `crate` 本身 → crate 根的文件
+  if (specifier === 'crate' || specifier === 'crate::') {
+    for (const srcRoot of srcRoots) {
+      for (const name of ['lib.rs', 'main.rs', 'mod.rs']) {
+        const candidate = srcRoot ? `${srcRoot}/${name}` : name;
+        if (fileSet.has(candidate)) return candidate;
+      }
+    }
+    return null;
+  }
+
+  // 只处理 `crate::` 开头的绝对路径
+  if (!specifier.startsWith('crate::')) return null;
+
+  const relPath = specifier.slice('crate::'.length);
+
+  // `crate::mod` → crate 根的 mod.rs
+  if (relPath === 'mod') {
+    for (const srcRoot of srcRoots) {
+      for (const name of ['mod.rs', 'lib.rs', 'main.rs']) {
+        const candidate = srcRoot ? `${srcRoot}/${name}` : name;
+        if (fileSet.has(candidate)) return candidate;
+      }
+    }
+    return null;
+  }
+
+  // `crate::core::registry` → 路径 `core/registry`
+  const segments = relPath.split('::').filter(Boolean);
+  if (segments.length === 0) return null;
+
+  const modulePath = segments.join('/');
+
+  for (const srcRoot of srcRoots) {
+    // ① 精确匹配：`<src>/<modulePath>.rs`
+    const direct = srcRoot ? `${srcRoot}/${modulePath}.rs` : `${modulePath}.rs`;
+    if (fileSet.has(direct)) return direct;
+
+    // ② 模块目录：`<src>/<modulePath>/mod.rs`
+    const modFile = srcRoot ? `${srcRoot}/${modulePath}/mod.rs` : `${modulePath}/mod.rs`;
+    if (fileSet.has(modFile)) return modFile;
+  }
+
+  // ③ 没有 crate 根时按后缀猜（ADR-069 §3.2 的兜底）
+  if (cargoRoot === null) {
+    for (const path of fileSet) {
+      if (path.endsWith(`/${modulePath}.rs`)) return path;
+      if (path.endsWith(`/${modulePath}/mod.rs`)) return path;
+    }
+  }
+
+  return null;
+}
+
 /**
  * 扫描项目，算出模块之间的实际依赖边。
  */
@@ -328,6 +516,13 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   // include 根目录（ADR-062）：C++ 的 `#include "nimrtc/core/x.hpp"`
   // 靠它才能解析到真实文件。
   const includeRoots = discoverIncludeRoots(root);
+
+  // Go 模块路径（ADR-069）：`go.mod` 的 module 行。
+  // import 路径以它开头 → 项目内部；否则外部依赖。
+  const goModulePath = findGoModulePath(root);
+
+  // Rust crate 根（ADR-069）：含 `Cargo.toml` 的目录，其 `src/` 是模块树起点。
+  const cargoRoot = findCargoRoot(root);
 
   // vendor 目录（ADR-065）：引入的外部代码，不是项目的架构。
   //
@@ -514,6 +709,40 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
           continue;
         }
         targetModule = targetModuleOwner;
+      } else if (file.lang === 'go') {
+        // Go 的 import —— 模块路径（ADR-069 §3.1）
+        //
+        // import 路径以 `go.mod` 的 module path 开头 → 项目内部，
+        // 去掉前缀得到包目录路径 → 按目录匹配模块归属。
+        //
+        // 匹配不到就是外部依赖（第三方库）—— 不进模块图。
+        const packageDir = resolveGoImport(ref.specifier, goModulePath);
+        if (packageDir === null) continue; // 外部依赖
+
+        // 按目录归属：包目录下的文件属于哪个模块
+        const prefix = packageDir === '.' ? '' : `${packageDir}/`;
+        const owners = new Set<string>();
+        for (const mod of modules) {
+          for (const file of moduleFiles.get(mod.name) ?? []) {
+            if (file.startsWith(prefix)) owners.add(mod.name);
+          }
+        }
+        if (owners.size !== 1) continue; // 判不出归属 → 不算依赖边
+        targetModule = [...owners][0];
+      } else if (file.lang === 'rust') {
+        // Rust 的 use / extern crate —— crate 内部路径（ADR-069 §3.2）
+        //
+        // `crate::core::registry` → 找 `src/core/registry.rs`
+        // （或 `src/core/registry/mod.rs`）
+        if (ref.kind !== 'relative') {
+          // `std::` 走 builtin 分支；`package`（外部 crate）不进模块图
+          continue;
+        }
+        const resolved = resolveRustImport(ref.specifier, fileSet, cargoRoot);
+        if (!resolved) continue; // 解析不到 → 不进模块图
+        const targetModuleOwner = ownerOf.get(resolved) ?? null;
+        if (!targetModuleOwner) continue;
+        targetModule = targetModuleOwner;
       } else if (ref.kind === 'relative') {
         const resolved = resolveRelative(path, ref.specifier, fileSet);
         if (!resolved) {
@@ -557,13 +786,17 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
       // ADR-064：条件编译的边**仍然算依赖**（开启特性时它就在），
       // 但要记下条件 —— 报告里能说清「这条边只在开启 X 时存在」。
       //
+      // ADR-069：`condition` 是通用字段（Go 的 `//go:build`、Rust 的 `#[cfg]`）；
+      // `cppCondition` 是 C++ 的旧名，保留为兼容别名。
+      //
       // 区分两种情况：
       //   - 边同时有无条件的和条件的来源 → 不是「条件边」
       //   - 边**只有**条件来源 → 「条件边」（conditionalOnly）
-      if (ref.cppCondition) {
+      const condition = ref.condition ?? ref.cppCondition;
+      if (condition) {
         edge.conditions ??= [];
-        if (!edge.conditions.includes(ref.cppCondition)) {
-          edge.conditions.push(ref.cppCondition);
+        if (!edge.conditions.includes(condition)) {
+          edge.conditions.push(condition);
         }
         edge.conditionalSources = (edge.conditionalSources ?? 0) + 1;
       } else {
