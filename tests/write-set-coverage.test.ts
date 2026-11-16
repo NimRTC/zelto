@@ -321,3 +321,61 @@ describe('parseMentionedPaths —— 路径识别的白名单', () => {
     assert.deepEqual(paths, [], `实际：${JSON.stringify(paths)}`);
   });
 });
+
+// ─── 花括号简写（D-26）────────────────────────────────────────────────────────
+//
+// 规格里很自然会写「新建 `src/x.{hpp,cpp}`」—— 这是**一个确定的文件集合**
+// 的简写。路径提取器不认识花括号时，会把它当成**一个**具体文件名，
+// 报出「规格提到它但写集里没有」—— 而写集里明明有那两个文件。
+//
+// **闸门误报比闸门漏报更糟**：漏报让人绕过一次检查，
+// 误报让人以为「规格有问题」，于是去改规格 —— 而规格是对的。
+
+describe('parseMentionedPaths —— 花括号简写', () => {
+  it('反引号里的 {hpp,cpp} 展开成两个路径', () => {
+    const paths = parseMentionedPaths('新建 `src/engine/src/rtcp_processor.{hpp,cpp}`。');
+    assert.ok(paths.includes('src/engine/src/rtcp_processor.hpp'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('src/engine/src/rtcp_processor.cpp'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('展开后不再出现带花括号的伪路径', () => {
+    const paths = parseMentionedPaths('新建 `src/engine/src/rtcp_processor.{hpp,cpp}`。');
+    assert.ok(
+      !paths.some((p) => p.includes('{') || p.includes('}')),
+      `不应有带花括号的路径，实际：${JSON.stringify(paths)}`,
+    );
+  });
+
+  it('带前后缀的展开也正确（a{b,c}d → abd / acd）', () => {
+    const paths = parseMentionedPaths('新建 `src/x_test.{hpp,cpp}` 与 `src/y.{md,txt}`。');
+    assert.ok(paths.includes('src/x_test.hpp'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('src/x_test.cpp'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('src/y.md'), `实际：${JSON.stringify(paths)}`);
+    assert.ok(paths.includes('src/y.txt'), `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('不含逗号的 {x} 不被展开，也不被当成具体路径', () => {
+    // `{x}` 不是简写 —— 展开它会把一个真实文件名改掉；
+    // 但带花括号的串多半不是真实文件名，报出去就是闸门误报。
+    // 处置：丢弃（不报）。闸门漏报可容忍，误报会把人引去改正确的规格。
+    const paths = parseMentionedPaths('改 `src/weird{name}.ts`。');
+    assert.deepEqual(paths, [], `实际：${JSON.stringify(paths)}`);
+  });
+
+  it('展开失败的花括号（嵌套）不报成具体路径', () => {
+    // 嵌套花括号不展开；但也不能把带花括号的串当成一个文件名报出去
+    const paths = parseMentionedPaths('新建 `src/a.{b,{c,d}}.cpp`。');
+    assert.ok(
+      !paths.some((p) => p.includes('{') || p.includes('}')),
+      `不应有带花括号的路径，实际：${JSON.stringify(paths)}`,
+    );
+  });
+
+  it('不带逗号的裸花括号不被当成路径', () => {
+    const paths = parseMentionedPaths('新建 `src/a.{b}.cpp`。');
+    assert.ok(
+      !paths.some((p) => p.includes('{') || p.includes('}')),
+      `不应有带花括号的路径，实际：${JSON.stringify(paths)}`,
+    );
+  });
+});

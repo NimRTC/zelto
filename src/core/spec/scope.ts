@@ -126,6 +126,47 @@ function looksLikePath(text: string): boolean {
 }
 
 /**
+ * 展开花括号简写：`src/x.{hpp,cpp}` → `src/x.hpp` + `src/x.cpp`。
+ *
+ * 为什么需要它（实测缺陷 D-26）：规格里很自然会写
+ * 「新建 `src/engine/src/rtcp_processor.{hpp,cpp}`」——
+ * 这是**一个确定的文件集合**的简写。但路径提取器不认识花括号，
+ * 于是把 `src/engine/src/rtcp_processor.{hpp,cpp}` 当成**一个**
+ * 具体文件名，报出「规格提到它但写集里没有」——
+ * 而写集里明明有 `rtcp_processor.hpp` 和 `rtcp_processor.cpp` 两个文件。
+ *
+ * **闸门误报比闸门漏报更糟**：漏报让人绕过一次检查，
+ * 误报让人以为「规格有问题」，于是去改规格 —— 而规格是对的。
+ *
+ * 展开而不是丢弃：规格确实提到了那两个文件，展开才能保持
+ * 「规格点名了但写集没覆盖」这条判据的原意。
+ *
+ * 展开规则与 shell 的 brace expansion 一致（单层、单组）：
+ * - `a{b,c}d` → `abd` + `acd`
+ * - 不含逗号的 `{x}` → 原样返回（不是简写）
+ * - 嵌套花括号不展开（保持简单；真实规格里不会出现）
+ */
+function expandBraces(raw: string): string[] {
+  const open = raw.indexOf('{');
+  if (open === -1) return [raw];
+  const close = raw.indexOf('}', open + 1);
+  if (close === -1) return [raw];
+
+  const prefix = raw.slice(0, open);
+  const suffix = raw.slice(close + 1);
+  const body = raw.slice(open + 1, close);
+
+  // 嵌套花括号 —— 不展开，避免歧义
+  if (body.includes('{') || body.includes('}')) return [raw];
+
+  const alternatives = body.split(',');
+  // 没有逗号 → 不是简写（`{x}` 是文件名的一部分）
+  if (alternatives.length < 2) return [raw];
+
+  return alternatives.map((alt) => `${prefix}${alt}${suffix}`);
+}
+
+/**
  * 扩展名是否在已知清单里。
  *
  * 大小写不敏感：`CMakeLists.TXT` 与 `CMakeLists.txt` 都要认。
@@ -189,13 +230,14 @@ export function parseMentionedPaths(content: string): string[] {
   const backticked = /`([^`\n]+)`/g;
   let m: RegExpExecArray | null;
   while ((m = backticked.exec(content)) !== null) {
-    const candidate = m[1].trim();
-    if (!looksLikePath(candidate)) continue;
-    const normalized = normalizeMentionedPath(candidate);
-    if (!normalized) continue;
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    paths.push(normalized);
+    for (const candidate of expandBraces(m[1].trim())) {
+      if (!looksLikePath(candidate)) continue;
+      const normalized = normalizeMentionedPath(candidate);
+      if (!normalized) continue;
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      paths.push(normalized);
+    }
   }
 
   // 行内裸路径：只认带已知扩展名的（`src/foo.cpp`），避免把散文当成路径。
@@ -250,6 +292,7 @@ export function parseMentionedPaths(content: string): string[] {
  * - URL（`https://example.com/x.ts` 的 host 部分会漏进裸路径匹配）
  * - 绝对路径（`/usr/include/x.hpp`、`C:\foo\bar.cpp`）
  * - 带 glob 通配的片段（`**` 之类，不是具体文件）
+ * - 残留的花括号（`a.{x,y}` 展开失败时不是具体文件）
  */
 function normalizeMentionedPath(raw: string): string | null {
   let p = raw.trim();
@@ -263,6 +306,9 @@ function normalizeMentionedPath(raw: string): string | null {
   if (p.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(p)) return null;
   // 含 glob 通配
   if (p.includes('*') || p.includes('?')) return null;
+  // 残留花括号 —— 展开失败的花括号简写不是具体文件（D-26）。
+  // 报一个不存在的文件名比不报更糟：闸门误报会把人引去改正确的规格。
+  if (p.includes('{') || p.includes('}')) return null;
   // 相对前缀 `./` 归一
   if (p.startsWith('./')) p = p.slice(2);
   if (!p) return null;
