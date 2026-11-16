@@ -153,7 +153,12 @@ register('set', async (args) => {
   const field = args[fieldIdx + 1];
   const rawValue = args[valueIdx + 1];
 
-  if (!field || !rawValue) {
+  // 只在「值整个缺失」时报错；**空串是合法值**。
+  //
+  // 有些字段需要清空（`baseCommit` 置 null、`traceWaiver` 置空）。
+  // 之前用 `!rawValue` 判定，把空串和 undefined 混为一谈 ——
+  // 结果是这些字段**永远清不掉**，只能手改 JSON。
+  if (!field || rawValue === undefined) {
     f.error('MISSING_ARGS', 'Both --field and --value require a value');
     return 1;
   }

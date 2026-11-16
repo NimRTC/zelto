@@ -7,7 +7,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -273,5 +273,36 @@ void describe('zelto snapshot', () => {
     const parsed = JSON.parse(stdout);
     assert.ok(parsed.id.startsWith('snap-'));
     assert.ok(Array.isArray(parsed.slices));
+  });
+});
+
+// ─── set Command Tests ────────────────────────────────────────────────────────
+//
+// `zelto set --value ""` 必须是**合法**的：有些字段需要清空
+// （baseCommit 置 null、traceWaiver 置空）。
+// 之前空串被当成「没给值」→ 这些字段永远清不掉，只能手改 JSON。
+
+void describe('zelto set', () => {
+  void it('set 的 --value 为空串时能清空 baseCommit', async () => {
+    await runCli('create', 'set-empty-slice');
+    await runCli('freeze', 'set-empty-slice');
+
+    // 先钉一个基点
+    const pin = await runCli('set', 'set-empty-slice', '--field', 'baseCommit', '--value', 'abc123');
+    assert.equal(pin.code, 0, `set baseCommit failed: ${pin.stderr}`);
+
+    // 再清空它
+    const clear = await runCli('set', 'set-empty-slice', '--field', 'baseCommit', '--value', '');
+    assert.equal(clear.code, 0, `清空 baseCommit 应当成功: ${clear.stdout}${clear.stderr}`);
+
+    const raw = await readFile(join(TEST_DIR, '.zelto', 'slices', 'set-empty-slice.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { baseCommit: string | null };
+    assert.equal(parsed.baseCommit, null, `baseCommit 应被清空，实际 ${parsed.baseCommit}`);
+  });
+
+  void it('set 完全不给 --value 时仍然报错', async () => {
+    const { stderr, code } = await runCli('set', 'set-empty-slice', '--field', 'baseCommit');
+    assert.equal(code, 1);
+    assert.ok(stderr.includes('required') || stderr.includes('require a value'));
   });
 });
