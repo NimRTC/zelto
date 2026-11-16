@@ -12,7 +12,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { SignManager } from '../../core/gate/sign.js';
-import { branchExists, isMergedIntoHead, isMergedIntoRef, type MergeSliceInfo } from './merge-executor.js';
+import { branchExists, isMergedIntoHead, isMergedIntoRef, verifyArtifactsInRef, type MergeSliceInfo } from './merge-executor.js';
 import { store, events, ZELTO_DIR, worktreeManager, removeWorktree } from './shared.js';
 
 /**
@@ -202,7 +202,24 @@ export async function collectMergeCandidates(
   for (const req of approved) {
     const manager = worktreeManager();
     const branch = manager.branchFor(req.sliceId);
-    if (!branchExists(branch, repoRoot)) continue;
+
+    // ADR-071：**没有分支的切片**也要纳入候选 —— 它可能是
+    // 「产物已由人直接提交到目标分支」的切片，合并对它是空操作。
+    //
+    // 判据：按写集路径核实产物是否已在目标 ref 上。
+    // 已就位 → 空操作合并候选；没就位 → 真的合不了，跳过。
+    if (!branchExists(branch, repoRoot)) {
+      // 已经空操作合过一次的不再重复列 —— 否则每次 `zelto merge`
+      // 都会把它列一遍（产物一直在目标分支上，判据永远成立），
+      // 人会以为它没合过。
+      if (await hasNoopMergeEvent(req.sliceId)) continue;
+
+      const noop = await isNoopCandidate(req.sliceId, target);
+      if (noop) {
+        candidates.push({ id: req.sliceId, branch, baseCommit: null, writes: noop.writes, noop: true });
+      }
+      continue;
+    }
 
     // 分支已合入目标 且 worktree 干净 —— 确实合完了。
     // 分支已合入但 worktree 还有改动 —— 产物没提交，得合。
@@ -212,17 +229,66 @@ export async function collectMergeCandidates(
     if (mergedAlready && !worktreeHasChanges(req.sliceId)) continue;
 
     let baseCommit: string | null = null;
+    let writes: string[] = [];
     try {
       const slice = await store.read(req.sliceId);
       baseCommit = slice.baseCommit;
+      writes = slice.writes;
     } catch {
       // 切片文件读不到时仍然合并——分支已经带着产物
     }
 
-    candidates.push({ id: req.sliceId, branch, baseCommit });
+    candidates.push({ id: req.sliceId, branch, baseCommit, writes });
   }
 
   return candidates;
+}
+
+/**
+ * 这个切片是不是已经空操作合过一次（ADR-071）。
+ *
+ * 判据：事件流里有 `mode: 'noop'` 的 `merge.completed`。
+ *
+ * 为什么需要这条：空操作切片的产物**已经在**目标分支上，
+ * 判据「产物在目标分支上」永远成立 —— 不加这条，
+ * 每次 `zelto merge` 都会把它重新列一遍，
+ * 人会以为它一直没合过。
+ *
+ * C4：事件流是追溯的唯一证据载体，这里只读不算新判定。
+ */
+async function hasNoopMergeEvent(sliceId: string): Promise<boolean> {
+  const list = await events.read(sliceId);
+  return list.some(
+    (e) => e.type === 'merge.completed' && e.payload?.mode === 'noop',
+  );
+}
+
+/**
+ * 这个没有分支的切片是不是「产物已在目标分支」的空操作切片（ADR-071）。
+ *
+ * 判据与 `merge.ts` 的前置守卫同源：**按写集路径核实产物**。
+ * 两处必须一致 —— 不一致会出现「不带 id 时列得出来、
+ * 带上 id 时说合不了」的分裂。
+ */
+async function isNoopCandidate(
+  sliceId: string,
+  target?: { branch: string | null; dir: string },
+): Promise<{ writes: string[] } | null> {
+  let writes: string[] = [];
+  try {
+    const slice = await store.read(sliceId);
+    writes = slice.writes;
+  } catch {
+    // 读不到切片 → 没有写集可核实 → 不算空操作
+    return null;
+  }
+  if (writes.length === 0) return null;
+
+  const repoRoot = target?.dir ?? process.cwd();
+  const targetRef = target?.branch ? `refs/heads/${target.branch}` : 'HEAD';
+  const { missing } = verifyArtifactsInRef(writes, targetRef, repoRoot);
+  if (missing.length > 0) return null;
+  return { writes };
 }
 
 /**
@@ -257,6 +323,13 @@ export async function cleanupMergedSlices(
       console.log(`     Remove it manually: git worktree remove --force ${manager.pathFor(id)}`);
     }
 
+    // ADR-071：空操作合并的切片**从来没有分支**（产物由人直接提交到
+    // 目标分支）。这时不该报「删不掉分支」—— 那会把「本来就没有」
+    // 说成「有但删不掉」，两种情形的排查方向完全不同。
+    if (!branchExists(manager.branchFor(id), process.cwd())) {
+      continue;
+    }
+
     try {
       const { execSync } = await import('node:child_process');
       // worktree 删掉之后 git 才肯放分支；再 prune 一次清掉残留登记。
@@ -271,8 +344,24 @@ export async function cleanupMergedSlices(
         execSync(`git branch -d ${manager.branchFor(id)}`, { cwd: process.cwd(), timeout: 5000 });
       }
       console.log(`  ✅ Deleted branch "${manager.branchFor(id)}"`);
-    } catch {
-      console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}" (may have unmerged changes)`);
+    } catch (err) {
+      // D-33：区分「分支没合到当前分支」与「分支有未合入的改动」。
+      //
+      // 原来两种情况都是同一句「may have unmerged changes」——
+      // 而它们要人做的事完全不同：
+      //   - 「没合到当前分支」：产物已经合进**别的**分支（典型是版本分支），
+      //     这里只是 `git branch -d` 的默认判据（按 HEAD）不认。
+      //     人要做的：确认目标分支对不对，或者用 `-D` 强删。
+      //   - 「有未合并的改动」：分支上真有没合进去的东西，
+      //     人要做的：先合或先查。
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/not fully merged|not merged/i.test(msg)) {
+        console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}": not fully merged into ${targetBranch ?? 'HEAD'}.`);
+        console.log(`     The slice's work is merged elsewhere — delete manually if intended: git branch -D ${manager.branchFor(id)}`);
+      } else {
+        console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}" (${msg.split('\n')[0]})`);
+        console.log(`     Delete manually: git branch -D ${manager.branchFor(id)}`);
+      }
     }
   }
 }

@@ -52,7 +52,7 @@ function runCommand(...args: string[]): Promise<{ stdout: string; stderr: string
   });
 }
 
-async function writeSlice(id: string): Promise<void> {
+async function writeSlice(id: string, writes: string[] = ['src/feature.ts']): Promise<void> {
   const now = new Date().toISOString();
   const slice = {
     id,
@@ -65,7 +65,7 @@ async function writeSlice(id: string): Promise<void> {
     trace: { requirements: [], contracts: [], tests: [] },
     traceWaiver: null,
     baseline: false,
-    writes: ['src/feature.ts'],
+    writes,
     runs: [],
     stall: { class: null, autoResolved: 0, gateRetries: 0 },
     createdAt: now,
@@ -171,14 +171,17 @@ describe('D-11：合并的假成功', () => {
     assert.ok(output.includes('✅ Merge complete'), `实际输出：${output}`);
   });
 
-  it('缺分支的切片合并失败并点名（D-11 的另一半）', async () => {
-    await writeSlice('no-branch-at-all');
+  it('缺分支且产物不在目标分支的切片合并失败并点名（D-11 的另一半）', async () => {
+    // ADR-071（D-32）：缺分支不再一律失败 —— 产物已在目标分支时走空操作合并。
+    // 但「缺分支 + 产物也不在目标分支」= 什么都没做，仍必须失败。
+    // 这里用一条目标分支上不存在的写集路径来区分这两种情形。
+    await writeSlice('no-branch-at-all', ['src/never-committed-artifact.ts']);
     await writeApprovedSign('no-branch-at-all');
 
     const { stdout, stderr, code } = await runCommand('merge', 'no-branch-at-all');
     const out = stdout + stderr;
 
-    assert.notEqual(code, 0, `缺分支时不该成功，实际输出：${out}`);
+    assert.notEqual(code, 0, `缺分支且产物不在目标分支时不该成功，实际输出：${out}`);
     assert.ok(
       out.includes('no-branch-at-all'),
       `应点名是哪个切片缺分支，实际输出：${out}`,

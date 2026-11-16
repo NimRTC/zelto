@@ -24,6 +24,21 @@ export interface MergeSliceInfo {
   branch: string;
   /** 切片冻结时的基点 commit —— 用于判定 base 是否已漂移 */
   baseCommit: string | null;
+  /**
+   * 这个切片的写集路径（ADR-071 §3 D1）。
+   *
+   * **只有**「没有分支」的切片才需要它 —— 用来核实产物是否
+   * 已经在目标分支上（空操作合并的判据）。
+   */
+  writes?: string[];
+  /**
+   * 是否是「产物已在目标分支」的空操作合并（ADR-071）。
+   *
+   * 为 true 时不执行 `git merge`（没什么可合的），
+   * 但仍记 `merge.completed` 事件（mode: 'noop'）——
+   * 追溯链不因为「这次没搬东西」而断。
+   */
+  noop?: boolean;
 }
 
 export interface MergeExecutorOptions {
@@ -242,6 +257,81 @@ function refCommit(repoRoot: string, ref: string): string | null {
 }
 
 /**
+ * 某个路径在指定 ref 上是否存在（ADR-071 §3 D2）。
+ *
+ * 判据是「路径在**目标 ref 的树里**」，不是「文件在磁盘上」——
+ * 后者会把未提交的本地改动算成已合入。
+ *
+ * 用 `git ls-tree` 而不是 `git cat-file`：`ls-tree` 对目录路径也返回条目
+ * （带 `tree` 类型），所以写集里的目录形态（`src/**`）也能核实。
+ */
+function pathExistsInRef(path: string, ref: string, repoRoot: string): boolean {
+  const res = git(['ls-tree', '-r', '--name-only', ref, '--', path], repoRoot);
+  if (!res.ok) return false;
+  return res.stdout.split('\n').some((l) => l.trim().length > 0);
+}
+
+/**
+ * 核实切片的产物是否已经在目标 ref 上（ADR-071 §3 D1）。
+ *
+ * 适用场景：**切片没有 `slice/<id>` 分支**，但产物由人直接提交到了
+ * 目标分支。此时合并是空操作 —— 产物已经在那儿了。
+ *
+ * 判据是**写集路径**：切片自己声明的产物清单。
+ * 这是「无分支」情形下唯一还在的证据（没有基点、没有分支、没有 diff）。
+ *
+ * 逐条路径核实：
+ * - 路径在目标 ref 上**存在** → 该条已就位
+ * - 路径在目标 ref 上**不存在**，但它在工作区里也不存在 → 视为
+ *   「该路径已被删除」，也算已就位（搬迁类切片）
+ * - 路径在目标 ref 上**不存在**，但工作区里有 → 缺失（未合入）
+ *
+ * @returns 缺失的路径清单。空数组 = 产物已全部就位。
+ */
+export function verifyArtifactsInRef(
+  writes: string[],
+  ref: string,
+  repoRoot: string,
+): { missing: string[]; satisfied: string[] } {
+  const missing: string[] = [];
+  const satisfied: string[] = [];
+
+  for (const raw of writes) {
+    const path = raw.trim();
+    if (!path) continue;
+
+    // glob 写集无法逐个核实 —— 保守地认为它「已就位」，
+    // 否则所有带 glob 写集的切片都会卡在这里（而 glob 写集的
+    // 实际内容由运行时守卫逐写判定管着，见 C9）。
+    if (path.includes('*') || path.includes('?')) {
+      satisfied.push(path);
+      continue;
+    }
+
+    if (pathExistsInRef(path, ref, repoRoot)) {
+      satisfied.push(path);
+      continue;
+    }
+
+    // 目标 ref 上没有 —— 该路径是不是「已经被删掉了」？
+    // 判据：工作区里也没有，且它在目标 ref 的**上一次提交**里曾经存在。
+    // 后者用 `git log --diff-filter=D` 查（该路径被删除过）。
+    const deleted = git(
+      ['log', '--diff-filter=D', '--name-only', '--format=%H', '-1', ref, '--', path],
+      repoRoot,
+    );
+    if (deleted.ok && deleted.stdout.split('\n').some((l) => l.trim() === path)) {
+      satisfied.push(path);
+      continue;
+    }
+
+    missing.push(path);
+  }
+
+  return { missing, satisfied };
+}
+
+/**
  * 执行一个合并计划。
  *
  * 每个 phase 的执行策略：
@@ -307,10 +397,16 @@ export async function executeMergePlan(
     const managedSkeletons: string[] = [];
     const managedState: string[] = [];
     // 待合分支（合并会碰到的来源）—— 用来判断 zelto 状态文件会不会被覆盖
+    //
+    // ADR-071：**空操作切片没有分支** —— 它的产物本来就在目标分支上，
+    // 合并不会碰任何东西。所以它不能进 candidateRefs：
+    // `pathDiffersFromAnyRef` 对不存在的 ref 会保守返回 true
+    //（「判定不出来 → 当作变了」），那会让所有 zelto 状态文件都失去豁免，
+    // 把空操作合并也拦下来 —— 而它压根不会碰这些文件。
     const candidateRefs = plan.slices
-      .map((id) => byId.get(id)?.branch)
-      .filter((b): b is string => Boolean(b))
-      .map((b) => `refs/heads/${b}`);
+      .map((id) => byId.get(id))
+      .filter((info): info is MergeSliceInfo => info !== undefined && info.noop !== true)
+      .map((info) => `refs/heads/${info.branch}`);
     for (let i = 0; i < entries.length; i += 1) {
       const entry = entries[i];
       const path = paths[i] ?? '';
@@ -411,12 +507,23 @@ export async function executeMergePlan(
   // ── 记录完成 ──
   const commit = refCommit(targetDir, targetRef) ?? headCommit(targetDir);
   for (const id of merged) {
+    // ADR-071 §3 D3：空操作合并也记事件 —— 追溯链不因为
+    // 「这次没搬东西」而断。mode 字段区分两种合并。
+    const info = byId.get(id);
+    const noop = info?.noop === true;
     await options.events.append(id, 'merge.completed', 'zelto', {
       sliceId: id,
       slices: merged,
       strategy: plan.strategy,
       phases: plan.phases.length,
       mergeCommit: commit,
+      mode: noop ? 'noop' : 'merged',
+      ...(noop
+        ? {
+            reason: '产物已在目标分支（无 slice 分支，按写集路径核实）',
+            artifacts: info?.writes ?? [],
+          }
+        : {}),
     });
   }
 
@@ -439,6 +546,25 @@ async function executePhase(
     const info = byId.get(id);
     if (!info) {
       log(`  ❌ Phase ${phase.phase}: 切片 "${id}" 没有分支信息，已跳过。`);
+      continue;
+    }
+
+    // ADR-071：空操作合并 —— 产物已在目标分支，没什么可合的。
+    //
+    // 这条路径**不执行 git merge**，但仍算「已合入」：
+    // 走完流程后切片的状态与审计链才是完整的。
+    if (info.noop === true) {
+      merged.push(id);
+      await options.events.append(id, 'merge.phase_complete', 'zelto', {
+        phase: phase.phase,
+        sliceId: id,
+        slices: [id],
+        strategy: 'noop',
+        branch: info.branch,
+        mergeCommit: refCommit(targetDir, targetRef) ?? headCommit(targetDir),
+        target: targetLabel,
+      });
+      log(`  ✅ ${id} 产物已在目标分支，无需合并（空操作）`);
       continue;
     }
 

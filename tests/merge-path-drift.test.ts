@@ -47,7 +47,7 @@ function runCommand(...args: string[]): Promise<{ stdout: string; stderr: string
   });
 }
 
-async function writeSlice(id: string): Promise<void> {
+async function writeSlice(id: string, writes: string[] = ['src/feature.ts']): Promise<void> {
   const now = new Date().toISOString();
   const slice = {
     id,
@@ -60,7 +60,7 @@ async function writeSlice(id: string): Promise<void> {
     trace: { requirements: [], contracts: [], tests: [] },
     traceWaiver: null,
     baseline: false,
-    writes: ['src/feature.ts'],
+    writes,
     runs: [],
     stall: { class: null, autoResolved: 0, gateRetries: 0 },
     createdAt: now,
@@ -113,8 +113,9 @@ describe('合并的两条路径 —— 判据漂移探查', () => {
     await rm(TEST_DIR, { recursive: true, force: true });
   });
 
-  it('漂移 1：已签字但分支不存在的切片 —— 不带 id 的路径应跳过', async () => {
-    await writeSlice('no-branch-slice');
+  it('漂移 1：已签字但分支不存在、产物也不在目标分支 —— 两条路径都该跳过', async () => {
+    // 产物路径在目标分支上不存在（也没被删过）→ 真的合不了
+    await writeSlice('no-branch-slice', ['src/never-existed.ts']);
     await writeApprovedSign('no-branch-slice');
 
     const all = await runCommand('merge');
@@ -122,26 +123,41 @@ describe('合并的两条路径 —— 判据漂移探查', () => {
 
     assert.ok(
       allOut.includes('没有待合并的切片'),
-      `不带 id 的路径应因分支不存在而跳过该切片，实际：${allOut}`,
+      `不带 id 的路径应跳过合不了的切片，实际：${allOut}`,
     );
     assert.ok(
       !allOut.includes('no-branch-slice'),
-      `分支不存在的切片不该被列进待合并，实际：${allOut}`,
+      `合不了的切片不该被列进待合并，实际：${allOut}`,
     );
   });
 
   it('漂移 1b：带 id 的路径对「分支不存在」要有明确处置（不能静默成功）', async () => {
-    await writeSlice('silent-no-branch');
+    await writeSlice('silent-no-branch', ['src/never-existed-either.ts']);
     await writeApprovedSign('silent-no-branch');
 
     const { stdout, stderr, code } = await runCommand('merge', 'silent-no-branch');
     const out = stdout + stderr;
 
-    // 分支不存在 → 合并无从下手，不能静默成功
-    assert.notEqual(code, 0, `分支不存在时不该成功，实际输出：${out}`);
+    // 分支不存在 + 产物不在目标分支 → 合并无从下手，不能静默成功
+    assert.notEqual(code, 0, `合不了的切片不该成功，实际输出：${out}`);
     assert.ok(
       !out.includes('没有已批准的签字'),
       `它已签字，不该被签字门拦下，实际输出：${out}`,
+    );
+  });
+
+  it('漂移 1c：无分支但产物已在目标分支 —— 走空操作合并（ADR-071 / D-32）', async () => {
+    // `src/feature.ts` 在 init 提交里 —— 产物已在目标分支上
+    await writeSlice('noop-artifact-slice', ['src/feature.ts']);
+    await writeApprovedSign('noop-artifact-slice');
+
+    const { stdout, stderr, code } = await runCommand('merge', 'noop-artifact-slice');
+    const out = stdout + stderr;
+
+    assert.equal(code, 0, `产物已在目标分支时应当成功（空操作），实际输出：${out}`);
+    assert.ok(
+      out.includes('空操作'),
+      `应当明说这是空操作合并，实际输出：${out}`,
     );
   });
 

@@ -14,7 +14,7 @@ import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager } from './shared.js';
 import { SignManager } from '../../core/gate/sign.js';
 import { buildMergePlan } from './merge-plan.js';
-import { executeMergePlan, branchExists, type MergeSliceInfo } from './merge-executor.js';
+import { executeMergePlan, branchExists, verifyArtifactsInRef, type MergeSliceInfo } from './merge-executor.js';
 import {
   collectMergeCandidates,
   commitPendingWorktrees,
@@ -193,6 +193,7 @@ register('merge', async (args) => {
         id,
         branch: `slice/${id}`,
         baseCommit: slice.baseCommit,
+        writes: slice.writes,
       });
     } catch {
       notFound.push(id);
@@ -294,16 +295,61 @@ register('merge', async (args) => {
   // 执行阶段才发现合不了 —— 到那时已经跑了 `commitPendingWorktrees`（有副作用）。
   //
   // 所以在这里就拒掉，并说清楚是哪个切片缺分支。
-  const missingBranches = ids.filter((id) => !branchExists(`slice/${id}`, process.cwd()));
-  if (missingBranches.length > 0) {
-    console.error('❌ 以下切片没有对应的分支，无法合并：');
-    for (const id of missingBranches) {
-      console.error(`   - ${id}（缺分支 slice/${id}）`);
+  //
+  // ── ADR-071：判据从「分支存在」改成「产物是否已在目标分支」──
+  //
+  // 有一类切片**天然没有** `slice/<id>` 分支：产物由人直接提交到
+  // 目标分支的切片（人自己改了代码、写集撞保护域时 agent 本来也过不了门禁①）。
+  //
+  // 对这类切片，合并是**空操作** —— 产物已经在目标分支里。
+  // 拒绝它等于让人去手工改状态，追溯链断在这里（实测缺陷 D-32）。
+  //
+  // 但也不能一律放行：「分支不存在就跳过」会让真正合不了的切片
+  // 悄悄通过（产物既不在目标分支、又没分支 = 什么都没做）——
+  // D-11 刚把「假成功」当严重缺陷修过一轮。
+  //
+  // 所以：**按写集路径核实产物是否已在目标 ref 上**。
+  // 全部就位 → 空操作合并；有任何缺失 → 仍然拒绝。
+  const targetRef = targetLabel === 'main' ? 'HEAD' : `refs/heads/${targetLabel}`;
+  const noopSlices = new Set<string>();
+  const missingBranchIds = ids.filter((id) => !branchExists(`slice/${id}`, process.cwd()));
+
+  if (missingBranchIds.length > 0) {
+    const unverifiable: Array<{ id: string; missing: string[] }> = [];
+
+    for (const id of missingBranchIds) {
+      const slice = slices.get(id);
+      const writes = slice?.writes ?? [];
+      const { missing } = verifyArtifactsInRef(writes, targetRef, target.dir);
+      if (missing.length === 0) {
+        noopSlices.add(id);
+      } else {
+        unverifiable.push({ id, missing });
+      }
     }
-    console.error('');
-    console.error('   分支通常在 `zelto run` 成功后创建。若切片已跑过，');
-    console.error('   先确认 worktree 还在：zelto slices');
-    return 1;
+
+    if (unverifiable.length > 0) {
+      console.error('❌ 以下切片既没有对应分支，产物也不在目标分支，无法合并：');
+      for (const { id, missing } of unverifiable) {
+        console.error(`   - ${id}（缺分支 slice/${id}，且这些产物尚未合入：${missing.join('、')}）`);
+      }
+      console.error('');
+      console.error('   分支通常在 `zelto run` 成功后创建。若切片已跑过，');
+      console.error('   先确认 worktree 还在：zelto slices');
+      console.error('');
+      console.error('   若产物已由人工直接提交到目标分支，合并会走空操作路径 ——');
+      console.error('   请确认上面的「尚未合入」清单为空（写集路径与目标分支对不上）。');
+      return 1;
+    }
+
+    for (const id of missingBranchIds) {
+      console.log(`  ℹ️  ${id}: 无 slice 分支，但产物已在 ${targetLabel} 上 —— 走空操作合并`);
+    }
+  }
+
+  // 空操作切片：标记到 mergeInfos 上，执行阶段跳过 git merge
+  for (const info of mergeInfos) {
+    if (noopSlices.has(info.id)) info.noop = true;
   }
 
   // ADR-018 §3.2：分支必须先带上产物，否则合并进来的是空分支。
