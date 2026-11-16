@@ -116,6 +116,10 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
     `Worktree created: ${String(e.payload?.path ?? '')} (branch ${String(e.payload?.branch ?? '')})`,
   'worktree.removed': (e) =>
     `Worktree removed: ${String(e.payload?.path ?? '')}`,
+  'worktree.base_resolved': (e) =>
+    `Worktree base resolved: ${String(e.payload?.source ?? '?')}${
+      e.payload?.version ? ` (version ${String(e.payload.version)})` : ''
+    }${e.payload?.note ? ` — ${String(e.payload.note)}` : ''}`,
   'coord.dep_added': (e) =>
     `Dependency added: ${String(e.payload?.sliceId ?? '')} → ${String(Array.isArray(e.payload?.dependsOn) ? (e.payload.dependsOn as string[]).join(', ') : '')} (phase ${String(e.payload?.phase ?? '?')})`,
   'coord.phase_ready': (e) =>

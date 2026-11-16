@@ -166,6 +166,10 @@ export async function installRuntimeGuard(
       return auditWorktreeWrites(hookRoot, options.writes, {
         baseCommit: options.baseCommit ?? null,
         managed,
+        // ADR-067 D3：只把本片自己产出的提交算进审计范围。
+        // 分支上别的提交（基点错位带进来的、运行期间被人合进来的）
+        // 不是本片 agent 写的，不该算成「本片的越界写入」。
+        sliceId: options.sliceId,
       });
     },
 

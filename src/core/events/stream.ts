@@ -63,6 +63,7 @@ export const EVENT_TYPES = [
   'sched.blocked',
   'worktree.created',
   'worktree.removed',
+  'worktree.base_resolved',
   'coord.dep_added',
   'coord.phase_ready',
   'coord.phase_complete',

@@ -34,6 +34,17 @@ export interface AuditOptions {
   baseCommit?: string | null;
   /** zelto 托管的文件：路径不计入越界，但内容被改动即视为篡改 */
   managed?: ManagedFile[];
+  /**
+   * 本片 id（ADR-067 D3）。
+   *
+   * 给了就**只把本片自己产出的提交**算进审计范围 ——
+   * 判据是 commit message 里的 `Refs-Slice: <id>` trailer。
+   *
+   * 不给就退回「基点..HEAD 的全部提交」（老行为）。这个行为在
+   * 切片分支被别的东西推进过时会误报：那些提交不是本片 agent 写的，
+   * 却会被算成「本片的越界写入」（实测 D-28）。
+   */
+  sliceId?: string | null;
 }
 
 export interface WriteAuditResult {
@@ -211,6 +222,71 @@ export function listFilesUnder(root: string, relativeDir: string): string[] {
 }
 
 /**
+ * 分支上属于某个切片的提交（ADR-067 D3）。
+ *
+ * 判据：commit message 里有 `Refs-Slice: <sliceId>` trailer。
+ * 这是 zelto 既有的提交约定（`merge-runner.ts` 的自动提交就带它），
+ * 确定性可判，不调模型、不触网（C3）。
+ *
+ * 为什么需要它：审计要回答「本片 agent 改了什么」。
+ * 分支上的提交可能不全来自本片 —— 基点错了、或运行期间有人把别的
+ * 分支合进来时，那些提交会被误算成「本片的越界写入」（实测 D-28）。
+ *
+ * @param repoRoot 仓库根
+ * @param baseCommit 起点 commit（不含）
+ * @param headCommit 终点 commit（含）
+ * @param sliceId 切片 id
+ * @returns 本片产出的 commit 列表（从旧到新）
+ */
+export function commitsOfSlice(
+  repoRoot: string,
+  baseCommit: string,
+  headCommit: string,
+  sliceId: string,
+): string[] {
+  let log: string;
+  try {
+    log = git(
+      ['log', '--format=%H%x00%B%x00%x00', `${baseCommit}..${headCommit}`],
+      repoRoot,
+    );
+  } catch {
+    return [];
+  }
+
+  const result: string[] = [];
+  // 格式：<hash>\0<body>\0\0<hash>\0<body>\0\0 ...
+  const records = log.split('\0\0');
+  for (const record of records) {
+    if (!record.trim()) continue;
+    const sep = record.indexOf('\0');
+    if (sep < 0) continue;
+    const hash = record.slice(0, sep).trim();
+    const body = record.slice(sep + 1);
+    if (!hash) continue;
+    if (hasRefsSlice(body, sliceId)) result.push(hash);
+  }
+  // git log 是从新到旧；反转成从旧到新（diff 累积时顺序不影响结果，
+  // 但可读性与调试体验更好）
+  return result.reverse();
+}
+
+/**
+ * 判断一条 commit message 是否声明「由某个切片产出」。
+ *
+ * trailer 格式：`Refs-Slice: <id>`（大小写不敏感的 key，
+ * 值精确匹配 —— `v1-a` 不能匹配 `v1-ab`）。
+ */
+export function hasRefsSlice(message: string, sliceId: string): boolean {
+  const pattern = /^Refs-Slice:\s*(.+)$/gim;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(message)) !== null) {
+    if (match[1].trim() === sliceId) return true;
+  }
+  return false;
+}
+
+/**
  * 审计某个 worktree 的改动是否全部落在写集内。
  *
  * @param worktreeRoot worktree 绝对路径
@@ -235,14 +311,37 @@ export function auditWorktreeWrites(
   }
 
   if (baseCommit) {
-    try {
-      const diff = git(['diff', '--name-only', `${baseCommit}..HEAD`], worktreeRoot);
-      for (const line of diff.split('\n')) {
-        const p = line.trim();
-        if (p) changed.add(p.replace(/\\/g, '/'));
+    // 审计要回答的是「**本片 agent 改了什么**」，不是「**本片分支上有哪些提交**」。
+    //
+    // 基点错了、或分支在运行期间被别的东西推进过时，
+    // 「基点..HEAD 的全部提交」里会混进不是本片产出的东西 ——
+    // 那些东西会被算成「本片的越界写入」（实测 D-28：上一片的三个文件
+    // 经一次事后快进进了本片分支，被判成本片越界）。
+    //
+    // 所以给了 sliceId 就按 `Refs-Slice:` trailer 过滤，只算本片的提交。
+    const sliceId = options.sliceId ?? null;
+    if (sliceId) {
+      for (const commit of commitsOfSlice(worktreeRoot, baseCommit, 'HEAD', sliceId)) {
+        try {
+          const diff = git(['diff', '--name-only', `${commit}^..${commit}`], worktreeRoot);
+          for (const line of diff.split('\n')) {
+            const p = line.trim();
+            if (p) changed.add(p.replace(/\\/g, '/'));
+          }
+        } catch {
+          // 单个提交读不出来（根提交没有父提交等）——跳过，不影响其余
+        }
       }
-    } catch {
-      // 基点不可达（比如分支被删）时跳过已提交部分
+    } else {
+      try {
+        const diff = git(['diff', '--name-only', `${baseCommit}..HEAD`], worktreeRoot);
+        for (const line of diff.split('\n')) {
+          const p = line.trim();
+          if (p) changed.add(p.replace(/\\/g, '/'));
+        }
+      } catch {
+        // 基点不可达（比如分支被删）时跳过已提交部分
+      }
     }
   }
 

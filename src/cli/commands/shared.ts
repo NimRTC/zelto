@@ -1,6 +1,7 @@
 // Shared utilities, types, and store instances for CLI commands
 
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LlmAdapter } from '../../core/ports/llm.js';
@@ -16,6 +17,10 @@ import type { GateAcceptanceConfig } from '../../core/gate/types.js';
 import { parseBlockScalarHeader, readBlockScalar } from './config-blocks.js';
 import { SliceStore } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
+import {
+  resolveSliceOwnership,
+  versionBranchTip,
+} from '../../core/version/branch.js';
 import { buildDeterministicSliceSpec } from '../../llm/generators/slice-spec.js';
 
 // 策略解析的唯一实现在 core/policy/yaml.ts（ADR-014 §4）。
@@ -911,6 +916,113 @@ export async function removeWorktree(sliceId: string, options: { force?: boolean
 }
 
 /**
+ * 切片的基点解析（ADR-067 D1）。
+ *
+ * 基点 = 「这片从哪里长出来的」。它决定了三件事：
+ * 1. agent 在 worktree 里**能看到什么**（基点里没有的文件就是不存在）
+ * 2. 写集审计的 diff 范围（基点..HEAD）
+ * 3. 合并时 fast-forward 是否可用
+ *
+ * 解析顺序（与 ADR-056 §3.2 的归属解析同一优先级）：
+ * 1. `override` —— 调用方显式指定（版本流水线算好了版本分支 tip）
+ * 2. `pinned` —— 切片文件里已钉死的基点（ADR-041 §3.2 的可复现保证）
+ * 3. `version-branch` —— 归属版本分支的 tip
+ * 4. `head` —— 主干 HEAD（兜底）
+ *
+ * 第 2 条不能省：切片跑过一次之后基点就不再重算，否则重跑同一个切片
+ * 会回到不同的基点，审计范围漂移、越界判据不稳定。
+ *
+ * 归属解析失败（命中多个版本计划）**不阻塞** —— 退回主干 HEAD 并
+ * 由调用方写事件说明（D2）。基点解析发生在建 worktree 时，
+ * 那时还没有「归属歧义」的报错路径。
+ */
+export type BaseCommitSource = 'override' | 'pinned' | 'version-branch' | 'head';
+
+export interface ResolvedBaseCommit {
+  commit: string | null;
+  source: BaseCommitSource;
+  /** 归属的版本 label（source === 'version-branch' 时有值） */
+  version: string | null;
+  /** 归属歧义等降级原因（供事件留痕） */
+  note: string | null;
+}
+
+export function resolveSliceBaseCommit(
+  sliceId: string,
+  sliceBaseCommit: string | null,
+  options: {
+    override?: string | null;
+    repoRoot?: string;
+    versionsDir?: string;
+    specPath?: string | null;
+  } = {},
+): ResolvedBaseCommit {
+  // 1. 显式覆盖
+  if (options.override) {
+    return { commit: options.override, source: 'override', version: null, note: null };
+  }
+
+  // 2. 已钉死的基点 —— 可复现优先
+  if (sliceBaseCommit) {
+    return { commit: sliceBaseCommit, source: 'pinned', version: null, note: null };
+  }
+
+  const repoRoot = options.repoRoot ?? process.cwd();
+  const versionsDir = options.versionsDir ?? join(ZELTO_DIR, 'versions');
+
+  // 3. 归属版本分支的 tip
+  try {
+    const ownership = resolveSliceOwnership(sliceId, {
+      versionsDir,
+      specPath: options.specPath ?? null,
+    });
+    if (ownership.kind === 'version') {
+      const tip = versionBranchTip(ownership.branch, repoRoot, gitRefCommit);
+      if (tip) {
+        return { commit: tip, source: 'version-branch', version: ownership.version, note: null };
+      }
+      // 版本分支还不存在 —— 退回主干 HEAD，但说清楚原因
+      return {
+        commit: null,
+        source: 'head',
+        version: ownership.version,
+        note: `版本分支 ${ownership.branch} 不存在，基点退回主干 HEAD`,
+      };
+    }
+  } catch (err) {
+    // 归属歧义 —— 不阻塞执行（D2），退回主干 HEAD 并留痕
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      commit: null,
+      source: 'head',
+      version: null,
+      note: `归属解析失败（${message}），基点退回主干 HEAD`,
+    };
+  }
+
+  // 4. 兜底：主干 HEAD
+  return { commit: null, source: 'head', version: null, note: null };
+}
+
+/**
+ * 取一个 ref 的 commit 号（用于版本分支 tip）。
+ * 分支不存在时返回 null —— 调用方据此决定降级。
+ */
+function gitRefCommit(args: string[], cwd: string): { ok: boolean; stdout: string } {
+  try {
+    const out = execFileSync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      timeout: 10_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { ok: true, stdout: out };
+  } catch {
+    return { ok: false, stdout: '' };
+  }
+}
+
+/**
  * Create (or reuse) the isolated worktree for a slice.
  *
  * Returns null when the current directory is not inside a git repository —
@@ -935,8 +1047,29 @@ export async function ensureWorktree(
   const slice = await store.read(id);
 
   const existed = manager.exists(id);
+
+  // 基点解析（ADR-067 D1）：显式覆盖 → 已钉死 → 归属版本分支 tip → 主干 HEAD。
+  //
+  // 第 3 条是本 ADR 的核心：**单片路径也必须知道自己属于哪个版本**。
+  // 不解析归属的话，同版本的第二片会从主干 HEAD 建 worktree，
+  // 看不到前一片的产物 —— agent 被迫重新实现上一片（实测 D-28）。
+  const base = resolveSliceBaseCommit(id, slice.baseCommit, {
+    override: options.baseCommitOverride ?? null,
+    repoRoot: process.cwd(),
+    specPath: slice.spec.path,
+  });
+
+  if (base.note) {
+    await events.append(id, 'worktree.base_resolved', 'zelto', {
+      sliceId: id,
+      source: base.source,
+      version: base.version,
+      note: base.note,
+    });
+  }
+
   const info = await manager.create(id, {
-    baseCommit: options.baseCommitOverride ?? slice.baseCommit ?? null,
+    baseCommit: base.commit ?? slice.baseCommit ?? null,
     specPath: slice.spec.path,
     acceptanceDir: slice.acceptance.dir,
   });

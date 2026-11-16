@@ -34,7 +34,7 @@
         "merge.conflict",
         "merge.stale_base",
         "sched.admitted", "sched.blocked",
-        "worktree.created", "worktree.removed",
+        "worktree.created", "worktree.removed", "worktree.base_resolved",
         "coord.dep_added",
         "coord.phase_ready",
         "coord.phase_complete",
