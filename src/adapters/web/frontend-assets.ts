@@ -56,6 +56,15 @@ nav button.active { color: var(--fg); border-color: var(--accent); background: #
 main { padding: 20px; max-width: 1200px; }
 #banner { padding: 0 20px; max-width: 1200px; }
 #banner .notice { margin: 10px 0; }
+/* 连接状态条 —— 独占一行，在动作横幅上方 */
+#conn {
+  margin: 0 20px 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--bad);
+  background: #1c2128;
+  border-radius: 0 6px 6px 0;
+  max-width: 1160px;
+}
 h2 { font-size: 14px; margin: 22px 0 10px; font-weight: 600; }
 h2:first-child { margin-top: 0; }
 table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
@@ -170,6 +179,11 @@ export function renderAppJs(): string {
 const TOKEN = window.__ZELTO_TOKEN__;
 const main = document.getElementById('main');
 const summaryLine = document.getElementById('summary-line');
+// 连接状态条 —— **与动作横幅分开**（见下方 noteDisconnected）。
+// 分开的原因：动作横幅是「追加」语义（一次签字要显示两条），
+// 连接状态是「独占」语义（一条状态，反复更新）。
+// 混在一个容器里，连接提示的 textContent 赋值会把动作横幅冲掉。
+const conn = document.getElementById('conn');
 let currentView = 'overview';
 // 当前是否停在**切片详情页**。
 //
@@ -182,22 +196,77 @@ let pollTimer = null;
 
 // ── HTTP ───────────────────────────────────────────────────────────────
 
+/**
+ * 把 fetch 的底层异常翻译成人能直接行动的话。
+ *
+ * 为什么必须翻译：fetch 失败时抛的是 TypeError: Failed to fetch ——
+ * 这句话对人**毫无帮助**。人看到它只知道「失败了」，
+ * 不知道是「服务器停了」还是「网络断了」还是「我地址打错了」。
+ * 实际排查时最容易踩的坑恰恰是：
+ * **浏览器还开着上一个会话的页面，但那个服务早就退了**
+ * （服务是前台进程，Ctrl+C 就停；标签页却留在那儿）。
+ * 这时人看到的是一句没有指向的「Failed to fetch」，
+ * 得自己想到「哦那个服务可能已经关了」。
+ *
+ * 所以这里把最常见的两种区分开：
+ * - TypeError（fetch 本身抛的）→ 连接根本建立不起来
+ *   → 明确告诉人「服务可能已经停了，去终端重新跑 zelto web」
+ * - 其它异常（HTTP 层的）→ 保留原话，那是服务端给的正经错误
+ */
+function friendlyError(err) {
+  if (err instanceof TypeError) {
+    return '连不上 zelto 服务（' + err.message + '）。' +
+      '多半是服务已经停了 —— 回到终端重新跑 zelto web，然后刷新本页。';
+  }
+  return err && err.message ? err.message : String(err);
+}
+
+/**
+ * 标记「这是连接层面的失败」。
+ *
+ * 为什么需要标记而不是靠 instanceof TypeError 判断：
+ * apiGet 会把 fetch 的 TypeError **包装**成普通 Error 再抛，
+ * 一路传到 UI 时早就不是 TypeError 了 —— 判断依据必须跟着错误走。
+ *
+ * 用一个自定义属性而不是子类：UI 侧的判断只需要一个布尔，
+ * 子类会让人误以为可以在上面 catch 出更精确的类型。
+ */
+function markConnectionError(err) {
+  err.isConnectionError = true;
+  return err;
+}
+
+function isConnectionError(err) {
+  return !!(err && err.isConnectionError);
+}
+
 async function apiGet(path) {
-  const res = await fetch(path, { headers: { 'Accept': 'application/json' } });
+  let res;
+  try {
+    res = await fetch(path, { headers: { 'Accept': 'application/json' } });
+  } catch (err) {
+    // fetch 连不上时抛 TypeError —— 先翻译再抛，别把裸异常漏给 UI
+    throw markConnectionError(new Error(friendlyError(err)));
+  }
   const body = await res.json().catch(function () { return { error: '响应不是 JSON' }; });
   if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
   return body;
 }
 
 async function apiPost(path, payload) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Zelto-Token': TOKEN
-    },
-    body: JSON.stringify(payload || {})
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Zelto-Token': TOKEN
+      },
+      body: JSON.stringify(payload || {})
+    });
+  } catch (err) {
+    throw markConnectionError(new Error(friendlyError(err)));
+  }
   const body = await res.json().catch(function () { return { error: '响应不是 JSON' }; });
   return { ok: res.ok, status: res.status, body: body };
 }
@@ -358,7 +427,8 @@ async function showSliceDetail(id, forSign) {
   try {
     d = await apiGet('/api/slices/' + encodeURIComponent(id));
   } catch (err) {
-    main.appendChild(el('p', 'notice bad', '加载失败：' + err.message));
+    main.appendChild(el('p', 'notice bad', '加载失败：' + friendlyError(err)));
+    if (isConnectionError(err)) noteDisconnected(err);
     return;
   }
 
@@ -519,7 +589,10 @@ async function render(view) {
     await VIEWS[view](main);
   } catch (err) {
     clear(main);
-    main.appendChild(el('p', 'notice bad', '加载失败：' + err.message));
+    main.appendChild(el('p', 'notice bad', '加载失败：' + friendlyError(err)));
+    // 连接层面的失败要在状态条上也说一声 —— 主区域会被下一次轮询换掉，
+    // 但状态条会一直在
+    if (isConnectionError(err)) noteDisconnected(err);
   }
   await refreshSummary();
 }
@@ -540,18 +613,57 @@ async function refreshSilently(view) {
     await VIEWS[view](holder);
   } catch (err) {
     // 渲染失败 —— 保留屏幕上原有的内容，别把人正在看的东西弄没
+    noteDisconnected(err);
     return;
   }
   clear(main);
   while (holder.firstChild) main.appendChild(holder.firstChild);
+  noteConnected();
   await refreshSummary();
+}
+
+// ── 连接状态 ───────────────────────────────────────────────────────────
+//
+// 为什么要有这个：服务是**前台进程**（ADR-072 §10，不是常驻 daemon），
+// Ctrl+C 就停 —— 但浏览器标签页还留在那儿，屏幕上还是上一次渲染的样子。
+// 人看着一个「看起来正常但其实已经不更新」的页面，
+// 会以为那就是当前状态 —— **这比直接报错更危险**。
+//
+// 所以：连续若干次拿不到数据，就在横幅上明确说「连接断了」。
+// 一次抖动不报（网络本来就会抖），连续失败才算数。
+
+const OFFLINE_AFTER = 3; // 连续失败几次就判定为「断了」
+let failStreak = 0;
+
+function noteDisconnected(err) {
+  failStreak++;
+  if (failStreak < OFFLINE_AFTER) return;
+  const msg = friendlyError(err);
+  if (conn.dataset.msg === msg) return;
+  conn.dataset.msg = msg;
+  conn.textContent = '⚠️ 与 zelto 服务的连接已断开：' + msg;
+  conn.className = 'banner bad';
+  conn.style.display = '';
+}
+
+function noteConnected() {
+  failStreak = 0;
+  if (conn.dataset.msg === '') return;
+  conn.dataset.msg = '';
+  conn.textContent = '';
+  conn.className = 'banner';
+  conn.style.display = 'none';
 }
 
 async function refreshSummary() {
   try {
     const s = await apiGet('/api/summary');
     summaryLine.textContent = s.totalSlices + ' 切片 · ' + s.pendingSignCount + ' 待签字 · ' + s.stalledCount + ' 停机';
-  } catch (err) { /* 概况拿不到不影响主视图 */ }
+    noteConnected();
+  } catch (err) {
+    // 概况拿不到不影响主视图 —— 但要记一笔，连续失败会判定为「断了」
+    noteDisconnected(err);
+  }
 }
 
 for (const b of document.querySelectorAll('nav button')) {

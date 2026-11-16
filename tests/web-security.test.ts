@@ -606,4 +606,85 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     assert.notEqual(code, 0, '端口被占用时不该成功退出');
     assert.match(out, /端口|占用/, `应当说清端口占用，实际：${out}`);
   });
+
+  // ── 连接断开的可发现性（D-35）────────────────────────────────────────
+  //
+  // 起因：服务是**前台进程**（ADR-072 §10，不是常驻 daemon），
+  // Ctrl+C 就停 —— 但浏览器标签页还留着，屏幕上还是上一次渲染的样子。
+  // 人看着一个「看起来正常但其实早已不更新」的页面，
+  // 会以为那就是当前状态 —— **这比直接报错更危险**。
+  //
+  // 原实现：轮询把所有错误都吞了（catch 里直接 return），
+  // 服务挂了页面纹丝不动、人毫无察觉。
+
+  it('前端：连接断了必须给出可行动提示，不能只留一句 Failed to fetch', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+
+    // 1. 必须有连接状态条（独占容器，不与动作横幅混用）
+    assert.ok(
+      html.includes('id="conn"'),
+      '页面必须有一个连接状态容器（服务停了要让人知道）',
+    );
+
+    // 2. 必须把 fetch 的裸异常翻译成人能行动的话
+    assert.ok(
+      html.includes('friendlyError'),
+      '前端必须有错误翻译函数，把 fetch 的 TypeError 换成可行动的话',
+    );
+    assert.ok(
+      html.includes('连不上 zelto 服务'),
+      '连接失败必须明确说「连不上服务」',
+    );
+    assert.ok(
+      html.includes('zelto web'),
+      '提示必须告诉人下一步做什么（重新跑 zelto web）',
+    );
+
+    // 3. 断连提示与动作横幅必须**分开** ——
+    //    动作横幅是追加语义，断连提示是独占语义，混一个容器会互相冲掉
+    assert.ok(
+      html.includes('const conn = document.getElementById(\'conn\')'),
+      '断连提示必须有独立的元素引用',
+    );
+  });
+
+  it('前端：轮询失败不能悄悄吞掉（否则页面看着正常其实早就没更新）', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+
+    // refreshSilently 的 catch 里必须记一笔失败，而不是直接 return
+    const fnStart = html.indexOf('async function refreshSilently');
+    assert.ok(fnStart > 0, '必须有 refreshSilently');
+    const fnBody = html.slice(fnStart, fnStart + 1200);
+    const catchIdx = fnBody.indexOf('catch');
+    assert.ok(catchIdx > 0, 'refreshSilently 必须有 catch');
+    const catchBody = fnBody.slice(catchIdx, catchIdx + 400);
+    assert.ok(
+      catchBody.includes('noteDisconnected'),
+      '轮询失败必须调 noteDisconnected —— 静默 return 会让人对着过期数据做决策',
+    );
+
+    // 一次抖动不报，连续失败才算数
+    assert.ok(
+      html.includes('OFFLINE_AFTER'),
+      '必须有连续失败阈值 —— 一次网络抖动不该报断连',
+    );
+  });
+
+  it('前端：连接恢复后提示要自动消失', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+    const fnStart = html.indexOf('function noteConnected');
+    assert.ok(fnStart > 0, '必须有 noteConnected');
+    const fnBody = html.slice(fnStart, fnStart + 500);
+    assert.ok(
+      fnBody.includes("conn.dataset.msg = ''"),
+      '恢复后必须清掉提示状态',
+    );
+    assert.ok(
+      fnBody.includes("display = 'none'"),
+      '恢复后必须把提示条隐藏',
+    );
+  });
 });

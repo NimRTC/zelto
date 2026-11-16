@@ -39,6 +39,7 @@ ${renderStyles()}
     </nav>
   </header>
   <main id="main"><p class="muted">加载中…</p></main>
+  <div id="conn" class="banner" style="display:none"></div>
   <div id="banner"></div>
 </div>
 <script>
