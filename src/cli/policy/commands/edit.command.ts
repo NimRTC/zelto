@@ -6,8 +6,8 @@
  * C6: cli/policy/ may depend on adapters/ and core/, but not vice versa.
  */
 
-import { editPolicyRule as handlerEdit } from '../handlers/edit.handler.js';
-import type { EditHandlerResult } from '../handlers/edit.handler.js';
+import { editPolicyRule as handlerEdit } from '../handlers/rules.handler.js';
+import type { EditHandlerResult } from '../handlers/rules.handler.js';
 import type { Decision } from '../../../core/policy/types.js';
 import { colors } from '../../color.js';
 import { writeOutput } from '../../output.js';

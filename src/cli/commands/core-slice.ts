@@ -1181,7 +1181,9 @@ register('run', async (args) => {
     // Check agent availability before starting
     try {
       const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
-      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName);
+      // D-27：把配置里的命令一起传进去 —— 命令行拼错时，
+      // 错误信息要指向那条**真的能用**的命令，而不是让人去改本来没问题的配置。
+      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName, agentCmd);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
         return 1;
@@ -1689,7 +1691,8 @@ register('start', async (args) => {
     // Check agent availability before starting
     try {
       const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
-      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName);
+      // D-27：同上 —— 带上配置里的命令，错误信息要指向能用的那条。
+      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName, cfg.agent.command);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
         return 1;

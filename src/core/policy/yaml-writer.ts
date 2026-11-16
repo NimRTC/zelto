@@ -119,12 +119,18 @@ export function serializeRulesToYaml(rules: RuleData[], headerComment?: string, 
  * @param filePath - Absolute path to the output file
  * @param rules - Rules to write
  * @param headerComment - Optional header comment block
+ * @param arch - Optional arch guard rules (ADR-027).
+ *
+ * **必须传。** ADR-068 D-30：`arch:` 段是架构护栏的判定依据，
+ * 漏传会让 `policy edit` / `policy remove` **静默抹掉整个 `arch:` 段** ——
+ * 人明确写下的「已知例外」（如 `cycle: ask`）会无声消失。
  */
 export function writePolicyYaml(
   filePath: string,
   rules: RuleData[],
   headerComment?: string,
+  arch?: ArchGuardRule[],
 ): void {
-  const content = serializeRulesToYaml(rules, headerComment);
+  const content = serializeRulesToYaml(rules, headerComment, arch);
   writeFileSync(filePath, content, 'utf-8');
 }

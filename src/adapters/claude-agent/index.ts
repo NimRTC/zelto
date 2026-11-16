@@ -784,7 +784,10 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
    * (`shell: true`), built-ins do run. So when the PATH lookup fails we fall
    * back to asking the shell whether it knows the command.
    */
-  static async checkAgentAvailable(agentCommand: string): Promise<string | null> {
+  static async checkAgentAvailable(
+    agentCommand: string,
+    configuredCommand?: string,
+  ): Promise<string | null> {
     const cmd = agentCommand.split(' ')[0]; // Get the base command
     const lookup = process.platform === 'win32' ? 'where' : 'which';
 
@@ -794,7 +797,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     } catch {
       // Not on PATH — check whether the shell can resolve it anyway.
       if (this.isShellResolvable(cmd)) return null;
-      return `Agent command "${agentCommand}" not found. Install it or update .zelto/config.yaml agent.command.`;
+      return describeMissingAgent(agentCommand, configuredCommand);
     }
   }
 
@@ -826,4 +829,42 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       return false;
     }
   }
+}
+
+/**
+ * 描述「agent 命令找不到」这件事，并且**指向正确的那条命令**。
+ *
+ * 缺陷 D-27（第二轮演练）：`zelto run <id> --agent claude-code` 拼错时，
+ * 错误信息只说「没找到」，还让人去改 `.zelto/config.yaml agent.command` ——
+ * 而**配置里的命令是对的**（`npx @anthropic-ai/claude-code`），
+ * 是命令行这一次的临时覆盖拼错了。
+ *
+ * 人看到「改 config.yaml」会去改一个**本来没问题**的文件，
+ * 改完还是错 —— **错误信息把人引向错误的方向**。
+ *
+ * 所以这里要说清三件事：
+ *   1. 哪个命令找不到
+ *   2. **当前配置里的命令是什么**（那才是可用的那条）
+ *   3. 这次错在哪 —— 命令行覆盖 vs 配置本身
+ *
+ * 纯函数（无 IO），便于单测。
+ */
+export function describeMissingAgent(
+  agentCommand: string,
+  configuredCommand?: string,
+): string {
+  const base = `Agent command "${agentCommand}" not found.`;
+
+  // 没有配置里的命令可比（或两者相同）→ 只能让人去装 / 去改配置
+  if (!configuredCommand || configuredCommand === agentCommand) {
+    return `${base} Install it or update .zelto/config.yaml agent.command.`;
+  }
+
+  // 配置里的命令与这次用的不同 → 是命令行这次的覆盖拼错了
+  return (
+    `${base}\n` +
+    `  当前配置里的命令是：${configuredCommand}` +
+    `\n  这次用的是命令行传的 --agent（与配置不同）。` +
+    `\n  改掉 --agent 的拼写，或去掉 --agent 用配置里的命令。`
+  );
 }

@@ -10,7 +10,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { loadPolicyConfig } from '../../commands/shared.js';
 import { validatePolicyConfig, validatePolicyYaml } from '../../../core/policy/validator.js';
-import { checkPolicyAnchor } from '../../../core/policy/lock.js';
+import { checkPolicyAnchor, computePolicyHash, writePolicyLock } from '../../../core/policy/lock.js';
 import { colors } from '../../color.js';
 import { writeOutput } from '../../output.js';
 
@@ -20,6 +20,14 @@ import { writeOutput } from '../../output.js';
 
 export interface ValidateOptions {
   json?: boolean;
+  /**
+   * 一体化重锚（ADR-068 D2）
+   *
+   * 策略文件本身合法、但锚点失配时，当场重锚。
+   * 策略文件本身**不合法**时不重锚 —— 给坏策略改锚等于让
+   * 「锚点一致」盖住「策略是坏的」。
+   */
+  update?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -149,16 +157,39 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
   // 未必是这个人想要的）。若 validate 因失配就红，人每次换策略都得先改锚 ——
   // 「失配 = 可检出的改动」就退化成「每次改策略先走一遍仪式」，人只会绕过它。
   // 判与报分开：validate 照样把失配说出来（不藏），lock 才是那个当门禁用的判据。
+  //
+  // ADR-068 D2：`--update` 提供**一体化入口** ——
+  // 「改完策略不知道还要跑什么」是每次都遇到的真实问题，
+  // 而「CI 看不见失配」是偶尔遇到的。所以做一体化入口，不做 error。
   const anchor = checkPolicyAnchor(process.cwd());
+
+  // ── 一体化重锚（ADR-068 D2）──────────────────────────────────────────
+  //
+  // 时序很关键：**策略文件本身合法**（上面的校验已经过了）才允许重锚。
+  // 给一个语法都过不了的策略改锚，等于让「锚点一致」盖住「策略是坏的」——
+  // 锚点的意义是「记录当时按什么标准拦的」，坏策略没有「标准」可言。
+  let anchorReanchored = false;
+  if (options.update && anchor.mismatch && anchor.current) {
+    writePolicyLock(process.cwd(), {
+      version: 1,
+      policy: computePolicyHash(readFileSync(policyPath, 'utf-8')),
+      lockedAt: new Date().toISOString(),
+      source: 'manual',
+    });
+    anchorReanchored = true;
+  }
+
   const anchorWarning = anchor.mismatch
     ? `策略锚点失配：锚点记的是 ${anchor.locked}，当前 policy.yaml 是 ${anchor.current}。` +
-      `策略被改过而锚点没动 —— 确认改动是有意的，跑 zelto policy lock --update 改锚。`
+      `策略被改过而锚点没动 —— 确认改动是有意的，跑 zelto policy validate --update 改锚。`
     : null;
 
   // All valid
   const warnings = [
     ...(yamlResult.warnings ?? []).map((w) => ({ path: w.path, message: w.message, code: w.code })),
-    ...(anchorWarning ? [{ path: '', message: anchorWarning, code: 'W_ANCHOR_MISMATCH' }] : []),
+    ...(anchorWarning && !anchorReanchored
+      ? [{ path: '', message: anchorWarning, code: 'W_ANCHOR_MISMATCH' }]
+      : []),
   ];
   if (options.json) {
     writeOutput(
@@ -171,11 +202,12 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
         },
         // 锚点状态随输出一起给：不藏，但也不改变 valid（valid 只说策略本身）
         anchor: {
-          status: anchor.mismatch ? 'mismatch' : anchor.hasLock ? 'matched' : 'unanchored',
+          status: anchorReanchored ? 'reanchored' : anchor.mismatch ? 'mismatch' : anchor.hasLock ? 'matched' : 'unanchored',
           locked: anchor.locked,
           current: anchor.current,
           mismatch: anchor.mismatch,
           source: anchor.source,
+          reanchored: anchorReanchored,
         },
         ...(warnings.length > 0 ? { warnings } : {}),
       },
@@ -190,7 +222,11 @@ export async function validatePolicy(options: ValidateOptions): Promise<number> 
     for (const w of yamlResult.warnings ?? []) {
       console.log(`${colors.yellow('⚠')} ${colors.bold('弃用段')} ${w.path ? `${colors.dim(w.path)}: ` : ''}${w.message}`);
     }
-    if (anchorWarning) {
+    if (anchorReanchored) {
+      console.log('');
+      console.log(`${colors.green('✓')} ${colors.bold('锚点已重锚')}`);
+      console.log(`  ${colors.dim('策略文件变了、锚点没跟上 —— 已按当前 policy.yaml 重锚。')}`);
+    } else if (anchorWarning) {
       console.log('');
       console.log(`${colors.yellow('⚠')} ${colors.bold('锚点失配')} ${colors.dim('（不影响 validate 的退出码 —— 判锚点用 zelto policy lock）')}`);
       console.log(`  ${colors.dim(anchorWarning)}`);
