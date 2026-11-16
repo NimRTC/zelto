@@ -1033,6 +1033,14 @@ register('freeze', async (args) => {
 // ─── run ─────────────────────────────────────────────────────────────────────
 
 register('run', async (args) => {
+  // `--help` 只读说明，不能进执行 —— 不拦住的话 `--help` 会被当成切片 id 去跑
+  if (args.includes('--help') || args.includes('-h')) {
+    console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
+    console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
+    console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
+    console.error('       zelto run <slice-id> --detach [--json]');
+    return 0;
+  }
   // Dispatch to parallel runner if --parallel flag is present
   if (args.includes('--parallel')) {
     return runParallel(args);

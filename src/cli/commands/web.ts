@@ -13,6 +13,15 @@ import { register } from './shared.js';
 const DEFAULT_PORT = 4321;
 
 register('web', async (args) => {
+  // `--help` 只读说明，不能进服务 —— 不拦住的话 `--help` 会被当成正常启动，
+  // 直接占住端口跑起一个前台服务（实测 `zelto web --help` 卡死在这）
+  if (args.includes('--help') || args.includes('-h')) {
+    console.error(`Usage: zelto web [--port ${DEFAULT_PORT}] [--open]`);
+    console.error('');
+    console.error('  --port <n>  监听端口（默认 4321，非法则拒绝启动）');
+    console.error('  --open      启动后自动打开浏览器');
+    return 0;
+  }
   const portIdx = args.indexOf('--port');
   let port = DEFAULT_PORT;
   if (portIdx >= 0) {

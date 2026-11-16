@@ -28,6 +28,8 @@ const EMPTY_TOKENS = new Set([
   '-',
   '—',
   '()',
+  '[]',
+  '{}',
 ]);
 
 /**
@@ -59,5 +61,8 @@ export function stripWrappingQuotes(raw: string): string {
 export function isEmptyToken(raw: string): boolean {
   const value = stripWrappingQuotes(raw).toLowerCase();
   if (!value) return true;
-  return EMPTY_TOKENS.has(value);
+  if (EMPTY_TOKENS.has(value)) return true;
+  // 括号里只剩空白也算空：`[ ]` / `( )` / `{ }` —— 人写占位时常带空格
+  const compact = value.replace(/\s+/g, '');
+  return compact === '[]' || compact === '()' || compact === '{}';
 }

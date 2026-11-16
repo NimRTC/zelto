@@ -390,6 +390,11 @@ function renderReport(
 
 register('arch', async (args) => {
   const f = getDefaultFormatter();
+  // `--help` 只读说明，不能进判定 —— 不拦住的话会被当成未知子命令报 USAGE 错误
+  if (args.includes('--help') || args.includes('-h')) {
+    f.error('USAGE', 'Usage: zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]');
+    return 0;
+  }
   const subcmd = args[0];
 
   if (subcmd && subcmd !== 'check') {

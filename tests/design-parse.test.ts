@@ -44,6 +44,15 @@ describe('parseFieldList', () => {
     assert.deepEqual(parseFieldList('-'), []);
   });
 
+  it('空括号占位词当成空（D-37：design patch --dep "" 后的回归）', () => {
+    // design patch 把「无依赖」写成 `[]` 后，parse 必须认出这是空，
+    // 否则 arch 会报「未知模块 []」（nimrtc-zelto 实战演练现场抓到）
+    assert.deepEqual(parseFieldList('[]'), []);
+    assert.deepEqual(parseFieldList('[ ]'), []);
+    assert.deepEqual(parseFieldList('()'), []);
+    assert.deepEqual(parseFieldList('{}'), []);
+  });
+
   it('顿号与换行也是分隔符', () => {
     assert.deepEqual(parseFieldList('src/a、src/b'), ['src/a', 'src/b']);
     assert.deepEqual(parseFieldList('src/a\nsrc/b'), ['src/a', 'src/b']);
