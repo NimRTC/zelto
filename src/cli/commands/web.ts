@@ -1,0 +1,66 @@
+// `zelto web` —— 浏览器驾驶舱（ADR-072）
+//
+// 形态：只读驾驶舱 + **唯一**的写操作（签字）。
+// 绑定：硬编码 `127.0.0.1`，不可配置（ADR-072 §7）。
+//
+// 没有 run / gate / freeze / admit / abandon / resume ——
+// 那些动作在 CLI 侧有完整实现，Web 侧再实现一份会分叉判定。
+// 理由见 ADR-072 §4。
+
+import { WebServer } from '../../adapters/web/index.js';
+import { register } from './shared.js';
+
+const DEFAULT_PORT = 4321;
+
+register('web', async (args) => {
+  const portIdx = args.indexOf('--port');
+  let port = DEFAULT_PORT;
+  if (portIdx >= 0) {
+    const parsed = Number.parseInt(args[portIdx + 1] ?? '', 10);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) {
+      console.error(`❌ 端口号非法：${args[portIdx + 1] ?? '(空)'}`);
+      console.error(`   用法：zelto web [--port ${DEFAULT_PORT}] [--open]`);
+      return 1;
+    }
+    port = parsed;
+  }
+
+  const openBrowser = args.includes('--open');
+
+  const server = new WebServer({ port, repoRoot: process.cwd() });
+
+  try {
+    await server.start();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`❌ Web 驾驶舱启动失败：${message}`);
+    return 1;
+  }
+
+  console.log(`🌐 zelto 驾驶舱已启动：${server.url}`);
+  console.log(`   （只读驾驶舱 + 签字。签字不等于合并 —— 合入主干请跑 zelto merge <id>）`);
+  console.log('   Ctrl+C 停止');
+
+  if (openBrowser) {
+    try {
+      const { execSync } = await import('node:child_process');
+      const p = process.platform;
+      if (p === 'win32') execSync(`start "" "${server.url}"`, { timeout: 5000 });
+      else if (p === 'darwin') execSync(`open "${server.url}"`, { timeout: 5000 });
+      else execSync(`xdg-open "${server.url}"`, { timeout: 5000 });
+    } catch {
+      console.log(`   手动打开：${server.url}`);
+    }
+  }
+
+  // 保持进程运行 —— 显式的前台进程，不是常驻 daemon（ADR-072 §10）
+  await new Promise<void>((resolve) => {
+    const stop = () => {
+      void server.stop().then(() => resolve());
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  });
+
+  return 0;
+});

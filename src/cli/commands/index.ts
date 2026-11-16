@@ -35,6 +35,7 @@ import './merge.js';
 import './architecture.js';
 import './slice-spec.js';
 import './contract.js';
+import './web.js';
 
 /**
  * 近形命令别名 —— 常见拼错 / 复数形式的直达表。
