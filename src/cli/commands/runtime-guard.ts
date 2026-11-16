@@ -15,6 +15,7 @@
 // C4: 取预约、放预约、审计结论都写 append-only 事件
 
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import {
   type ManagedFile,
@@ -23,6 +24,7 @@ import {
   ReservationStore,
   auditWorktreeWrites,
   hashFile,
+  parsePorcelainStatus,
   LOCKS_DIR,
 } from '../../core/sched/index.js';
 import { events } from './shared.js';
@@ -37,6 +39,29 @@ import {
 
 /** zelto 装进 worktree 的 Claude Code 设置文件（相对 worktree 的路径） */
 export const MANAGED_SETTINGS_PATH = CLAUDE_SETTINGS_RELATIVE.replace(/\\/g, '/');
+
+/**
+ * 开工时的基线快照（D-29）：worktree 建出来那一刻就已经脏的路径。
+ *
+ * 主仓工作区里本来就有 `-dirty`（例如 nimrtc 的 msquic 嵌套 submodule
+ * 被改过），worktree 继承了这份脏。快照只读 `git status`，不调模型、
+ * 不触网（C3）。返回相对 worktree 的正斜杠路径；读不到时返回空数组
+ * （不阻断开工，审计退回老行为）。
+ */
+export function snapshotBaselineChanged(worktreePath: string): string[] {
+  try {
+    const out = execFileSync(
+      'git',
+      ['-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=all'],
+      { cwd: worktreePath, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    // 解析规则与审计侧共用（decodeGitPath 处理中文路径的八进制转义），
+    // 两边各抄一份就会漂移 —— D-28 就是这么来的。
+    return parsePorcelainStatus(String(out));
+  } catch {
+    return [];
+  }
+}
 
 export interface RuntimeGuardOptions {
   /** 切片 id */
@@ -122,6 +147,10 @@ export async function installRuntimeGuard(
   const installed = installClaudeCodeHook(hookOptions);
   const exec = buildPreToolHookExec(hookOptions);
 
+  // D-29 基线快照：worktree 建出来那一刻就已经脏的路径（主仓继承的 -dirty）。
+  // 必须在 agent 开工前拍 —— 之后再拍就分不清谁写的了。
+  const baselineChanged = options.worktree ? snapshotBaselineChanged(hookRoot) : [];
+
   if (!installed.installed) {
     // 钩子没装上 = 运行时拦不住越界写。运行后的审计还在，但过程里没人拦 ——
     // 必须让人看见。
@@ -149,6 +178,7 @@ export async function installRuntimeGuard(
     pid: reservation.pid,
     hookInstalled: installed.installed,
     hookCommand: exec.args.join(' '),
+    baselineChanged,
   });
 
   let released = false;
@@ -166,6 +196,7 @@ export async function installRuntimeGuard(
       return auditWorktreeWrites(hookRoot, options.writes, {
         baseCommit: options.baseCommit ?? null,
         managed,
+        baselineChanged,
         // ADR-067 D3：只把本片自己产出的提交算进审计范围。
         // 分支上别的提交（基点错位带进来的、运行期间被人合进来的）
         // 不是本片 agent 写的，不该算成「本片的越界写入」。

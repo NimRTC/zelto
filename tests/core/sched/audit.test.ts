@@ -154,4 +154,25 @@ describe('auditWorktreeWrites', () => {
       rmSync(notARepo, { recursive: true, force: true });
     }
   });
+
+  it('excludes pre-existing dirty paths (D-29) from violations but keeps them in changed', () => {
+    // 主仓继承的 -dirty：开工前就已经脏，agent 没碰过 —— 不该判越界。
+    mkdirSync(join(repo, 'vendor'), { recursive: true });
+    writeFileSync(join(repo, 'vendor', 'x.txt'), 'x\n', 'utf-8');
+
+    const result = auditWorktreeWrites(repo, ['src/core/**'], {
+      baselineChanged: ['vendor/x.txt', 'vendor\\y.txt'],
+    });
+    assert.deepEqual(result.violations, []);
+    assert.ok(result.changed.includes('vendor/x.txt'));
+  });
+
+  it('still flags writes outside both the write-set and the baseline', () => {
+    writeFileSync(join(repo, 'stray.ts'), 'export const s = 1;\n', 'utf-8');
+
+    const result = auditWorktreeWrites(repo, ['src/core/**'], {
+      baselineChanged: ['vendor/x.txt'],
+    });
+    assert.deepEqual(result.violations, ['stray.ts']);
+  });
 });

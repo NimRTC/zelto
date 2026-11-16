@@ -35,6 +35,20 @@ export interface AuditOptions {
   /** zelto 托管的文件：路径不计入越界，但内容被改动即视为篡改 */
   managed?: ManagedFile[];
   /**
+   * 运行开始时 worktree 就已经脏的路径（相对 worktree，正斜杠）。
+   *
+   * 为什么需要：nimrtc-zelto 实测 D-29 —— 主仓工作区里
+   * `src/third_party/msquic` 本来就是 `-dirty`（嵌套 submodule
+   * `submodules/quictls` 被改过），worktree 建出来继承了这份脏。
+   * agent 碰都没碰它，审计却把它算成「本片的越界写入」，
+   * 切片直接被打回 frozen。预置脏不是 agent 写的，不该判越界。
+   *
+   * 语义：只从 `violations` 里排除，`changed` 里照样列出（可审计）。
+   * 同一文件 agent 又改了也无法区分 —— 保守起见一律不判，
+   * 与「无 worktree 时不审计」的 fail-open 方向一致（误报比漏报贵）。
+   */
+  baselineChanged?: string[];
+  /**
    * 本片 id（ADR-067 D3）。
    *
    * 给了就**只把本片自己产出的提交**算进审计范围 ——
@@ -354,7 +368,15 @@ export function auditWorktreeWrites(
     if (actual !== file.hash) tampered.push(rel);
   }
 
+  // 预置脏（D-29）：运行开始时 worktree 就已经脏的路径不算越界，
+  // 只从 violations 里排除，changed 里照样保留以便审计。
+  const baseline = new Set(
+    (options.baselineChanged ?? []).map((p) => p.replace(/\\/g, '/')),
+  );
+
   const all = [...changed];
-  const violations = all.filter((p) => !managedPaths.has(p) && !pathInWriteSet(p, writes));
+  const violations = all.filter(
+    (p) => !managedPaths.has(p) && !baseline.has(p) && !pathInWriteSet(p, writes),
+  );
   return { changed: all, violations, tampered, error: null };
 }
