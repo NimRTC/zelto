@@ -93,6 +93,27 @@ export interface EventEnvelope {
   payload: Record<string, unknown>;
 }
 
+/**
+ * 去掉行首的 BOM（U+FEFF）。
+ *
+ * Windows 上很常见（PowerShell 5.1 的 `Set-Content -Encoding UTF8`、
+ * 记事本、部分编辑器）。仓库里的既有惯例：
+ * `core/design/store.ts`、`core/version/branch.ts`、`core/version/store.ts`、
+ * `core/contracts/baseline.ts`、`core/regression/baseline.ts`、
+ * `core/review/revisions.ts` —— 全是「读时容错、写时不动」。
+ *
+ * 为什么不能靠 `trim()` 顺手解决：
+ * `trim()` 确实会把 U+FEFF 去掉（它属于 JS 的 WhiteSpace），
+ * 但 `JSON.parse` **不接受**带 BOM 的字符串 —— 它不是 JSON 语法的一部分。
+ * 所以必须显式剥掉，不能指望 trim 顺手带过。
+ *
+ * 注意：只剥**行首**。BOM 出现在文件开头（第一行）时，
+ * 逐行剥就够了；出现在中间的行首则同样是「外部工具追加的痕迹」，一并容错。
+ */
+function stripBom(line: string): string {
+  return line.charCodeAt(0) === 0xfeff ? line.slice(1) : line;
+}
+
 export class EventStream {
   private readonly baseDir: string;
   private seq: number = 0;
@@ -118,7 +139,9 @@ export class EventStream {
           const lastNewline = trimmed.lastIndexOf('\n');
           const lastLine = lastNewline >= 0 ? trimmed.slice(lastNewline + 1) : trimmed;
           if (lastLine) {
-            const last = JSON.parse(lastLine);
+            // 同样要剥 BOM —— 否则带 BOM 的事件文件读不出 runSeq，
+            // 重启后序号会从头开始，与既有事件撞号（C4 的追溯链会乱）
+            const last = JSON.parse(stripBom(lastLine));
             if (typeof last.runSeq === 'number' && last.runSeq > maxSeq) {
               maxSeq = last.runSeq;
             }
@@ -168,7 +191,17 @@ export class EventStream {
         .filter(Boolean)
         .map((line) => {
           try {
-            return JSON.parse(line) as EventEnvelope;
+            // Windows 编辑器可能带 BOM —— 去掉再解析。
+            //
+            // 为什么这层容错是必须的：事件流是 C4 说的「追溯的唯一证据载体」，
+            // 一行读不懂就被静默丢掉，等于**证据凭空消失**。
+            // 实测：带 BOM 的 events.jsonl 首行整行解析失败，
+            // `gate.result` 事件被丢掉 → 签字页的「验收真跑过」判据误判为不过。
+            //
+            // 仓库惯例是「读时容错、写时不动」（core/design/store.ts、
+            // core/version/branch.ts 等 8 处都是这个写法）：
+            // 工具没资格改文件的编码标记。
+            return JSON.parse(stripBom(line)) as EventEnvelope;
           } catch {
             return null;
           }

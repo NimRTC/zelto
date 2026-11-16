@@ -38,7 +38,8 @@ export class QuestionStore {
   async read(id: string): Promise<QuestionRecord | null> {
     try {
       const content = await readFile(this.path(id), 'utf-8');
-      return JSON.parse(content) as QuestionRecord;
+      // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+      return JSON.parse(content.replace(/^\uFEFF/, '')) as QuestionRecord;
     } catch {
       return null;
     }

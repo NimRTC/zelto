@@ -93,7 +93,8 @@ export class ReservationStore {
     if (!existsSync(this.pathFor(sliceId))) return null;
     try {
       const raw = await readFile(this.pathFor(sliceId), 'utf-8');
-      const parsed = JSON.parse(raw) as WriteReservation;
+      // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+      const parsed = JSON.parse(raw.replace(/^\uFEFF/, '')) as WriteReservation;
       if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.writes)) return null;
       return parsed;
     } catch {

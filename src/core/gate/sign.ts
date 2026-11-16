@@ -164,7 +164,8 @@ export class SignManager {
 
   async get(id: string): Promise<SignRequest> {
     const content = await readFile(this.path(id), 'utf-8');
-    return JSON.parse(content) as SignRequest;
+    // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+    return JSON.parse(content.replace(/^\uFEFF/, '')) as SignRequest;
   }
 
   async list(status?: SignRequest['status']): Promise<SignRequest[]> {
@@ -176,7 +177,8 @@ export class SignManager {
         if (!file.endsWith('.json') || !file.startsWith('sign-')) continue;
         try {
           const content = await readFile(join(this.locksDir, file), 'utf-8');
-          const req = JSON.parse(content) as SignRequest;
+          // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+          const req = JSON.parse(content.replace(/^\uFEFF/, '')) as SignRequest;
           if (!status || req.status === status) {
             requests.push(req);
           }

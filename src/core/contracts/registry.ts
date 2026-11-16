@@ -38,7 +38,8 @@ export class ContractRegistry {
 
     const filePath = join(this.schemasDir, fileName);
     const raw = await readFile(filePath, 'utf-8');
-    const schema = JSON.parse(raw) as Record<string, unknown>;
+    // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+    const schema = JSON.parse(raw.replace(/^\uFEFF/, '')) as Record<string, unknown>;
 
     const name = basename(fileName, extname(fileName));
     const description = (schema.description as string) ?? name;

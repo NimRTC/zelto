@@ -126,7 +126,8 @@ export class SliceStore {
 
   async read(id: string): Promise<SliceData> {
     const content = await readFile(this.path(id), 'utf-8');
-    const slice = JSON.parse(content) as SliceData;
+    // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）
+    const slice = JSON.parse(content.replace(/^\uFEFF/, '')) as SliceData;
     // 归一化：老状态文件里 `runs` 从未被写入过（永远是空数组），
     // `clarifyRounds` 也不存在。读的时候补齐，避免各处散着做兜底。
     slice.runs = normalizeRuns(slice.runs);
