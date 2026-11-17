@@ -94,12 +94,19 @@ describe('acceptance: config-loading', () => {
     ].join('\n'), 'utf-8');
 
     // Write a policy.yaml
+    // 写集是 `src/**/*.ts`；allow 规则必须与它**同形**（都覆盖 `.ts`）——
+    // freeze 现在也是闸门，会预检「写集 × 策略」。写集里若有 `.cjs`
+    // 之类的路径，这里的 allow 规则覆盖不到，冻结就会按策略预检被拒。
     await writeFile(POLICY_FILE, [
       'rules:',
       '  - id: allow-src-ts',
       '    match: { path: "src/**/*.ts", operation: "write" }',
       '    action: allow',
       '    basis: "policy.yaml#allow-src-ts"',
+      '  - id: allow-acceptance-cjs',
+      '    match: { path: "tests/acceptance/**", operation: "write" }',
+      '    action: allow',
+      '    basis: "policy.yaml#allow-acceptance-cjs"',
       '  - id: allow-read-all',
       '    match: { path: "**", operation: "read" }',
       '    action: allow',

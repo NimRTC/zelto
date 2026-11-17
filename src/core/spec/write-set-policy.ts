@@ -56,61 +56,168 @@ function toPosix(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
+function hasGlob(p: string): boolean {
+  return p.includes('*') || p.includes('?');
+}
+
 /**
- * glob 写集与一条规则路径的交集判定。
+ * 一条 glob 能否**接受**某个路径前缀（允许零段匹配）。
  *
- * 两条 glob 要判「有没有交集」，不能简单地把其中一条当正则去测另一条 ——
- * `src/**` 与 `src/modules/rd_input/**` 有交集，但
- * `demo-agent-realtime/**` 与 `src/**` 没有。
- *
- * 做法：把规则路径**逐段**下探到写集 glob 能接受的形状里。
- * 这里采取保守策略：**宁可判「有交集」也不判「没交集」**——
- * 误报会多提示一句，漏报会让一片注定跑不起来的切片跑起来。
+ * `matchPath('examples/**', 'examples')` 是 false —— `**` 在这些规则里
+ * 至少占一段。但判「写集能不能碰到这里」时，`examples/**` 的根目录
+ * `examples` 显然在可达范围内：它下面的任何东西都归它。所以这里单独放宽
+ * 「末端 `**` 的零段情形」，其余照 `matchPath` 的口径。
  */
-function globMayOverlap(writeGlob: string, rulePath: string): boolean {
-  const w = toPosix(writeGlob);
-  const r = toPosix(rulePath);
+function globReaches(pattern: string, path: string): boolean {
+  if (matchPath(pattern, path)) return true;
+  const c = toPosix(path).replace(/\/+$/, '');
+  if (!c) return false;
+  const p = toPosix(pattern).replace(/\/+$/, '');
+  const segs = p.split('/').filter((s) => s !== '');
+  for (let k = 1; k < segs.length; k++) {
+    const prefix = segs.slice(0, k).join('/');
+    if (prefix === c && (segs[k] === '**' || p.includes('**'))) return true;
+  }
+  return false;
+}
 
-  // 写集是 glob，规则是字面路径：
-  //   把字面路径逐段拿去测写集 glob，命中任一段即算有交集。
-  //   （`src/**` 测 `src/modules/x.cpp` → `src/modules/x.cpp` 命中 → 有交集；
-  //     `src/**` 测 `docs/a.md` → 不命中 → 无交集）
-  if (w.includes('*') || w.includes('?')) {
-    if (matchPath(w, r)) return true;
-    // 规则路径是目录前缀时，写集可能落在它下面的子目录里：
-    //   `examples/**` 与 `examples/demo/foo.cpp` → 上面已命中。
-    //   `examples` （无通配）与 `examples/**` → 命中。
-    //   规则路径带通配时，逐段下探：
-    const rSegments = r.split('/');
-    const wSegments = w.split('/');
-    // 写集比规则更深时，先看规则前缀能否满足写集的前缀段
-    const minLen = Math.min(rSegments.length, wSegments.length);
-    for (let i = 0; i < minLen; i++) {
-      const wSeg = wSegments[i];
-      const rSeg = rSegments[i];
-      if (wSeg === '**') {
-        // 写集此处通配 → 规则剩下的段都可能被覆盖
-        if (i < rSegments.length) return true;
-        return false;
+/**
+ * glob 写集与一条规则路径的「交集见证」。
+ *
+ * 两条 glob 要判「有没有交集」，不能把其中一条当正则去测另一条 ——
+ * `src/**` 与 `src/modules/rd_input/**` 有交集（规则 `src/**` 接受
+ * 写集里的任何具体路径），但没有哪一条包含另一条的字符串。
+ *
+ * 做法：**以写集为模板、在规则路径里找一件证物**。逐段对齐：
+ *
+ * - 写集字面段与规则字面段必须相等
+ * - 写集字面段 vs 规则通配段 → 规则段必须命中这个字面段
+ * - 写集通配段 vs 规则字面段 → 写集段必须命中这个字面段
+ * - 两边同一位置都是通配 → 放弃（没有具体路径可借用，宁可不判「有交集」）
+ * - 任一侧出现 `**` → 该侧剩余段全部「随便」，另一侧剩余段必须能落地
+ *
+ * 为什么必须严格：这条判据的两端都会误伤。
+ * **误判「有交集」** → 写集明明放行不了，门禁却说没问题，
+ * 一片注定跑不起来的切片被放进去烧 token（漏报，最糟）；
+ * **误判「没交集」** → 门禁拦住一片其实能跑的切片，人被引去改正确的策略（误报）。
+ * 见证法两头都堵住：找得出见证才说「有交集」。
+ *
+ * @returns 一件落在两边各自范围内的具体路径（见证）；无交集时 null
+ */
+function overlapWitness(writePath: string, rulePath: string): string | null {
+  const w = toPosix(writePath).replace(/\/+$/, '');
+  const r = toPosix(rulePath).replace(/\/+$/, '');
+
+  // 完全同形的 pattern：一件证物都不必造，它自己就是
+  if (w === r) return w;
+
+  // 写集是字面路径：规则能接受它，它本身就是见证
+  if (!hasGlob(w)) return globReaches(r, w) ? w : null;
+
+  // 规则是字面路径：写集能接受它，它本身就是见证
+  if (!hasGlob(r)) return globReaches(w, r) ? r : null;
+
+  // 写集以 `**` 收尾（`dir/**`）：规则里任何落在 `dir` 下的路径都是见证。
+  // 规则也以 `**` 收尾时，两边的根目录是同一个才算。
+  //
+  // 空写集（`**`）不归这条管：它的「根」是仓库根，对任何规则都成立，
+  // 见上面的 `globReaches` 兜底。
+  const wSegs = w.split('/').filter((s) => s !== '');
+  const rSegs = r.split('/').filter((s) => s !== '');
+  if (w === '**') return hasGlob(r) ? null : r;
+  if (wSegs[wSegs.length - 1] === '**') {
+    const wRoot = wSegs.slice(0, -1).join('/');
+    if (wRoot === '' || wRoot.includes('*') || wRoot.includes('?')) {
+      // 根目录本身带通配：只能尝试规则的所有前缀
+      for (let k = rSegs.length; k >= 1; k--) {
+        const cand = rSegs.slice(0, k).join('/');
+        if (globReaches(w, cand) && globReaches(r, cand)) return cand;
       }
-      if (rSeg.includes('*') || rSeg.includes('?')) return true;
-      if (wSeg !== rSeg) return false;
+      return null;
     }
-    // 写集比规则短（如写集 `examples`、规则 `examples/demo/**`）
-    // → 写集是规则的前缀，落在规则覆盖范围内 → 有交集
-    if (wSegments.length <= rSegments.length) return true;
-    return false;
+    // 规则路径里，`wRoot` 或其下一段就是见证
+    for (let k = 1; k <= rSegs.length; k++) {
+      const cand = rSegs.slice(0, k).join('/');
+      if (!globReaches(w, cand)) continue;
+      // 见证必须**真的被规则接受**：`x/src` 只命中 `x/src/**` 的前缀，
+      // 不等于规则接受它，也不能用来证明与别的写集有交集。
+      if (matchPath(r, cand)) return cand;
+    }
+    // 规则的根就在 `wRoot` 本身或它的前缀上（规则 `dir` / `dir/**`
+    // vs 写集 `dir/**`）：见证取两者中更短的那个具体路径。
+    for (let k = 1; k <= wSegs.length - 1; k++) {
+      const cand = wSegs.slice(0, k).join('/');
+      if (cand.includes('*') || cand.includes('?')) continue;
+      if (globReaches(r, cand)) return cand;
+    }
+    return null;
   }
 
-  // 写集是字面路径，规则是 glob：直接测
-  if (r.includes('*') || r.includes('?')) {
-    return matchPath(r, w);
+  // 写集不以 `**` 收尾：逐段对齐到写集耗尽。
+  //
+  // 对齐规则：两侧都有 `**` 段时，**先消费写集的 `**`**（把写集的剩余段
+  // 对齐到规则尾部），否则先消费规则的 `**`（规则剩余段随便）。
+  // 写集 `src/**\/*.ts` vs 规则 `src/**`：规则的 `**` 吞掉写集余下所有段，
+  // 见证就是已对齐的前缀 `src`。
+  const cand: string[] = [];
+  let j = 0;
+  for (let i = 0; i < wSegs.length; i++) {
+    const wSeg = wSegs[i];
+    if (wSeg === '**') {
+      const wRest = wSegs.slice(i + 1);
+      if (wRest.length === 0) {
+        return cand.length > 0 ? cand.join('/') : null;
+      }
+      // 规则此处是 `dir/**/file` 或直接以 `**` 收尾：写集剩余段整体
+      // 交给规则的 `**` 处理 —— 规则的 `**` 接受写集余下所有段。
+      if (rSegs.includes('**', j)) {
+        const firstDs = rSegs.indexOf('**', j);
+        const before = rSegs.slice(0, firstDs);
+        if (before.length !== j) return null;
+        return cand.length > 0 ? cand.join('/') : before[before.length - 1];
+      }
+      // 规则没有 `**`：写集剩余段必须能对齐到规则剩余段的尾部
+      const rRest = rSegs.slice(rSegs.length - wRest.length);
+      if (rRest.length !== wRest.length) return null;
+      for (let k = 0; k < wRest.length; k++) {
+        if (hasGlob(wRest[k]) && hasGlob(rRest[k])) return null;
+        if (hasGlob(wRest[k])) {
+          if (!matchPath(wRest[k], rRest[k])) return null;
+        } else if (hasGlob(rRest[k])) {
+          if (!matchPath(rRest[k], wRest[k])) return null;
+        } else if (wRest[k] !== rRest[k]) {
+          return null;
+        }
+      }
+      return rSegs.slice(0, rSegs.length - wRest.length).join('/') || null;
+    }
+    // 规则到了 `**`：写集剩余段全由规则的 `**` 接受
+    while (j < rSegs.length && rSegs[j] === '**') {
+      j++;
+      if (j >= rSegs.length) {
+        if (cand.length === 0) return null;
+        return cand.join('/');
+      }
+    }
+    if (j >= rSegs.length) return null;
+    const rSeg = rSegs[j];
+    if (hasGlob(wSeg) && hasGlob(rSeg)) return null;
+    if (hasGlob(wSeg)) {
+      if (!matchPath(wSeg, rSeg)) return null;
+      cand.push(rSeg);
+    } else if (hasGlob(rSeg)) {
+      if (!matchPath(rSeg, wSeg)) return null;
+      cand.push(wSeg);
+    } else {
+      if (wSeg !== rSeg) return null;
+      cand.push(wSeg);
+    }
+    j++;
   }
-
-  // 两条都是字面路径：目录前缀关系
-  const wTrim = w.replace(/\/+$/, '');
-  const rTrim = r.replace(/\/+$/, '');
-  return wTrim === rTrim || wTrim.startsWith(`${rTrim}/`) || rTrim.startsWith(`${wTrim}/`);
+  // 写集耗尽：规则剩余段可以随便（`**` 收尾），但至少要有见证
+  if (cand.length === 0) return null;
+  const witness = cand.join('/');
+  return globReaches(r, witness) ? witness : null;
 }
 
 /**
@@ -145,7 +252,7 @@ export function evaluateWriteSetAgainstPolicy(
       // 只关心写操作
       if (rule.match.operation && rule.match.operation !== 'write') continue;
 
-      if (!globMayOverlap(write, rulePath)) continue;
+      if (overlapWitness(write, rulePath) === null) continue;
 
       if (rule.action === 'deny') {
         deniedBy = rule.id;

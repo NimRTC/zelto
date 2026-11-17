@@ -92,6 +92,40 @@ describe('D-41① · 写集 × policy.yaml 的交集判定', () => {
     const r = evaluateWriteSetAgainstPolicy(['examples/demo-agent-realtime/**'], nimrtcPolicy);
     assert.equal(r.conflicts.length, 0);
   });
+
+  it('反向也成立：规则比写集宽（写集 examples/**、规则 examples/demo/**）→ 有交集', () => {
+    const policy: PolicyConfig = {
+      rules: [
+        { id: 'allow-demo', match: { path: 'examples/demo/**', operation: 'write' }, action: 'allow', basis: 'p' },
+      ],
+      protected: [],
+    };
+    const r = evaluateWriteSetAgainstPolicy(['examples/**'], policy);
+    assert.equal(r.conflicts.length, 0);
+  });
+
+  it('两条 glob 只是字面同名、方向并不重合 → 不算交集（src/** vs x/src/**）', () => {
+    const policy: PolicyConfig = {
+      rules: [
+        { id: 'allow-x-src', match: { path: 'x/src/**', operation: 'write' }, action: 'allow', basis: 'p' },
+      ],
+      protected: [],
+    };
+    const r = evaluateWriteSetAgainstPolicy(['src/**'], policy);
+    assert.equal(r.conflicts.length, 1);
+    assert.equal(r.conflicts[0].severity, 'blocking');
+  });
+
+  it('写集是具体文件、规则是它的父目录 → 不算交集（目录规则不覆盖其下文件的写）', () => {
+    const policy: PolicyConfig = {
+      rules: [
+        { id: 'allow-examples-dir', match: { path: 'examples', operation: 'write' }, action: 'allow', basis: 'p' },
+      ],
+      protected: [],
+    };
+    const r = evaluateWriteSetAgainstPolicy(['examples/CMakeLists.txt'], policy);
+    assert.equal(r.conflicts.length, 1);
+  });
 });
 
 // ─── ② 写集路径写错的近名提示 ─────────────────────────────────────────────────

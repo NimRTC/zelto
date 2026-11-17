@@ -1,7 +1,7 @@
 import { describe, it, before, after } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, cpSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, cpSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorktreeManager, WorktreeError, WORKTREE_BASE_DIR } from '../../../src/core/worktree/index.js';
@@ -88,6 +88,83 @@ describe('WorktreeManager — create / list / remove', () => {
 
     const info = await manager.create('slice-c', { specPath: 'specs/slices/slice-c.md' });
     assert.ok(existsSync(join(info.path, 'specs', 'slices', 'slice-c.md')));
+  });
+
+  // ─── D-47：规格改了，复用 worktree 时必须重新同步 ─────────────────────
+  //
+  // 病灶（nimrtc-zelto v2-ai-decision，2026-11-17）：
+  //   worktree 05:12 创建（规格 4 条验收标准）
+  //   → 09:04 人把规格重写成 9 条
+  //   → 10:00 重跑 agent —— agent 读到的是 worktree 里的**旧 4 条**，
+  //     照着旧规格实现，缺了六项
+  //
+  // **判据分裂**：门禁按新规格判，agent 按旧规格干 ——
+  // 拦住的不是「实现有 bug」，而是「实现的是另一个需求」。
+  // 每一道闸门单独看都在正常工作，所以这种失败最难查。
+  //
+  // 规格是 agent 的**输入**，输入必须在每次开跑前对齐到当前真源。
+  describe('D-47 · 复用 worktree 时重新同步规格与验收目录', () => {
+    it('规格在 worktree 创建后被改写 → 复用时同步新版本', async () => {
+      const manager = new WorktreeManager(repo);
+      mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+      const specRel = 'specs/slices/slice-sync.md';
+      const specAbs = join(repo, specRel);
+      writeFileSync(specAbs, '# 旧规格（4 条）\n');
+
+      const info = await manager.create('slice-sync', { specPath: specRel });
+      const wtSpec = join(info.path, specRel);
+      assert.equal(readFileSync(wtSpec, 'utf-8'), '# 旧规格（4 条）\n');
+
+      // 人重写了规格（freeze --refreeze 的前置动作）
+      writeFileSync(specAbs, '# 新规格（9 条）\n');
+
+      // 复用 worktree —— 必须把新规格带进去
+      await manager.create('slice-sync', { specPath: specRel });
+      assert.equal(
+        readFileSync(wtSpec, 'utf-8'),
+        '# 新规格（9 条）\n',
+        '复用 worktree 时必须同步新规格 —— agent 读到旧规格就等于实现另一个需求',
+      );
+    });
+
+    it('验收目录在 worktree 创建后被改写 → 复用时同步新版本', async () => {
+      const manager = new WorktreeManager(repo);
+      const accRel = 'tests/acceptance/slice-sync-acc';
+      mkdirSync(join(repo, accRel), { recursive: true });
+      writeFileSync(join(repo, accRel, 'acceptance.test.cjs'), '// 旧断言\n');
+
+      const info = await manager.create('slice-sync-acc', { acceptanceDir: accRel });
+      const wtAcc = join(info.path, accRel, 'acceptance.test.cjs');
+      assert.equal(readFileSync(wtAcc, 'utf-8'), '// 旧断言\n');
+
+      writeFileSync(join(repo, accRel, 'acceptance.test.cjs'), '// 新断言\n');
+
+      await manager.create('slice-sync-acc', { acceptanceDir: accRel });
+      assert.equal(
+        readFileSync(wtAcc, 'utf-8'),
+        '// 新断言\n',
+        '验收目录同样是 agent 的输入 —— 改了就要同步',
+      );
+    });
+
+    it('同步不会覆盖 agent 在 worktree 里的代码改动', async () => {
+      const manager = new WorktreeManager(repo);
+      const specRel = 'specs/slices/slice-keep.md';
+      mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+      writeFileSync(join(repo, specRel), '# 规格\n');
+
+      const info = await manager.create('slice-keep', { specPath: specRel });
+      // agent 在 worktree 里写的代码
+      const agentFile = join(info.path, 'agent-output.cpp');
+      writeFileSync(agentFile, '// agent 的产出\n');
+
+      await manager.create('slice-keep', { specPath: specRel });
+      assert.equal(
+        readFileSync(agentFile, 'utf-8'),
+        '// agent 的产出\n',
+        '同步规格不能动 agent 的产出 —— 只同步规格与验收目录',
+      );
+    });
   });
 
   it('removes the worktree and its git registration', async () => {

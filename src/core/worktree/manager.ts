@@ -233,6 +233,33 @@ export class WorktreeManager {
       if (options.initSubmodules !== false) {
         this.syncSubmodules(target);
       }
+      // 规格与验收目录**也**要补一次同步（D-47）。
+      //
+      // 为什么不能只在「创建时」同步一次：规格是会变的 ——
+      // 人重写了规格（`zelto freeze --refreeze`）之后，主仓里的是新版，
+      // 而 worktree 里还留着**创建那一刻的旧版快照**。
+      //
+      // 实测（nimrtc-zelto v2-ai-decision，2026-11-17）：
+      //   worktree 05:12 创建（规格 4 条验收标准）
+      //   → 09:04 人把规格重写成 9 条（更具体、更可验证）
+      //   → 10:00 重跑 agent —— agent 读到的是 worktree 里的**旧 4 条**，
+      //     于是照着旧规格实现，缺了 partial/barge_in/agent-control/
+      //     framed/IASR/ILLM 六项
+      //   → 冻结哈希算的是主仓的新规格（漂移告警正确地响了），
+      //     但 agent 干活时依据的是旧规格
+      //
+      // **判据分裂**：门禁按新规格判，agent 按旧规格干 —— 拦住的不是
+      // 「实现有 bug」，而是「实现的是另一个需求」。这种失败最难查，
+      // 因为每一道闸门单独看都在正常工作。
+      //
+      // 所以：规格是 agent 的**输入**，输入必须在每次开跑前对齐到当前真源。
+      // 验收目录同理 —— 人改了验收测试，agent 也要看到新版。
+      if (options.specPath) {
+        this.copyIntoWorktree(target, options.specPath, true);
+      }
+      if (options.acceptanceDir) {
+        this.copyIntoWorktree(target, options.acceptanceDir, true);
+      }
       return {
         sliceId,
         path: target,
