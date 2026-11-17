@@ -38,6 +38,11 @@ function branchExists(branch: string): boolean {
 function makeLegacyRepo(plan: object): void {
   mkdirSync(REPO, { recursive: true });
   git(['init', '-q', '-b', 'main']);
+  // 提交身份必须**在仓库里**设，不能靠全局配置 ——
+  // CI 机器上往往没有全局 user.name/user.email（runner 是干净容器），
+  // 缺了它 `git commit` 直接报 "Author identity unknown"，测试全红。
+  git(['config', 'user.email', 'test@zelto.local']);
+  git(['config', 'user.name', 'zelto test']);
   writeFileSync(join(REPO, 'src.txt'), 'code');
   mkdirSync(join(REPO, '.zelto', 'versions'), { recursive: true });
   writeFileSync(
