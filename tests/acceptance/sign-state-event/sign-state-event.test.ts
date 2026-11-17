@@ -3,7 +3,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, rm, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
 function findProjectRoot(from: string): string {
@@ -84,6 +84,46 @@ describe('acceptance: sign-state-event', () => {
     await zelto('freeze', 'sign-approve-test');
     const gateResult = await zelto('gate', 'sign-approve-test');
     assert.equal(gateResult.code, 0, `gate should exit 0: ${gateResult.stdout}`);
+
+    // 补一条「验收真跑过」的 gate.result —— 签字前确认项②的判据（ADR-033/051）。
+    //
+    // 这个项目的 config.yaml 没配 `gate.acceptance` 段，所以门禁②的验收步骤
+    // 记为 `skipped`（ADR-033 的 fail-closed 没被触发）。而**签字**这一侧
+    // 要求「本片确实被验收过」（D-48）—— 两者口径不同，这里显式补上证据。
+    //
+    // collectGateFacts 取**最后**一条 gate.result，所以追加即可。
+    const eventsDir = join(BASE_DIR, '.zelto', 'events', 'sign-approve-test');
+    await mkdir(eventsDir, { recursive: true });
+    await appendFile(
+      join(eventsDir, 'events.jsonl'),
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        type: 'gate.result',
+        actor: 'zelto',
+        payload: {
+          sliceId: 'sign-approve-test',
+          passed: true,
+          results: [
+            {
+              command: 'acceptance',
+              passed: true,
+              exitCode: 0,
+              durationMs: 50,
+              stdout: '# pass 1\n# fail 0\n',
+              stderr: null,
+            },
+          ],
+          acceptance: {
+            status: 'passed',
+            path: 'tests/acceptance/sign-approve-test',
+            command: 'node --test tests/acceptance/sign-approve-test',
+            exitCode: 0,
+            durationMs: 50,
+          },
+        },
+      })}\n`,
+      'utf-8',
+    );
 
     // Now approve
     const { code, stdout } = await zelto('sign', 'sign-approve-test', '--approve');

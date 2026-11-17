@@ -11,6 +11,13 @@ import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
 import { resolve } from 'node:path';
 import { readdir } from 'node:fs/promises';
 import { runSignReview } from './sign-review.js';
+import { collectSignReviewFacts } from '../sign-review/collect-facts.js';
+import { evaluateSignChecks } from '../../core/sign-review/evaluate.js';
+import {
+  SIGN_APPROVAL_DEFAULT_EXEMPT,
+  evaluateSignApprovalGate,
+  renderSignApprovalBlockers,
+} from '../../core/sign-review/approval-gate.js';
 
 // ─── gate ────────────────────────────────────────────────────────────────────
 
@@ -416,6 +423,9 @@ register('sign', async (args) => {
   const [id, action] = args;
   if (!id || !action) {
     console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke] [--comment <text>]');
+    console.error('       zelto sign <slice-id> --approve [--force]');
+    console.error('         --approve 会先跑签字前确认（追溯/验收/写集）；有不过的就拦下（D-48）');
+    console.error('         --force   明知故犯地跳过确认项（会在输出里留痕）');
     return 1;
   }
 
@@ -437,6 +447,45 @@ register('sign', async (args) => {
 
   try {
     if (action === '--approve') {
+      // ── 签字前确认闸门（D-48）────────────────────────────────────────
+      //
+      // 病灶（nimrtc-zelto v2-input-binder，2026-11-17）：验收测试三条
+      // 用例**全是 `test.todo`**，规格的 5 条验收标准一条都没被验证过；
+      // 项目又没配 `gate.acceptance` → 门禁②的验收步骤记为 `skipped`
+      // → gate 报 `passed: true` → 签字请求照常发出。
+      //
+      // ADR-070 的 `sign --review` 其实抓到了这件事（「验收真跑过本片 ❌」），
+      // 但 `--approve` **不经过它** —— 审查工具存在，签字路径绕过审查。
+      //
+      // 现在 `--approve` 先跑四项确认，有不过的就拦住。
+      // `--force` 是留给人的显式出口：明知故犯可以，但要明着做。
+      const force = args.includes('--force');
+      if (!force) {
+        const approvalGate = await evaluateApprovalGate(id);
+        if (!approvalGate.approvable) {
+          if (isJson) {
+            console.log(
+              JSON.stringify({
+                sliceId: id,
+                action: 'blocked',
+                error: '签字前确认项没有全部通过',
+                blockers: approvalGate.blockers.map((b) => ({
+                  label: b.label,
+                  evidence: b.evidence,
+                  adrRef: b.adrRef,
+                })),
+                hint: '确认要跳过：zelto sign <id> --approve --force',
+              }),
+            );
+          } else {
+            console.error(renderSignApprovalBlockers(approvalGate.blockers));
+          }
+          return 1;
+        }
+      } else if (!isJson) {
+        console.log('  ⚠️  --force：跳过签字前确认项（明知故犯）');
+      }
+
       const pending = await signManager.list('pending');
       const req = pending.find((r) => r.sliceId === id);
       if (!req) {
@@ -518,3 +567,18 @@ register('sign', async (args) => {
   }
   return 0;
 });
+
+/**
+ * 收集签字前事实并跑确认闸门（D-48）。
+ *
+ * 与 `sign --review` 走**同一套**事实收集与判定 —— 不另写一份判据，
+ * 否则两处会漂移（ADR-070 的核心诉求：判定只有一处）。
+ *
+ * 「产物真落地」在签字阶段必然是 `not-in-trunk`（产物要合并后才进主干），
+ * 所以默认豁免它 —— 它属于合并阶段的确认。
+ */
+async function evaluateApprovalGate(sliceId: string) {
+  const facts = await collectSignReviewFacts(sliceId);
+  const checks = evaluateSignChecks(facts);
+  return evaluateSignApprovalGate(checks, { excludeLabels: SIGN_APPROVAL_DEFAULT_EXEMPT });
+}

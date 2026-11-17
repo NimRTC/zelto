@@ -3,7 +3,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile, rm, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, rm, readFile, appendFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -77,6 +77,12 @@ agent:
     sliceData.state = 'frozen';
     sliceData.spec.frozenHash = 'sha256:test';
     sliceData.spec.frozenAt = new Date().toISOString();
+    // 追溯要齐 —— 签字前确认项①的判据（ADR-060/032，D-48）
+    sliceData.trace = {
+      requirements: [{ text: '需求 REQ-1', ref: 'REQ-1', kind: 'requirement' }],
+      contracts: [{ text: '契约 CTR-1', ref: 'CTR-1', kind: 'contract' }],
+      tests: [{ text: '测试 TST-1', ref: 'TST-1', kind: 'test' }],
+    };
     await writeFile(slicePath, JSON.stringify(sliceData, null, 2));
 
     // Run gate
@@ -128,6 +134,47 @@ agent:
         decidedBy: null,
         comment: null,
       }), 'utf-8');
+    }
+
+    // 补「验收真跑过」的证据 —— 签字前确认项②的判据（ADR-033/051，D-48）。
+    //
+    // 这个项目的 config.yaml 没配 `gate.acceptance` 段 → 门禁②的验收步骤
+    // 记为 `skipped`。但**签字**要求「本片确实被验收过」（D-48）——
+    // 两侧口径不同，这里显式补上验收记录。
+    const eventsDir = join(TEST_DIR, '.zelto', 'events', 'test-auto-sign');
+    await mkdir(eventsDir, { recursive: true });
+    const eventsPath = join(eventsDir, 'events.jsonl');
+    const gateEnvelope = `${JSON.stringify({
+      ts: new Date().toISOString(),
+      type: 'gate.result',
+      actor: 'zelto',
+      payload: {
+        sliceId: 'test-auto-sign',
+        passed: true,
+        results: [
+          {
+            command: 'acceptance',
+            passed: true,
+            exitCode: 0,
+            durationMs: 50,
+            stdout: '# pass 1\n# fail 0\n',
+            stderr: null,
+          },
+        ],
+        acceptance: {
+          status: 'passed',
+          path: 'tests/acceptance/test-auto-sign',
+          command: 'node --test tests/acceptance/test-auto-sign',
+          exitCode: 0,
+          durationMs: 50,
+        },
+      },
+    })}\n`;
+    // collectGateFacts 取**最后**一条 gate.result —— 追加即可
+    if (existsSync(eventsPath)) {
+      await appendFile(eventsPath, gateEnvelope, 'utf-8');
+    } else {
+      await writeFile(eventsPath, gateEnvelope, 'utf-8');
     }
 
     // Approve the sign request

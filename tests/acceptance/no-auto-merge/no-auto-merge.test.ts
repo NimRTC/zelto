@@ -78,7 +78,12 @@ async function setupSignedSlice(id: string, file: string, content: string) {
     acceptance: { dir: `tests/acceptance/${id}/`, frozenHash: null, oracleSrc: null },
     baseCommit: null,
     drift: { detected: false, reason: null, at: null },
-    trace: { requirements: [], contracts: [], tests: [] },
+    // 追溯要齐 —— 签字前确认项①的判据（ADR-060/032）
+    trace: {
+      requirements: [{ text: `需求 ${id}`, ref: `REQ-${id}`, kind: 'requirement' }],
+      contracts: [{ text: `契约 ${id}`, ref: `CTR-${id}`, kind: 'contract' }],
+      tests: [{ text: `测试 ${id}`, ref: `TST-${id}`, kind: 'test' }],
+    },
     traceWaiver: null,
     writes: [file],
     runs: [],
@@ -87,6 +92,40 @@ async function setupSignedSlice(id: string, file: string, content: string) {
     updatedAt: new Date().toISOString(),
   };
   await writeFile(join(SLICES_DIR, `${id}.json`), JSON.stringify(slice, null, 2), 'utf-8');
+
+  // 「验收真跑过」的证据 —— 签字前确认项②的判据（ADR-033/051，D-48）。
+  // 没有它，签字会被确认闸门拦下 —— 那正是 D-48 要的行为。
+  await mkdir(join(EVENTS_DIR, id), { recursive: true });
+  await writeFile(
+    join(EVENTS_DIR, id, 'events.jsonl'),
+    `${JSON.stringify({
+      ts: new Date().toISOString(),
+      type: 'gate.result',
+      actor: 'zelto',
+      payload: {
+        sliceId: id,
+        passed: true,
+        results: [
+          {
+            command: 'acceptance',
+            passed: true,
+            exitCode: 0,
+            durationMs: 100,
+            stdout: '# pass 1\n# fail 0\n',
+            stderr: null,
+          },
+        ],
+        acceptance: {
+          status: 'passed',
+          path: `tests/acceptance/${id}`,
+          command: 'node --test tests/acceptance/x',
+          exitCode: 0,
+          durationMs: 100,
+        },
+      },
+    })}\n`,
+    'utf-8',
+  );
 
   // 产物提交到切片分支上
   git('checkout', '-b', `slice/${id}`);
