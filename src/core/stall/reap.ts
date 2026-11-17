@@ -24,6 +24,7 @@ import {
   classifyLiveness,
   readRecoveries,
   readSliceLivenessRecord,
+  readSliceLivenessRecords,
   type LivenessInfo,
 } from '../activity/index.js';
 
@@ -141,7 +142,20 @@ export function findOrphanShells(
     try {
       const rec = readSliceLivenessRecord(projectRoot, slice.id);
       if (rec === null) {
-        // 没有任何运行记录 —— agent 从来没起过（D-64）。
+        // `readSliceLivenessRecord` 只返回 status==='running' 的记录，所以
+        // rec===null 有**两种**可能，必须分开：
+        //
+        //   (a) 盘上**一条记录都没有** → agent 从来没起过（准备阶段就挂了）
+        //   (b) 有记录但都不是 running → 那一轮**已经收尾**了
+        //
+        // (b) 不是空壳：那一轮跑过了，收尾路径该自己把切片退回 frozen；
+        // 这时去抢着改状态会与正常路径打架。所以只认 (a)。
+        //
+        // 判据用 `readSliceLivenessRecords`（它**不**按 status 过滤）——
+        // 它为空才说明真的什么记录都没有。
+        const anyRecord = readSliceLivenessRecords(projectRoot, slice.id);
+        if (anyRecord.length > 0) continue;
+
         liveness = {
           state: 'dead',
           lastActivityAt: null,
@@ -227,7 +241,22 @@ export async function reapDeadSlices(
       let live: LivenessInfo;
       try {
         const rec = readSliceLivenessRecord(orphanOpt.projectRoot, sliceId);
-        live = classifyLiveness(rec, { isProcessAlive: orphanOpt.isProcessAlive });
+        if (rec === null) {
+          // 没有任何运行记录 —— agent 从来没起过（D-64）。
+          //
+          // 判据与 `findOrphanShells` 保持一致：那边把它算空壳，
+          // 这边若只认 stale/dead，就会出现「列表里看得见、
+          // 清理时却不认」的错位 —— 人看着列表，命令却说「没找到」。
+          live = {
+            state: 'dead',
+            lastActivityAt: null,
+            idleMs: null,
+            pid: null,
+            reason: '没有任何运行记录（agent 从未开跑）',
+          };
+        } else {
+          live = classifyLiveness(rec, { isProcessAlive: orphanOpt.isProcessAlive });
+        }
       } catch {
         continue;
       }
