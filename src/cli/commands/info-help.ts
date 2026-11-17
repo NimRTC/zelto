@@ -3,7 +3,14 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Scheduler } from '../../core/sched/engine.js';
-import { isSliceStalled, findDeadSlices, reapDeadSlices } from '../../core/stall/index.js';
+import { isSliceStalled, findDeadSlices, findOrphanShells, reapDeadSlices } from '../../core/stall/index.js';
+import {
+  classifyLiveness,
+  readSessionLiveness,
+  readSliceLivenessRecord,
+  readRecoveries,
+} from '../../core/activity/index.js';
+import { isProcessAlive } from '../../core/sched/index.js';
 import type { SliceData } from '../../core/slice/store.js';
 import { AuditTrail } from '../../core/audit/trail.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
@@ -739,6 +746,12 @@ register('reservation', async (args) => {
  * 「死切片」= 状态还停在 `running`，但 agent 早就挂了 —— 它带停机分类，
  * 且不是提问回路（`agent_question` 的 agent 还活着，只是等人数码）。
  *
+ * 另外认**空壳**（D-30）：状态 running、**没有任何停机分类**、
+ * 会话/任务文件却没有活人管（无 pid 或 pid 已死、或心跳早过阈值）。
+ * 典型成因是 `--detach` 后 CLI 主进程退出，后台监视器一起被杀，
+ * 没人写收尾 —— 文件永远停在 running。旧判据只认「带停机分类」，
+ * 所以这类空壳永远清不掉。
+ *
  * **为什么是显式的批量命令**：批量改状态的动作必须显式（ADR-047 §6）。
  * 这条命令只把状态掰回「可跑」，不动停机分类，也不碰预约 ——
  * 停机这件事本身仍然成立，人还是得逐片 `zelto resume` 走正式流程。
@@ -752,28 +765,44 @@ async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean
   }
 
   const dead = findDeadSlices(slices);
+  const orphans = findOrphanShells(slices, process.cwd(), isProcessAlive);
+  const allIdsToReap = [...dead.map((d) => d.sliceId), ...orphans.map((o) => o.sliceId)];
+  const reapOptions = {
+    actor: 'human',
+    reason: '清理死切片：agent 已停机，切片卡在 running',
+    includeOrphans: { projectRoot: process.cwd(), isProcessAlive },
+  };
 
   if (options.isJson) {
     if (options.dryRun) {
-      console.log(JSON.stringify({ dryRun: true, dead, reaped: [] }, null, 2));
+      console.log(JSON.stringify({ dryRun: true, dead, orphans, reaped: [] }, null, 2));
       return 0;
     }
-    const reaped = await reapDeadSlices(store, events, dead.map((d) => d.sliceId), {
-      actor: 'human',
-      reason: '清理死切片：agent 已停机，切片卡在 running',
-    });
-    console.log(JSON.stringify({ dead, reaped }, null, 2));
+    const reaped = await reapDeadSlices(store, events, allIdsToReap, reapOptions);
+    const tasksClosed = closeOrphanTasks(allIdsToReap);
+    console.log(JSON.stringify({ dead, orphans, reaped, tasksClosed }, null, 2));
     return 0;
   }
 
-  if (dead.length === 0) {
-    console.log('没有死切片（没有卡在 running 的停机切片）。');
+  if (dead.length === 0 && orphans.length === 0) {
+    console.log('没有死切片（没有卡在 running 的停机切片或空壳）。');
     return 0;
   }
 
-  console.log(`死切片（卡在 running，agent 已停机）：${dead.length} 个`);
-  for (const d of dead) {
-    console.log(`  ${d.sliceId.padEnd(20)} ${d.stallClass.padEnd(25)} ${d.lastRunAt ?? '(无运行记录)'}`);
+  if (dead.length > 0) {
+    console.log(`死切片（卡在 running，agent 已停机）：${dead.length} 个`);
+    for (const d of dead) {
+      console.log(`  ${d.sliceId.padEnd(20)} ${d.stallClass.padEnd(25)} ${d.lastRunAt ?? '(无运行记录)'}`);
+    }
+  }
+  if (orphans.length > 0) {
+    if (dead.length > 0) console.log('');
+    console.log(`空壳切片（卡在 running，无停机分类，但现场无人在管）：${orphans.length} 个`);
+    for (const o of orphans) {
+      const badge = o.liveness.state === 'dead' ? '💀 dead' : '⚠️ stale';
+      const wd = o.escalated ? '（已上报）' : o.recoveries > 0 ? `（自愈过 ${o.recoveries} 次）` : '';
+      console.log(`  ${o.sliceId.padEnd(20)} ${badge.padEnd(10)} ${o.liveness.reason}${wd}`);
+    }
   }
 
   if (options.dryRun) {
@@ -782,24 +811,63 @@ async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean
     return 0;
   }
 
-  const reaped = await reapDeadSlices(store, events, dead.map((d) => d.sliceId), {
-    actor: 'human',
-    reason: '清理死切片：agent 已停机，切片卡在 running',
-  });
+  const reaped = await reapDeadSlices(store, events, allIdsToReap, reapOptions);
+
+  // 任务文件同步：切片已退回 frozen，任务文件还写着 running 就是第二层谎言
+  // （`zelto tasks` 会继续把它当在跑）。这里只改状态字段，不删文件 ——
+  // 失败现场（exitCode 为空、输出为空）本身就是要给人看的信息。
+  const closedTasks = closeOrphanTasks(allIdsToReap);
 
   console.log('');
   console.log(`↩️  已清理 ${reaped.length} 个死切片（running → frozen）`);
   for (const r of reaped) {
     if (r.reverted) {
-      console.log(`  ${r.sliceId}: ${r.from} → ${r.to}（stall: ${r.stallClass} 保留）`);
+      const note = r.stallClass === 'orphan_shell'
+        ? '（原为空壳，无停机分类）'
+        : `（stall: ${r.stallClass} 保留）`;
+      console.log(`  ${r.sliceId}: ${r.from} → ${r.to}${note}`);
     } else {
       console.log(`  ${r.sliceId}: 状态未变（${r.from}），已记录事件`);
     }
+  }
+  if (closedTasks > 0) {
+    console.log(`  同时收尾 ${closedTasks} 个还写着 running 的任务文件（→ failed）。`);
   }
   console.log('');
   console.log('停机分类仍保留 —— 逐片处理：zelto resume <id> → zelto run <id>');
   console.log('写集预约不受影响（C9）：确认现场后再 zelto reservation release <id>。');
   return 0;
+}
+
+/**
+ * 把被清理切片名下还写着 `running` 的任务文件收尾成 `failed`。
+ *
+ * 只改状态与时间戳 —— **不删文件**：空输出 / 空 exitCode 的现场本身就是
+ * 「监视器被杀、没人收尾」的证据，删掉等于毁掉追溯（C4 的精神）。
+ * 返回改了几个。
+ */
+function closeOrphanTasks(sliceIds: string[]): number {
+  const wanted = new Set(sliceIds);
+  if (wanted.size === 0) return 0;
+  const dir = join(ZELTO_DIR, 'tasks');
+  if (!existsSync(dir)) return 0;
+  let closed = 0;
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.json')) continue;
+    const p = join(dir, f);
+    try {
+      const task = JSON.parse(readFileSync(p, 'utf-8')) as {
+        sliceId?: string; status?: string; completedAt?: string; reason?: string;
+      };
+      if (!task.sliceId || !wanted.has(task.sliceId) || task.status !== 'running') continue;
+      task.status = 'failed';
+      task.completedAt = new Date().toISOString();
+      task.reason = 'zelto stall --reap：切片已退回 frozen，任务不再在跑';
+      writeFileSync(p, JSON.stringify(task, null, 2), 'utf-8');
+      closed++;
+    } catch { /* 坏文件跳过 */ }
+  }
+  return closed;
 }
 
 register('stall', async (args) => {
@@ -814,6 +882,7 @@ register('stall', async (args) => {
     console.log('       zelto stall --reap [--dry-run] [--json]   批量清理死切片（ADR-053）');
     console.log('');
     console.log('死切片 = 状态卡在 running 且带停机分类（提问回路 agent_question 除外）。');
+    console.log('空壳   = 状态卡在 running、无停机分类，但进程已死或心跳早过阈值（D-30）。');
     console.log('--reap 把它们退回 frozen；停机分类保留，人仍需逐片 zelto resume。');
     return 0;
   }
@@ -835,13 +904,24 @@ register('stall', async (args) => {
   if (id && !id.startsWith('--')) {
     try {
       const slice = await store.read(id);
-      if (!isSliceStalled(slice) && !showAutoResolved) {
+      const isShell = slice.state === 'running' && slice.stall.class === null;
+      if (!isSliceStalled(slice) && !showAutoResolved && !isShell) {
         console.log(`Slice "${id}" is not stalled.`);
         return 0;
       }
       console.log(`Slice:  ${id}`);
       console.log(`Title:  ${slice.title}`);
       console.log(`State:  ${slice.state}`);
+      // D-30：单片也要能回答「活没活、救过几次、上报没」—— 不能只看 stall 分类。
+      try {
+        const projectRoot = process.cwd();
+        const record = readSliceLivenessRecord(projectRoot, id);
+        const live = classifyLiveness(record, { isProcessAlive });
+        const badge = live.state === 'active' ? '🔄 active' : live.state === 'stale' ? '⚠️ stale（可疑）' : live.state === 'dead' ? '💀 dead（进程已死）' : live.state;
+        console.log(`Liveness: ${badge} · ${live.reason}`);
+        const rec = readRecoveries(projectRoot, id);
+        if (rec.count > 0) console.log(`看门狗：  已自愈 ${rec.count} 次${rec.escalated ? '（已上报，需人看现场）' : ''}${rec.lastReason ? `，上次：${rec.lastReason}` : ''}`);
+      } catch { /* 不阻断展示 */ }
       if (slice.stall.class) {
         console.log(`Stall class:    ${slice.stall.class}`);
         console.log(`Auto-resolved:  ${slice.stall.autoResolved}`);
@@ -881,25 +961,36 @@ register('stall', async (args) => {
 
   if (stalled.length === 0) {
     console.log('No stalled slices found.');
-    return 0;
+  } else {
+    console.log('Stalled slices:');
+    for (const s of stalled) {
+      console.log(`  ${s.id.padEnd(20)} ${s.stallClass.padEnd(25)} auto-resolved: ${s.autoResolved}`);
+    }
   }
 
-  console.log('Stalled slices:');
-  for (const s of stalled) {
-    console.log(`  ${s.id.padEnd(20)} ${s.stallClass.padEnd(25)} auto-resolved: ${s.autoResolved}`);
-  }
-
-  // 死切片单独点出来 —— 它们的状态是 `running`，混在停机列表里看不出
-  // 「这个还在卡着、那个只是等着处理」的差别（ADR-053）。
-  const dead = findDeadSlices(await Promise.all(
+  // 死切片 / 空壳单独点出来 —— 它们的状态是 `running`，混在停机列表里看不出
+  // 「这个还在卡着、那个只是等着处理」的差别（ADR-053 / D-30）。
+  const loaded = (await Promise.all(
     (await store.list()).map((sid) => store.read(sid).catch(() => null)),
-  ).then((list) => list.filter((s): s is SliceData => s !== null)));
+  )).filter((s): s is SliceData => s !== null);
+  const dead = findDeadSlices(loaded);
+  const orphans = findOrphanShells(loaded, process.cwd(), isProcessAlive);
 
   if (dead.length > 0) {
     console.log('');
     console.log(`死切片（卡在 running，agent 已停机）：${dead.length} 个`);
     for (const d of dead) {
       console.log(`  ${d.sliceId.padEnd(20)} ${d.stallClass.padEnd(25)} ${d.lastRunAt ?? '(无运行记录)'}`);
+    }
+    console.log('  清理：zelto stall --reap');
+  }
+
+  if (orphans.length > 0) {
+    console.log('');
+    console.log(`空壳切片（卡在 running，无停机分类，现场无人在管）：${orphans.length} 个`);
+    for (const o of orphans) {
+      const badge = o.liveness.state === 'dead' ? '💀 dead' : '⚠️ stale';
+      console.log(`  ${o.sliceId.padEnd(20)} ${badge.padEnd(10)} ${o.liveness.reason}`);
     }
     console.log('  清理：zelto stall --reap');
   }
@@ -992,6 +1083,7 @@ register('status', async (args) => {
     const activeSlices: Array<{
       id: string; title: string; state: string; runningSince?: string;
       elapsed?: string; sessionId?: string; exitCode?: number | null;
+      liveness?: string; liveReason?: string;
     }> = [];
 
     for (const id of allIds) {
@@ -1006,13 +1098,21 @@ register('status', async (args) => {
       } catch { /* skip */ }
     }
 
-    // Check session persistence for running sessions
+    // Check session persistence for running sessions —— D-30 被动活性：
+    // 不信 status: running，现场读会话文件 + kill(pid,0)，给出 active/stale/dead。
+    //
+    // 会话文件说 running ≠ 切片在跑：空壳清理（`zelto stall --reap`）会把切片
+    // 退回 frozen，但盘上的老会话文件仍然写着 running。只看会话文件的话，
+    // 已经处理掉的切片会一直出现在「活动会话」里 —— 那是第二层假象。
+    // 判据是**切片状态**：切片不在 running，它的会话文件再怎么写也不算在跑。
+    const runningSliceIds = new Set(activeSlices.map((a) => a.id));
+    const projectRoot = process.cwd();
     if (existsSync(SESSIONS_DIR)) {
       for (const file of readdirSync(SESSIONS_DIR)) {
         if (!file.endsWith('.json')) continue;
         try {
           const data = JSON.parse(readFileSync(join(SESSIONS_DIR, file), 'utf-8'));
-          if (data.status === 'running') {
+          if (data.status === 'running' && runningSliceIds.has(data.sliceId)) {
             const existing = activeSlices.find((a) => a.id === data.sliceId);
             const elapsed = data.startedAt
               ? formatElapsed(new Date(data.startedAt).getTime())
@@ -1036,6 +1136,20 @@ register('status', async (args) => {
       }
     }
 
+    // 为每个 running 项算活性 —— 挑选规则收在 core（C3 单一判据）：
+    // 同一切片可能有多份会话文件，取 lastActivity 最新的那份，别拿尸体当现场。
+    for (const a of activeSlices) {
+      let record = readSliceLivenessRecord(projectRoot, a.id);
+      if (!record && a.sessionId) record = readSessionLiveness(projectRoot, a.sessionId);
+      if (!a.sessionId && record) {
+        const sid = (record as { sessionId?: string }).sessionId;
+        if (sid) a.sessionId = sid;
+      }
+      const live = classifyLiveness(record, { isProcessAlive });
+      a.liveness = live.state;
+      a.liveReason = live.reason;
+    }
+
     if (isJson) {
       f.data({
         timestamp: new Date().toISOString(),
@@ -1053,9 +1167,17 @@ register('status', async (args) => {
     f.out(`  ${colors.bold(`Active agent sessions (${activeSlices.length}):`)}`);
     f.out('');
     for (const slice of activeSlices) {
-      f.out(`  ${colors.cyan(slice.id)}`);
+      const badge = slice.liveness === 'active' ? '🔄 active'
+        : slice.liveness === 'stale' ? '⚠️ stale（可疑）'
+        : slice.liveness === 'dead' ? '💀 dead（进程已死）'
+        : slice.liveness ?? 'running';
+      f.out(`  ${colors.cyan(slice.id)}  ${badge}`);
       f.out(`    Title:    ${slice.title}`);
-      f.out(`    Status:   ${colors.green('running')}`);
+      f.out(`    Status:   ${colors.green('running')} · ${slice.liveReason ?? ''}`);
+      try {
+        const r = readRecoveries(process.cwd(), slice.id);
+        if (r.count > 0) f.out(`    看门狗：  已自愈 ${r.count} 次${r.escalated ? '（已上报，需人看）' : ''}`);
+      } catch { /* 不阻断展示 */ }
       if (slice.elapsed) {
         f.out(`    Elapsed:  ${slice.elapsed}`);
       }

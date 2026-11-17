@@ -49,6 +49,18 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
+import {
+  classifyLiveness,
+  formatIdle,
+  lastActivityOf,
+  readSessionLiveness,
+  decideRecovery,
+  readRecoveries,
+  recordRecovery,
+  recordEscalation,
+  MAX_AUTO_RECOVERIES,
+} from '../../core/activity/index.js';
+import { isProcessAlive } from '../../core/sched/index.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths, parseAcceptanceCriteria, parseMentionedPaths } from '../../core/spec/scope.js';
 import { evaluateWriteSet, evaluateWriteSetCoverage } from '../../core/spec/write-set.js';
@@ -1239,9 +1251,12 @@ register('run', async (args) => {
 
     // ── Detach mode ─────────────────────────────────────────────────
     if (isDetach) {
-      // Save task tracking info and return immediately
+      // Save task tracking info and return immediately.
+      // D-30：任务文件也要记心跳 + pid —— 监视器随主进程退出后，
+      // 后来的任何 zelto 调用（tasks / task-status / wait）都要能回答
+      // 「它多久没动了、进程还在不在」，不能只信 status: running。
       const taskId = `task-${id}-${Date.now()}`;
-      const taskInfo = {
+      const taskInfo: TaskInfo = {
         taskId,
         sliceId: id,
         sessionId,
@@ -1249,6 +1264,15 @@ register('run', async (args) => {
         startedAt: new Date().toISOString(),
         status: 'running' as const,
       };
+      try {
+        const sessRaw = readSessionLiveness(process.cwd(), sessionId);
+        if (sessRaw) {
+          if (typeof sessRaw.pid === 'number') taskInfo.pid = sessRaw.pid;
+          if (sessRaw.lastActivityAt) taskInfo.lastActivityAt = sessRaw.lastActivityAt;
+          if (sessRaw.lastOutputAt) taskInfo.lastOutputAt = sessRaw.lastOutputAt;
+        }
+      } catch { /* 心跳回填失败不阻断 detach —— 判定侧会回读会话文件兜底 */ }
+      if (!taskInfo.lastActivityAt) taskInfo.lastActivityAt = taskInfo.startedAt;
       const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
       const { join } = await import('node:path');
       const tasksDir = join(ZELTO_DIR, 'tasks');
@@ -1835,6 +1859,10 @@ interface TaskInfo {
   completedAt?: string;
   exitCode?: number;
   elapsedSec?: number;
+  /** 心跳 —— D-30：detach 任务也要能回答「多久没动了」。spawn 后从会话文件回填 pid。 */
+  pid?: number;
+  lastActivityAt?: string;
+  lastOutputAt?: string;
 }
 
 function tasksDir(): string {
@@ -1860,6 +1888,107 @@ async function loadTask(taskId: string): Promise<TaskInfo | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * 被动式活性检查（D-30）。
+ *
+ * `--detach` 的内存监视器随主进程退出而死 —— 这里不依赖任何后台进程：
+ * 每次 `tasks` / `task-status` / `wait` / Web 查询时，现场读文件 + `kill(pid,0)`
+ * 判定进程死活。任务文件缺心跳字段时（老任务），回读会话文件兜底并回填。
+ */
+function taskLiveRecord(task: TaskInfo): import('../../core/activity/index.js').LivenessRecord {
+  const merged: import('../../core/activity/index.js').LivenessRecord = {
+    status: task.status,
+    startedAt: task.startedAt,
+    lastActivityAt: task.lastActivityAt,
+    lastOutputAt: task.lastOutputAt,
+    pid: task.pid,
+  };
+  try {
+    const sess = readSessionLiveness(process.cwd(), task.sessionId);
+    if (sess) {
+      if (merged.pid === undefined && typeof sess.pid === 'number') merged.pid = sess.pid;
+      const taskLast = lastActivityOf(merged);
+      const sessLast = lastActivityOf(sess);
+      if (sessLast !== null && (taskLast === null || sessLast > taskLast)) {
+        merged.lastActivityAt = sess.lastActivityAt ?? sess.lastOutputAt ?? sess.startedAt;
+        merged.lastOutputAt = sess.lastOutputAt;
+      }
+      if (!merged.startedAt && sess.startedAt) merged.startedAt = sess.startedAt;
+    }
+  } catch { /* 会话文件读不到就用任务文件本身 */ }
+  return merged;
+}
+
+function taskLiveness(task: TaskInfo): import('../../core/activity/index.js').LivenessInfo {
+  return classifyLiveness(taskLiveRecord(task), { isProcessAlive });
+}
+
+/** 把会话文件的新心跳同步回任务文件 —— 后续查询不用再回读会话。 */
+async function syncTaskHeartbeat(task: TaskInfo): Promise<TaskInfo> {
+  try {
+    const sess = readSessionLiveness(process.cwd(), task.sessionId);
+    if (!sess) return task;
+    let dirty = false;
+    if (task.pid === undefined && typeof sess.pid === 'number') { task.pid = sess.pid; dirty = true; }
+    const taskLast = lastActivityOf(task);
+    const sessLast = lastActivityOf(sess);
+    if (sessLast !== null && (taskLast === null || sessLast > taskLast)) {
+      task.lastActivityAt = sess.lastActivityAt ?? sess.lastOutputAt ?? sess.startedAt;
+      if (sess.lastOutputAt) task.lastOutputAt = sess.lastOutputAt;
+      dirty = true;
+    }
+    if (dirty && task.status === 'running') await saveTask(task);
+  } catch { /* 同步失败不阻断展示 */ }
+  return task;
+}
+
+/**
+ * 看门狗单步处置（D-30）：`dead` 的 running 任务自动恢复，超预算则上报。
+ *
+ * - recover：任务文件置 failed + 切片 running→frozen + 计数 + 事件（可重跑）
+ * - escalate：不再默默恢复 —— 任务保持 running，写 run.stalled 上报等人看
+ *
+ * 返回处置结果；非 dead 或已非 running 返回 `{ acted: false }`。
+ */
+async function maybeRecoverDeadTask(task: TaskInfo): Promise<{ acted: boolean; action?: 'recover' | 'escalate' }> {
+  if (task.status !== 'running') return { acted: false };
+  const live = taskLiveness(task);
+  if (live.state !== 'dead') return { acted: false };
+  const rec = readRecoveries(process.cwd(), task.sliceId);
+  const decision = decideRecovery(rec);
+  if (decision.action === 'recover') {
+    task.status = 'failed';
+    task.completedAt = new Date().toISOString();
+    if (live.lastActivityAt) task.lastActivityAt = live.lastActivityAt;
+    await saveTask(task);
+    recordRecovery(process.cwd(), task.sliceId, live.reason);
+    try {
+      const s = await store.read(task.sliceId).catch(() => null);
+      if (s && s.state === 'running') await store.transit(task.sliceId, 'RUN_FINISH');
+    } catch { /* 切片不在 running 就不强掰 */ }
+    await events.append(task.sliceId, 'run.aborted', 'watchdog', {
+      sliceId: task.sliceId, taskId: task.taskId, reason: `看门狗自动恢复：${live.reason}`,
+      recoveries: rec.count + 1, maxAutoRecoveries: MAX_AUTO_RECOVERIES,
+    });
+    return { acted: true, action: 'recover' };
+  }
+  recordEscalation(process.cwd(), task.sliceId);
+  await events.append(task.sliceId, 'run.stalled', 'watchdog', {
+    sliceId: task.sliceId, taskId: task.taskId,
+    reason: `同一切片假死 ${rec.count} 次已达上限（${MAX_AUTO_RECOVERIES}），不再自动恢复，请人看现场：${live.reason}`,
+    escalated: true, recoveries: rec.count,
+  });
+  return { acted: true, action: 'escalate' };
+}
+
+function taskLiveBadge(task: TaskInfo): string {
+  const live = taskLiveness(task);
+  if (live.state === 'active') return `🔄 active（${formatIdle(live.idleMs ?? 0)}前有动静）`;
+  if (live.state === 'stale') return `⚠️ stale（${formatIdle(live.idleMs ?? 0)}没动静）`;
+  if (live.state === 'dead') return `💀 dead（${live.reason}）`;
+  return task.status;
 }
 
 /**
@@ -1980,11 +2109,18 @@ register('tasks', async (args) => {
 
   console.log('Background tasks:');
   for (const file of files) {
-    const task = await loadTask(file.slice(0, -5));
+    let task = await loadTask(file.slice(0, -5));
     if (!task) continue;
-    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? '🔄' : '❌';
+    if (task.status === 'running') {
+      task = await syncTaskHeartbeat(task);
+      await maybeRecoverDeadTask(task);
+      task = (await loadTask(task.taskId)) ?? task;
+    }
+    const live = task.status === 'running' ? ` · ${taskLiveBadge(task)}` : '';
+    const rec = task.status !== 'running' ? '' : (() => { try { const r = readRecoveries(process.cwd(), task.sliceId); return r.count > 0 ? ` · 自愈${r.count}次${r.escalated ? '(已上报)' : ''}` : ''; } catch { return ''; } })();
+    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? (taskLiveness(task).state === 'dead' ? '💀' : taskLiveness(task).state === 'stale' ? '⚠️' : '🔄') : '❌';
     const elapsed = task.elapsedSec ? `${task.elapsedSec}s` : '—';
-    console.log(`  ${icon} ${task.taskId.padEnd(30)} ${task.status.padEnd(10)} ${elapsed}`);
+    console.log(`  ${icon} ${task.taskId.padEnd(30)} ${task.status.padEnd(10)} ${elapsed}${live}${rec}`);
   }
   return 0;
 });
@@ -2001,14 +2137,19 @@ register('task-status', async (args) => {
       const files = readdirSync(dir).filter((f) => f.endsWith('.json'));
       const running = [];
       for (const file of files) {
-        const t = await loadTask(file.slice(0, -5));
-        if (t?.status === 'running') running.push(t);
+        let t = await loadTask(file.slice(0, -5));
+        if (t?.status === 'running') {
+          t = await syncTaskHeartbeat(t);
+          await maybeRecoverDeadTask(t);
+          t = (await loadTask(t.taskId)) ?? t;
+          if (t.status === 'running') running.push(t);
+        }
       }
       if (running.length > 0) {
         console.log(`Running tasks (${running.length}):`);
         for (const task of running) {
           const elapsed = Math.floor((Date.now() - new Date(task.startedAt).getTime()) / 1000);
-          console.log(`  🔄 ${task.taskId} — ${task.sliceId} (${elapsed}s)`);
+          console.log(`  🔄 ${task.taskId} — ${task.sliceId} (${elapsed}s) · ${taskLiveBadge(task)}`);
         }
         return 0;
       }
@@ -2019,15 +2160,28 @@ register('task-status', async (args) => {
 
   // Check if target is a task ID (starts with "task-")
   if (target.startsWith('task-')) {
-    const task = await loadTask(target);
+    let task = await loadTask(target);
     if (!task) {
       console.error(`Task not found: ${target}`);
       return 1;
     }
-    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? '🔄' : '❌';
+    if (task.status === 'running') {
+      task = await syncTaskHeartbeat(task);
+      const acted = await maybeRecoverDeadTask(task);
+      task = (await loadTask(task.taskId)) ?? task;
+      if (acted.acted) {
+        console.log(`  🤖 看门狗处置：${acted.action === 'recover' ? `自动恢复（running→failed，切片可重跑）` : `已上报（假死超${MAX_AUTO_RECOVERIES}次，请人看现场）`}`);
+      }
+    }
+    const live = taskLiveness(task);
+    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? (live.state === 'dead' ? '💀' : live.state === 'stale' ? '⚠️' : '🔄') : '❌';
     console.log(`  ${icon} ${task.taskId}`);
     console.log(`    Slice:    ${task.sliceId}`);
-    console.log(`    Status:   ${task.status}`);
+    console.log(`    Status:   ${task.status} · 活性 ${live.state}（${live.reason}）`);
+    try {
+      const r = readRecoveries(process.cwd(), task.sliceId);
+      if (r.count > 0) console.log(`    看门狗：  已自愈 ${r.count} 次${r.escalated ? '（已上报）' : ''}${r.lastReason ? `，上次：${r.lastReason}` : ''}`);
+    } catch { /* 不阻断展示 */ }
     console.log(`    Agent:    ${task.agentName}`);
     console.log(`    Session:  ${task.sessionId}`);
     if (task.elapsedSec) console.log(`    Elapsed:  ${task.elapsedSec}s`);
@@ -2066,15 +2220,35 @@ register('wait', async (args) => {
     return task.status === 'completed' ? 0 : 1;
   }
 
-  // Poll for completion
+  // Poll for completion —— 每次轮询都做一次被动活性检查（D-30）。
+  // 内存监视器可能早死了，这里不信它，只信文件 + pid。
   const startTime = Date.now();
   // eslint-disable-next-line no-constant-condition
   while (true) {
     await new Promise((r) => setTimeout(r, 2000));
     task = await loadTask(taskId);
+    if (!task) break;
+    if (task.status === 'running') {
+      task = await syncTaskHeartbeat(task);
+      const acted = await maybeRecoverDeadTask(task);
+      task = (await loadTask(taskId)) ?? task;
+      if (task.status !== 'running') {
+        if (acted.acted && acted.action === 'escalate') {
+          console.log(`\n💀 Task ${taskId}: 进程已死且自愈超${MAX_AUTO_RECOVERIES}次 —— 已上报，请人看现场`);
+        } else if (acted.acted) {
+          console.log(`\n🤖 Task ${taskId}: 看门狗自动恢复（进程已死，切片已可重跑）`);
+        }
+        break;
+      }
+      const live = taskLiveness(task);
+      if (live.state === 'stale') {
+        process.stdout.write(`\r  ⚠️  Waiting... ${Math.floor((Date.now() - startTime) / 1000)}s · ${formatIdle(live.idleMs ?? 0)}没动静（可疑）  `);
+        continue;
+      }
+    }
     if (!task || task.status !== 'running') break;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    process.stdout.write(`\r  ??  Waiting... ${elapsed}s`);
+    process.stdout.write(`\r  🔄  Waiting... ${elapsed}s`);
   }
 
   process.stdout.write('\r' + ' '.repeat(30) + '\r');

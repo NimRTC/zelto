@@ -35,16 +35,35 @@ export class BudgetCollector {
    * Reads `amount` from `budget.spent` events (authoritative cost source).
    */
   async getSpent(sliceId: string): Promise<number> {
+    return (await this.getSpentDetail(sliceId)).spent;
+  }
+
+  /**
+   * 花费 + 「有没有测到」。
+   *
+   * 为什么不能只看 `getSpent()` 的数字：没见过成本事件的切片返回 0，
+   * 「真的没花钱」和「压根没记账」在界面上都是 $0.0000 —— 那是在
+   * 用假数据撑门面。`measured=false` 时界面必须显示「未记账」而不是金额。
+   *
+   * 判据：事件流里出现过任何一条成本证据（`budget.spent` 或 `llm.called`）。
+   * 只读 `budget.spent` 不够 —— LLM 调用先写 `llm.called`，成本事件
+   * 万一写失败，token 花掉了但账没记上，那也是「有证据但没金额」。
+   */
+  async getSpentDetail(sliceId: string): Promise<{ spent: number; measured: boolean }> {
     const evts = await this.events.read(sliceId);
     let total = 0;
+    let measured = false;
 
     for (const evt of evts) {
       if (evt.type === 'budget.spent') {
         total += this.extractAmount(evt);
+        measured = true;
+      } else if (evt.type === 'llm.called') {
+        measured = true;
       }
     }
 
-    return total;
+    return { spent: total, measured };
   }
 
   /**

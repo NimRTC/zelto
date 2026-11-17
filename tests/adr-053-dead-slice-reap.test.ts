@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 
 import { SliceStore } from '../src/core/slice/store.js';
 import { EventStream } from '../src/core/events/stream.js';
-import { findDeadSlices, reapDeadSlices } from '../src/core/stall/index.js';
+import { findDeadSlices, findOrphanShells, reapDeadSlices } from '../src/core/stall/index.js';
 
 const TEST_DIR = join(tmpdir(), `zelto-adr053-test-${Date.now()}`);
 const SLICES_DIR = join(TEST_DIR, '.zelto', 'slices');
@@ -174,5 +174,121 @@ describe('ADR-053 · 死切片的批量清理', () => {
 
     assert.equal(results.length, 0);
     assert.equal((await store.read('reap-done')).state, 'completed');
+  });
+});
+
+// ─── D-30 · 空壳（无停机分类的僵尸 running）────────────────────────────────
+//
+// 实测（nimrtc）：`zelto run --detach` 之后 CLI 主进程退出，后台监视器
+// 跟着被 process.exit() 杀掉 —— agent 早就没了，但没人写收尾，
+// 会话/任务文件永远停在 running。这类切片**没有停机分类**，
+// 旧判据（findDeadSlices 只认带分类的）永远看不见它们。
+
+describe('D-30 · 空壳切片（running 但无停机分类、现场无人在管）', () => {
+  let store: SliceStore;
+  let events: EventStream;
+  const ROOT = join(tmpdir(), `zelto-orphan-test-${Date.now()}`);
+  const SESSIONS = join(ROOT, '.zelto', 'sessions');
+
+  before(async () => {
+    await mkdir(join(ROOT, '.zelto', 'slices'), { recursive: true });
+    await mkdir(join(ROOT, '.zelto', 'events'), { recursive: true });
+    await mkdir(SESSIONS, { recursive: true });
+    store = new SliceStore(join(ROOT, '.zelto', 'slices'));
+    events = new EventStream(join(ROOT, '.zelto', 'events'));
+  });
+
+  after(async () => {
+    await rm(ROOT, { recursive: true, force: true });
+  });
+
+  async function writeSession(id: string, data: Record<string, unknown>) {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(join(SESSIONS, `claude-agent-${id}.json`), JSON.stringify(data), 'utf-8');
+  }
+
+  it('老会话文件没有 pid 也没有心跳 = 空壳（不能因为「没心跳」当它刚起跑）', async () => {
+    const slice = makeSlice(store, 'shell-legacy', 'running', null);
+    await store.write(slice);
+    await writeSession('shell-legacy', {
+      sliceId: 'shell-legacy', status: 'running', output: [],
+    });
+
+    const shells = findOrphanShells([slice], ROOT, () => true);
+    assert.equal(shells.length, 1);
+    assert.equal(shells[0].liveness.state, 'stale');
+  });
+
+  it('pid 已死的 running 切片 = 空壳（dead）', async () => {
+    const slice = makeSlice(store, 'shell-dead', 'running', null);
+    await store.write(slice);
+    await writeSession('shell-dead', {
+      sliceId: 'shell-dead', status: 'running', pid: 999999,
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    const shells = findOrphanShells([slice], ROOT, () => false);
+    assert.equal(shells.length, 1);
+    assert.equal(shells[0].liveness.state, 'dead');
+  });
+
+  it('真正在跑的切片（pid 活着、心跳新鲜）不算空壳', async () => {
+    const slice = makeSlice(store, 'shell-alive', 'running', null);
+    await store.write(slice);
+    await writeSession('shell-alive', {
+      sliceId: 'shell-alive', status: 'running', pid: 4242,
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    assert.equal(findOrphanShells([slice], ROOT, () => true).length, 0);
+  });
+
+  it('带停机分类的归 findDeadSlices 管，不在这里重复报', async () => {
+    const slice = makeSlice(store, 'shell-stalled', 'running', 'environment_failure');
+    await store.write(slice);
+    await writeSession('shell-stalled', { sliceId: 'shell-stalled', status: 'running' });
+
+    assert.equal(findOrphanShells([slice], ROOT, () => true).length, 0);
+  });
+
+  it('清理需要显式 opt-in —— 不传 includeOrphans 时空壳不动', async () => {
+    await store.write(makeSlice(store, 'shell-noopt', 'running', null));
+    await writeSession('shell-noopt', { sliceId: 'shell-noopt', status: 'running' });
+
+    const results = await reapDeadSlices(store, events, ['shell-noopt']);
+    assert.equal(results.length, 0);
+    assert.equal((await store.read('shell-noopt')).state, 'running');
+  });
+
+  it('显式 opt-in 后空壳退回 frozen，事件里标 orphanShell', async () => {
+    await store.write(makeSlice(store, 'shell-reap', 'running', null));
+    await writeSession('shell-reap', { sliceId: 'shell-reap', status: 'running' });
+
+    const results = await reapDeadSlices(store, events, ['shell-reap'], {
+      includeOrphans: { projectRoot: ROOT, isProcessAlive: () => true },
+    });
+
+    assert.equal(results.length, 1);
+    assert.equal(results[0].stallClass, 'orphan_shell');
+    assert.equal((await store.read('shell-reap')).state, 'frozen');
+    const evt = (await events.read('shell-reap')).find(
+      (e) => e.type === 'slice.state.changed' && (e.payload as Record<string, unknown>).orphanShell === true,
+    );
+    assert.ok(evt, '空壳清理必须留痕');
+  });
+
+  it('opt-in 也不能误伤真正在跑的切片（判据在清理时重算，不信列表）', async () => {
+    await store.write(makeSlice(store, 'shell-live-2', 'running', null));
+    await writeSession('shell-live-2', {
+      sliceId: 'shell-live-2', status: 'running', pid: 4242,
+      lastActivityAt: new Date().toISOString(),
+    });
+
+    const results = await reapDeadSlices(store, events, ['shell-live-2'], {
+      includeOrphans: { projectRoot: ROOT, isProcessAlive: () => true },
+    });
+
+    assert.equal(results.length, 0);
+    assert.equal((await store.read('shell-live-2')).state, 'running');
   });
 });

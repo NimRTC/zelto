@@ -109,6 +109,30 @@ test('测试文件仍然归属到模块（不报「文件无归属」）', () =>
   );
 });
 
+test('报告：无归属的测试文件不报「文件无归属」偏离（zelto 自己生成的验收骨架）', () => {
+  // 真实证据：`tests/acceptance/<slice>/acceptance.test.cjs` 由 zelto 生成，
+  // 不属于任何设计模块。若报 unmapped_file（deny），**每个切片**都会被
+  // 自己的验收文件拦住门禁 —— 死锁。
+  const root = makeProject({
+    'src/core/index.ts': "export const a = 1;\n",
+    'tests/acceptance/s1/acceptance.test.cjs': "console.log('ok');\n",
+    'src/loose.ts': "export const loose = 1;\n",
+  });
+
+  const scan = scanArchitecture(root, MODULES);
+  const report = buildArchitectureReport(MODULES, scan);
+
+  const unmappedFiles = report.deviations
+    .filter((d) => d.kind === 'unmapped_file')
+    .map((d) => d.to);
+  assert.ok(
+    !unmappedFiles.includes('tests/acceptance/s1/acceptance.test.cjs'),
+    '测试文件不该报「文件无归属」',
+  );
+  // 生产文件的无归属仍然要报 —— 别把人真该修的事一起吞掉
+  assert.ok(unmappedFiles.includes('src/loose.ts'), '生产代码的无归属必须继续报');
+});
+
 test('覆盖统计：测试文件单独计数，不混进语言分母', () => {
   const root = makeProject({
     'src/core/index.ts': "export const a = 1;\n",

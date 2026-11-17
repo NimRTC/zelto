@@ -823,7 +823,17 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     })
     .sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
 
-  const unmapped = scanned.filter((f) => f.module === null).map((f) => f.path);
+  // ADR-066：测试文件**不属于架构耦合**，所以「没有模块认领」也不是偏离。
+  //
+  // 真实证据（nimrtc-zelto 实战演练）：zelto 自身生成的验收骨架
+  // `tests/acceptance/<slice>/acceptance.test.cjs` 不可能被任何设计模块认领
+  // （它不是生产代码），却让**每个切片**在门禁上被自己判成
+  // 「文件无归属（deny）」而 blocked —— 修这个 trigger 的切片自己过不去。
+  //
+  // 与依赖边同一判据：测试文件仍计入文件数与覆盖统计，只是不产生偏离。
+  const unmapped = scanned
+    .filter((f) => f.module === null && !f.isTest)
+    .map((f) => f.path);
 
   return {
     files: scanned,

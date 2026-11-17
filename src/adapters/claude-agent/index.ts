@@ -40,6 +40,19 @@ export interface PersistentSessionData {
   prompt: string;        // original bundle path for retry
   output: string[];
   /**
+   * 心跳 —— 最后活动时间（ISO）。
+   *
+   * D-30：`--detach` 的后台监视器随主进程退出而死，只剩一个永远 `running`
+   * 的空壳。任何后来的 zelto 调用（`tasks` / `status` / `watchdog` / Web）
+   * 都要能回答「它多久没动了」—— 靠的就是这个字段。
+   * 每次有输出、每次心跳 tick 都刷新它（见 spawn 里的数据回调与心跳定时器）。
+   */
+  lastActivityAt?: string;
+  /** 最后一条 agent 输出的时间（输出是副产品，心跳才是「还管着」的证据） */
+  lastOutputAt?: string;
+  /** 跑这条会话的 agent 子进程 pid —— 没了它就没法判定进程死活 */
+  pid?: number;
+  /**
    * Agent-side session id (the Claude Code session uuid).
    *
    * zelto generates it at start time and passes it via `--session-id`, so that
@@ -267,11 +280,12 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     writeFileSync(tmpFile, instructions, 'utf-8');
 
     // Create persistent session data
+    const nowIso = new Date().toISOString();
     const sessionData: PersistentSessionData = {
       sessionId,
       sliceId,
       agentCommand,
-      startedAt: new Date().toISOString(),
+      startedAt: nowIso,
       status: 'running',
       exitCode: null,
       timeoutMs: this.timeoutMs,
@@ -279,6 +293,9 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       maxRetries: this.maxRetries,
       prompt: bundlePath,
       output: [],
+      lastActivityAt: nowIso,
+      lastOutputAt: undefined,
+      pid: undefined,
       agentSessionId,
       cwd: workDir,
       resumedFrom: opts.resumedFromZelto,
@@ -330,10 +347,16 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     );
 
     // Capture stdout
+    const touchActivity = (): void => {
+      const now = new Date().toISOString();
+      sessionData.lastOutputAt = now;
+      sessionData.lastActivityAt = now;
+    };
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf-8');
       state.output.push(text);
       sessionData.output.push(text);
+      touchActivity();
       if (this.onOutput) {
         this.onOutput(sessionId, text);
       }
@@ -344,6 +367,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       const text = chunk.toString('utf-8');
       state.output.push(text);
       sessionData.output.push(text);
+      touchActivity();
       if (this.onOutput) {
         this.onOutput(sessionId, text);
       }
@@ -361,6 +385,12 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
 
     this.sessions.set(sessionId, state);
 
+    // D-30 心跳：pid + 最后活动时间落盘，后来的任何 zelto 调用都能判定活性。
+    // 只在内存里记 = 主进程一退就全丢，这正是假死的来源。
+    sessionData.pid = child.pid ?? undefined;
+    sessionData.lastActivityAt = nowIso;
+    saveSession(sessionData);
+
     // Set timeout
     const timeout = setTimeout(() => {
       this.handleTimeout(sessionId);
@@ -368,17 +398,29 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     this.timeouts.set(sessionId, timeout);
 
     // Start progress reporting interval (every 5 seconds)
-    if (this.onProgress) {
-      const startedAt = Date.parse(sessionData.startedAt);
-      const progressInterval = setInterval(() => {
+    // D-30 心跳落盘：不管有没有 onProgress，都每 5 秒把 lastActivityAt 写进
+    // 会话文件 —— 这是「还活着」的唯一跨进程证据。主进程退了，文件还在，
+    // 后来的 zelto 调用才能判定「它多久没动了」。
+    {
+      const heartbeat = setInterval(() => {
         if (!this.sessions.has(sessionId)) {
-          clearInterval(progressInterval);
+          clearInterval(heartbeat);
           return;
         }
-        const elapsed = Date.now() - startedAt;
-        this.onProgress!(sessionId, elapsed, 'running');
+        const data = this.sessionData.get(sessionId);
+        if (data && data.status === 'running') {
+          data.lastActivityAt = new Date().toISOString();
+          try {
+            saveSession(data);
+          } catch { /* 心跳写盘失败不阻断运行 */ }
+        }
+        if (this.onProgress) {
+          const startedAt = Date.parse(sessionData.startedAt);
+          const elapsed = Date.now() - startedAt;
+          this.onProgress(sessionId, elapsed, 'running');
+        }
       }, 5000);
-      this.progressIntervals.set(sessionId, progressInterval);
+      this.progressIntervals.set(sessionId, heartbeat);
     }
 
     // Clean up temp file on exit
