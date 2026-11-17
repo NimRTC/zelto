@@ -193,6 +193,11 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
   // 那两条路径各自需要时才采集。
   let progress: ProgressReport | null = null;
   let progressCollected = false;
+  /**
+   * 惰性采集「做成了什么」。
+   *
+   * `violations`：审计判定的越界文件（审计的结论，不是重新算的）。
+   */
   const progressPayload = async (
     violations: string[] = [],
   ): Promise<Record<string, unknown> | null> => {

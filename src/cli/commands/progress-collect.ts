@@ -99,17 +99,28 @@ export async function collectSliceProgress(input: {
 
     const allChanged = worktree ? listChangedFiles(worktree) : [];
 
-    // 「做成了什么」只算**agent 这一轮写的**文件。
-    //
-    // 要排除两类不是 agent 写的：
-    //   - **托管文件**（zelto 自己写进 worktree 的规格副本、bundle）；
-    //   - **预置脏**（worktree 建出来时就已经脏的路径，D-29）。
-    //
-    // 不排除的话，人看到「改了 3 个文件」，
-    // 其中两个是 zelto 自己放的 —— 「做成了什么」就不准了。
+    // zelto 自己写进 worktree 的文件（规格副本、bundle）不算 agent 的成果。
     const managed = new Set((input.guard?.managedPaths ?? []).map((p) => p.replace(/\\/g, '/')));
-    const baseline = new Set((input.guard?.baselineChanged ?? []).map((p) => p.replace(/\\/g, '/')));
-    const changedFiles = allChanged.filter((f) => !managed.has(f) && !baseline.has(f));
+
+    // 「做成了什么」的改动清单 = **审计认定的改动**。
+    //
+    // 这里**不排除预置脏**（D-29 baseline）。
+    //
+    // 审计侧排除预置脏的理由是「它不是 agent 写的，别判它越界」——
+    // 那是**判定**（agent 有没有越界）。但「做成了什么」是**陈述**：
+    // 「这一轮结束时，这个 worktree 里相对基线有哪些改动」。
+    //
+    // 排除掉就出了大问题（实测 nimrtc-zelto v3-chrome-waterfall，2026-11-18）：
+    // 一片重跑了 4 轮，第 3 轮超时被砍但已经写好了 4 个文件，
+    // 第 4 轮开工时那些文件**已经是脏的** → 被当成「预置脏」排除
+    // → `changedFiles=[]` → `verdict=unknown` → 事件里写「进展不明」。
+    //
+    // 而第 4 轮恰恰**是把这 4 个文件做完的那一轮**。
+    // 人翻事件流看到的是「这一轮什么也没做成」，其实全做成了。
+    //
+    // 排除预置脏是为了**不误判越界**，不是为了**不陈述事实**。
+    // 两件事分开，别把判据混进陈述。
+    const changedFiles = allChanged.filter((f) => !managed.has(f));
 
     // 越界文件用**审计的结论**，不自己重算 ——
     // 审计已经处理了托管文件、预置脏、submodule 假脏等一堆细节，

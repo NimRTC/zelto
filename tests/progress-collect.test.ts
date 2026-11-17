@@ -153,8 +153,8 @@ describe('D-56 采集：越界文件用审计的结论，不自己重算', () =>
   });
 });
 
-describe('D-56 采集：托管文件与预置脏不算 agent 改的', () => {
-  it('被守卫列为托管/预置的文件不进改动清单', async () => {
+describe('D-56 采集：托管文件不算 agent 改的', () => {
+  it('被守卫列为托管的文件不进改动清单', async () => {
     const root = makeProject({
       '.zelto/slices/s1.json': SLICE_JSON,
       'src/agent.js': 'base\n',
@@ -184,12 +184,52 @@ describe('D-56 采集：托管文件与预置脏不算 agent 改的', () => {
         '托管文件不该算 agent 改的',
       );
       assert.ok(
-        !report.changedFiles.includes('src/preexisting.js'),
-        '预置脏不该算 agent 改的（D-29）',
-      );
-      assert.ok(
         report.changedFiles.includes('src/agent.js'),
         'agent 真正改的该被列出来',
+      );
+    } finally {
+      rm(root);
+    }
+  });
+});
+
+describe('D-56 采集：预置脏要**列出来**（判定 ≠ 陈述）', () => {
+  it('预置脏不进「写集外」，但要在改动清单里', async () => {
+    // 病灶（实测 nimrtc-zelto v3-chrome-waterfall，2026-11-18）：
+    // 一片重跑了 4 轮。第 3 轮超时被砍，但已经写好了 4 个文件。
+    // 第 4 轮开工时那些文件**已经是脏的** → 快照把它们记成「预置脏」。
+    //
+    // 于是「做成了什么」把它们全排除了 → changedFiles=[] →
+    // verdict=unknown → 事件里写「进展不明：规格要求 6 条验收标准」。
+    //
+    // 而第 4 轮恰恰**是把这 4 个文件做完的那一轮**。
+    // 人翻事件流看到的是「这一轮什么也没做成」，其实全做成了。
+    //
+    // 排除预置脏是为了**不误判越界**（判定）；
+    // 「做成了什么」是**陈述** —— 陈述不该受判据影响。
+    const root = makeProject({
+      '.zelto/slices/s1.json': SLICE_JSON,
+      'src/kept.js': 'base\n',
+    });
+    try {
+      writeFileSync(join(root, 'src', 'kept.js'), 'changed\n', 'utf-8');
+
+      const report = await inProject(root, () =>
+        collectSliceProgress({
+          sliceId: 's1',
+          worktree: root,
+          runAcceptance: false,
+          guard: {
+            managedPaths: [],
+            baselineChanged: ['src/kept.js'],
+          },
+        }),
+      );
+
+      assert.ok(report);
+      assert.ok(
+        report.changedFiles.includes('src/kept.js'),
+        `预置脏也要列进改动清单，实际：${JSON.stringify(report.changedFiles)}`,
       );
     } finally {
       rm(root);
