@@ -15,6 +15,7 @@ import {
   isZeltoStatePath,
 } from '../../core/project/managed-paths.js';
 import { parsePorcelainStatus, isSubmoduleOnlyDirty } from '../../core/sched/audit.js';
+import { clearUntrackedManagedSpecs } from '../../core/project/untracked-specs.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import {
   branchOfVersion,
@@ -488,6 +489,40 @@ export async function executeMergePlan(
         aborted: true,
         abortReason: `目标工作区有未提交改动（${dirty.length} 项），已跳过合并`,
       };
+    }
+  }
+
+  // ── D-62：清掉「未跟踪的 zelto 规格文件副本」 ────────────────────────
+  //
+  // 上面那个守卫把 `specs/slices/**` 豁免了（报「不影响合并」），
+  // 但 **git 自己不认这个豁免** —— 未跟踪文件会被合并覆盖时，
+  // git 直接拒绝合并：
+  //
+  //     error: The following untracked working tree files would be overwritten by merge:
+  //             specs/slices/v3-chrome-waterfall.md
+  //
+  // 于是「守卫放行 → git 硬拦」—— 失败信息还是 git 的原话，
+  // 人看不到到底是谁挡的路。
+  //
+  // 这些副本是 zelto 自己写的产物；待合 ref 上有它们的正式版本。
+  // 内容一致（只差行尾）就删掉工作区这份，让合并把 ref 上的版本落下来。
+  // 内容不一致 → 不删，报出来让人看（保守方向：误删一份不一样的规格
+  // 比合并失败一次贵得多）。
+  const refsForSpecCleanup = plan.slices
+    .map((id) => byId.get(id))
+    .filter((info): info is MergeSliceInfo => info !== undefined && info.noop !== true)
+    .map((info) => `refs/heads/${info.branch}`);
+  for (const ref of refsForSpecCleanup) {
+    const cleanup = clearUntrackedManagedSpecs(targetDir, ref);
+    if (cleanup.removed.length > 0) {
+      log(`  ℹ️  清理了 ${cleanup.removed.length} 个未跟踪的规格文件副本（与 ${ref} 上的一致）：`);
+      for (const p of cleanup.removed.slice(0, 5)) log(`     ${p}`);
+      if (cleanup.removed.length > 5) log('     …');
+    }
+    for (const note of cleanup.notes) log(`  ⚠️  ${note}`);
+    if (cleanup.conflicts.length > 0) {
+      log(`  ⚠️  ${cleanup.conflicts.length} 个规格文件副本与待合分支不一致，已保留（合并可能被 git 拦）：`);
+      for (const p of cleanup.conflicts.slice(0, 5)) log(`     ${p}`);
     }
   }
 

@@ -26,6 +26,7 @@ import {
   isZeltoStatePath,
 } from '../../core/project/managed-paths.js';
 import { parsePorcelainStatus } from '../../core/sched/audit.js';
+import { clearUntrackedManagedSpecs } from '../../core/project/untracked-specs.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import { branchExists, pathDiffersFromAnyRef } from './version-runtime.js';
 import { getDefaultFormatter } from '../output-formatter.js';
@@ -149,6 +150,35 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
 
   const current = git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot);
   const target = current.ok ? current.stdout.trim() : 'HEAD';
+
+  // ── D-62：清掉「未跟踪的 zelto 规格文件副本」 ────────────────────────
+  //
+  // 上面那个守卫把 `specs/slices/**` 豁免了（报「不影响 ship」），
+  // 但 **git 自己不认这个豁免** —— 未跟踪文件会被合并覆盖时，
+  // git 直接拒绝合并：
+  //
+  //     error: The following untracked working tree files would be overwritten by merge:
+  //             specs/slices/v3-chrome-waterfall.md
+  //
+  // 于是「守卫放行 → git 硬拦」—— 失败信息是 git 的原话，
+  // 人看不到「其实是 zelto 自己的豁免跟 git 的硬拦冲突」。
+  //
+  // 实测（nimrtc-zelto v3 ship，2026-11-18）：就卡在这儿。
+  //
+  // 这些副本是 zelto 自己写的产物；版本分支上有它们的正式版本。
+  // 内容一致（只差行尾）就删掉工作区这份，让合并把版本分支上的落下来。
+  // 内容不一致 → 不删，报出来让人看（保守方向）。
+  const specCleanup = clearUntrackedManagedSpecs(repoRoot, `refs/heads/${versionBranch}`);
+  if (specCleanup.removed.length > 0) {
+    log(`  ℹ️  清理了 ${specCleanup.removed.length} 个未跟踪的规格文件副本（与 ${versionBranch} 上的一致）：`);
+    for (const p of specCleanup.removed.slice(0, 5)) log(`     ${p}`);
+    if (specCleanup.removed.length > 5) log('     …');
+  }
+  for (const note of specCleanup.notes) log(`  ⚠️  ${note}`);
+  if (specCleanup.conflicts.length > 0) {
+    log(`  ⚠️  ${specCleanup.conflicts.length} 个规格文件副本与 ${versionBranch} 上不一致，已保留（合并可能被 git 拦）：`);
+    for (const p of specCleanup.conflicts.slice(0, 5)) log(`     ${p}`);
+  }
 
   // 基点漂移：版本分支的基点是否还是当前 HEAD
   // 版本分支从哪建的不一定等于现在的 HEAD（主干在这期间前进过）
