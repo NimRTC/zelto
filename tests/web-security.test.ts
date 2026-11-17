@@ -613,6 +613,80 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     }
   });
 
+  // ── ADR-010 §5.3 里 ADR-072 §4 没有砍掉的只读端点 ──────────────────
+  //
+  // ADR-072 §4 砍掉的是**写操作**（run/gate/freeze/admit/abandon/resume/create），
+  // 只读的度量与状态展示原本就在 ADR-010 §5.3 的范围里。
+  // 人要求「都在驾驶舱里能看到」—— 这些端点补上。
+
+  it('只读端点：度量 / 停机 / 策略 / 预算 / 全链 全部可用', async () => {
+    const endpoints = ['/api/metrics', '/api/stalls', '/api/policy', '/api/budget', '/api/pipeline'];
+    for (const path of endpoints) {
+      const res = await req(path);
+      assert.equal(res.status, 200, `${path} 应当可用，实际：${res.status} ${res.raw}`);
+    }
+  });
+
+  it('只读端点：这些端点不许有写操作（POST 一律拒绝）', async () => {
+    const token = await readSessionToken();
+    for (const path of ['/api/metrics', '/api/stalls', '/api/policy', '/api/budget', '/api/pipeline']) {
+      const res = await req(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
+        body: '{}',
+      });
+      // 404 或 405 都行 —— 路由按 method 匹配，命中不了就是 404；
+      // 关键是**不能是 2xx**（不能有写操作生效）
+      assert.ok(
+        res.status === 404 || res.status === 405,
+        `${path} 不该接受 POST，实际：${res.status}`,
+      );
+    }
+  });
+
+  it('只读端点：策略端点必须给出规则与来源（不能是个空壳）', async () => {
+    const res = await req('/api/policy');
+    assert.equal(res.status, 200);
+    assert.equal(typeof res.body.exists, 'boolean', '必须标明策略是否存在');
+    assert.ok(Array.isArray(res.body.rules), '必须有规则数组');
+    // arch: 段也是策略的一部分 —— 只给 rules 会让人以为策略只有一条规则
+    assert.ok(Array.isArray(res.body.arch), '必须带 arch 段（哪怕是空的）');
+  });
+
+  it('只读端点：全链端点必须诚实报出未归属的切片', async () => {
+    const res = await req('/api/pipeline');
+    assert.equal(res.status, 200);
+    assert.ok(res.body.requirements, '必须有需求段');
+    assert.ok(res.body.designs, '必须有设计段');
+    assert.ok(res.body.plans, '必须有计划段');
+    assert.ok(res.body.versions, '必须有版本段');
+    assert.ok(res.body.slices, '必须有切片段');
+    assert.ok(Array.isArray(res.body.slices.unassigned), '必须报出未归属的切片 —— 别让人以为漏了');
+    assert.ok(res.body.slices.byVersion, '必须有按版本的归属统计');
+  });
+
+  it('只读端点：预算端点必须报出花费最高的切片（钱花在哪了）', async () => {
+    const res = await req('/api/budget');
+    assert.equal(res.status, 200);
+    assert.equal(typeof res.body.spentUsd, 'number');
+    assert.ok(Array.isArray(res.body.topSpenders), '必须报出花费最高的切片');
+  });
+
+  it('前端：导航里必须有这 5 个新视图的入口', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+    for (const view of ['metrics', 'stalls', 'policy', 'budget', 'pipeline']) {
+      assert.ok(
+        html.includes(`data-view="${view}"`),
+        `导航里必须有 ${view} 的入口 —— 端点实现了却没入口 = 人看不到`,
+      );
+    }
+    // 视图函数必须真的存在（注册进 VIEWS）
+    for (const fn of ['viewMetrics', 'viewStalls', 'viewPolicy', 'viewBudget', 'viewPipeline']) {
+      assert.ok(html.includes(`function ${fn}`), `必须有 ${fn} 实现`);
+    }
+  });
+
   it('首页：有 token、有导航、没有外链资源（不触网）', async () => {
     const res = await fetch(`${BASE}/`);
     const html = await res.text();
@@ -843,6 +917,162 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     assert.ok(
       fnBody.includes("display = 'none'"),
       '恢复后必须把提示条隐藏',
+    );
+  });
+
+  // ── ⑦ 驾驶舱三件事：工程名 / 事件去重 / 实时进度可感知 ────────────────
+  //
+  // 这三条都是「人打开页面就发现」的问题，不是安全面：
+  //   1. 标题只有「zelto 驾驶舱」—— 开两个项目就分不清是哪个
+  //   2. 事件页同一条 policy.decision 刷了上百行，真正有事的那条挤没了
+  //   3. 页面静默轮询、内容不变时看着像死掉，人不知道它还在不在
+
+  it('工程名：/api/project 返回工程名与根目录', async () => {
+    const res = await req('/api/project');
+    assert.equal(res.status, 200);
+    assert.equal(typeof res.body.name, 'string', '必须给出工程名');
+    assert.ok(res.body.name.length > 0, '工程名不能是空串');
+    assert.equal(res.body.root, TEST_DIR, '必须给出工程根目录');
+  });
+
+  it('工程名：项目有 project-map.json 时以它为准', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await writeFile(
+      join(TEST_DIR, '.zelto', 'project-map.json'),
+      JSON.stringify({ projectName: 'nimrtc' }),
+      'utf-8',
+    );
+    const res = await req('/api/project');
+    assert.equal(res.body.name, 'nimrtc', '必须以 project-map.json 的 projectName 为准');
+  });
+
+  it('工程名：前端标题区有工程名占位，且会去拉 /api/project', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+    assert.ok(html.includes('id="project-name"'), '标题区必须有工程名位置');
+    assert.ok(html.includes('/api/project'), '前端必须真的去拉 /api/project');
+  });
+
+  it('事件去重：相邻的完全重复事件被折叠成一条并带次数', async () => {
+    const sliceId = 'dup-event-slice';
+    const dir = join(TEST_DIR, '.zelto', 'events', sliceId);
+    await mkdir(dir, { recursive: true });
+    const payload = { decision: 'allow', path: 'src/a.ts' };
+    const mk = (ts: string, type: string, p: Record<string, unknown>) =>
+      JSON.stringify({ ts, runSeq: 1, slice: sliceId, run: null, type, actor: 'hook', payload: p });
+    const lines = [
+      mk('2026-01-01T00:00:01.000Z', 'policy.decision', payload),
+      mk('2026-01-01T00:00:02.000Z', 'policy.decision', payload),
+      mk('2026-01-01T00:00:03.000Z', 'policy.decision', payload),
+      // 有差异的事件不能被折叠
+      mk('2026-01-01T00:00:04.000Z', 'policy.decision', { decision: 'deny', path: 'src/a.ts' }),
+    ];
+    await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n', 'utf-8');
+
+    const res = await req('/api/events?limit=200');
+    assert.equal(res.status, 200);
+    const rows = res.body.filter((e: any) => e.slice === sliceId);
+    assert.equal(rows.length, 2, `相邻完全重复应折叠为 2 条，实际 ${rows.length}`);
+    // 最新是一条 deny（不折），更早的三条 allow 折成一条、count=3
+    const allow = rows.find((e: any) => (e.payload || {}).decision === 'allow');
+    assert.ok(allow, '必须有 allow 那一条');
+    assert.equal(allow.count, 3, `折叠后的次数应为 3，实际 ${allow.count}`);
+    assert.equal(
+      allow.since,
+      '2026-01-01T00:00:01.000Z',
+      '折叠行必须保留「从什么时候开始」—— otherwise 人以为它只发生过一次',
+    );
+  });
+
+  it('事件去重：中间夹了别的事件就不折叠（那不是刷屏，是有节奏的动作）', async () => {
+    const sliceId = 'interleaved-slice';
+    const dir = join(TEST_DIR, '.zelto', 'events', sliceId);
+    await mkdir(dir, { recursive: true });
+    const mk = (ts: string, type: string) =>
+      JSON.stringify({ ts, runSeq: 1, slice: sliceId, run: null, type, actor: 'hook', payload: {} });
+    const lines = [
+      mk('2026-01-02T00:00:01.000Z', 'policy.decision'),
+      mk('2026-01-02T00:00:02.000Z', 'run.started'),
+      mk('2026-01-02T00:00:03.000Z', 'policy.decision'),
+    ];
+    await writeFile(join(dir, 'events.jsonl'), lines.join('\n') + '\n', 'utf-8');
+
+    const res = await req('/api/events?limit=200');
+    const rows = res.body.filter((e: any) => e.slice === sliceId);
+    assert.equal(rows.length, 3, '中间夹了别的事件，三条都应保留');
+    assert.ok(rows.every((e: any) => (e.count ?? 1) === 1));
+  });
+
+  it('实时进度：running 切片带已运行时长与最后一条输出', async () => {
+    const sliceId = 'running-progress-slice';
+    const now = new Date();
+    const startedAt = new Date(now.getTime() - 42_000).toISOString();
+    await writeSlice(sliceId);
+    // 把切片改成 running
+    const slicePath = join(TEST_DIR, '.zelto', 'slices', `${sliceId}.json`);
+    const { readFile: rf } = await import('node:fs/promises');
+    const slice = JSON.parse(await rf(slicePath, 'utf-8'));
+    slice.state = 'running';
+    await writeFile(slicePath, JSON.stringify(slice, null, 2), 'utf-8');
+
+    // 造一份会话文件：进程 pid 用当前测试进程（活着），带输出与启动时间
+    const sessDir = join(TEST_DIR, '.zelto', 'sessions');
+    await mkdir(sessDir, { recursive: true });
+    await writeFile(
+      join(sessDir, 'sess-1.json'),
+      JSON.stringify({
+        sessionId: 'sess-1',
+        sliceId,
+        status: 'running',
+        startedAt,
+        lastActivityAt: now.toISOString(),
+        lastOutputAt: now.toISOString(),
+        pid: process.pid,
+        output: ['正在跑测试…\n', 'PASS schema.test.ts\n'],
+      }),
+      'utf-8',
+    );
+
+    const res = await req('/api/slices');
+    const row = res.body.find((s: any) => s.id === sliceId);
+    assert.ok(row, '列表里应当有这片');
+    assert.equal(row.state, 'running');
+    assert.ok(
+      typeof row.elapsedMs === 'number' && row.elapsedMs >= 40_000,
+      `必须有已运行时长（≥40s），实际：${row.elapsedMs}`,
+    );
+    assert.equal(
+      row.progressLine,
+      'PASS schema.test.ts',
+      `进度行应是最后一条有内容的输出，实际：${JSON.stringify(row.progressLine)}`,
+    );
+    assert.ok(row.progressAt, '必须带上这条输出的时间');
+  });
+
+  it('实时进度：非 running 切片不伪造进度', async () => {
+    await writeSlice('idle-progress-slice');
+    const res = await req('/api/slices');
+    const row = res.body.find((s: any) => s.id === 'idle-progress-slice');
+    assert.equal(row.progressLine, null, '没在跑就不该有进度行');
+    assert.equal(row.elapsedMs, null, '没在跑就不该有已运行时长');
+  });
+
+  it('实时进度：前端有进度列与刷新心跳（页面不能看着像死了）', async () => {
+    const res = await fetch(`${BASE}/`);
+    const html = await res.text();
+    // 进度：已跑时长 + 最后一条输出
+    assert.ok(html.includes('function progressCell'), '必须有进度单元格实现');
+    assert.ok(html.includes('已跑 '), '进度必须显示已运行时长');
+    // 刷新心跳：一个每轮都在走的时间戳，把「静默」和「死掉」区分开
+    assert.ok(html.includes('id="refresh-line"'), '必须有刷新心跳元素');
+    assert.ok(html.includes('function markRefresh'), '必须有刷新心跳的更新函数');
+    assert.ok(html.includes('最后刷新'), '心跳必须说清「最后刷新」是什么时候');
+    // 总览页必须有「正在运行」一节
+    assert.ok(html.includes('正在运行'), '总览页必须有正在运行一节');
+    // 断连时心跳不能还显示绿色（假心跳比不刷更糟）
+    assert.ok(
+      html.includes('已停止刷新'),
+      '断连时心跳必须明确说「已停止刷新」',
     );
   });
 });

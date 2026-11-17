@@ -13,8 +13,14 @@
 实现 ADR-010 提议的浏览器端界面，但**收窄写操作范围**并**修掉 ADR-010 的 CSRF 漏洞**。
 
 形态：`zelto web` 起一个只绑定 `127.0.0.1` 的 `node:http` 服务，
-提供**只读驾驶舱**（切片总览 / 切片详情 / 事件流 / 审计 / 签字复查）
+提供**只读驾驶舱**（切片总览 / 切片详情 / 事件流 / 审计 / 签字复查 /
+**度量 / 停机 / 策略 / 预算 / 全链**）
 与**唯一的一个写操作**：人在浏览器里**看完事实再签字**。
+
+> **2026-11-17 补**：摘要里原本只列了五类只读面板，
+> 但 ADR-010 §5.3 的只读面板还有度量/停机/策略/预算/pipeline ——
+> ADR-072 §4 砍掉的是**写操作**，这些只读面板本来就不在砍掉的范围内。
+> 已补齐（见 §6.1）。
 
 **与 ADR-010 的差别只有两处，且都是收窄，不是扩张。**
 
@@ -209,8 +215,45 @@ src/adapters/web/api/*.ts           ← 复用 core 版
 | GET | `/api/events` | 全局最近事件 |
 | GET | `/api/sign-requests` | 签字请求清单（按状态过滤） |
 | GET | `/api/summary` | 概况（切片数 / 状态分布 / 待签字数 / **成本**） |
+| GET | `/api/metrics` | 全项目度量报告（`core/metrics/collector.ts`） |
+| GET | `/api/stalls` | 停机列表（`core/stall/classifier.ts` 的 `isSliceStalled`） |
+| GET | `/api/policy` | 策略规则 + `arch:` 段（`core/policy/data-access.ts`） |
+| GET | `/api/budget` | 预算概览（已花费 / 上限 / 花费最高的切片） |
+| GET | `/api/pipeline` | 全链状态（需求 → 设计 → 计划 → 版本 → 切片） |
+| GET | `/api/project` | 工程信息（`projectName` / 根目录）—— 驾驶舱标题用 |
 | POST | `/api/sign-requests/:id/approve` | **唯一写操作**（§5） |
 | GET | `/` | SPA |
+
+### 6.1 只读面板补齐（2026-11-17 补）
+
+ADR-072 §6 最初只列了「切片 / 事件 / 签字」三类只读端点，
+但 ADR-010 §5.3 里的**度量、停机、策略、预算、pipeline** 这些**只读**面板
+并不在 ADR-072 §4 的砍掉范围内（§4 砍掉的是 run/gate/freeze/admit/abandon/resume/create
+这些**写操作**）。人问「都在驾驶舱里能看到吧」—— 于是补齐。
+
+**判据一律复用 core 的既有实现，不在 Web 侧另立一份**（C3）：
+
+| 面板 | 复用 | 为什么不另写 |
+|---|---|---|
+| 度量 | `core/metrics/collector.ts` 的 `generateReport()` | 与 CLI `zelto summary --metrics` 同一份计算 |
+| 停机 | `core/stall/classifier.ts` 的 `isSliceStalled()` | 与 CLI `zelto stall` 同一份判据 |
+| 策略 | `core/policy/data-access.ts` 的 `loadPolicy()` | `core/policy/yaml.ts` 是唯一解析器；另写一份必然漂移 |
+| 预算 | `core/budget/collector.ts` | `budget.spent` 事件是权威成本来源 |
+| 全链 | `core/version/branch.ts` 的 `resolveSliceOwnership()` | 与 CLI `zelto merge` 同一份归属判定（D-11 同族） |
+
+> **归属判定为什么必须复用**：
+> CLI 侧判「这片归 v2」、Web 侧判「这片归 v1」—— 人看到两套说法，
+> 无从判断该信哪个。归属判据散着写必然漂移。
+
+> **未归属的切片要直说**：
+> `/api/pipeline` 的 `slices.unassigned` 明确列出不属于任何版本的切片。
+> 少列一份看起来更清爽，但人看到「v1 有 14 片」会以为其余都归了别处；
+> 直说「这 40 片没进任何版本计划」才是事实。
+
+> **策略的 `arch:` 段也要给**：
+> 只给 `rules:` 会让人以为策略只有一条规则 ——
+> 而 `arch:` 段是架构护栏的判据依据，漏掉它等于让人漏看一半策略。
+
 
 > **「追溯」给明细而不是条目数**（2026-11-16 补）：
 > 一开始只给条目数，理由是「列表页放不下那么多字」。
@@ -226,6 +269,23 @@ src/adapters/web/api/*.ts           ← 复用 core 版
 **SSE 不做**（ADR-010 §5.5）：前端用 5 秒轮询。
 SSE 需要在服务端保持长连接与连接状态 —— 那是**内存状态**，
 而 zelto 的状态只该在文件里（C1）。轮询读文件，天然与 CLI 一致。
+
+### 6.2 可感知的三件事（2026-11-17 补）
+
+轮询是静默的（不清屏、不闪），好处是页面不跳，代价是**看起来一动不动**。
+内容没变化的驾驶舱与死掉的页面在视觉上完全一样 —— 这是「误以为死掉」的根源。
+补三件事：
+
+| 问题 | 做法 |
+|---|---|
+| 开着几个项目的驾驶舱，标题都叫「zelto 驾驶舱」，分不清谁是谁 | 标题显示工程名（`/api/project`，来源 `.zelto/project-map.json` 的 `projectName`，退回目录名）；标签页标题同步 |
+| 「最近事件」被同一条 `policy.decision` 刷满屏，真正有事的那条被挤出去 | 服务端**只折叠相邻的完全重复**（slice/type/actor/payload 全同），保留 `count` 与 `since`；中间夹了别的事件就断开。折叠只影响展示，不隐藏事实 |
+| running 切片只显示「活性」，看不出「在推进」，人盯几分钟就怀疑卡死 | 新增 `progressLine`（agent 最后一条有内容的输出，来自会话文件 `output`）、`progressAt`、`elapsedMs`（从 `startedAt` 起算）。总览页新增「正在运行」一节（已跑时长在走秒 + 最后一条输出） |
+| 页面完全没有「还在刷新」的证据 | 顶端「最后刷新 HH:MM:SS」心跳 + 绿点，每 5 秒更新；进详情页也照走（数据不刷、心跳照走）；断连时变红并写明「已停止刷新」—— **不能**用假心跳掩盖连接已断 |
+
+另外，`/api/events` 的数据源从「切片状态文件列表」改成**直接扫事件目录**：
+原来只读到「还有状态文件在的切片」的事件，实测本仓事件目录 1429 个、
+切片状态文件一百来个 —— 大部分事件根本进不了那一页，而它正是追溯的入口。
 
 ---
 

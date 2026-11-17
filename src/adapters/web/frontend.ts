@@ -30,12 +30,21 @@ ${renderStyles()}
 <body>
 <div id="app">
   <header>
-    <h1>zelto 驾驶舱 <small id="summary-line">加载中…</small></h1>
+    <h1><span id="project-name" class="project-name">…</span> <span class="h1-sep">·</span> <span class="h1-sub">zelto 驾驶舱</span> <small id="summary-line">加载中…</small></h1>
+    <div class="head-meta">
+      <span id="refresh-line" class="muted small">正在连接…</span>
+      <span id="project-root" class="muted small"></span>
+    </div>
     <nav>
       <button data-view="overview" class="active">总览</button>
       <button data-view="slices">切片</button>
       <button data-view="signs">待签字</button>
       <button data-view="events">事件</button>
+      <button data-view="metrics">度量</button>
+      <button data-view="stalls">停机</button>
+      <button data-view="pipeline">全链</button>
+      <button data-view="budget">预算</button>
+      <button data-view="policy">策略</button>
     </nav>
   </header>
   <main id="main"><p class="muted">加载中…</p></main>

@@ -3,7 +3,8 @@
 // 手动路由，零依赖。端点少，路由表一眼能看完 ——
 // 这正是 ADR-010 §7.1 选 `node:http` 的理由。
 //
-// 端点清单（ADR-072 §6）—— 除签字外全是只读：
+// 端点清单（ADR-072 §6 + ADR-010 §5.3 里 ADR-072 未砍掉的只读端点）——
+// 除签字外全是只读：
 //   GET  /api/slices
 //   GET  /api/slices/:id
 //   GET  /api/slices/:id/events
@@ -11,6 +12,12 @@
 //   GET  /api/events
 //   GET  /api/sign-requests
 //   GET  /api/summary
+//   GET  /api/project      （工程名 / 根目录 —— 驾驶舱标题用）
+//   GET  /api/metrics      （全项目度量）
+//   GET  /api/stalls       （停机列表）
+//   GET  /api/policy       （策略规则）
+//   GET  /api/budget       （预算概览）
+//   GET  /api/pipeline     （需求→设计→版本→切片 全链状态）
 //   POST /api/sign-requests/:id/approve
 //
 // **没有** run / gate / freeze / admit / abandon / resume ——
@@ -42,9 +49,51 @@ export function createWebRouter(): WebRouter {
 async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
   const { method, path, api } = ctx;
 
+  // ── GET /api/project ────────────────────────────────────────────────
+  // 工程信息（名称 / 根目录）—— 驾驶舱标题用
+  if (method === 'GET' && path === '/api/project') {
+    sendJson(res, 200, await api.projectInfo());
+    return;
+  }
+
   // ── GET /api/summary ────────────────────────────────────────────────
   if (method === 'GET' && path === '/api/summary') {
     sendJson(res, 200, await api.summary());
+    return;
+  }
+
+  // ── GET /api/metrics ────────────────────────────────────────────────
+  // 全项目度量报告（ADR-010 §5.3）
+  if (method === 'GET' && path === '/api/metrics') {
+    sendJson(res, 200, await api.metrics());
+    return;
+  }
+
+  // ── GET /api/stalls ─────────────────────────────────────────────────
+  // 停机列表（ADR-010 §5.3）
+  if (method === 'GET' && path === '/api/stalls') {
+    sendJson(res, 200, await api.stalls());
+    return;
+  }
+
+  // ── GET /api/policy ─────────────────────────────────────────────────
+  // 策略规则列表（ADR-010 §5.3）—— 只读
+  if (method === 'GET' && path === '/api/policy') {
+    sendJson(res, 200, await api.policy());
+    return;
+  }
+
+  // ── GET /api/budget ─────────────────────────────────────────────────
+  // 预算概览（ADR-010 §5.3）—— 只读
+  if (method === 'GET' && path === '/api/budget') {
+    sendJson(res, 200, await api.budget());
+    return;
+  }
+
+  // ── GET /api/pipeline ───────────────────────────────────────────────
+  // AI pipeline 全链状态（ADR-010 §5.3）—— 只读
+  if (method === 'GET' && path === '/api/pipeline') {
+    sendJson(res, 200, await api.pipeline());
     return;
   }
 
