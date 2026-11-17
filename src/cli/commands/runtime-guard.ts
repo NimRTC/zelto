@@ -45,21 +45,71 @@ export const MANAGED_SETTINGS_PATH = CLAUDE_SETTINGS_RELATIVE.replace(/\\/g, '/'
  *
  * 主仓工作区里本来就有 `-dirty`（例如 nimrtc 的 msquic 嵌套 submodule
  * 被改过），worktree 继承了这份脏。快照只读 `git status`，不调模型、
- * 不触网（C3）。返回相对 worktree 的正斜杠路径；读不到时返回空数组
- * （不阻断开工，审计退回老行为）。
+ * 不触网（C3）。返回相对 worktree 的正斜杠路径。
+ *
+ * ── 读不到时**不能**假装干净（D-61）────────────────────────────
+ *
+ * 原来的写法是 `catch { return []; }` —— 读不到就返回空数组，
+ * 语义上是「这个 worktree 一开始是干净的」。
+ *
+ * **但「读不到」和「干净」是两件事。**
+ *
+ * 实测（nimrtc-zelto v3-weaknet-verdict，2026-11-17）：
+ * worktree 建在大仓库上，`git status --porcelain --untracked-files=all`
+ * 跑了 **60 秒还没完** → 撞上 `timeout: 60_000` → 抛异常
+ * → 快照返回 `[]` → 审计以为「预置脏不存在」
+ * → 那个本来就脏的规格副本被判成「agent 越界写入」
+ * → 整轮作废（agent 一个字节都没碰它）。
+ *
+ * 同一片重跑一次，那次 git status 1.2 秒就完了 —— 快照正常，
+ * 结果那一轮什么毛病都没有。**同一个工程、同一个文件，
+ * 两次运行结论相反。**
+ *
+ * 这比「读不到」本身严重：**判定的输入不可复现**。
+ *
+ * 修法：**读不到就明确说读不到**，别装作干净。
+ * `snapshotBaselineChanged` 失败时抛出去，让调用方决定怎么办 ——
+ * 而调用方（装守卫）**拒绝开工**：基线不明的运行，
+ * 审计结论必然不可信（要么误判越界，要么漏判越界）。
+ *
+ * 「不阻断开工」是错的取舍：宁可这一轮不跑，
+ * 也不要跑出一轮**结论随缘**的判定。
  */
 export function snapshotBaselineChanged(worktreePath: string): string[] {
   try {
     const out = execFileSync(
       'git',
       ['-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=all'],
-      { cwd: worktreePath, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+      {
+        cwd: worktreePath,
+        encoding: 'utf-8',
+        // 超时给 3 分钟而不是 60 秒（D-61）。
+        //
+        // 实测：刚建出来的 worktree 上第一次 git status 要把整棵树
+        // stat 一遍（nimrtc 带 googletest / msquic 两个大 submodule），
+        // 冷缓存下**能跑过 60 秒** —— 而 60 秒那次刚好撞上超时，
+        // 于是快照被静默丢成「干净的」，整轮被判越界。
+        //
+        // 缓存热了之后同一条命令只要 0.6~1.7 秒。
+        // 也就是说：慢的那一次恰恰是**第一次**，
+        // 而第一次恰恰是最不能出错的那一次
+        // —— 它决定后面所有审计的基线。
+        timeout: 180_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
     );
     // 解析规则与审计侧共用（decodeGitPath 处理中文路径的八进制转义），
     // 两边各抄一份就会漂移 —— D-28 就是这么来的。
     return parsePorcelainStatus(String(out));
-  } catch {
-    return [];
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `无法取得 worktree 的基线快照（git status 失败）：${message}\n` +
+        `  worktree：${worktreePath}\n` +
+        `  这一轮不开工 —— 基线不明的话，运行后的写集审计分不清\n` +
+        `  「这个文件本来就是脏的」与「agent 越界改了它」，\n` +
+        `  结论会随 git status 的快慢变化。`,
+    );
   }
 }
 
@@ -140,6 +190,15 @@ export async function installRuntimeGuard(
   const projectRoot = resolve(options.projectRoot);
   const hookRoot = options.worktree ? resolve(options.worktree) : projectRoot;
 
+  // D-29 基线快照：worktree 建出来那一刻就已经脏的路径（主仓继承的 -dirty）。
+  // 必须在 agent 开工前拍 —— 之后再拍就分不清谁写的了。
+  //
+  // **在取预约之前拍**（D-61）：快照失败会抛（读不到 ≠ 干净）。
+  // 若放在取预约之后，一次抛错就会留下一个**没人释放的预约**
+  // → 下一片撞写集冲突 → 整个队列卡住。
+  // 先拍快照：拍不到就什么都没开始，不留残局。
+  const baselineChanged = options.worktree ? snapshotBaselineChanged(hookRoot) : [];
+
   const store = new ReservationStore(reservationDir(projectRoot));
   const reservation = await store.acquire(options.sliceId, {
     writes: options.writes,
@@ -159,10 +218,6 @@ export async function installRuntimeGuard(
   };
   const installed = installClaudeCodeHook(hookOptions);
   const exec = buildPreToolHookExec(hookOptions);
-
-  // D-29 基线快照：worktree 建出来那一刻就已经脏的路径（主仓继承的 -dirty）。
-  // 必须在 agent 开工前拍 —— 之后再拍就分不清谁写的了。
-  const baselineChanged = options.worktree ? snapshotBaselineChanged(hookRoot) : [];
 
   if (!installed.installed) {
     // 钩子没装上 = 运行时拦不住越界写。运行后的审计还在，但过程里没人拦 ——
