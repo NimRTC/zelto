@@ -104,7 +104,8 @@ export function findDeadSlices(slices: SliceData[]): DeadSlice[] {
 }
 
 /**
- * 找出空壳切片：状态是 `running`、**没有停机分类**、活性判定为 `stale` / `dead`。
+ * 找出空壳切片：状态是 `running`、**没有停机分类**、活性判定为 `stale` / `dead`
+ * **或压根没有任何运行记录**。
  *
  * 「提问回路」（`agent_question`）永远排除：那是有分类的、agent 还活着。
  *
@@ -112,6 +113,18 @@ export function findDeadSlices(slices: SliceData[]): DeadSlice[] {
  * 老会话文件没有 pid，进程表查不了 —— 那是「无法确认活着」而不是
  * 「确认活着」。对它们唯一的证据就是时间：几小时没有任何心跳，还能是什么？
  * 这类切片**不会自动改状态**（改状态必须显式），但必须能在清理命令里被看见。
+ *
+ * 为什么「压根没有运行记录」也要算进来（D-64）：
+ * 切片状态是 `running`，但会话/任务文件里**一条记录都没有** ——
+ * 说明 agent 从来没起来过（准备阶段就挂了：装守卫失败、worktree 建不出来、
+ * 进程在起 agent 前被杀）。这比 stale/dead 更确定：**没有任何东西在管它**。
+ *
+ * 原判据把它漏掉了：`classifyLiveness(null)` 返回 `finished`
+ * （不是 stale/dead）→ 不算空壳 → `zelto stall --reap` 看不见它。
+ * 结果是这种切片永远卡在 running：跑不了、合不了、reap 不到，
+ * 唯一出路是 `abandon`（整个切片作废，规格得重写）。
+ * 实测于 nimrtc-zelto v4-ai-teammate（2026-11-18）：
+ * `version start v4` 装守卫时 git status 超时 → 整批 abort → 切片卡在 running。
  */
 export function findOrphanShells(
   slices: SliceData[],
@@ -127,7 +140,18 @@ export function findOrphanShells(
     let liveness: LivenessInfo;
     try {
       const rec = readSliceLivenessRecord(projectRoot, slice.id);
-      liveness = classifyLiveness(rec, { isProcessAlive });
+      if (rec === null) {
+        // 没有任何运行记录 —— agent 从来没起过（D-64）。
+        liveness = {
+          state: 'dead',
+          lastActivityAt: null,
+          idleMs: null,
+          pid: null,
+          reason: '没有任何运行记录（agent 从未开跑）',
+        };
+      } else {
+        liveness = classifyLiveness(rec, { isProcessAlive });
+      }
     } catch {
       continue;
     }

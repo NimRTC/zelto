@@ -89,7 +89,7 @@ import {
   printOutcome,
   writeSetOutcomeLines,
 } from './run-messages.js';
-import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost, gateCommandsForSlice, markSliceStalled, precheckWriteSetAgainstPolicy } from './run-support.js';
+import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost, gateCommandsForSlice, markSliceStalled, precheckWriteSetAgainstPolicy, revertRunAbortedBeforeStart } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -1687,6 +1687,11 @@ register('run', async (args) => {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ❌ 无法取得写集预约: ${msg}`);
+      // agent 还没起（拿不到预约就 fail closed）—— 切片必须退回 frozen，
+      // 否则卡在 running 且没人能救（D-64）：
+      //   `run` 拒绝跑（准入只认 frozen/completed）、`merge` 不收、
+      //   `stall --reap` 看不见（连会话文件都没写）、只能 `abandon`。
+      await revertRunAbortedBeforeStart(id, { reason: `无法取得写集预约: ${msg}` });
       return 1;
     }
     guard = activeGuard;

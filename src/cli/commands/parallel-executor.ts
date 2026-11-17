@@ -31,7 +31,7 @@ import {
   store,
   worktreeManager,
 } from './shared.js';
-import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, markSliceStalled } from './run-support.js';
+import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, markSliceStalled, revertRunAbortedBeforeStart } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -306,6 +306,27 @@ export async function executeSlicesParallel(
 
   const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
+  /**
+   * 把本轮「已 startRun 但还没起 agent」的切片一起退回 `frozen`（D-64）。
+   *
+   * 为什么是**整批**退而不是只退失败的那一片：并行批次里，第 2 片装守卫失败时，
+   * 第 1 片已经被 startRun 推到 `running`、守卫也装了，但 agent 一次都没起
+   * （Phase 3 在整个准备循环之后才拉 agent）。整批 abort 时，第 1 片同样卡在
+   * running —— 而它的守卫会被 `releaseGuards` 摘掉，剩下一个
+   * 「running 但没人管、也没预约」的壳子。
+   *
+   * 这种壳子**没人能救**（实测 nimrtc-zelto v4-ai-teammate，2026-11-18）：
+   *   - `run` 拒绝跑（准入只认 frozen / completed）
+   *   - `merge` 不收它（没签字）
+   *   - `stall --reap` 看不见它（连会话文件都没写 → 活性判定不是 stale/dead）
+   *   - 唯一出路是 `abandon` —— 整个切片作废，规格得重写
+   */
+  async function revertStartedRound(started: string[], reason: string): Promise<void> {
+    for (const id of started) {
+      await revertRunAbortedBeforeStart(id, { reason });
+    }
+  }
+
   /** 被拉闸打断、没能跑起来的切片 */
   const haltedIds = new Set<string>();
 
@@ -376,6 +397,9 @@ export async function executeSlicesParallel(
 
   // 每个切片一份运行时守卫（C9）：写集预约 + PreToolUse 钩子
   const guards = new Map<string, RuntimeGuard>();
+  // 本轮已经 startRun（切片 → running）但**还没起 agent** 的切片。
+  // 中止时它们要一起退回 frozen —— 见循环里的说明（D-64）。
+  const startedThisRound: string[] = [];
 
   // 主仓有未提交改动时提醒：这些改动不会被带进 worktree
   try {
@@ -391,6 +415,14 @@ export async function executeSlicesParallel(
     const slice = slices[i];
 
     await scheduler.startRun(st.id);
+    // 记下「这一轮已经 startRun 过」—— 中止时要把它连同后面几片一起退回 frozen。
+    //
+    // 为什么不能只退失败的那一片（D-64）：并行批次里，第 2 片装守卫失败时，
+    // 第 1 片已经被 startRun 推到 `running`、守卫也装了，但**agent 一次都没起**
+    // （Phase 3 在整个循环之后才拉 agent）。整批 abort 时，第 1 片同样卡在
+    // running —— 而且它的守卫会被 releaseGuards 摘掉，剩下一个
+    // 「running 但没人管」的壳子。
+    startedThisRound.push(st.id);
 
     // 约束包：规格路径 + 写集 + 保护域 + 相关策略规则 + 亲和上下文（只读建议）
     const affinityGroup = options.affinity?.get(st.id) ?? null;
@@ -422,6 +454,10 @@ export async function executeSlicesParallel(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ❌ ${st.id}: 无法创建隔离 worktree: ${msg}`);
+      // 切片已经被 startRun 推到 `running` 了 —— 退回去（D-64）。
+      // 不退的话这片卡在 running，而「没开跑过的 running」连
+      // `stall --reap` 都看不见（没有会话记录 → 活性判定不是 stale/dead）。
+      await revertStartedRound(startedThisRound, `无法创建隔离 worktree: ${msg}`);
       await releaseGuards(guards);
       return { ...empty(), abortReason: `${st.id}: 无法创建隔离 worktree: ${msg}`, aborted: true };
     }
@@ -440,6 +476,8 @@ export async function executeSlicesParallel(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ❌ ${st.id}: 无法取得写集预约: ${msg}`);
+      // 同上：agent 还没起（拿不到预约就 fail closed），切片必须退回 frozen（D-64）。
+      await revertStartedRound(startedThisRound, `无法取得写集预约: ${msg}`);
       await releaseGuards(guards);
       return { ...empty(), abortReason: `${st.id}: 无法取得写集预约: ${msg}`, aborted: true };
     }

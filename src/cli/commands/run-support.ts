@@ -618,6 +618,61 @@ export async function rollbackStalledSlice(
 }
 
 /**
+ * 「agent 还没起来就中止了」—— 把切片退回 `frozen`，不留停机分类。
+ *
+ * 病灶（实测于 nimrtc-zelto v4-ai-teammate，2026-11-18）：
+ *
+ *   `zelto version start v4` → 并行执行器先 `startRun`（切片 → `running`），
+ *   再建 worktree、再装写集守卫。装守卫时 git status 超时（ETIMEDOUT），
+ *   执行器 abort 整批 —— 但**切片留在了 `running`**。
+ *
+ *   而这个状态**没人能救**：
+ *   - `zelto run` 拒绝跑（准入只认 frozen / completed）
+ *   - `zelto merge` 不收它（没签字）
+ *   - `zelto stall --reap` 看不见它 —— 见 `findOrphanShells`：它按
+ *     「会话/任务文件里的活性记录」判定，而这片**连会话文件都没写**
+ *     （agent 根本没起），`classifyLiveness(null)` 返回 `finished`
+ *     （不是 stale/dead）→ 不算空壳 → 不在清理名单里
+ *   - 唯一出路是 `zelto abandon` —— 整个切片作废，规格得重写
+ *
+ * 也就是「环境抖一下，切片就废了」。这不是设计意图：拿不到预约是
+ * **环境问题**，重跑就行（与「agent 失败通常重跑就能过」同一条理）。
+ *
+ * 为什么**不**写停机分类：停机的语义是「agent 跑了但没成」，
+ * 而这里 agent 压根没跑 —— 写分类会让 `zelto next` 把人往一片
+ * 根本没开工的切片上引。退到 `frozen` 就够了：它本来就是「可再跑」。
+ *
+ * 与 `markSliceStalled` 的区别：那个写停机分类（agent 跑了没成），
+ * 这个不写（agent 没跑）。两条退路都落到 `frozen`。
+ *
+ * C1: 状态只落在文件里；C4: 留痕写 append-only 事件
+ */
+export async function revertRunAbortedBeforeStart(
+  id: string,
+  options?: { reason?: string; actor?: string },
+): Promise<{ reverted: boolean; from: string | null; to: string | null }> {
+  const actor = options?.actor ?? 'zelto';
+  const reason = options?.reason ?? 'agent 未开跑即中止';
+
+  // 退状态 —— 与 ADR-037 的越界回退同一条路、同一个语义：
+  // 「这一轮没跑成，但不算数，可以再跑」。
+  const rollback = await rollbackStalledSlice(id, { reason, actor });
+  if (!rollback.reverted) return rollback;
+
+  // 留痕：为什么这一轮没跑成。事件里说清「agent 没起」，
+  // 否则人看到 run.aborted 会以为 agent 跑了却没成果。
+  await events.append(id, 'run.aborted', actor, {
+    sliceId: id,
+    reason,
+    agentStarted: false,
+    stateFrom: rollback.from,
+    stateTo: rollback.to,
+  });
+
+  return rollback;
+}
+
+/**
  * 处置「写集越界」的切片：退回 `frozen` 并留痕。
  *
  * 为什么必须退回 `frozen`（而不是把切片留在 `running`）：
