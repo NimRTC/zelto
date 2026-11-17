@@ -129,7 +129,7 @@ describe('D-61 源码级锁定：快照在取预约之前拍', () => {
     );
   });
 
-  it('超时从 60 秒放宽到 3 分钟（慢的那一次恰恰是第一次）', () => {
+  it('不再用 --untracked-files=all（它在冷 worktree 上要 224 秒，D-63）', () => {
     const repoRoot = process.cwd();
     const srcPath = join(repoRoot, 'src', 'cli', 'commands', 'runtime-guard.ts');
     const src = readFileSync(srcPath, 'utf-8');
@@ -138,15 +138,29 @@ describe('D-61 源码级锁定：快照在取预约之前拍', () => {
     assert.ok(fnIdx >= 0, '找不到 snapshotBaselineChanged');
     const body = src.slice(fnIdx, src.indexOf('\n}\n', fnIdx));
 
-    assert.match(
-      body,
-      /timeout:\s*180_000/,
-      '超时必须是 180 秒 —— 冷缓存下第一次 git status 能跑过 60 秒（D-61 实测）',
-    );
+    // D-63：`git status --porcelain --untracked-files=all` 要逐个 stat
+    // 每一个未跟踪文件，nimrtc 带 googletest / msquic 两个大 submodule，
+    // 冷缓存下 **224 秒** —— 比任何合理超时都长。
+    //
+    // 原来的修法是「把超时从 60 秒放宽到 180 秒」。那不够：
+    // 224 > 180，**慢的那一次恰恰是第一次**，
+    // 而第一次恰恰决定后面所有审计的基线。
+    //
+    // 现在改用 `listChangedPaths`（diff + diff --cached + ls-files），
+    // 同样语义、快 17 倍 —— 于是超时这个变量整个不成立了。
+    //
+    // 判据只看**代码**：注释里要提到那个旧标志（说明为什么换），
+    // 所以先把注释剥掉再匹配。
+    const code = body.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     assert.doesNotMatch(
-      body,
-      /timeout:\s*60_000/,
-      '60 秒太紧 —— 实测刚好在那撞上超时，把基线静默丢成「干净的」',
+      code,
+      /--untracked-files=all/,
+      '快照不能用 --untracked-files=all —— 实测冷 worktree 上要 224 秒（D-63）',
+    );
+    assert.match(
+      code,
+      /listChangedPaths\(/,
+      '快照应改用 listChangedPaths（语义等价、快 17 倍）',
     );
   });
 });

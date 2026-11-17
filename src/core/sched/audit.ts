@@ -389,6 +389,25 @@ export function hasRefsSlice(message: string, sliceId: string): boolean {
  * 少一条就会漏判：只留 `diff` 会漏掉未跟踪文件（agent 新建的文件），
  * 只留 `ls-files` 会漏掉已修改的文件 —— 两者都是越界写入的常见形态。
  *
+ * ── 为什么读不出来要**抛错**而不是「少一路」 ──────────────────────────
+ *
+ * 这段代码原本是「catch 掉、少一路、继续」（D-63 初版）。那样写有个致命后果：
+ *
+ *   `git diff --name-only` 在**不是 git 仓库**的目录里会失败（exit 129），
+ *   `git ls-files` 也会失败（exit 128）。三路全失败 → 返回**空数组**。
+ *
+ *   而空数组在审计那边是「**这个 worktree 什么都没改**」——
+ *   `auditWorktreeWrites` 于是报 `violations: []`、`error: null`，
+ *   **审计通过了**。
+ *
+ *   这与 C9 直接冲突：写集审计的意义是「越界就拦下」，
+ *   而「git 读不出来」时它反而说「一切正常」。
+ *   实测（2026-11-18，D-63 回归）：在非仓库目录里审计，
+ *   `result.error` 是 null、`violations` 是空 —— 测试直接挂了。
+ *
+ *   「读不出来」必须当成「判不出来」，而判不出来要**fail closed**：
+ *   抛错 → 上层报 `error` → 这一轮不算数（D-61 的同一条退路）。
+ *
  * C3: 纯 git 判定，不调模型、不触网
  */
 export function listChangedPaths(repoRoot: string): string[] {
@@ -401,21 +420,16 @@ export function listChangedPaths(repoRoot: string): string[] {
     }
   };
 
-  try {
-    add(git(['diff', '--name-only'], repoRoot));
-  } catch {
-    // 读不出来就少一路 —— 调用方按「判不出来」处理（保守方向）
-  }
-  try {
-    add(git(['diff', '--cached', '--name-only'], repoRoot));
-  } catch {
-    // 同上
-  }
-  try {
-    add(git(['ls-files', '--others', '--exclude-standard'], repoRoot));
-  } catch {
-    // 同上
-  }
+  // 三条命令任一读不出来 → 抛错（fail closed）。
+  //
+  // 不吞异常：吞掉的后果是「审计读不到 git → 一切正常」，
+  // 而那正是 C9 要防的事 —— 越界写入会在审计里消失。
+  //
+  // 「不是 git 仓库」这种整体失败会在这里冒出来，
+  // 上层据此把这一轮判成「审计失败」而不是「没有越界」。
+  add(git(['diff', '--name-only'], repoRoot));
+  add(git(['diff', '--cached', '--name-only'], repoRoot));
+  add(git(['ls-files', '--others', '--exclude-standard'], repoRoot));
 
   return [...paths].sort();
 }
