@@ -40,6 +40,15 @@ export interface WriteSetCheckResult {
   issues: string[];
   /** 提示项：需要人看一眼，但不该拦住 */
   advisories: string[];
+  /**
+   * 「路径可能写错了」的候选 —— 写集里的路径不存在，
+   * 但仓库里**有同名文件在别的目录**。
+   *
+   * 这不是阻断项（agent 大概率会新建一个同名文件），
+   * 但它几乎总是「写集路径写错了」的信号：真实路径多了一层
+   * `include/nimrtc/xxx/` 之类的目录段。
+   */
+  nearMisses: Array<{ path: string; candidates: string[] }>;
 }
 
 /** 判定选项 */
@@ -173,6 +182,74 @@ function globMatchesSomething(pattern: string, projectRoot: string): boolean {
 }
 
 /**
+ * 在仓库里找「同名文件在别的目录」的候选。
+ *
+ * 病灶（实测于 nimrtc-zelto v2-input-binder）：
+ *
+ *   写集写的是 `src/modules/rd_input/ref_frame_binder.hpp`，
+ *   仓库里真实的文件在 `src/modules/rd_input/include/nimrtc/rd_input/ref_frame_binder.hpp`。
+ *   写集路径「不存在」→ 门禁①只提示「agent 会新建」→ 放行 →
+ *   agent 找到真实文件去改 → hook 按写集判定越界 → 拒绝。
+ *
+ *   也就是说：**写集路径写错 = agent 注定被拒**，但门禁①看不出来。
+ *
+ * 做法：按**文件名**（不含目录）在仓库里找同名文件。
+ * 命中且路径不同 → 报成提示项（不阻断，但要说清「大概你想写的是那个」）。
+ *
+ * 代价控制：只扫有限深度、跳过常见的忽略目录、总量封顶。
+ */
+function findSameNameElsewhere(
+  pattern: string,
+  projectRoot: string,
+  limit = 5,
+): string[] {
+  const fileName = pattern.slice(pattern.lastIndexOf('/') + 1);
+  if (!fileName || fileName.includes('*') || fileName.includes('?')) return [];
+
+  const skipDirs = new Set([
+    'node_modules', '.git', '.zelto', 'dist', 'dist-test', 'build',
+    'target', '__pycache__', 'coverage', '.cache', 'out', '.claude',
+  ]);
+
+  const found: string[] = [];
+  const stack: string[] = [resolve(projectRoot)];
+  let visited = 0;
+
+  while (stack.length > 0 && visited < 20000 && found.length < limit) {
+    const dir = stack.pop()!;
+    visited++;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = resolve(dir, entry);
+      const rel = toPosix(relative(resolve(projectRoot), full));
+      if (rel === toPosix(pattern)) continue; // 它自己不算「在别处」
+      let isDir = false;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (isDir) {
+        if (skipDirs.has(entry)) continue;
+        stack.push(full);
+        continue;
+      }
+      if (entry === fileName) {
+        found.push(rel);
+        if (found.length >= limit) break;
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
  * 判定写集。
  *
  * 返回的 `issues` 是阻断项（写集本身有问题），`advisories` 是提示项
@@ -185,6 +262,7 @@ export function evaluateWriteSet(options: WriteSetCheckOptions): WriteSetCheckRe
   const globs: string[] = [];
   const issues: string[] = [];
   const advisories: string[] = [];
+  const nearMisses: WriteSetCheckResult['nearMisses'] = [];
 
   for (const raw of options.writes) {
     const pattern = raw.trim();
@@ -220,9 +298,20 @@ export function evaluateWriteSet(options: WriteSetCheckOptions): WriteSetCheckRe
     // 不存在 —— 这是 agent 要**新建**的文件，不是错误。
     toCreate.push(pattern);
     advisories.push(`Write-set path does not exist yet (agent will create it): ${pattern}`);
+
+    // ── 近名文件在别处 → 「路径可能写错了」的提示 ──
+    // 见 findSameNameElsewhere 的说明：写集路径写错 = agent 注定被 hook 拒绝。
+    const candidates = findSameNameElsewhere(pattern, projectRoot);
+    if (candidates.length > 0) {
+      nearMisses.push({ path: pattern, candidates });
+      advisories.push(
+        `Write-set path "${pattern}" does not exist, but a file with the same name exists at: ` +
+          `${candidates.join(', ')} — the write-set path is likely wrong (agent would be denied on the real path)`,
+      );
+    }
   }
 
-  return { existing, toCreate, globs, issues, advisories };
+  return { existing, toCreate, globs, issues, advisories, nearMisses };
 }
 
 /**

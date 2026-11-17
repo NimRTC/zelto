@@ -120,6 +120,23 @@ describe('zelto freeze —— 规格与写集一致性（D-4）', () => {
     await mkdir(join(TEST_DIR, '.zelto', 'locks'), { recursive: true });
     await mkdir(join(TEST_DIR, 'specs', 'slices'), { recursive: true });
     await mkdir(join(TEST_DIR, 'policy'), { recursive: true });
+    // freeze 现在也是闸门：冻结前会预检「写集 × 策略」。这里要测的是
+    // 规格 ↔ 写集的一致性，不是策略覆盖，所以给测试工作区一份允许
+    // `src/**` 的策略 —— 否则每条用例都会先被策略预检拦下（那是另一条判据）。
+    await writeFile(
+      join(TEST_DIR, 'policy', 'policy.yaml'),
+      [
+        'rules:',
+        '  - id: allow-src',
+        '    match:',
+        '      path: "src/**"',
+        '      operation: "write"',
+        '    action: allow',
+        '    basis: "policy.yaml#allow-src"',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
   });
 
   after(async () => {
@@ -292,6 +309,15 @@ describe('parseMentionedPaths —— 路径识别的白名单', () => {
   it('散文不被误判成路径', () => {
     const paths = parseMentionedPaths('这个功能应该很快，用户会觉得这个体验不错。');
     assert.deepEqual(paths, [], `散文不应产生路径，实际：${JSON.stringify(paths)}`);
+  });
+
+  it('指标名的 p50/p95 简写不被当成路径', () => {
+    // `input_to_photon_p50/p95` 含 `/`，但它是**指标名**不是文件。
+    // 早先的判据「含 `/` 就是路径」把它当成文件报出去，
+    // 于是 D-4 报「规格提到 input_to_photon_p50/p95，但它不在写集里」——
+    // 一条根本不是文件的东西。
+    const paths = parseMentionedPaths('产出 `input_to_photon_p50/p95`。');
+    assert.deepEqual(paths, [], `指标名不应产生路径，实际：${JSON.stringify(paths)}`);
   });
 
   it('URL 不被当成路径', () => {

@@ -22,6 +22,12 @@ import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../..
 import type { EventEnvelope } from '../../core/events/index.js';
 import { extractClaudeJson, extractClaudeResult, parseClaudeUsage } from '../usage-parse.js';
 import { killProcessTree, killProcessTreeGracefully } from '../process-tree.js';
+import { readProcessTable, findDescendants, findPidsByCmdline } from '../../core/sched/process-table.js';
+
+/** 睡一会儿（毫秒）—— 只用于「等 agent 进程起来」这种轮询。 */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -52,6 +58,17 @@ export interface PersistentSessionData {
   lastOutputAt?: string;
   /** 跑这条会话的 agent 子进程 pid —— 没了它就没法判定进程死活 */
   pid?: number;
+  /**
+   * **真正的 agent 进程** pid（Windows 上与 `pid` 不同）。
+   *
+   * `pid` 记的是外层 `cmd.exe`（`shell: true` 的必然结果），
+   * 真正的 agent（`claude.exe`）是它的孙进程。外层退出后 agent 还活着，
+   * 但按 `pid` 判就是「死了」→ 看门狗误判 → 在同一个 worktree 上
+   * 又起一个 agent，两个 agent 互相覆盖（实测于 nimrtc-zelto v2-input-binder）。
+   *
+   * 所以活性判定以本字段为准；它没记上时退回到「看整棵进程树」。
+   */
+  agentPid?: number;
   /**
    * Agent-side session id (the Claude Code session uuid).
    *
@@ -152,6 +169,23 @@ function claudeCodeFlags(extra: string[] = []): string {
   ].join(' ');
 }
 
+/**
+ * 一行 stderr 是不是 Claude Code 的启动噪声（ADR-074）。
+ *
+ * 判据：以 `[claude-code:` 开头的诊断行（如 `unrecognized_model`）。
+ * 实测于 nimrtc-zelto：接自定义网关时 `ANTHROPIC_MODEL=deepseek-v4-flash-anthropic`
+ * 不在 Claude Code 内置模型表里，它每次启动都打一行
+ * `[claude-code:unrecognized_model] {...}` —— **一次都没导致失败**
+ * （退出码 0、结果完整），只是把会话文件的「最后一条输出」霸占成了噪声。
+ *
+ * 多行块里只要混有真实输出，就不算噪声（返回 false）。
+ */
+export function isStartupNoise(text: string): boolean {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return false;
+  return lines.every((l) => l.trim().startsWith('[claude-code:'));
+}
+
 export class ClaudeAgentAdapter implements ExecutorAdapter {
   readonly name = 'claude-agent';
   readonly metadata: AdapterMeta = ADAPTER_META;
@@ -164,6 +198,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
   private readonly sessions = new Map<string, SessionState>();
+  /**
+   * 尚未落盘的启动噪声（`[claude-code:*]` 行），按会话记。
+   * 运行成功 → 丢弃；运行失败 → 补回会话输出（ADR-074，见 spawn 的 stderr 处理）。
+   */
+  private readonly pendingNoise = new Map<string, string[]>();
   /** Live session records — the in-memory twin of the persisted session file. */
   private readonly sessionData = new Map<string, PersistentSessionData>();
   private timeouts = new Map<string, ReturnType<typeof setTimeout>>();
@@ -362,17 +401,6 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       }
     });
 
-    // Capture stderr
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf-8');
-      state.output.push(text);
-      sessionData.output.push(text);
-      touchActivity();
-      if (this.onOutput) {
-        this.onOutput(sessionId, text);
-      }
-    });
-
     const state: SessionState = {
       child,
       startedAt: sessionData.startedAt,
@@ -385,11 +413,52 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
 
     this.sessions.set(sessionId, state);
 
+    // Capture stderr
+    //
+    // ADR-074：Claude Code 的启动噪声（`[claude-code:<tag>] …`，例如
+    // `unrecognized_model` —— 自定义网关下 ANTHROPIC_MODEL 不匹配内置表时
+    // 它每次启动都会打一行）**不是失败**：运行照常完成、退出码 0。
+    // 但它会霸占会话文件的「最后一条输出」，驾驶舱于是把一条噪声显示成
+    // 「进度」。处理方式：运行中先压着，**失败时**再补回输出；
+    // 成功时丢弃 —— 成功的事实由 `run.finished` 与退出码记录，不需要噪声陪葬。
+    const pendingNoise: string[] = [];
+    this.pendingNoise.set(sessionId, pendingNoise);
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf-8');
+      state.output.push(text);
+      const noiseOnly = isStartupNoise(text);
+      if (noiseOnly) {
+        pendingNoise.push(text);
+      } else {
+        // 噪声之后有真实输出：噪声先补回**会话文件**，保持输出顺序
+        // （内存里的输出不补 —— 它服务的是本轮 `onOutput`，噪声已经在界面上被压掉了）
+        if (pendingNoise.length > 0) {
+          sessionData.output.push(...pendingNoise.splice(0));
+        }
+        sessionData.output.push(text);
+        touchActivity();
+      }
+      if (this.onOutput && !noiseOnly) {
+        this.onOutput(sessionId, text);
+      }
+    });
+
     // D-30 心跳：pid + 最后活动时间落盘，后来的任何 zelto 调用都能判定活性。
     // 只在内存里记 = 主进程一退就全丢，这正是假死的来源。
     sessionData.pid = child.pid ?? undefined;
     sessionData.lastActivityAt = nowIso;
     saveSession(sessionData);
+
+    // 定位**真正的 agent 进程** pid（见 PersistentSessionData.agentPid 的说明）。
+    //
+    // `child.pid` 是外层 cmd.exe 的 pid（`shell: true` 的必然结果），
+    // 真正的 agent 是孙进程。外层退出后 agent 还活着 ——
+    // 按 `child.pid` 判会误判「死了」，看门狗据此重跑，
+    // 于是在同一个 worktree 上起了第二个 agent，两者互相覆盖产出。
+    //
+    // 找法：agent 命令行里有本次会话独有的 `--session-id <uuid>`，
+    // 按这个特征在进程表里反查，比「猜第几层子进程」可靠。
+    void this.resolveAgentPid(sessionId, agentSessionId, child.pid);
 
     // Set timeout
     const timeout = setTimeout(() => {
@@ -439,6 +508,75 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   }
 
   // ─── Timeout Handling ──────────────────────────────────────────────────────
+
+  /**
+   * 找出真正的 agent 进程 pid，记进会话文件。
+   *
+   * 判据：命令行里含 `--session-id <本次会话 uuid>`。
+   * 这个 uuid 是 zelto 生成的、每次运行独有，所以反查它是精确的 ——
+   * 不会误认成别人的 agent，也不会漏掉自己的。
+   *
+   * 找不到就退而求其次：取包装进程的后代里、**最深的那个**
+   * （agent 一定是链条末端）。仍然找不到就不写 ——
+   * 活性判定会退回到「看整棵进程树」，不会因此误判。
+   */
+  private async resolveAgentPid(
+    sessionId: string,
+    agentSessionId: string,
+    wrapperPid: number | undefined,
+  ): Promise<void> {
+    const needle = `--session-id ${agentSessionId}`;
+    // agent 起来要时间：轮询几次，每次间隔 1s，最多 ~8s。
+    for (let attempt = 0; attempt < 8; attempt++) {
+      await sleep(1000);
+      const data = this.sessionData.get(sessionId);
+      if (!data || data.status !== 'running') return; // 已经结束了，不必再找
+
+      const pids = await findPidsByCmdline(needle);
+      if (pids.length > 0) {
+        // 排除包装进程本身（cmd.exe 的命令行里也有这个参数）。
+        const real = pids.find((p) => p !== wrapperPid) ?? pids[0];
+        data.agentPid = real;
+        try {
+          saveSession(data);
+        } catch { /* 写盘失败不阻断运行 */ }
+        return;
+      }
+    }
+
+    // 兜底：取包装进程的最深后代。
+    if (wrapperPid === undefined) return;
+    const rows = await readProcessTable();
+    if (rows.length === 0) return;
+    const descendants = findDescendants(rows, wrapperPid);
+    if (descendants.length === 0) return;
+    // 深度 = 沿 ppid 链的长度；最深的就是离包装进程最远的那个。
+    const depthOf = (pid: number): number => {
+      const byPid = new Map(rows.map((r) => [r.pid, r]));
+      let d = 0;
+      let cur = byPid.get(pid);
+      while (cur && cur.ppid !== 0 && cur.ppid !== cur.pid && d < 32) {
+        cur = byPid.get(cur.ppid);
+        d++;
+      }
+      return d;
+    };
+    let deepest = descendants[0];
+    let deepestDepth = depthOf(deepest.pid);
+    for (const d of descendants) {
+      const depth = depthOf(d.pid);
+      if (depth > deepestDepth) {
+        deepest = d;
+        deepestDepth = depth;
+      }
+    }
+    const data = this.sessionData.get(sessionId);
+    if (!data || data.status !== 'running') return;
+    data.agentPid = deepest.pid;
+    try {
+      saveSession(data);
+    } catch { /* 写盘失败不阻断运行 */ }
+  }
 
   private handleTimeout(sessionId: string): void {
     const session = this.sessions.get(sessionId);
@@ -491,6 +629,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
         data.status = 'timeout';
       } else {
         data.status = exitCode === 0 ? 'completed' : 'failed';
+        // ADR-074：启动噪声（`[claude-code:*]`）在成功时丢弃、失败时补回。
+        // 成功时保留它只会霸占「最后一条输出」，让下一轮的人以为是当代进度。
+        const noise = this.pendingNoise.get(sessionId);
+        this.pendingNoise.delete(sessionId);
+        if (noise && noise.length > 0 && exitCode !== 0) data.output.push(...noise);
       }
       saveSession(data);
     }

@@ -400,10 +400,22 @@ function progressCell(s) {
   if (s.progressAt) {
     head.appendChild(el('span', 'muted', (head.firstChild ? ' · ' : '') + '更新于 ' + new Date(s.progressAt).toLocaleTimeString()));
   }
+  // 输出静默时长（ADR-074）：agent 活着但很久没吐字 —— 如实说，不留空白让人猜。
+  // 不是「死了」（死了有活性徽标说），而是「在跑，只是没产出」。
+  if (typeof s.elapsedIdleMs === 'number' && s.elapsedIdleMs >= 60000) {
+    head.appendChild(el('span', 'muted', ' · ' + formatIdleMs(s.elapsedIdleMs) + '无输出'));
+  }
   if (!head.firstChild) head.appendChild(el('span', 'muted', '等待 agent 输出…'));
   box.appendChild(head);
   if (s.progressLine) {
     box.appendChild(el('div', 'progress-line', s.progressLine));
+  } else if (s.state === 'running' && s.liveness !== 'dead') {
+    // 没输出 ≠ 没在跑：claude --output-format json 下 agent 只在结束时吐一次 stdout。
+    // 说清这一点，人才不会把「安静的进度行」当成「死掉」。
+    const hint = s.liveness === 'stale'
+      ? '很久没有动静 —— 看一眼 zelto status'
+      : 'agent 运行中（当前模式下输出会在结束时一次性给出）';
+    box.appendChild(el('div', 'progress-line muted', hint));
   }
   return box;
 }

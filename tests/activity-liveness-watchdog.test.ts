@@ -155,3 +155,40 @@ describe('D-30 · 看门狗预算（3 次上限）', () => {
     }
   });
 });
+
+describe('ADR-074 世代过滤 —— 上一代被收走的会话文件不算本轮现场', () => {
+  it('readSliceLivenessRecord(after=...) 跳过上一代的尸体', async () => {
+    const dir = join(tmpdir(), `zelto-gen-test-${Date.now()}`);
+    const sessions = join(dir, '.zelto', 'sessions');
+    await mkdir(sessions, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      // 上一代：06:01 起跑，pid 早已没了，status 仍是 running（进程死时没人写 failed）
+      await writeFile(join(sessions, 'old.json'), JSON.stringify({
+        sessionId: 'old', sliceId: 's1', status: 'running', pid: 48092,
+        startedAt: '2026-11-17T06:01:50.000Z', lastActivityAt: '2026-11-17T06:01:50.000Z',
+      }));
+      // 本轮：07:00 起跑
+      await writeFile(join(sessions, 'new.json'), JSON.stringify({
+        sessionId: 'new', sliceId: 's1', status: 'running', pid: 12345,
+        startedAt: '2026-11-17T07:00:00.000Z', lastActivityAt: '2026-11-17T07:00:05.000Z',
+      }));
+
+      const { readSliceLivenessRecord } = await import('../src/core/activity/liveness.js');
+      // 不传世代：取 lastActivity 最新的那份 —— 本轮
+      const anyGen = readSliceLivenessRecord(dir, 's1');
+      assert.equal(anyGen?.pid, 12345);
+
+      // 传本轮起跑时刻：上一代被过滤，即使它更「新」也不会被当成现场
+      const fresh = readSliceLivenessRecord(dir, 's1', '2026-11-17T07:00:00.000Z');
+      assert.equal(fresh?.pid, 12345);
+
+      // 本轮记录还不存在（起跑 07:30 之后）：只有上一代的尸体 → 返回 null，
+      // 而不是把尸体交出去让调用方判「死了」
+      const beforeGen = readSliceLivenessRecord(dir, 's1', '2026-11-17T07:30:00.000Z');
+      assert.equal(beforeGen, null);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

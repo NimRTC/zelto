@@ -83,6 +83,17 @@ export interface LivenessRecord {
   /** 跑这条任务的进程 pid */
   pid?: number;
   /**
+   * **真正的 agent 进程** pid（Windows 上与 `pid` 不同）。
+   *
+   * `pid` 记的是外层包装进程（`cmd.exe`），真正的 agent 是它的孙进程。
+   * 包装进程退出后 agent 还活着 —— 按 `pid` 判会误判「死了」，
+   * 看门狗据此重跑，在同一个 worktree 上起了第二个 agent
+   * （实测于 nimrtc-zelto v2-input-binder）。
+   *
+   * 有本字段时以它为准；没有就退回到「看整棵进程树」。
+   */
+  agentPid?: number;
+  /**
    * agent 的累计输出（会话文件里保存的是分块字符串数组；任务文件可能没有）。
    *
    * 驾驶舱要靠它回答「它现在在干什么」——「最后活动时间」只能说明
@@ -112,6 +123,14 @@ export function classifyLiveness(
     now?: number;
     staleThresholdMs?: number;
     isProcessAlive?: (pid: number) => boolean;
+    /**
+     * 整棵进程树是否还有活着的进程。
+     *
+     * 只在**同步**判定里可用的版本见 `classifyLivenessAsync` ——
+     * 查进程表要起子进程，是异步的，所以「看整棵树」这件事
+     * 只能在异步判定里做。
+     */
+    isProcessTreeAlive?: (pid: number) => boolean;
   } = {},
 ): LivenessInfo {
   const now = options.now ?? Date.now();
@@ -128,18 +147,34 @@ export function classifyLiveness(
   }
 
   const pid = typeof record.pid === 'number' ? record.pid : null;
+  const agentPid = typeof record.agentPid === 'number' ? record.agentPid : null;
   const lastActivity = lastActivityOf(record);
   const idleMs = lastActivity === null ? null : Math.max(0, now - lastActivity);
 
   // pid 没了 = 确定死了。这是最硬的证据 —— 先于一切超时判断。
-  if (pid !== null && options.isProcessAlive && !options.isProcessAlive(pid)) {
-    return {
-      state: 'dead',
-      lastActivityAt: lastActivity === null ? null : new Date(lastActivity).toISOString(),
-      idleMs,
-      pid,
-      reason: `进程 ${pid} 已经不在了`,
-    };
+  //
+  // **但要挑对 pid**：Windows 上记录的是外层 `cmd.exe`，真正的 agent 是孙进程。
+  // 外层退出后 agent 还活着（还在改文件、还在烧 token），
+  // 按外层 pid 判会误判「死」→ 看门狗重跑 → 同一 worktree 上起第二个 agent，
+  // 两个 agent 互相覆盖产出（实测于 nimrtc-zelto v2-input-binder）。
+  //
+  // 判定顺序：
+  //   1. 有 `agentPid` → 看它（它才是 agent 本人）
+  //   2. 没有 → 看包装 pid；**只要整棵树里还有活着的后代，就不算死**
+  const pidToCheck = agentPid ?? pid;
+  if (pidToCheck !== null && options.isProcessAlive && !options.isProcessAlive(pidToCheck)) {
+    // 包装进程不在了，但整棵树里可能还有活着的后代（agent 本人）。
+    // 只有在**确认整棵树都死了**时才算死。
+    const treeAlive = options.isProcessTreeAlive ? options.isProcessTreeAlive(pidToCheck) : false;
+    if (!treeAlive) {
+      return {
+        state: 'dead',
+        lastActivityAt: lastActivity === null ? null : new Date(lastActivity).toISOString(),
+        idleMs,
+        pid: pidToCheck,
+        reason: `进程 ${pidToCheck} 已经不在了`,
+      };
+    }
   }
 
   if (idleMs === null) {
@@ -187,6 +222,88 @@ export function classifyLiveness(
     pid,
     reason: `${formatIdle(idleMs)} 前还有动静`,
   };
+}
+
+/**
+ * 活性判定（异步版）—— 能「看整棵进程树」的版本。
+ *
+ * 与同步版 `classifyLiveness` 的唯一区别：进程死活的判定多看一层
+ * 「整棵进程树里还有没有活着的后代」。
+ *
+ * 为什么需要它（实测于 nimrtc-zelto v2-input-binder）：
+ *   Windows 上 zelto 用 `shell: true` 起 agent，记录的 pid 是外层
+ *   `cmd.exe`，真正的 agent（`claude.exe`）是孙进程。外层退出后 agent
+ *   还活着，但按外层 pid 判就是「死了」→ 看门狗重跑 → 同一个 worktree
+ *   上起了第二个 agent，两者互相覆盖产出。
+ *
+ * 查进程表要起子进程（Windows 上 ~1s），所以是异步的。
+ */
+export async function classifyLivenessAsync(
+  record: LivenessRecord | null | undefined,
+  options: {
+    now?: number;
+    staleThresholdMs?: number;
+    isProcessAlive?: (pid: number) => boolean;
+    isProcessTreeAlive?: (pid: number) => Promise<boolean>;
+  } = {},
+): Promise<LivenessInfo> {
+  const syncOptions = {
+    now: options.now,
+    staleThresholdMs: options.staleThresholdMs,
+    isProcessAlive: options.isProcessAlive,
+  };
+
+  if (!record || (record.status !== undefined && record.status !== 'running')) {
+    return classifyLiveness(record, syncOptions);
+  }
+
+  const agentPid = typeof record.agentPid === 'number' ? record.agentPid : null;
+  const pid = typeof record.pid === 'number' ? record.pid : null;
+  const pidToCheck = agentPid ?? pid;
+
+  // 进程本身还活着 → 直接走同步判定（快路径）。
+  if (pidToCheck === null || !options.isProcessAlive || options.isProcessAlive(pidToCheck)) {
+    return classifyLiveness(record, syncOptions);
+  }
+
+  // 进程本身没了 → 看整棵树。
+  const treeAlive = options.isProcessTreeAlive ? await options.isProcessTreeAlive(pidToCheck) : false;
+  if (treeAlive) {
+    // 树还活着 → 不能判死。走同步判定，但跳过「pid 不在」那一步：
+    // 用一个「活着」的假 pid 绕过去不干净，所以这里直接算活性。
+    const now = options.now ?? Date.now();
+    const threshold = options.staleThresholdMs ?? DEFAULT_STALE_THRESHOLD_MS;
+    const lastActivity = lastActivityOf(record);
+    const idleMs = lastActivity === null ? null : Math.max(0, now - lastActivity);
+    if (idleMs === null || lastActivity === null) {
+      return {
+        state: 'active',
+        lastActivityAt: null,
+        idleMs: null,
+        pid: pidToCheck,
+        reason: `进程 ${pidToCheck} 的包装进程已退出，但 agent 进程树还在运行`,
+      };
+    }
+    if (idleMs >= threshold) {
+      return {
+        state: 'stale',
+        lastActivityAt: new Date(lastActivity).toISOString(),
+        idleMs,
+        pid: pidToCheck,
+        reason: `agent 进程树还在运行，但已经 ${formatIdle(idleMs)} 没有任何动静（阈值 ${formatIdle(threshold)}）`,
+      };
+    }
+    return {
+      state: 'active',
+      lastActivityAt: new Date(lastActivity).toISOString(),
+      idleMs,
+      pid: pidToCheck,
+      reason: `agent 进程树还在运行（${formatIdle(idleMs)} 前还有动静）`,
+    };
+  }
+
+  // 整棵树都死了 → 确定死了。
+  return classifyLiveness(record, syncOptions);
 }
 
 /**
@@ -293,14 +410,61 @@ function readLivenessFile(path: string): LivenessRecord | null {
 export function readSliceLivenessRecord(
   projectRoot: string,
   sliceId: string,
+  after?: string | null,
 ): LivenessRecord | null {
-  const best = newestRunningRecord(join(projectRoot, SESSIONS_DIR_REL), sliceId);
+  const best = newestRunningRecord(join(projectRoot, SESSIONS_DIR_REL), sliceId, after);
   if (best) return best;
-  return newestRunningRecord(join(projectRoot, TASKS_DIR_REL), sliceId);
+  return newestRunningRecord(join(projectRoot, TASKS_DIR_REL), sliceId, after);
 }
 
-function newestRunningRecord(dir: string, sliceId: string): LivenessRecord | null {
+/**
+ * 读一片切片的**全部** running 运行记录（会话 + 任务），按世代过滤。
+ *
+ * 给活进程看门狗用（ADR-074）：它需要自己挑「本轮最新」，
+ * 而不是拿 `readSliceLivenessRecord` 已经挑好的那一条 ——
+ * 后者可能挑到上一代的尸体（见 `after` 参数）。
+ *
+ * @param after 只要 `startedAt >= after` 的记录（ISO 时刻）；null 不过滤
+ */
+export function readSliceLivenessRecords(
+  projectRoot: string,
+  sliceId: string,
+  after?: string | null,
+): LivenessRecord[] {
+  const cutoff = after ? Date.parse(after) : Number.NaN;
+  const out: LivenessRecord[] = [];
+  for (const dirRel of [SESSIONS_DIR_REL, TASKS_DIR_REL]) {
+    const dir = join(projectRoot, dirRel);
+    if (!existsSync(dir)) continue;
+    let files: string[];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      const rec = readLivenessFile(join(dir, f));
+      if (!rec || rec.status !== 'running') continue;
+      if (rec.sliceId !== sliceId) continue;
+      if (Number.isFinite(cutoff)) {
+        const t = rec.startedAt ? Date.parse(rec.startedAt) : Number.NaN;
+        // 1 秒容差：事件时刻与文件写入时刻来自两次 `new Date()`
+        if (!Number.isFinite(t) || t < cutoff - 1_000) continue;
+      }
+      out.push(rec);
+    }
+  }
+  return out;
+}
+
+function newestRunningRecord(
+  dir: string,
+  sliceId: string,
+  after?: string | null,
+): LivenessRecord | null {
   if (!existsSync(dir)) return null;
+  const cutoff = after ? Date.parse(after) : Number.NaN;
   let best: LivenessRecord | null = null;
   let bestTs = -1;
   let files: string[];
@@ -315,6 +479,13 @@ function newestRunningRecord(dir: string, sliceId: string): LivenessRecord | nul
     if (!rec || rec.status !== 'running') continue;
     const sid = rec.sliceId;
     if (sid !== sliceId) continue;
+    // 世代过滤（ADR-074）：上一代被收走的运行记录还留在盘上、status 仍是
+    // running —— 不过滤就会把尸体当成当前的现场。1 秒容差见
+    // `readSliceLivenessRecords`。
+    if (Number.isFinite(cutoff)) {
+      const started = rec.startedAt ? Date.parse(rec.startedAt) : Number.NaN;
+      if (!Number.isFinite(started) || started < cutoff - 1_000) continue;
+    }
     const t = lastActivityOf(rec);
     const ts = t === null ? -1 : t;
     // 用 `>=` 而不是 `>`：完全没有时间戳的老空壳 ts 也是 -1，

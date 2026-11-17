@@ -591,6 +591,7 @@ register('plan', async (args) => {
     f.out('       zelto plan show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto plan confirm <id>');
     f.out('       zelto plan add-version <id> <description>');
+    f.out('       zelto plan patch <id> --version <v> [--add-slice <id> | --remove-slice <id> | --slice <id> --write <p>...]');
     return 1;
   }
 
@@ -656,6 +657,11 @@ register('plan', async (args) => {
     }
     f.out('确认完再跑 zelto version start —— 没有确认过的规格不会被冻结。');
     return 0;
+  }
+
+  if (subcmd === 'patch') {
+    const { planPatch } = await import('./plan-patch.js');
+    return planPatch(args.slice(1));
   }
 
   if (subcmd === 'add-version') {

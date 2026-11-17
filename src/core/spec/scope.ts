@@ -118,11 +118,31 @@ const KNOWN_EXTENSIONLESS_FILENAMES = [
  *  - 含路径分隔符 `/`（含开头的 `./`）；
  *  - 扩展名属于 `KNOWN_EXTENSIONS`；
  *  - 文件名（无扩展名部分）属于 `KNOWN_EXTENSIONLESS_FILENAMES`。
+ *
+ * **含 `/` 就认**这条有代价：规格里写指标名 `input_to_photon_p50/p95`
+ * （p50 与 p95 的简写）时，它含 `/` 但不是文件 → 会被当成路径报出去，
+ * 于是 D-4 报「规格提到 input_to_photon_p50/p95，但它不在写集里」——
+ * 一条**根本不是文件**的东西。这个误报实测踩到过。
+ *
+ * 收紧办法：**最后一段必须带已知扩展名**，或者整串是已知无扩展名文件名。
+ * `src/a.cpp` ✓（末段 .cpp 已知）；`input_to_photon_p50/p95` ✗（末段 p95 无扩展名）；
+ * `build/Makefile` ✓（末段是已知无扩展名文件名）；`src/a/b` ✗（末段无扩展名且不认识）。
+ *
+ * 代价：真写了一个没有扩展名的文件（`src/foo/Bar`）会被漏掉。
+ * 那个代价可接受 —— 漏报只是少拦一次，误报是每次都要人去分辨。
  */
 function looksLikePath(text: string): boolean {
   if (!text) return false;
-  if (text.includes('/')) return true;
-  return hasKnownExtension(text) || hasKnownExtensionlessName(text);
+
+  // 末段单独判定
+  const segments = text.split('/').filter((s) => s.length > 0);
+  if (segments.length === 0) return false;
+  const last = segments[segments.length - 1];
+
+  if (hasKnownExtension(last)) return true;
+  if (hasKnownExtensionlessName(last)) return true;
+
+  return false;
 }
 
 /**

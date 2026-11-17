@@ -52,7 +52,29 @@ export function register(name: string, fn: Command) {
 
 // ─── Policy Config ───────────────────────────────────────────────────────────
 
-export function loadPolicyConfig(root?: string): PolicyConfig {
+/**
+ * 加载策略配置。
+ *
+ * **来源很重要** —— 调用方要区分「项目自己的策略」与「zelto 的兜底策略」：
+ *
+ * - 项目有 `policy/policy.yaml` → 用它，`source: 'project'`
+ * - 项目没有 → 回落到 zelto 内置的兜底策略，`source: 'fallback'`
+ *
+ * 为什么必须区分：兜底策略是**给 zelto 自己（TypeScript 项目）**用的
+ * （`src/` 与 `tests/` 下的 `.ts` 文件）。拿它去判一个 C++ 项目的写集
+ * （`src/engine/src/foo.cpp`）会得出「不在任何允许规则覆盖范围内」——
+ * **一个纯误判**：那个路径在项目自己的策略里很可能被允许，
+ * 只是这个项目还没写策略而已。
+ *
+ * 所以：**阻断性判定只能用 `source: 'project'` 的策略**。
+ * 兜底策略只够用来做「读总是允许」「保护域是什么」这类不依赖项目语义的判断。
+ */
+export interface LoadedPolicy extends PolicyConfig {
+  /** 策略的来源：项目自己的 / zelto 兜底的 */
+  source: 'project' | 'fallback';
+}
+
+export function loadPolicyConfig(root?: string): LoadedPolicy {
   const policyPath = join(root ?? process.cwd(), 'policy', 'policy.yaml');
   if (existsSync(policyPath)) {
     try {
@@ -63,6 +85,7 @@ export function loadPolicyConfig(root?: string): PolicyConfig {
           rules: parsed.rules,
           protected: ['policy/**', '.zelto/**', 'AGENTS.md', '.cursor/rules/**'],
           ...(parsed.arch ? { arch: parsed.arch } : {}),
+          source: 'project',
         };
       }
     } catch {
@@ -112,6 +135,7 @@ export function loadPolicyConfig(root?: string): PolicyConfig {
       },
     ],
     protected: ['policy/**', '.zelto/**', 'AGENTS.md', '.cursor/rules/**'],
+    source: 'fallback',
   };
 }
 

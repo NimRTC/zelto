@@ -189,9 +189,33 @@ describe('ADR-034 · 验收统计判定', () => {
 
 // ─── CLI 闭环 ──────────────────────────────────────────────────────────────
 
-describe('ADR-034 · zelto spec 命令', () => {
+describe('ADR-034 · zelto 命令', () => {
   before(async () => {
     await mkdir(TEST_DIR, { recursive: true });
+    // freeze 现在也是闸门：冻结前会预检「写集 × 策略」。本组测的是
+    // 规格闭环，不是策略覆盖，所以给一份允许 `src/**` 与 `tests/**`
+    // 的策略（`spec draft` 会顺带生成验收骨架，写集里就有它）。
+    await mkdir(join(TEST_DIR, 'policy'), { recursive: true });
+    await writeFile(
+      join(TEST_DIR, 'policy', 'policy.yaml'),
+      [
+        'rules:',
+        '  - id: allow-src',
+        '    match:',
+        '      path: "src/**"',
+        '      operation: "write"',
+        '    action: allow',
+        '    basis: "policy.yaml#allow-src"',
+        '  - id: allow-tests',
+        '    match:',
+        '      path: "tests/**"',
+        '      operation: "write"',
+        '    action: allow',
+        '    basis: "policy.yaml#allow-tests"',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
   });
 
   after(async () => {

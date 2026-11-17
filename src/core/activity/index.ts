@@ -5,6 +5,7 @@ export {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_STALE_THRESHOLD_MS,
   classifyLiveness,
+  classifyLivenessAsync,
   lastActivityOf,
   lastOutputLine,
   formatIdle,
@@ -13,6 +14,7 @@ export {
   readSessionLiveness,
   readTaskLiveness,
   readSliceLivenessRecord,
+  readSliceLivenessRecords,
 } from './liveness.js';
 export type { LivenessState, LivenessInfo, LivenessRecord } from './liveness.js';
 

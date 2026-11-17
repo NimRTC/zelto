@@ -136,6 +136,94 @@ export async function resolveWriteSet(
 }
 
 /**
+ * 写集 × 策略的预检 —— 「这片注定跑不起来就别跑」（ADR-042）。
+ *
+ * 病灶（实测于 nimrtc-zelto v2-ai-decision，2026-11-17）：
+ *   切片写集声明 `demo-agent-realtime/**`，policy.yaml 的 allow 规则不覆盖它
+ *   → agent 起跑，第一次写文件就被 hook 按 `policy.yaml#default` 拒绝
+ *   → 换路径再试 → 再被拒 → 一路烧 token 直到 30 分钟超时耗尽。
+ *   **worktree 里一个字节代码都没留下。**
+ *
+ * 为什么这个检查要出现在三个地方（check / freeze / run）：
+ *   `check` 早就有这个判据，但它**只是一个命令** —— 人不主动跑它，
+ *   判定就只是屏幕上的一段字。真正的闸门在**会改变状态的路径**上：
+ *     - `freeze`：把规格钉死成「基线」的那一刻
+ *     - `run`：agent 真正开跑的那一刻（最后一道，也是最贵的一道）
+ *   三处共用同一个判据，避免「check 拦得住但 run 拦不住」这种
+ *   **判定有、闸门没接上**的半成品状态。
+ *
+ * 判据本身在 core/spec/write-set-policy.ts（纯计算，C2/C3 合规）。
+ * 这里只负责：取策略 → 跑判定 → 落事件 → 决定放不放行。
+ */
+export interface WriteSetPolicyVerdict {
+  /** 可以开跑 */
+  ok: boolean;
+  /** 阻断项的人话说明（空 = 无阻断） */
+  details: string[];
+  /** 提示项 */
+  advisories: string[];
+}
+
+/**
+ * 跑一次写集 × 策略的预检。
+ *
+ * @param sliceId 切片 id（用于把判定写进事件流）
+ * @param writes  有效写集（必须是解析后的最终写集，不是 slice.writes）
+ */
+export async function precheckWriteSetAgainstPolicy(
+  sliceId: string,
+  writes: string[],
+): Promise<WriteSetPolicyVerdict> {
+  const { evaluateWriteSetAgainstPolicy } = await import('../../core/spec/write-set-policy.js');
+  const { loadPolicyConfig } = await import('./shared.js');
+
+  // 策略读不出来 = 没有判据 = 放行。
+  // 读策略失败不该让流程卡死：策略本身有独立的存在性检查，
+  // 这里判不了就说「判不了」，而不是编一个「跑不起来」的结论。
+  let policyConfig = null;
+  let policySource: 'project' | 'fallback' = 'fallback';
+  try {
+    const loaded = loadPolicyConfig();
+    policyConfig = loaded;
+    policySource = loaded.source;
+  } catch {
+    policyConfig = null;
+  }
+
+  // ── 兜底策略不能用来阻断 ─────────────────────────────────────────────
+  //
+  // 项目没有自己的 `policy/policy.yaml` 时，`loadPolicyConfig` 回落到的
+  // 是 **zelto 自己的兜底策略**（`src/**/*.ts` / `tests/**/*.ts`）——
+  // 那是给 TypeScript 项目用的。拿它去判一个 C++ 项目的写集
+  // （`src/engine/src/foo.cpp`）会得出「不在任何允许规则覆盖范围内」，
+  // **一个纯误判**：那个路径在项目自己的策略里很可能被允许，
+  // 只是这个项目还没写策略而已。
+  //
+  // 「还没写策略」和「策略不允许」是两件事。前者不该拦人。
+  // 阻断性判定只认项目自己的策略（source === 'project'）。
+  if (policySource !== 'project') {
+    return { ok: true, details: [], advisories: [] };
+  }
+
+  const result = evaluateWriteSetAgainstPolicy(writes, policyConfig);
+  const details = result.conflicts.map((c) => c.message);
+  const advisories = result.advisories.map((a) => a.message);
+
+  if (details.length > 0 || advisories.length > 0) {
+    // 判定要留痕（C4）：「为什么没跑」必须事后可查。
+    await events.append(sliceId, 'spec.checked', 'cli', {
+      sliceId,
+      issues: details.length,
+      passed: details.length === 0,
+      details: [...details, ...advisories],
+      phase: 'write-set-policy',
+    });
+  }
+
+  return { ok: details.length === 0, details, advisories };
+}
+
+/**
  * 记一次 agent 会话的用量（ADR-035 §3.3 / §3.4）。
  *
  * 记账的唯一入口。适配器不知道切片 id、也不该知道事件流（C2：依赖单向向下），

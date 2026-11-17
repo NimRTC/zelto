@@ -5,12 +5,12 @@ import { join } from 'node:path';
 import { Scheduler } from '../../core/sched/engine.js';
 import { isSliceStalled, findDeadSlices, findOrphanShells, reapDeadSlices } from '../../core/stall/index.js';
 import {
-  classifyLiveness,
+  classifyLivenessAsync,
   readSessionLiveness,
   readSliceLivenessRecord,
   readRecoveries,
 } from '../../core/activity/index.js';
-import { isProcessAlive } from '../../core/sched/index.js';
+import { isProcessAlive, isProcessTreeAlive } from '../../core/sched/index.js';
 import type { SliceData } from '../../core/slice/store.js';
 import { AuditTrail } from '../../core/audit/trail.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
@@ -916,9 +916,12 @@ register('stall', async (args) => {
       try {
         const projectRoot = process.cwd();
         const record = readSliceLivenessRecord(projectRoot, id);
-        const live = classifyLiveness(record, { isProcessAlive });
+        const live = await classifyLivenessAsync(record, { isProcessAlive, isProcessTreeAlive });
         const badge = live.state === 'active' ? '🔄 active' : live.state === 'stale' ? '⚠️ stale（可疑）' : live.state === 'dead' ? '💀 dead（进程已死）' : live.state;
         console.log(`Liveness: ${badge} · ${live.reason}`);
+        if (slice.state === 'running' && live.state === 'dead') {
+          console.log(`看门狗：  这一轮已经没有进程在管 —— 前台运行中会被当场退回 frozen；手动清：zelto stall --reap`);
+        }
         const rec = readRecoveries(projectRoot, id);
         if (rec.count > 0) console.log(`看门狗：  已自愈 ${rec.count} 次${rec.escalated ? '（已上报，需人看现场）' : ''}${rec.lastReason ? `，上次：${rec.lastReason}` : ''}`);
       } catch { /* 不阻断展示 */ }
@@ -1145,9 +1148,14 @@ register('status', async (args) => {
         const sid = (record as { sessionId?: string }).sessionId;
         if (sid) a.sessionId = sid;
       }
-      const live = classifyLiveness(record, { isProcessAlive });
+      const live = await classifyLivenessAsync(record, { isProcessAlive, isProcessTreeAlive });
       a.liveness = live.state;
       a.liveReason = live.reason;
+      // 活进程看门狗（ADR-074）：进程已死 / 状态已收尾的运行记录，
+      // 只要切片还写着 running，就给一句「会发生什么」—— 而不是让人自己去猜。
+      if (live.state === 'dead') {
+        a.liveReason = `${live.reason} —— 活进程看门狗会把它退回 frozen（前台运行中则当场收走），之后 zelto run 重跑`;
+      }
     }
 
     if (isJson) {

@@ -288,6 +288,24 @@ describe('接管既有项目 · spec confirm 不确认注定不能用的规格',
     const { code } = await runCli(dir, 'spec', 'confirm', 'no-req2');
     assert.equal(code, 0, '草稿里补了编号验收标准后应能确认');
 
+    // 冻结也是闸门，会预检「写集 × 策略」。本用例要断言的是 confirm 与
+    // freeze 的**准入判据同源**，不是策略覆盖 —— 所以补一条覆盖验收骨架
+    // 的 allow 规则，免得冻结被另一条判据拦下。
+    await writeFile(
+      join(dir, 'policy', 'policy.yaml'),
+      [
+        'rules:',
+        '  - id: allow-acceptance',
+        '    match:',
+        '      path: "tests/acceptance/**"',
+        '      operation: "write"',
+        '    action: allow',
+        '    basis: "policy.yaml#allow-acceptance"',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+
     // 冻结也要过 —— 两处判据同源
     const frozen = await runCli(dir, 'freeze', 'no-req2');
     assert.equal(frozen.code, 0, `冻结也应通过：\n${frozen.stdout}\n${frozen.stderr}`);

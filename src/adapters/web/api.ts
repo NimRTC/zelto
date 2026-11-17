@@ -24,8 +24,14 @@ import { WorktreeManager } from '../../core/worktree/manager.js';
 import { BudgetCollector, UNLIMITED_BUDGET, type CostMeasurement } from '../../core/budget/collector.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
 import { isSliceStalled } from '../../core/stall/classifier.js';
-import { classifyLiveness, lastOutputLine, readRecoveries, readSliceLivenessRecord } from '../../core/activity/index.js';
-import { isProcessAlive } from '../../core/sched/index.js';
+import {
+  classifyLiveness,
+  classifyLivenessAsync,
+  lastOutputLine,
+  readRecoveries,
+  readSliceLivenessRecord,
+} from '../../core/activity/index.js';
+import { isProcessAlive, isProcessTreeAlive } from '../../core/sched/index.js';
 import { loadPolicy } from '../../core/policy/data-access.js';
 import { VersionStore } from '../../core/version/store.js';
 import { DesignStore } from '../../core/design/store.js';
@@ -113,10 +119,16 @@ export interface SliceSummary {
    * `progressLine` 是 agent 最后一条有内容的输出（一行，已截断）；
    * `progressAt` 是那一行的时刻；`elapsedMs` 是本次运行已经跑了多久。
    * 三者一起，界面才能显示成「在跑 3 分 12 秒 · 正在跑测试…」。
+   *
+   * `elapsedIdleMs`（ADR-074）是「最新输出距今多久」。`--output-format json`
+   * 让 Claude Code 只在结束时吐一次 stdout —— 运行中 `progressLine` 恒为 null，
+   * 光看它，「在跑但没产出」与「空壳」长得一模一样。有了这个数，
+   * 界面可以说「已运行 12 分 · 3 分钟无输出」，而不是留一片空白让人猜。
    */
   progressLine: string | null;
   progressAt: string | null;
   elapsedMs: number | null;
+  elapsedIdleMs: number | null;
 }
 
 /** 切片详情 —— 含签字复查的事实与判定。 */
@@ -775,10 +787,11 @@ async function toSummary(
   let progressLine: string | null = null;
   let progressAt: string | null = null;
   let elapsedMs: number | null = null;
+  let elapsedIdleMs: number | null = null;
   if (slice.state === 'running') {
     try {
       const rec = readSliceLivenessRecord(repoRoot, slice.id);
-      const live = classifyLiveness(rec, { isProcessAlive });
+      const live = await classifyLivenessAsync(rec, { isProcessAlive, isProcessTreeAlive });
       liveness = live.state;
       liveReason = live.reason;
       idleMs = live.idleMs;
@@ -791,6 +804,13 @@ async function toSummary(
       const startedAt = rec?.startedAt ? Date.parse(rec.startedAt) : Number.NaN;
       if (Number.isFinite(startedAt)) {
         elapsedMs = Math.max(0, Date.now() - startedAt);
+      }
+      // 输出静默时长（ADR-074）：有输出 → 距最后一条输出的时间；没输出 → 等于已运行时长
+      const progressMs = progressAt ? Date.parse(progressAt) : Number.NaN;
+      if (Number.isFinite(progressMs)) {
+        elapsedIdleMs = Math.max(0, Date.now() - progressMs);
+      } else if (elapsedMs !== null) {
+        elapsedIdleMs = elapsedMs;
       }
     } catch {
       liveness = null;
@@ -842,6 +862,7 @@ async function toSummary(
     progressLine,
     progressAt,
     elapsedMs,
+    elapsedIdleMs,
   };
 }
 

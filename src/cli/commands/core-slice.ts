@@ -51,18 +51,26 @@ import { detectSliceType } from '../../core/gate/types.js';
 import { classifyStall, isAutoResolvable } from '../../core/stall/classifier.js';
 import {
   classifyLiveness,
+  classifyLivenessAsync,
   formatIdle,
   lastActivityOf,
   readSessionLiveness,
+  readSliceLivenessRecord,
+  readSliceLivenessRecords,
   decideRecovery,
   readRecoveries,
   recordRecovery,
   recordEscalation,
   MAX_AUTO_RECOVERIES,
 } from '../../core/activity/index.js';
-import { isProcessAlive } from '../../core/sched/index.js';
+import { isProcessAlive, isProcessTreeAlive } from '../../core/sched/index.js';
+import {
+  decideRunWatchdog,
+  type RunWatchdogAction,
+} from '../../core/sched/index.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
 import { parseScopePaths, parseAcceptanceCriteria, parseMentionedPaths } from '../../core/spec/scope.js';
+import { parseReferencedPaths } from '../../core/spec/reference.js';
 import { evaluateWriteSet, evaluateWriteSetCoverage } from '../../core/spec/write-set.js';
 import { judgeTrace, traceCountsOf, blockingViolations, advisoryViolations } from '../../core/trace/index.js';
 import { validateDeterministic } from '../../core/spec/deterministic/validator.js';
@@ -81,7 +89,7 @@ import {
   printOutcome,
   writeSetOutcomeLines,
 } from './run-messages.js';
-import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost, gateCommandsForSlice, markSliceStalled } from './run-support.js';
+import { resolveWriteSet, checkBudget, autoGateAfterRun, handleAgentFailure, detectDefaultWrites, settleRunCost, gateCommandsForSlice, markSliceStalled, precheckWriteSetAgainstPolicy } from './run-support.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -146,13 +154,112 @@ async function resumeForRetry(
 
 /**
  * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
- *
  * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
  * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
  * 但内容被改动就是篡改：改了规格副本等于自动改规格（AGENTS.md 禁区）。
  *
  * 实现在 ./parallel-executor.ts —— 单切片运行与并行执行器共用同一份定义。
  */
+
+/**
+ * 活进程看门狗（ADR-074）—— 每一轮的起跑时刻。
+ *
+ * 为什么需要它：`waitForExit` 的 Promise 只在**本进程内**有效。
+ * 会话文件里的运行记录没有「世代」字段，而上一代被收走（reap）的记录
+ * 还留在盘上、status 仍是 running。看门狗要靠「起跑时刻」把两者分开 ——
+ * 这一轮开跑之前的记录一律不算本轮的现场（见 core/sched/watchdog-policy）。
+ *
+ * 重试（续跑 / 从头跑）会开新的一轮，所以每次重新 start 都覆盖它。
+ */
+const runGenStartedAt = new Map<string, string>();
+
+/** 看门狗的轮询间隔（毫秒）。 */
+const RUN_WATCHDOG_INTERVAL_MS = 5_000;
+
+/**
+ * 一次「等 agent 结束」，期间由活进程看门狗盯着现场。
+ *
+ * 两种情况任一先到即返回：
+ *   - `waitForExit` 正常返回（agent 退出，正常路径接手停机判定）
+ *   - 看门狗判定本轮没有进程在管（`reap`）→ 就地停机并返回 exitCode=null，
+ *     不再傻等一个永远不会 resolve 的 Promise
+ *
+ * 为什么必须有看门狗（实测于 nimrtc-zelto）：
+ * 停机判定原先只在 `waitForExit` 之后执行。CLI 进程先死时，这一行从没
+ * 被执行到 —— 切片停在 running、预约锁不释放，准入永久挡。
+ * 看门狗把「进程死了」变成「当场退 frozen」，而不是等人几小时后想起来 `--reap`。
+ */
+async function waitForExitWithWatchdog(opts: {
+  sliceId: string;
+  sessionId: string;
+  adapter: ExecutorAdapter;
+  runStartedAt: string;
+  maxRetries: number;
+}): Promise<{ exitCode: number | null; watchdogReaped: boolean }> {
+  const { sliceId, sessionId, adapter, runStartedAt, maxRetries } = opts;
+  const exitPromise = adapter.waitForExit(sessionId).then((code) => ({ exitCode: code, watchdogReaped: false }));
+
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const watchdogPromise = new Promise<{ exitCode: number | null; watchdogReaped: boolean }>((resolve) => {
+    timer = setInterval(async () => {
+      let action: RunWatchdogAction;
+      try {
+        const slice = await store.read(sliceId);
+        action = decideRunWatchdog({
+          sliceId,
+          sliceState: slice.state,
+          stallClass: slice.stall.class,
+          runStartedAt,
+          // 只拿「本轮起跑之后」落盘的运行记录 —— 上一代的尸体不算现场
+          records: readSliceLivenessRecords(process.cwd(), sliceId, runStartedAt),
+          recoveries: readRecoveries(process.cwd(), sliceId).count,
+          isProcessAlive,
+        });
+      } catch {
+        return; // 读盘失败不改变判定 —— 下一轮再试
+      }
+      if (action.action === 'none') return;
+
+      // 处置：退 frozen + 写分类 + 留痕（与 agent 失败同一条落点，ADR-047）
+      const internal = sessionId;
+      let transitioned: Awaited<ReturnType<typeof markSliceStalled>> | null = null;
+      try {
+        transitioned = await markSliceStalled(sliceId, classifyStall({
+          type: 'build_failure',
+          message: action.reason,
+          attempts: 1,
+        }), { exitCode: null, reason: `live-process watchdog: ${action.reason}` });
+      } catch { /* 状态被别处改过：事件照样留 */ }
+
+      await events.append(sliceId, 'run.aborted', 'watchdog', {
+        sliceId,
+        exitCode: null,
+        reason: action.reason,
+        watchdog: true,
+        action: action.action,
+        sessionId: internal,
+      });
+      // 记账：这一轮同样是一次运行（ADR-041 §3.1）
+      try {
+        await store.recordRun(sliceId, { ok: false, exitCode: null });
+      } catch { /* 记账失败不阻断处置 */ }
+
+      const stateNote = transitioned?.reverted ? '（已退回 frozen，修好环境后直接重跑）' : '';      console.error(`\n  🐕 活进程看门狗：${action.reason}${stateNote}`);
+      if (action.action === 'escalate') {
+        console.error('     看门狗自动恢复次数已达上限 —— 请人看现场后 zelto resume ' + sliceId);
+      }
+      resolve({ exitCode: null, watchdogReaped: true });
+    }, RUN_WATCHDOG_INTERVAL_MS);
+  });
+  // 看门狗定时器不能让进程退不出去
+  (timer as unknown as { unref?: () => void } | null)?.unref?.();
+
+  try {
+    return await Promise.race([exitPromise, watchdogPromise]);
+  } finally {
+    if (timer) clearInterval(timer);
+  }
+}
 
 // ─── slices ──────────────────────────────────────────────────────────────────
 
@@ -538,6 +645,27 @@ register('check', async (args) => {
           `  New files: ${writeSetResult.toCreate.length} path(s) will be created by the agent`,
         );
       }
+      for (const nm of writeSetResult.nearMisses) {
+        console.log(
+          `  ⚠️  Write-set path "${nm.path}" does not exist; same-name file(s) at: ${nm.candidates.join(', ')}`,
+        );
+      }
+
+      // 写集 × 策略的交集判定（实测于 nimrtc-zelto v2-ai-decision）：
+      //   写集声明的路径如果完全不在 policy.yaml 的允许规则覆盖范围内，
+      //   agent 第一次写文件就会被 hook 按 default 拒绝 —— 这片**注定跑不起来**。
+      //   门禁①存在的意义正是「跑之前就确定跑不起来就别跑」，所以这是阻断项。
+      //
+      // 用**有效写集**（解析后的），不是 slice.writes —— 写集有三级来源
+      // （slice.writes → 规格「范围」章节 → 目录探测），只看 slice.writes
+      // 会让「写集由规格推导出来」的正常切片漏判。与 run / freeze 同口径。
+      const effectiveWrites = await resolveWriteSet(id, false).then(
+        (r) => r.writes,
+        () => slice.writes,
+      );
+      const policyVerdict = await precheckWriteSetAgainstPolicy(id, effectiveWrites);
+      for (const d of policyVerdict.details) issues.push(d);
+      for (const a of policyVerdict.advisories) advisories.push(a);
     }
 
     // Validate acceptance test path exists
@@ -954,7 +1082,57 @@ register('freeze', async (args) => {
       (r) => r.writes,
       () => slice.writes,
     );
-    const coverage = evaluateWriteSetCoverage(parseMentionedPaths(specContent), effectiveWrites);
+
+    // ── 写集 × 策略的预检（freeze 也是闸门，不只是 check）──────────────
+    //
+    // 放在 D-4 检查**之前**：D-4 问「规格提到的文件在写集里吗」，
+    // 这条问「写集里的路径 policy 放行吗」。**先问后者**——
+    // 写集整体被策略挡住时，D-4 报「某文件不在写集里」只是症状，
+    // 病根在策略。顺序反了会让人去改写集，而真正该改的是策略。
+    //
+    // 冻结 = 把规格钉成「基线」。钉一个**注定跑不起来**的基线没有意义：
+    // 后面每一条事件都会指向这个基线，而基线对应的活根本交不出来。
+    //
+    // 判据与 `run` / `check` 完全同源（core/spec/write-set-policy.ts）——
+    // 三处共用一个判据，不各写一份（各写一份必然漂移）。
+    {
+      const verdict = await precheckWriteSetAgainstPolicy(id, effectiveWrites);
+      for (const a of verdict.advisories) console.warn(`  ⚠️  ${a}`);
+      if (!verdict.ok) {
+        if (isJson) {
+          console.log(JSON.stringify({
+            sliceId: id, success: false,
+            error: `写集与策略互相矛盾，拒绝冻结：${verdict.details.join('；')}`,
+            issues: verdict.details,
+          }));
+        } else {
+          console.error(`zelto freeze ${id} — ❌ 写集与策略互相矛盾，拒绝冻结`);
+          for (const d of verdict.details) console.error(`  - ${d}`);
+          console.error('');
+          console.error('  冻结一个注定跑不起来的基线没有意义 —— 后面每条事件都会指向它。');
+          console.error('  修法二选一：');
+          console.error('    - 把该路径加进 policy.yaml 的 allow 规则（之后跑 zelto policy lock --update 更新锚点）');
+          console.error(`    - 或改写集： zelto set ${id} --field writes --value "<路径>"`);
+        }
+        return 1;
+      }
+    }
+
+    // ── D-4：规格提到的文件必须在写集里 ────────────────────────────
+    //
+    // 放在写集×策略检查**之后**：D-4 问「规格提到的文件在写集里吗」，
+    // 那条问「写集里的路径 policy 放行吗」。**先问后者**——
+    // 写集整体被策略挡住时，D-4 报「某文件不在写集里」只是症状，
+    // 病根在策略。顺序反了会让人去改写集，而真正该改的是策略。
+    //
+    // **只读引用要豁免**（`parseReferencedPaths`）：
+    // 规格里「对应 `docs/plan/xxx.md` §5.1」这种**指路**不是「要改它」——
+    // 那份规划文档恰恰是 agent 不该动的（它是人批准的出处）。
+    // 把指路当成要求修改 → 冻结被拦，而规格完全没问题（闸门误报）。
+    const mentionedPaths = parseMentionedPaths(specContent);
+    const referencedPaths = new Set(parseReferencedPaths(specContent));
+    const requiredPaths = mentionedPaths.filter((p) => !referencedPaths.has(p));
+    const coverage = evaluateWriteSetCoverage(requiredPaths, effectiveWrites);
     if (coverage.uncovered.length > 0) {
       const details = coverage.uncovered.map(
         (p) => `规格提到「${p}」，但它不在写集里 —— agent 改不了它`,
@@ -1096,6 +1274,50 @@ register('run', async (args) => {
   try {
     const scheduler = new Scheduler(store, events, loadPolicyConfig());
 
+    // ── 写集 × 策略的预检（最先做的一道）──────────────────────────────────
+    //
+    // 放在 `admit` **之前**，不是之后 —— 顺序有讲究：
+    //   admit 管的是「状态对不对 / 有没有别人在跑同一片」，
+    //   写集策略管的是「这片写不进任何文件」，
+    //   后者更根本：一个 draft 的切片和一个 frozen 但注定写不起来的切片，
+    //   **后者的信息量更大**（它已经被人批准过了，却被策略挡住）。
+    //   便宜的判定在前，人才知道真正该修什么。
+    //
+    // 为什么 run 也要查（check 里早有了，但 check 只是个命令）：
+    //   病灶（nimrtc-zelto v2-ai-decision，2026-11-17）：写集不在 policy
+    //   允许范围内 → agent 第一次写文件就被 hook 拒 → 换路径再试 → 再被拒
+    //   → 30 分钟超时耗尽，worktree 里一个字节都没留下。
+    //   `zelto check` 早就报出了这句话，但没人跑 check 就等于没有闸门。
+    //   **判定有、闸门没接上** —— 这里把闸门接上。
+    const preResolved = await resolveWriteSet(id);
+    {
+      const verdict = await precheckWriteSetAgainstPolicy(id, preResolved.writes);
+      for (const a of verdict.advisories) console.warn(`  ⚠️  ${a}`);
+      if (!verdict.ok) {
+        if (isJson) {
+          console.log(JSON.stringify({
+            sliceId: id,
+            decision: 'blocked',
+            reason: '写集与策略互相矛盾 —— 这片注定跑不起来',
+            blockedBy: ['write-set-policy'],
+            details: verdict.details,
+          }));
+        } else {
+          console.error(`zelto run ${id} — ❌ 写集与策略互相矛盾，拒绝开跑`);
+          for (const d of verdict.details) console.error(`  - ${d}`);
+          console.error('');
+          console.error('  这片跑不起来：agent 第一次写文件就会被 hook 按 default 拒绝，');
+          console.error('  反复重试只会烧 token 直到超时。');
+          console.error('');
+          console.error('  修法二选一：');
+          console.error(`    - 把该路径加进 policy.yaml 的 allow 规则： zelto policy add <rule-id> --path "<路径>" --operation write --action allow --basis "<依据>"`);
+          console.error(`    - 或改写集： zelto set ${id} --field writes --value "<路径>"`);
+          console.error(`  改完跑 zelto policy lock --update 更新锚点，再 zelto check ${id} 确认。`);
+        }
+        return 1;
+      }
+    }
+
     const result = await scheduler.admit(id);
     if (result.decision !== 'admitted') {
       if (isJson) {
@@ -1110,7 +1332,7 @@ register('run', async (args) => {
     }
 
     // Resolve write-set: slice.writes → spec 「范围」 → detectDefaultWrites()
-    const resolved = await resolveWriteSet(id);
+    const resolved = preResolved;
     if (resolved.changed) {
       console.log(
         resolved.source === 'spec'
@@ -1154,6 +1376,36 @@ register('run', async (args) => {
     }
 
     await scheduler.startRun(id);
+
+    // ── 重复 agent 守卫 ──────────────────────────────────────────────────
+    // 这片之前已经有 agent 在跑 → 拒绝再起一个。
+    //
+    // 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+    //   活性判定按外层 `cmd.exe` 的 pid 判进程死活，而真正的 agent
+    //   （claude.exe）是它的孙进程。外层退出后 agent 还活着，
+    //   判定却说是「死了」→ 重跑 → **同一个 worktree 上起了第二个 agent**，
+    //   两个 agent 互相覆盖产出，谁的成果都留不下。
+    //
+    // 判据：查会话文件里最新的那条，用「整棵进程树」判活。
+    // 树还活着 → 拒绝并说清是谁在跑。
+    {
+      const rec = readSliceLivenessRecord(process.cwd(), id);
+      if (rec) {
+        const live = await classifyLivenessAsync(rec, { isProcessAlive, isProcessTreeAlive });
+        if (live.state === 'active' || live.state === 'stale') {
+          const msg =
+            `切片 "${id}" 已经有一个 agent 在运行（${live.reason}）—— ` +
+            `拒绝再起一个（两个 agent 会抢同一个 worktree）。` +
+            `先确认它是否真的还活着：zelto status`;
+          if (isJson) {
+            console.log(JSON.stringify({ sliceId: id, decision: 'blocked', reason: msg }));
+          } else {
+            console.error(`zelto run ${id} — ❌ ${msg}`);
+          }
+          return 1;
+        }
+      }
+    }
 
     const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
     console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
@@ -1244,6 +1496,11 @@ register('run', async (args) => {
     let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
     let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
+    // 活进程看门狗（ADR-074）：记下本轮起跑时刻 —— 它把「本轮的现场」
+    // 与「上一代被收走的尸体」分开（见 waitForExitWithWatchdog）
+    let runStartedAt = new Date().toISOString();
+    runGenStartedAt.set(id, runStartedAt);
+
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
       worktree: worktree?.relativePath ?? null,
@@ -1302,9 +1559,19 @@ register('run', async (args) => {
     const maxRetries = config.agent.maxRetries ?? 2;
     let finalExitCode: number | null = null;
     let attempt = 0;
+    let watchdogRecorded = false;
 
     while (attempt <= maxRetries) {
-      const exitCode = await adapter.waitForExit(sessionId);
+      // 活进程看门狗（ADR-074）：CLI 先死、agent 变孤儿、会话文件换壳……
+      // 任何一种「这一轮已经没有进程在管」都在这里当场收走，不再傻等
+      const waited = await waitForExitWithWatchdog({
+        sliceId: id,
+        sessionId,
+        adapter,
+        runStartedAt,
+        maxRetries,
+      });
+      const exitCode = waited.exitCode;
 
       // Clear progress display
       if (progressTimer) {
@@ -1315,6 +1582,14 @@ register('run', async (args) => {
 
       if (exitCode === 0) {
         finalExitCode = 0;
+        break;
+      }
+
+      // 看门狗已经写好了停机（退 frozen + 分类 + run.aborted + 记账）——
+      // 再走一遍 handleAgentFailure 只会写第二份分类、迁第二次状态。
+      if (waited.watchdogReaped) {
+        finalExitCode = null;
+        watchdogRecorded = true;
         break;
       }
 
@@ -1346,6 +1621,9 @@ register('run', async (args) => {
             const started = await adapter.start({ sliceId: id, prompt: bundlePath });
             sessionId = started.sessionId;
           }
+          // 新一轮（续跑或从头跑）—— 看门狗的「世代」跟着走
+          runStartedAt = new Date().toISOString();
+          runGenStartedAt.set(id, runStartedAt);
 
           // Restart progress display
           progressTimer = setInterval(() => {
@@ -1370,10 +1648,20 @@ register('run', async (args) => {
 
     // 记账（ADR-041 §3.1）：一次 agent 运行 = 一条运行记录。
     // 记在写集审计之前 —— 审计只判「有没有越界」，不改变「agent 跑没跑完」这个事实。
-    await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+    //
+    // 看门狗收走的那一轮已经记过账（exitCode=null）—— 不再记第二次，
+    // 否则一次运行会变成两条记录。
+    if (!watchdogRecorded) {
+      await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+    }
 
     // 写集审计（ADR-014 §5）：agent 跑完了，拿 git 的真实改动再对一次写集。
     // 静态分析拦不住的写（`node -e "fs.writeFileSync(...)"` 之类）到这里兜住。
+    if (watchdogRecorded) {
+      // 这一轮被看门狗收走（退 frozen + 分类已写）—— 现场已经交回给人。
+      // 跑门禁 / 审计越界都没有意义（而且 enforceWriteSet 会再退一次状态）。
+      return 1;
+    }
     const withinBounds = await enforceWriteSet(id, activeGuard);
 
     if (finalExitCode === 0) {
@@ -1738,6 +2026,10 @@ register('start', async (args) => {
     let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
     let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
+    // 活进程看门狗（ADR-074）的「本轮起跑时刻」
+    let runStartedAt = new Date().toISOString();
+    runGenStartedAt.set(id, runStartedAt);
+
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
     });
@@ -1755,15 +2047,31 @@ register('start', async (args) => {
     const maxRetries = cfg.agent.maxRetries ?? 2;
     let finalExitCode: number | null = null;
     let attempt = 0;
+    let watchdogRecorded = false;
 
     while (attempt <= maxRetries) {
-      const exitCode = await adapter.waitForExit(sessionId);
+      // 活进程看门狗（ADR-074）—— 与单片路径同一个等法
+      const waited = await waitForExitWithWatchdog({
+        sliceId: id,
+        sessionId,
+        adapter,
+        runStartedAt,
+        maxRetries,
+      });
+      const exitCode = waited.exitCode;
 
       clearInterval(progressTimer);
       process.stdout.write('\r' + ' '.repeat(50) + '\r');
 
       if (exitCode === 0) {
         finalExitCode = 0;
+        break;
+      }
+
+      // 看门狗已写好停机与记账 —— 不再走 handleAgentFailure
+      if (waited.watchdogReaped) {
+        finalExitCode = null;
+        watchdogRecorded = true;
         break;
       }
 
@@ -1788,6 +2096,9 @@ register('start', async (args) => {
             const started = await adapter.start({ sliceId: id, prompt: bundlePath });
             sessionId = started.sessionId;
           }
+          // 新一轮 —— 看门狗的世代跟着走
+          runStartedAt = new Date().toISOString();
+          runGenStartedAt.set(id, runStartedAt);
           progressTimer = setInterval(() => {
             const e = Math.floor((Date.now() - startTime) / 1000);
             const mins = Math.floor(e / 60);
@@ -1806,8 +2117,15 @@ register('start', async (args) => {
       break;
     }
 
-    // 记账（ADR-041 §3.1）
-    await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+    // 记账（ADR-041 §3.1）—— 看门狗收走的那一轮已经记过，不再记第二次。
+    if (!watchdogRecorded) {
+      await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+    }
+
+    if (watchdogRecorded) {
+      // 这一轮已交回给人（frozen + 停机分类），不再跑门禁 / 不进签字
+      return 1;
+    }
 
     if (finalExitCode === 0) {
       // 提问回路：agent 以问题收尾 → 挂起切片，不跑门禁（ADR-013 §3.6）
@@ -2005,12 +2323,24 @@ async function monitorTaskInBackground(
   guard?: RuntimeGuard,
 ): Promise<void> {
   try {
-    const exitCode = await adapter.waitForExit(sessionId);
+    // 活进程看门狗（ADR-074）：后台监视器同样要能认出「这一轮已经没有进程在管」
+    const runStartedAt = readSessionLiveness(process.cwd(), sessionId)?.startedAt
+      ?? new Date(startTime).toISOString();
+    const waited = await waitForExitWithWatchdog({
+      sliceId,
+      sessionId,
+      adapter,
+      runStartedAt,
+      maxRetries: loadConfig().agent.maxRetries ?? 2,
+    });    const exitCode = waited.exitCode;
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     const status = exitCode === 0 ? 'completed' : 'failed';
 
     // 记账（ADR-041 §3.1）：后台运行同样是一次运行。
-    await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
+    // 看门狗收走的那一轮已经记过账 —— 不再记第二次。
+    if (!waited.watchdogReaped) {
+      await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
+    }
 
     // Update task file
     const task = await loadTask(taskId);
@@ -2020,6 +2350,13 @@ async function monitorTaskInBackground(
       task.elapsedSec = elapsed;
       task.completedAt = new Date().toISOString();
       await saveTask(task);
+    }
+
+    if (waited.watchdogReaped) {
+      // 停机（frozen + 分类 + 事件）已由看门狗写好，现场交回给人。
+      // 但预约钩子是挂在**这个进程**里的 —— 它退出前必须摘掉，
+      // 否则 agent 原样再起时会被一个指向死进程的钩子挡住每一次写。
+      return;
     }
 
     // 写集审计（ADR-014 §5）

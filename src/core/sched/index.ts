@@ -29,6 +29,14 @@ export {
   LOCKS_DIR,
 } from './reservation.js';
 export {
+  type ProcessRow,
+  readProcessTable,
+  findDescendants,
+  isProcessTreeAlive,
+  findPidsByCmdline,
+  invalidateProcessTable,
+} from './process-table.js';
+export {
   type ManagedFile,
   type AuditOptions,
   type WriteAuditResult,
@@ -44,3 +52,11 @@ export {
   overlappingPaths,
   versionsOverlap,
 } from './cross-version.js';
+export {
+  type RunWatchdogInput,
+  type RunWatchdogAction,
+  SPAWN_GRACE_MS,
+  decideRunWatchdog,
+  selectGenerationRecords,
+  toWatchdogDecision,
+} from './watchdog-policy.js';
