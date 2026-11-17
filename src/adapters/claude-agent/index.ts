@@ -390,6 +390,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       const now = new Date().toISOString();
       sessionData.lastOutputAt = now;
       sessionData.lastActivityAt = now;
+      // D-55：输出就是「有进展」—— 空转的倒计时要重新开始。
+      this.resetIdleTimer(sessionId);
     };
     child.stdout?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf-8');
@@ -460,11 +462,29 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     // 按这个特征在进程表里反查，比「猜第几层子进程」可靠。
     void this.resolveAgentPid(sessionId, agentSessionId, child.pid);
 
-    // Set timeout
-    const timeout = setTimeout(() => {
-      this.handleTimeout(sessionId);
-    }, this.timeoutMs);
-    this.timeouts.set(sessionId, timeout);
+    // D-55：这里是**空转超时**（idle timeout），不是绝对超时。
+    //
+    // 病灶（实测于 nimrtc-zelto v3-chrome-waterfall，2026-11-17）：
+    //   原先是「起跑后 1800s 一刀切」。而这个 agent 在被砍的前 30 秒
+    //   **还在改文件** —— 它不是做不完，是「做得完但总时长超过上限」。
+    //   于是一轮 30 分钟的工作被砍掉、续跑、再砍、再续跑 ——
+    //   三轮 90 分钟、token 大把烧掉，产物仍未过门禁。
+    //
+    //   绝对超时惩罚的是「做得久」，而超时真正该抓的是「卡住不动」。
+    //   所以倒计时改成：**没有进展**才走。每有一次进展（输出、
+    //   工具调用、hook 判定）就重新开始计时。
+    //
+    // 「进展」从哪来（两个真实信号）：
+    //   1. agent 的 stdout/stderr —— 见上面的 `touchActivity`；
+    //   2. **工具调用** —— CLI 层看到切片事件流有新事件就调
+    //      `adapter.markProgress(sessionId)`（见 executor.ts 的说明）。
+    //      这一条是关键：Claude Code 跑的是 `--output-format json`，
+    //      stdout 直到最后才有内容 —— 只看输出的话，
+    //      「正在连续调用工具的 agent」会被误判成卡住。
+    //
+    // 上限不变（还是配置里的 `agent.timeout`），但语义从「总时长」
+    // 变成「无进展时长」。进展一直有 → 永远不砍。
+    this.resetIdleTimer(sessionId);
 
     // Start progress reporting interval (every 5 seconds)
     // D-30 心跳落盘：不管有没有 onProgress，都每 5 秒把 lastActivityAt 写进
@@ -578,6 +598,45 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     } catch { /* 写盘失败不阻断运行 */ }
   }
 
+  /**
+   * 重新开始「无进展」倒计时（D-55）。
+   *
+   * 每次有进展（输出 / 工具调用）就调一次。倒计时归零 → `handleTimeout`
+   * → 标记 `status = 'timeout'` 并杀掉整棵进程树。
+   *
+   * 会话已经不在了（跑完了）就什么都不做 —— 不给已结束的会话留定时器。
+   */
+  private resetIdleTimer(sessionId: string): void {
+    const existing = this.timeouts.get(sessionId);
+    if (existing) clearTimeout(existing);
+    if (!this.sessions.has(sessionId)) {
+      this.timeouts.delete(sessionId);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.handleTimeout(sessionId);
+    }, this.timeoutMs);
+    // 定时器不能拖住进程退出（主进程 process.exit 时要能走）
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.timeouts.set(sessionId, timer);
+  }
+
+  /**
+   * 外部报告「这一轮有进展」（D-55）。
+   *
+   * 谁调它：CLI 层（前台跑与后台监督进程）在**看到切片事件流有新事件**时
+   * —— 那些事件是 agent 的 PreToolUse hook 写的，每调用一次工具就有一条。
+   * 这条通道是必需的：Claude Code 跑 `--output-format json`，
+   * stdout 直到最后才有内容，只看输出会把「正在连续调用工具的 agent」
+   * 误判成卡住。
+   *
+   * 没实现的适配器不受影响（可选能力）。
+   */
+  markProgress(sessionId: string): void {
+    if (!this.sessions.has(sessionId)) return;
+    this.resetIdleTimer(sessionId);
+  }
+
   private handleTimeout(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -585,12 +644,14 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data && data.status === 'running') {
       data.status = 'timeout';
-      data.output.push(`[zelto: timeout after ${this.timeoutMs}ms]`);
+      // D-55：措辞要准 —— 是「无进展超时」，不是「跑太久」。
+      // 说成「跑太久」会让人去调小上限，而正确反应是「agent 卡住了」。
+      data.output.push(`[zelto: no progress for ${this.timeoutMs}ms — killed]`);
       saveSession(data);
     }
 
     if (this.onOutput) {
-      this.onOutput(sessionId, `\n[zelto: timeout after ${this.timeoutMs}ms]\n`);
+      this.onOutput(sessionId, `\n[zelto: no progress for ${this.timeoutMs}ms — killed]\n`);
     }
 
     // Kill the whole process tree — not just the shell wrapper (ADR-055).

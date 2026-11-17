@@ -82,6 +82,21 @@ export interface ExecutorAdapter {
   continueSession?(sessionId: string, instructions: string): Promise<{ sessionId: string }>;
 
   /**
+   * 报告「这一轮有进展」（D-55）。
+   *
+   * 存在的理由：适配器的超时是**空转超时**（没有进展才杀），而
+   * 「进展」不只有 stdout —— Claude Code 跑 `--output-format json`，
+   * stdout 直到最后才有内容。只看输出的话，一个正在连续调用工具的
+   * agent 会被误判成卡住。
+   *
+   * 谁调它：CLI 层在**看到切片事件流有新事件**时 —— 那些事件是 agent 的
+   * PreToolUse hook 写的，每调用一次工具就有一条。
+   *
+   * 可选能力：没实现的适配器不受影响（调用方要判存在性）。
+   */
+  markProgress?(sessionId: string): void;
+
+  /**
    * Get the agent's output text for a session.
    *
    * Used to read the agent's final answer — e.g. to parse the question marker

@@ -370,7 +370,7 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     let alreadyStalled = false;
 
     for (;;) {
-      exitCode = await waitForAgentExit(args, sessionId, log);
+      exitCode = await waitForAgentExit(args, sessionId, log, adapter);
       if (exitCode === 0) break;
 
       // 只有「可自动恢复」的停机类别才值得重试（环境抖动、上下文超限…）。
@@ -489,14 +489,27 @@ async function waitForAgentExit(
   args: SupervisorArgs,
   sessionId: string,
   log: (line: string) => void,
+  adapter?: import('../../core/ports/executor.js').ExecutorAdapter,
 ): Promise<number | null> {
   const { readSessionLiveness } = await import('../../core/activity/index.js');
   const { isProcessAlive, isProcessTreeAlive } = await import('../../core/sched/index.js');
+  const { SliceProgressProbe } = await import('./progress-probe.js');
 
   const deadline = Date.now() + args.timeoutMs + 60_000;
   let goneSince: number | null = null;
 
+  // D-55：进展探针 —— agent 每调用一次工具，hook 就往事件流写一条。
+  // 有新事件 = 它还在推进 → 适配器的空转倒计时重新开始。
+  //
+  // 没有这一条，`--output-format json` 模式下 stdout 直到最后才有内容，
+  // 一个正在连续调用工具的 agent 会被当成「一声不吭」→ 被空转超时砍掉。
+  const progress = new SliceProgressProbe(args.projectRoot, args.sliceId);
+
   while (Date.now() < deadline) {
+    try {
+      if (progress.poll()) adapter?.markProgress?.(sessionId);
+    } catch { /* 探针失败不影响等待 */ }
+
     const rec = readSessionLiveness(args.projectRoot, sessionId);
     const pids = [
       rec?.agentPid,

@@ -102,6 +102,7 @@ import {
   supervisorLogPath,
 } from './supervisor.js';
 import { finishRun } from './run-finish.js';
+import { SliceProgressProbe } from './progress-probe.js';
 import { loadTask, mergeSessionLiveness, patchTask, saveTask, tasksDir, type TaskInfo } from './task-store.js';
 
 // 供其它命令复用（ai-pipeline.ts / question.ts）
@@ -237,9 +238,22 @@ async function waitForExitWithWatchdog(opts: {
   const { sliceId, sessionId, adapter, runStartedAt, maxRetries } = opts;
   const exitPromise = adapter.waitForExit(sessionId).then((code) => ({ exitCode: code, watchdogReaped: false }));
 
+  // D-55：进展探针 —— agent 每调用一次工具，hook 就往事件流写一条。
+  // 有新事件 = 它还在推进 → 告诉适配器「倒计时重新开始」。
+  //
+  // 这一条是必需的：Claude Code 跑 `--output-format json`，
+  // stdout 直到最后才有内容 —— 只看输出会把「正在连续调用工具的 agent」
+  // 误判成卡住，然后被空转超时砍掉（D-55 的病灶）。
+  const progress = new SliceProgressProbe(process.cwd(), sliceId);
+
   let timer: ReturnType<typeof setInterval> | null = null;
   const watchdogPromise = new Promise<{ exitCode: number | null; watchdogReaped: boolean }>((resolve) => {
     timer = setInterval(async () => {
+      // 进展探针先行 —— 它只读文件大小，不会因失败阻断看门狗。
+      try {
+        if (progress.poll()) adapter.markProgress?.(sessionId);
+      } catch { /* 探针失败不影响看门狗判定 */ }
+
       let action: RunWatchdogAction;
       try {
         const slice = await store.read(sliceId);
