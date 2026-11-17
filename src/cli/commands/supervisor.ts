@@ -310,14 +310,29 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     // 预约与钩子装在这里（而不是主进程）：守卫要在 agent 跑的那段时间里
     // 一直有效，而释放它的是这个进程 —— 谁装谁放，才不会漏。
     const { installRuntimeGuard } = await import('./runtime-guard.js');
+    const { zeltoOwnedPaths } = await import('./parallel-executor.js');
     const slice = await store.read(args.sliceId).catch(() => null);
     const bundlePath = join(args.projectRoot, '.zelto', `${args.sliceId}-bundle.json`);
+    const worktreePath = args.workDir === args.projectRoot ? null : args.workDir;
     guard = await installRuntimeGuard({
       sliceId: args.sliceId,
       writes: slice?.writes ?? [],
-      worktree: args.workDir === args.projectRoot ? null : args.workDir,
+      worktree: worktreePath,
       projectRoot: args.projectRoot,
       baseCommit: slice?.baseCommit ?? null,
+      // D-60：托管文件清单必须与前台路径同源。
+      //
+      // 少了这一行，规格副本（zelto 自己复制进 worktree 的）会被
+      // 运行后的写集审计算成「agent 的越界写入」——
+      // agent 一个字节都没碰它，却把整轮运行判成越界（实测
+      // nimrtc-zelto v3-weaknet-verdict，2026-11-17：越界文件
+      // `specs/slices/v3-weaknet-verdict.md`，内容与主仓真源逐字节相同）。
+      //
+      // 前台路径（core-slice.ts / parallel-executor.ts）都传了
+      // `zeltoOwnedPaths`，只有这里漏了 —— 于是「后台跑就一定会被
+      // 自己的规格副本拦下」。
+      managedPaths:
+        slice && worktreePath ? zeltoOwnedPaths(worktreePath, slice) : undefined,
     });
     log(`写集预约已取得：${(slice?.writes ?? []).join(', ') || '(空)'}`);
 
