@@ -1126,7 +1126,91 @@ export async function ensureWorktree(
     });
   }
 
+  // ── 规格副本对齐校验（D-47 的硬闸门）───────────────────────────────
+  //
+  // 为什么同步完了还要再校验一次：
+  //
+  //   同步动作本身可能没跑（老版本二进制、路径写错、copy 抛错被吞），
+  //   而**判据分裂的后果极重**：门禁按主仓的新规格判，agent 按 worktree 里的
+  //   旧规格干 —— 拦住的是「实现的是另一个需求」，不是「实现有 bug」。
+  //
+  //   实测（nimrtc-zelto v2-ai-decision，2026-11-17）：
+  //     主仓规格 = 9 条验收标准（partial / barge_in / agent-control / framed /
+  //              IASR / ILLM …）
+  //     worktree 里的副本 = 4 条（LLM 草稿：延迟 <50ms / 准确率 ≥90% / 3 种策略 / 日志）
+  //     → agent 老老实实实现了那 4 条
+  //     → 门禁按 9 条判 → 判定分裂，两边都「正常工作」
+  //
+  // 所以：**起跑前**必须确认 worktree 里的规格副本与主仓真源一致。
+  // 不一致 → 直接拦下，不让 agent 拿着旧规格去干活。
+  const specSync = verifyWorktreeSpecSync(id, info.path, slice.spec.path, slice.spec.frozenHash);
+  if (!specSync.ok) {
+    await events.append(id, 'slice.drift_detected', 'zelto', {
+      sliceId: id,
+      expectedHash: slice.spec.frozenHash,
+      actualHash: specSync.worktreeHash,
+      reason: specSync.reason,
+      scope: 'worktree-spec-copy',
+    });
+    throw new Error(
+      `worktree 里的规格副本与主仓真源不一致 —— 拒绝起跑。\n` +
+      `  ${specSync.reason}\n` +
+      `  主仓：${slice.spec.path}\n` +
+      `  worktree：${info.relativePath}/${slice.spec.path}\n` +
+      `  修法：删掉 worktree 目录（zelto 会在下次起跑时重建并同步），` +
+      `或确认二进制是最新构建。`,
+    );
+  }
+
   return info;
+}
+
+/**
+ * 校验 worktree 里的规格副本与主仓真源是否一致（D-47）。
+ *
+ * 判据：**内容哈希**相同。不比大小、不比时间戳 ——
+ * 时间戳会被 git checkout 改、会被复制改，只有内容哈希是判据本身。
+ *
+ * @param frozenHash 冻结时的哈希；主仓规格漂移（人改过规格但没重冻）
+ *   由门禁①另行报，这里**不**重复报 —— 两件事、两处出口。
+ */
+export function verifyWorktreeSpecSync(
+  sliceId: string,
+  worktreePath: string,
+  specPath: string,
+  frozenHash: string | null,
+): { ok: boolean; worktreeHash: string | null; reason: string } {
+  const sourcePath = join(process.cwd(), specPath);
+  const destPath = join(worktreePath, specPath);
+
+  if (!existsSync(sourcePath)) {
+    return { ok: true, worktreeHash: null, reason: '主仓没有规格文件 —— 无从比对' };
+  }
+  if (!existsSync(destPath)) {
+    return {
+      ok: false,
+      worktreeHash: null,
+      reason: `worktree 里没有规格副本（${specPath}）—— agent 会拿不到规格`,
+    };
+  }
+
+  const sourceHash = hashSpecFile(specPath);
+  const destHash = hashSpecFile(join(worktreePath, specPath));
+  if (sourceHash === null || destHash === null) {
+    return { ok: false, worktreeHash: destHash, reason: '规格副本无法读取，无法比对' };
+  }
+  if (sourceHash === destHash) {
+    return { ok: true, worktreeHash: destHash, reason: '规格副本与主仓真源一致' };
+  }
+
+  return {
+    ok: false,
+    worktreeHash: destHash,
+    reason:
+      `worktree 里的规格副本是旧版（主仓 ${sourceHash.slice(0, 12)}… / ` +
+      `worktree ${destHash.slice(0, 12)}…）—— agent 会照旧规格干活` +
+      (frozenHash ? `（冻结哈希 ${frozenHash.slice(0, 12)}…）` : ''),
+  };
 }
 
 // ─── Policy YAML Parser ─────────────────────────────────────────────────────

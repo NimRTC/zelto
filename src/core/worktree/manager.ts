@@ -253,12 +253,31 @@ export class WorktreeManager {
       // 因为每一道闸门单独看都在正常工作。
       //
       // 所以：规格是 agent 的**输入**，输入必须在每次开跑前对齐到当前真源。
-      // 验收目录同理 —— 人改了验收测试，agent 也要看到新版。
       if (options.specPath) {
         this.copyIntoWorktree(target, options.specPath, true);
       }
+      // 验收目录要同步，但**不能覆盖 agent 已经写好的断言**。
+      //
+      // 归属划分（这一条是 D-47 修复里最容易搞错的地方）：
+      //   - 规格文件 = **人的产出**，真源在主仓 → 同步时覆盖是对的；
+      //   - 验收测试 = **agent 的产出**，真源在 worktree → 同步时覆盖会
+      //     把 agent 写的真断言换回主仓的 `test.todo` 骨架。
+      //
+      // 后果很具体（实测 nimrtc-zelto v2-ai-decision）：
+      //   agent 在 worktree 里把验收测试写成了 6 条真断言（0 个 todo），
+      //   主仓里还是 4 条 `test.todo`。若这里无脑覆盖，
+      //   重跑时 agent 看到的又是空骨架 —— 而**它上一轮写的真断言
+      //   会当场消失**。那是拿 agent 的成果去换 agent 的成果。
+      //
+      // 合并时 `commitWorktreeChanges` 会把 worktree 的验收测试提交进分支，
+      // 所以 agent 的断言最终会进主干 —— **主仓的 todo 会被替换掉**，
+      // 不需要（也不应该）在同步阶段动手。
+      //
+      // 同步只做一件事：**补齐主仓有、worktree 没有的验收文件**。
+      // 已有文件不动 —— 它要么是 agent 写的，要么是主仓的原版，
+      // 两种都不该被「同步」覆盖。
       if (options.acceptanceDir) {
-        this.copyIntoWorktree(target, options.acceptanceDir, true);
+        this.copyMissingIntoWorktree(target, options.acceptanceDir);
       }
       return {
         sliceId,
@@ -386,7 +405,26 @@ export class WorktreeManager {
             // 注意配置键用的是 submodule 的 **name**（.gitmodules 的 section 名），
             // 不是 path —— 两者相同时看不出差别，不同时就改错了 submodule。
             '-c', `submodule.${sub.name}.url=${moduleGitDir}`,
-            'submodule', 'update', '--init', '--recursive', sub.path,
+            // ── 不用 `--recursive` ───────────────────────────────────
+            // `--recursive` 会把**嵌套** submodule 也拉进来。而嵌套层的
+            // 克隆源在主仓里没有对应的 module git 目录可指向 ——
+            // git 只好按 `.gitmodules` 里写的 https URL **联网**克隆。
+            //
+            // 实测（nimrtc-zelto v2-input-binder，2026-11-17）：
+            //   `git submodule update --init --recursive` 触发
+            //   `git clone https://github.com/openssl/openssl ...`
+            //   → 两个 clone 挂起 5 分钟以上（还在等网络），
+            //     agent 迟迟起不来，worktree 里的 vendor 目录是空的。
+            //
+            // 后果有两条，都很重：
+            //   1. **违反 C3**（`core/` 不触网）—— 判定路径居然在拉网络；
+            //   2. **不确定的耗时** —— 门禁跑在 vendor 缺失的目录上，
+            //      agent 只能干等，或者自己手工拷一份（把 vendor 改成
+            //      「非 submodule 的普通目录」，破坏主仓的一致性）。
+            //
+            // 嵌套 submodule 由 `alignNestedSubmodules` 处理 ——
+            // 直接从**主仓工作区**复制（主仓里那些目录已经有内容了）。
+            'submodule', 'update', '--init', sub.path,
           ],
           undefined,
           false,
@@ -398,7 +436,74 @@ export class WorktreeManager {
       }
     }
 
+    // 嵌套 submodule：主仓里已有内容 → 直接复制，不联网。
+    this.copyNestedSubmodules(worktreePath, submodules.map((s) => s.path));
+
     return { initialized, skipped };
+  }
+
+  /**
+   * 把**嵌套** submodule 从主仓复制到 worktree（不联网）。
+   *
+   * 为什么需要这一步：`git submodule update --init`（不带 `--recursive`）
+   * 只处理顶层 submodule。嵌套层（msquic 的 openssl / quictls /
+   * googletest 等）留在 worktree 里就是空目录 —— 门禁配置阶段就会报
+   * 「找不到 googletest」。
+   *
+   * 为什么是**复制**而不是 `submodule update --init`：
+   *   嵌套 submodule 的克隆源在主仓里没有对应的 module git 目录
+   *   （`.git/modules/<name>` 只有顶层那一份），git 只能按 https URL
+   *   联网克隆 —— 违反 C3，且耗时不可控（实测挂起 5 分钟以上）。
+   *
+   * 主仓工作区里那些目录**已经有内容**（那是能编译通过的证据），
+   * 复制它们既不触网又与主仓一致。
+   */
+  private copyNestedSubmodules(worktreePath: string, topLevelPaths: string[]): void {
+    for (const topPath of topLevelPaths) {
+      const mainTop = join(this.repoRoot, topPath);
+      if (!existsSync(mainTop)) continue;
+
+      // 顶层自己就是嵌套的根：它的 .gitmodules 里还有一层
+      const nestedGitmodules = join(mainTop, '.gitmodules');
+      if (!existsSync(nestedGitmodules)) continue;
+
+      let nested: Array<{ name: string; path: string }> = [];
+      try {
+        const raw = this.git(
+          ['config', '--file', nestedGitmodules, '--get-regexp', '^submodule\\..*\\.path$'],
+          undefined,
+          true,
+          mainTop,
+        );
+        nested = raw
+          .split('\n')
+          .map((line) => {
+            const idx = line.indexOf(' ');
+            if (idx === -1) return null;
+            const key = line.slice(0, idx).trim();
+            const name = key.replace(/^submodule\./, '').replace(/\.path$/, '');
+            const path = line.slice(idx + 1).trim();
+            return name && path ? { name, path } : null;
+          })
+          .filter((s): s is { name: string; path: string } => s !== null);
+      } catch {
+        continue;
+      }
+
+      for (const sub of nested) {
+        const source = join(mainTop, sub.path);
+        if (!existsSync(source)) continue;
+        if (!this.hasDirectoryContent(source)) continue;
+        const dest = join(worktreePath, topPath, sub.path);
+        if (existsSync(dest) && this.hasDirectoryContent(dest)) continue;
+        try {
+          mkdirSync(join(dest, '..'), { recursive: true });
+          cpSync(source, dest, { recursive: true, force: true, errorOnExist: false });
+        } catch {
+          // 复制失败不阻断 —— 门禁会因缺依赖报错，信息更明确
+        }
+      }
+    }
   }
 
   /**
@@ -641,6 +746,49 @@ export class WorktreeManager {
     }
     mkdirSync(join(dest, '..'), { recursive: true });
     cpSync(source, dest, { recursive: true });
+  }
+
+  /**
+   * 只补齐**主仓有、worktree 没有**的验收文件；已有的一个都不动。
+   *
+   * 为什么不能像规格那样直接覆盖 —— 见 `create()` 里复用分支的注释：
+   * 验收测试是 **agent 的产出**，真源在 worktree 里。覆盖等于
+   * 把 agent 写的真断言换回主仓的 `test.todo` 骨架。
+   *
+   * 补齐（而不是不抄）是为了另一种情形：主仓里**新增**了验收文件
+   * （比如人手工加了一条回归用例），worktree 里还没有 ——
+   * 那份是人的产出，agent 应该看到。
+   *
+   * 判据按**相对路径**逐个文件比：worktree 里有的就跳过。
+   */
+  private copyMissingIntoWorktree(worktreePath: string, relativePath: string): void {
+    const source = join(this.repoRoot, relativePath);
+    if (!existsSync(source)) return;
+
+    const sourceStat = statSync(source);
+    if (!sourceStat.isDirectory()) {
+      // 单文件：只有 worktree 里没有时才补
+      const dest = join(worktreePath, relativePath);
+      if (!existsSync(dest)) {
+        mkdirSync(join(dest, '..'), { recursive: true });
+        cpSync(source, dest, { recursive: true });
+      }
+      return;
+    }
+
+    mkdirSync(join(worktreePath, relativePath), { recursive: true });
+    for (const entry of readdirSync(source, { withFileTypes: true })) {
+      const childRel = join(relativePath, entry.name);
+      if (entry.isDirectory()) {
+        this.copyMissingIntoWorktree(worktreePath, childRel);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const dest = join(worktreePath, childRel);
+      if (existsSync(dest)) continue; // worktree 已有 —— agent 的产出，不动
+      mkdirSync(join(dest, '..'), { recursive: true });
+      cpSync(join(this.repoRoot, childRel), dest, { recursive: true });
+    }
   }
 
   /** 目录里有没有实际内容（排除只有 `.git` 的空 submodule 目录）。 */

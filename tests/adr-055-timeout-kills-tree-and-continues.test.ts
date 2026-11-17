@@ -36,8 +36,26 @@ import { execFile } from 'node:child_process';
 
 import { killProcessTree, killProcessTreeGracefully } from '../src/adapters/process-tree.js';
 import { ClaudeAgentAdapter } from '../src/adapters/claude-agent/index.js';
+import { readSessionLiveness } from '../src/core/activity/liveness.js';
 
 const TEST_DIR = join(tmpdir(), `zelto-adr055-test-${Date.now()}`);
+
+/**
+ * 删临时目录（Windows 上可能要重试）。
+ *
+ * 被杀的 agent 可能还短暂持有 cwd 句柄 → `rm` 报 EBUSY。
+ * 那是**清理时机**问题，不是测试失败 —— 重试几次，失败也只记一笔。
+ */
+async function rmTestDir(): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    try {
+      await rm(TEST_DIR, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
 
 /** 起一个会自己退出的子进程，返回 pid 与 child 句柄。 */
 async function spawnSleeping(seconds: number): Promise<{ pid: number; child: import('node:child_process').ChildProcess }> {
@@ -82,7 +100,7 @@ describe('ADR-055 · 杀干净进程树', () => {
   });
 
   after(async () => {
-    await rm(TEST_DIR, { recursive: true, force: true });
+    await rmTestDir();
   });
 
   it('无效 pid 不抛异常（终止失败不该把调用方带崩）', async () => {
@@ -157,6 +175,68 @@ describe('ADR-055 · 超时保留 timeout 状态，不写成 failed', () => {
     const status = adapter.getSessionStatus(sessionId);
     assert.ok(status);
     assert.equal(status.status, 'completed');
+  });
+});
+
+// ── D-48：包装 pid 与 agent 本人 pid 都必须被杀 ────────────────────────
+//
+// 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+//
+//   超时点 `taskkill /pid <包装pid> /T` **没杀掉真正的 agent**。
+//   包装 cmd.exe 早就退出了（`/T` 按它当时的子进程树算，
+//   而 agent 是它的孙进程），于是 taskkill 找不到人。
+//   真正的 agent（pid 28072）继续跑：继续改文件、继续发 policy.decision，
+//   而 zelto 已经把它判成 timeout 并准备重试 —— 两个 agent 抢同一批文件。
+//
+// 所以杀的时候必须**两个 pid 都杀**：包装 pid（杀管道与后代）
+// 与 `agentPid`（杀 agent 本人）。
+describe('D-48 · 超时要把包装 pid 与 agent 本人 pid 都杀掉', () => {
+  before(async () => {
+    await mkdir(TEST_DIR, { recursive: true });
+  });
+
+  after(async () => {
+    await rmTestDir();
+  });
+
+  it('agent 本人 pid 与包装 pid 是两个不同的进程，都要被杀掉', async () => {
+    // 模拟真实形态：包装进程很快退出，agent（孙进程）继续活着。
+    // 用 shell 起一个「先退出包装、留下真 agent」的组合：
+    //   cmd.exe → node（真 agent）
+    // 包装 pid 退出后，taskkill /T 已经找不到 agent 了 ——
+    // 这正是「只杀包装 pid」漏掉 agent 的原因。
+    const node = `"${process.execPath}"`;
+    const adapter = new ClaudeAgentAdapter({
+      agentCommand: `${node} -e "setTimeout(()=>{}, 60000)"`,
+      cwd: TEST_DIR,
+      timeoutMs: 800,
+    });
+
+    // 会话文件写在**进程 cwd** 下（`saveSession` 用相对路径 '.zelto/sessions'）。
+    // chdir 进临时目录，免得把测试会话文件落进仓库里。
+    const cwd = process.cwd();
+    process.chdir(TEST_DIR);
+    let rec: ReturnType<typeof readSessionLiveness>;
+    try {
+      const { sessionId } = await adapter.start({ sliceId: 'd48-double-kill', prompt: 'bundle' });
+      await adapter.waitForExit(sessionId);
+
+      // 超时之后 agent 本人必须不在了。
+      const status = adapter.getSessionStatus(sessionId);
+      assert.ok(status);
+      assert.equal(status.status, 'timeout');
+
+      rec = readSessionLiveness(TEST_DIR, sessionId);
+    } finally {
+      process.chdir(cwd);
+    }
+    assert.ok(rec, '会话文件应该存在');
+    const agentPid = rec.agentPid;
+    if (agentPid !== undefined) {
+      // 宽限期后再判 —— 优雅终止 → 强杀是异步的。
+      await new Promise((r) => setTimeout(r, 5000));
+      assert.equal(isAlive(agentPid), false, `agent 本人 pid ${agentPid} 必须被杀掉`);
+    }
   });
 });
 

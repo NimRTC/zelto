@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, cpSync, read
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorktreeManager, WorktreeError, WORKTREE_BASE_DIR } from '../../../src/core/worktree/index.js';
+import { verifyWorktreeSpecSync } from '../../../src/cli/commands/shared.js';
 
 /** Create a throwaway git repo with one commit so worktree add can succeed. */
 function makeRepo(): string {
@@ -127,7 +128,7 @@ describe('WorktreeManager — create / list / remove', () => {
       );
     });
 
-    it('验收目录在 worktree 创建后被改写 → 复用时同步新版本', async () => {
+    it('验收目录在 worktree 创建后被改写 → 不覆盖 agent 已有的验收文件', async () => {
       const manager = new WorktreeManager(repo);
       const accRel = 'tests/acceptance/slice-sync-acc';
       mkdirSync(join(repo, accRel), { recursive: true });
@@ -137,13 +138,35 @@ describe('WorktreeManager — create / list / remove', () => {
       const wtAcc = join(info.path, accRel, 'acceptance.test.cjs');
       assert.equal(readFileSync(wtAcc, 'utf-8'), '// 旧断言\n');
 
-      writeFileSync(join(repo, accRel, 'acceptance.test.cjs'), '// 新断言\n');
+      // agent 在 worktree 里写了真断言 —— 这是 agent 的产出，真源在 worktree
+      writeFileSync(wtAcc, '// agent 写的真断言\n');
+
+      // 主仓那份被改回骨架（合并前主仓仍是旧的）
+      writeFileSync(join(repo, accRel, 'acceptance.test.cjs'), '// 主仓的 todo 骨架\n');
 
       await manager.create('slice-sync-acc', { acceptanceDir: accRel });
       assert.equal(
         readFileSync(wtAcc, 'utf-8'),
-        '// 新断言\n',
-        '验收目录同样是 agent 的输入 —— 改了就要同步',
+        '// agent 写的真断言\n',
+        '验收测试是 agent 的产出 —— 同步不能覆盖它（否则拿 agent 的成果换 agent 的成果）',
+      );
+    });
+
+    it('主仓新增的验收文件 → 补进 worktree（那是人的产出，agent 该看到）', async () => {
+      const manager = new WorktreeManager(repo);
+      const accRel = 'tests/acceptance/slice-new-acc';
+      mkdirSync(join(repo, accRel), { recursive: true });
+
+      const info = await manager.create('slice-new-acc', { acceptanceDir: accRel });
+      const wtAcc = join(info.path, accRel);
+
+      // 人后来在主仓加了一个回归用例
+      writeFileSync(join(repo, accRel, 'regression.test.cjs'), '// 人加的回归用例\n');
+
+      await manager.create('slice-new-acc', { acceptanceDir: accRel });
+      assert.ok(
+        existsSync(join(wtAcc, 'regression.test.cjs')),
+        '主仓新增的验收文件应当补进 worktree',
       );
     });
 
@@ -480,6 +503,87 @@ describe('WorktreeManager — submodules (ADR-044)', () => {
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── D-47：worktree 里的规格副本必须与主仓真源一致 ──────────────────────
+//
+// 病灶（实测于 nimrtc-zelto v2-ai-decision，2026-11-17）：
+//
+//   主仓规格 = 9 条验收标准（partial / barge_in / agent-control / framed …）
+//   worktree 里的副本 = 4 条（LLM 草稿：延迟 / 准确率 / 3 种策略 / 日志）
+//   → agent 老老实实实现了那 4 条
+//   → 门禁按 9 条判 → **判定分裂**：拦住的不是「实现有 bug」，
+//     而是「实现的是另一个需求」。每一道闸门单独看都在正常工作。
+//
+// 所以规格副本的对齐不能靠「同步动作跑过了」来保证 ——
+// 必须**在起跑前**比对内容哈希，不一致就拦下。
+describe('D-47：规格副本对齐校验', () => {
+  let repo: string;
+
+  before(() => {
+    repo = makeRepo();
+  });
+
+  after(() => {
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('副本与主仓一致 → 通过', () => {
+    const specPath = 'specs/slices/demo.md';
+    mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(repo, specPath), '# 规格\n', 'utf-8');
+    const wt = mkdtempSync(join(tmpdir(), 'zelto-wt-spec-'));
+    mkdirSync(join(wt, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(wt, specPath), '# 规格\n', 'utf-8');
+
+    const cwd = process.cwd();
+    try {
+      process.chdir(repo);
+      const result = verifyWorktreeSpecSync('demo', wt, specPath, null);
+      assert.equal(result.ok, true, result.reason);
+    } finally {
+      process.chdir(cwd);
+      rmSync(wt, { recursive: true, force: true });
+    }
+  });
+
+  it('副本是旧版 → 拦下，并说清两边哈希', () => {
+    const specPath = 'specs/slices/demo.md';
+    mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(repo, specPath), '# 新规格（9 条）\n', 'utf-8');
+    const wt = mkdtempSync(join(tmpdir(), 'zelto-wt-spec-'));
+    mkdirSync(join(wt, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(wt, specPath), '# 旧规格（4 条）\n', 'utf-8');
+
+    const cwd = process.cwd();
+    try {
+      process.chdir(repo);
+      const result = verifyWorktreeSpecSync('demo', wt, specPath, null);
+      assert.equal(result.ok, false, '旧副本必须被拦下');
+      assert.match(result.reason, /旧版/);
+    } finally {
+      process.chdir(cwd);
+      rmSync(wt, { recursive: true, force: true });
+    }
+  });
+
+  it('worktree 里没有副本 → 拦下（agent 会拿不到规格）', () => {
+    const specPath = 'specs/slices/demo2.md';
+    mkdirSync(join(repo, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(repo, specPath), '# 规格\n', 'utf-8');
+    const wt = mkdtempSync(join(tmpdir(), 'zelto-wt-spec-'));
+
+    const cwd = process.cwd();
+    try {
+      process.chdir(repo);
+      const result = verifyWorktreeSpecSync('demo2', wt, specPath, null);
+      assert.equal(result.ok, false);
+      assert.match(result.reason, /没有规格副本/);
+    } finally {
+      process.chdir(cwd);
+      rmSync(wt, { recursive: true, force: true });
     }
   });
 });

@@ -177,6 +177,37 @@ const runGenStartedAt = new Map<string, string>();
 const RUN_WATCHDOG_INTERVAL_MS = 5_000;
 
 /**
+ * 本轮 agent 的进程是否还活着（**直接问进程表**，不看会话文件）。
+ *
+ * 为什么不能只看会话文件（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+ *
+ *   会话文件的 `status` 在超时时被写成 `timeout`（不是 `running`），
+ *   而 `readSliceLivenessRecords` 只收 `status === 'running'` 的记录 →
+ *   这份被滤掉；剩下上一代的记录 `startedAt` 早于本轮起跑 → 也被滤掉。
+ *   结果：records 为空 → 看门狗判「从没真正开跑」→ **收走一个活着的 agent**。
+ *
+ *   那个 agent 毫不知情：它继续改文件、继续发 `policy.decision`，
+ *   直到自己跑完。而 zelto 已经在同一 worktree 上重试 —— 两个 agent 抢同一批文件。
+ *
+ * 判据：会话文件里记的 `agentPid`（按 `--session-id` 反查拿到的 agent 本人 pid）
+ * 或包装 `pid`，**或其任一后代**还活着 → 就算活着。
+ *
+ * 拿不到进程表时返回 `true`（fail safe）：宁可多等，也不误杀正在干活的 agent。
+ */
+function agentProcessAlive(sessionId: string): boolean {
+  const rec = readSessionLiveness(process.cwd(), sessionId);
+  if (!rec) return false;
+  const pids = [rec.agentPid, rec.pid].filter(
+    (p): p is number => typeof p === 'number' && p > 0,
+  );
+  if (pids.length === 0) return false;
+  for (const pid of pids) {
+    if (isProcessAlive(pid)) return true;
+  }
+  return false;
+}
+
+/**
  * 一次「等 agent 结束」，期间由活进程看门狗盯着现场。
  *
  * 两种情况任一先到即返回：
@@ -214,6 +245,11 @@ async function waitForExitWithWatchdog(opts: {
           records: readSliceLivenessRecords(process.cwd(), sliceId, runStartedAt),
           recoveries: readRecoveries(process.cwd(), sliceId).count,
           isProcessAlive,
+          // 「没有记录」不等于「没有进程」—— reap 之前先问一次进程表。
+          // 实测（nimrtc-zelto v2-input-binder，2026-11-17）：看门狗把一个
+          // 正在改文件的 agent 判成「从没开跑」，退成 frozen，而 agent 毫不知情
+          // 地继续跑 —— 现场是两个 agent 抢同一批文件。
+          isAgentAlive: () => agentProcessAlive(sessionId),
         });
       } catch {
         return; // 读盘失败不改变判定 —— 下一轮再试
@@ -1494,12 +1530,16 @@ register('run', async (args) => {
     console.log(`  Reservation:   ${bundle.writes.join(', ') || '(空)'}`);
 
     let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
-    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     // 活进程看门狗（ADR-074）：记下本轮起跑时刻 —— 它把「本轮的现场」
     // 与「上一代被收走的尸体」分开（见 waitForExitWithWatchdog）
+    //
+    // **必须在 start 之前**取（D-49）：适配器写会话文件用的 `startedAt`
+    // 比这个时刻早，取晚了本轮记录会被世代过滤滤掉 → 看门狗误判「从没开跑」。
     let runStartedAt = new Date().toISOString();
     runGenStartedAt.set(id, runStartedAt);
+
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
@@ -1614,6 +1654,11 @@ register('run', async (args) => {
           // 从头再跑一遍等于把那些工作重做一遍（编译、跑测试、改代码），
           // 还把 agent 的上下文清零，让它重新摸索一遍已经摸清的东西。
           // 能续就续：同一个 agent 会话（`--resume`），提示它「继续」。
+          //
+          // 新一轮的「起跑时刻」必须在 start **之前**取（见上面 D-49 的说明）：
+          // 世代过滤靠它切分本轮记录与上一代的尸体，取晚了本轮记录会被滤掉。
+          runStartedAt = new Date().toISOString();
+          runGenStartedAt.set(id, runStartedAt);
           const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
           if (resumed) {
             sessionId = resumed;
@@ -1621,9 +1666,6 @@ register('run', async (args) => {
             const started = await adapter.start({ sliceId: id, prompt: bundlePath });
             sessionId = started.sessionId;
           }
-          // 新一轮（续跑或从头跑）—— 看门狗的「世代」跟着走
-          runStartedAt = new Date().toISOString();
-          runGenStartedAt.set(id, runStartedAt);
 
           // Restart progress display
           progressTimer = setInterval(() => {
@@ -2024,11 +2066,19 @@ register('start', async (args) => {
     const adapterType = optionValueStrict(args, '--adapter');
     const sliceForTimeout = await store.read(id);
     let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
-    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
-
-    // 活进程看门狗（ADR-074）的「本轮起跑时刻」
+    // 活进程看门狗（ADR-074）的「本轮起跑时刻」—— **必须在 start 之前**取。
+    //
+    // 世代过滤靠它切分「本轮的记录」与「上一代的尸体」：只有
+    // `startedAt >= 起跑时刻` 的记录才算本轮。适配器写会话文件用的
+    // `startedAt` 是它自己 new Date() 取的 —— 比这里的时刻**早**（start
+    // 先返回，CLI 才接着取时刻）。
+    //
+    // 取晚了就出事：差值超过 1 秒容差时，本轮自己的记录会被世代过滤
+    // 滤掉 → 看门狗看到「本轮没有任何记录」→ 判「从没开跑」→ 收走。
+    // 于是每次重试都要么秒收一次、要么被上一代的尸体当成现场（D-49）。
     let runStartedAt = new Date().toISOString();
     runGenStartedAt.set(id, runStartedAt);
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
@@ -2089,6 +2139,11 @@ register('start', async (args) => {
           attempt = result.retryCount ?? attempt + 1;
           adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
           // 超时重试接着上一次跑，不从头再来（ADR-055）
+          //
+          // 新一轮的「起跑时刻」必须在 start **之前**取（见上面 D-49 的说明）：
+          // 世代过滤靠它切分本轮记录与上一代的尸体，取晚了本轮记录会被滤掉。
+          runStartedAt = new Date().toISOString();
+          runGenStartedAt.set(id, runStartedAt);
           const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
           if (resumed) {
             sessionId = resumed;
@@ -2096,9 +2151,6 @@ register('start', async (args) => {
             const started = await adapter.start({ sliceId: id, prompt: bundlePath });
             sessionId = started.sessionId;
           }
-          // 新一轮 —— 看门狗的世代跟着走
-          runStartedAt = new Date().toISOString();
-          runGenStartedAt.set(id, runStartedAt);
           progressTimer = setInterval(() => {
             const e = Math.floor((Date.now() - startTime) / 1000);
             const mins = Math.floor(e / 60);

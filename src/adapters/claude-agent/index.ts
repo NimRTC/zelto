@@ -596,7 +596,48 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     // Kill the whole process tree — not just the shell wrapper (ADR-055).
     // 只杀 shell 的话，agent 会变成孤儿继续跑：继续改文件、继续烧 token，
     // 而 zelto 已经判了「失败」并准备重试 —— 两个 agent 抢同一批文件。
-    killProcessTreeGracefully(session.child.pid);
+    //
+    // ── 但光靠包装 pid 还不够 ────────────────────────────────────────
+    // 实测（nimrtc-zelto v2-input-binder，2026-11-17）：
+    // 超时点 `taskkill /pid <包装pid> /T` **没杀掉真正的 agent**。
+    // 包装 cmd.exe 早就退出了（`/T` 按它当时的子进程树算，
+    // 而 agent 是它的孙进程），于是 taskkill 找不到人，
+    // 真正的 agent（pid 28072）继续跑：继续改文件、继续发 policy.decision，
+    // 而 zelto 已经把它判成 timeout 并准备重试 —— 两个 agent 抢同一批文件。
+    //
+    // 所以这里必须**两个 pid 都杀**：包装 pid（杀管道与后代）
+    // 与 `agentPid`（杀 agent 本人）。
+    this.killSessionTree(sessionId, session.child.pid);
+  }
+
+  /**
+   * 杀掉一次运行涉及的全部进程：包装进程树 + 真正的 agent。
+   *
+   * 为什么要两个都杀（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+   *
+   *   `child.pid` 是外层 `cmd.exe`（`shell: true` 的必然结果）。
+   *   `taskkill /pid <cmd.exe> /T` 杀的是**它当时的子进程树** ——
+   *   而 cmd.exe 通常在 npx 启动后不久就退出了，它的树里已经没有 agent 了，
+   *   `npx`/`node`/`claude` 是被**孤儿收养**后继续跑的独立进程。
+   *
+   *   结果：超时判定生效了（status=timeout），agent 却没死。
+   *   它继续改文件、继续烧 token，而 zelto 已经在同一 worktree 上重试 ——
+   *   两个 agent 抢同一批文件，产出互相覆盖。
+   *
+   *   `agentPid` 是按 `--session-id <uuid>` 反查进程表拿到的 agent 本人 pid
+   *   （见 `resolveAgentPid`）。它必须被单独杀一次。
+   */
+  private killSessionTree(sessionId: string, wrapperPid: number | undefined): void {
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    const agentPid = typeof data?.agentPid === 'number' ? data.agentPid : undefined;
+
+    // 包装进程树（含 npx / cmd 等中间层）
+    killProcessTreeGracefully(wrapperPid);
+
+    // agent 本人 —— 包装树杀不到它时，它是唯一的兜底。
+    if (agentPid && agentPid !== wrapperPid) {
+      killProcessTreeGracefully(agentPid);
+    }
   }
 
   // ─── Exit Handling ─────────────────────────────────────────────────────────
@@ -806,8 +847,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
 
     session.child.kill('SIGTERM');
     // Kill the whole tree — the shell wrapper alone would leave the agent
-    // running as an orphan (ADR-055).
-    killProcessTreeGracefully(session.child.pid, 5000);
+    // running as an orphan (ADR-055). 包装 pid 与 agent 本人 pid 都要杀。
+    this.killSessionTree(sessionId, session.child.pid);
   }
 
   // ─── Events ────────────────────────────────────────────────────────────────

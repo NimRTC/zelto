@@ -418,11 +418,25 @@ export function readSliceLivenessRecord(
 }
 
 /**
- * 读一片切片的**全部** running 运行记录（会话 + 任务），按世代过滤。
+ * 读一片切片的**全部**运行记录（会话 + 任务），按世代过滤。
  *
  * 给活进程看门狗用（ADR-074）：它需要自己挑「本轮最新」，
  * 而不是拿 `readSliceLivenessRecord` 已经挑好的那一条 ——
  * 后者可能挑到上一代的尸体（见 `after` 参数）。
+ *
+ * **不按 status 过滤**（D-49）：看门狗必须能区分两种「没有正在跑的记录」——
+ *   - **本轮还没落盘**：agent 根本没起来 → 收走是对的；
+ *   - **本轮已经收尾**（timeout / failed / completed）：agent 跑过了 →
+ *     停机该由正常路径接手（ADR-055 的续跑就靠这条路），收走是错的。
+ *
+ * 这两种情况在文件里长得一模一样 —— 都是「没有 status==='running' 的记录」。
+ * 之前在这里按 status 过滤，两种情况一起塌成一种，于是：
+ * agent 撞上超时（status 写成 timeout）→ 记录被滤掉 → 看门狗判
+ * 「从没真正开跑」→ 收走一个刚跑完 30 分钟的 agent，抢在正常路径前面
+ * 把 ADR-055 的续跑掐死（实测 nimrtc-zelto v2-input-binder，2026-11-17）。
+ *
+ * 所以这里只做**世代**过滤，status 的解释权交给看门狗策略
+ * （`decideRunWatchdog` 里有「本轮记录已收尾 → none」这一档）。
  *
  * @param after 只要 `startedAt >= after` 的记录（ISO 时刻）；null 不过滤
  */
@@ -445,7 +459,8 @@ export function readSliceLivenessRecords(
     for (const f of files) {
       if (!f.endsWith('.json')) continue;
       const rec = readLivenessFile(join(dir, f));
-      if (!rec || rec.status !== 'running') continue;
+      // 注意：这里**不**按 status 过滤 —— 见上面的 D-49 说明。
+      if (!rec) continue;
       if (rec.sliceId !== sliceId) continue;
       if (Number.isFinite(cutoff)) {
         const t = rec.startedAt ? Date.parse(rec.startedAt) : Number.NaN;

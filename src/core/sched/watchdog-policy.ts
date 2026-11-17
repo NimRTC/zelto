@@ -58,6 +58,26 @@ export interface RunWatchdogInput {
   now?: number;
   /** 进程存活判定（注入） */
   isProcessAlive?: (pid: number) => boolean;
+  /**
+   * 本轮 agent 的进程是否还活着（**直接问进程表**）。
+   *
+   * 为什么需要这一条独立通道（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+   *
+   *   本轮起跑 30 分钟后，看门狗判「仍无任何运行记录」→ reap，
+   *   把切片退成 frozen 并写下 `environment_failure`。
+   *   **可 agent 一直活着** —— 它还在改文件、还在发 `policy.decision`，
+   *   直到几分钟后才自己退出。
+   *
+   *   根因是**世代过滤与状态字段互相打架**：
+   *     - 会话文件的 `status` 在超时时被写成 `timeout`（不是 `running`）；
+   *     - `readSliceLivenessRecords` 只收 `status === 'running'` 的记录 → 这份被滤掉；
+   *     - 剩下上一代的记录 `startedAt` 早于本轮起跑 → 也被滤掉；
+   *     - 结果：records 为空 → 判「从没真正开跑」→ 误 reap 一个活着的 agent。
+   *
+   *   「没有记录」从来不是「没有进程」的证据。所以 reap 之前**必须**问一次进程表：
+   *   进程还在，就不许收 —— 只把「记录没落盘」记下来，让人去看。
+   */
+  isAgentAlive?: () => boolean;
   /** 假死阈值（毫秒） */
   staleThresholdMs?: number;
 }
@@ -160,6 +180,22 @@ export function decideRunWatchdog(input: RunWatchdogInput): RunWatchdogAction {
     //
     // 注意：「没有记录」不是硬证据（进程可能只是还没写盘），所以**不消耗**
     // 看门狗的自愈预算 —— 预算记的是「救了多少次尸体」，这里连尸体都没有。
+    //
+    // ── 但要先问一次进程表 ──────────────────────────────────────────
+    // 「没有记录」≠「没有进程」。实测（nimrtc-zelto v2-input-binder）：
+    // 会话文件的 status 被写成 `timeout` → 世代过滤把它和上一代一起滤掉 →
+    // records 为空 → 看门狗把一个**正在改文件**的 agent 判成「从没开跑」，
+    // 退成 frozen 并写下 environment_failure。agent 毫不知情地继续跑。
+    //
+    // 进程还在 → 不许收。只如实报告「记录没落盘但进程活着」。
+    if (input.isAgentAlive?.()) {
+      return {
+        action: 'none',
+        reason:
+          `本轮起跑 ${Math.floor(ageMs / 1000)}s 还没有运行记录落盘 —— ` +
+          '但 agent 进程还活着，不收（记录没落盘 ≠ 进程没了）',
+      };
+    }
     return {
       action: 'reap',
       reason: `本轮起跑 ${Math.floor(ageMs / 1000)}s 仍无任何运行记录 —— 这一轮从没真正开跑`,

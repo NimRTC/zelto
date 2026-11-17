@@ -192,3 +192,75 @@ describe('ADR-074 世代过滤 —— 上一代被收走的会话文件不算本
     }
   });
 });
+
+// ── D-49：读记录时不能按 status 过滤 ─────────────────────────────────────────
+//
+// 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+//   agent 跑满 `agent.timeout` 被杀 → 适配器把会话 `status` 写成 `timeout`
+//   → `readSliceLivenessRecords` 只收 `status === 'running'` 的记录
+//   → 本轮记录被滤掉 → 看门狗看到「本轮没有任何记录」→ 判「从没开跑」
+//   → reap，抢在正常路径前面掐死 ADR-055 的续跑。
+//
+// 修法：只做世代过滤；status 的解释权交给看门狗策略。
+describe('D-49：readSliceLivenessRecords 不按 status 过滤', () => {
+  it('本轮记录 status=timeout —— 仍要被读出来（否则看门狗误判「从没开跑」）', async () => {
+    const dir = join(tmpdir(), `zelto-d49-test-${Date.now()}`);
+    const sessions = join(dir, '.zelto', 'sessions');
+    await mkdir(sessions, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      await writeFile(join(sessions, 'timed-out.json'), JSON.stringify({
+        sessionId: 'timed-out', sliceId: 's1', status: 'timeout', pid: 12345,
+        startedAt: '2026-11-17T11:04:49.802Z', lastActivityAt: '2026-11-17T11:34:45.951Z',
+      }));
+
+      const { readSliceLivenessRecords } = await import('../src/core/activity/liveness.js');
+      const recs = readSliceLivenessRecords(dir, 's1', '2026-11-17T11:04:49.829Z');
+
+      assert.equal(recs.length, 1, '本轮的 timeout 记录必须读得到');
+      assert.equal(recs[0]?.status, 'timeout');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('上一代的 timeout 记录仍被世代过滤掉', async () => {
+    const dir = join(tmpdir(), `zelto-d49-gen-${Date.now()}`);
+    const sessions = join(dir, '.zelto', 'sessions');
+    await mkdir(sessions, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      await writeFile(join(sessions, 'old.json'), JSON.stringify({
+        sessionId: 'old', sliceId: 's1', status: 'timeout', pid: 48092,
+        startedAt: '2026-11-17T06:01:50.000Z', lastActivityAt: '2026-11-17T06:31:50.000Z',
+      }));
+
+      const { readSliceLivenessRecords } = await import('../src/core/activity/liveness.js');
+      const recs = readSliceLivenessRecords(dir, 's1', '2026-11-17T07:00:00.000Z');
+
+      assert.equal(recs.length, 0, '上一代的记录不算本轮现场');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('别的切片的记录不混进来', async () => {
+    const dir = join(tmpdir(), `zelto-d49-other-${Date.now()}`);
+    const sessions = join(dir, '.zelto', 'sessions');
+    await mkdir(sessions, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      await writeFile(join(sessions, 'other.json'), JSON.stringify({
+        sessionId: 'other', sliceId: 's2', status: 'timeout', pid: 1,
+        startedAt: '2026-11-17T11:04:49.802Z',
+      }));
+
+      const { readSliceLivenessRecords } = await import('../src/core/activity/liveness.js');
+      const recs = readSliceLivenessRecords(dir, 's1', '2026-11-17T11:00:00.000Z');
+
+      assert.equal(recs.length, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
