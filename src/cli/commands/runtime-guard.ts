@@ -24,7 +24,7 @@ import {
   ReservationStore,
   auditWorktreeWrites,
   hashFile,
-  parsePorcelainStatus,
+  listChangedPaths,
   LOCKS_DIR,
 } from '../../core/sched/index.js';
 import { events } from './shared.js';
@@ -77,34 +77,27 @@ export const MANAGED_SETTINGS_PATH = CLAUDE_SETTINGS_RELATIVE.replace(/\\/g, '/'
  */
 export function snapshotBaselineChanged(worktreePath: string): string[] {
   try {
-    const out = execFileSync(
-      'git',
-      ['-c', 'core.quotePath=false', 'status', '--porcelain', '--untracked-files=all'],
-      {
-        cwd: worktreePath,
-        encoding: 'utf-8',
-        // 超时给 3 分钟而不是 60 秒（D-61）。
-        //
-        // 实测：刚建出来的 worktree 上第一次 git status 要把整棵树
-        // stat 一遍（nimrtc 带 googletest / msquic 两个大 submodule），
-        // 冷缓存下**能跑过 60 秒** —— 而 60 秒那次刚好撞上超时，
-        // 于是快照被静默丢成「干净的」，整轮被判越界。
-        //
-        // 缓存热了之后同一条命令只要 0.6~1.7 秒。
-        // 也就是说：慢的那一次恰恰是**第一次**，
-        // 而第一次恰恰是最不能出错的那一次
-        // —— 它决定后面所有审计的基线。
-        timeout: 180_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
-    // 解析规则与审计侧共用（decodeGitPath 处理中文路径的八进制转义），
-    // 两边各抄一份就会漂移 —— D-28 就是这么来的。
-    return parsePorcelainStatus(String(out));
+    // D-63：不用 `git status --porcelain --untracked-files=all`。
+    //
+    // 实测（nimrtc-zelto，2026-11-18，刚建出来的 worktree）：
+    //   status --untracked-files=all → 224 秒
+    //   diff + ls-files --others     →  13 秒（冷）/ 0.6 秒（热）
+    //
+    // 224 秒比任何合理超时都长 —— 快照直接被超时打断，
+    // 整轮开工被拒（「基线不明就不开工」，D-61）。
+    //
+    // 病根在 `--untracked-files=all`：它要逐个 stat 每一个未跟踪文件，
+    // 而 nimrtc 带两个大 submodule，冷缓存下遍历整棵树要几分钟。
+    // `git ls-files --others --exclude-standard` 走索引与目录项，
+    // 同样语义下快 17 倍。
+    //
+    // 语义等价：`listChangedPaths` 用 diff + diff --cached + ls-files 三条
+    // 命令覆盖 porcelain 的全部状态（已改/已暂存/已删/未跟踪）。
+    return listChangedPaths(worktreePath);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(
-      `无法取得 worktree 的基线快照（git status 失败）：${message}\n` +
+      `无法取得 worktree 的基线快照（读工作区改动失败）：${message}\n` +
         `  worktree：${worktreePath}\n` +
         `  这一轮不开工 —— 基线不明的话，运行后的写集审计分不清\n` +
         `  「这个文件本来就是脏的」与「agent 越界改了它」，\n` +

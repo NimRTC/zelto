@@ -354,6 +354,73 @@ export function hasRefsSlice(message: string, sliceId: string): boolean {
 }
 
 /**
+ * 列出工作区里所有「变了的」路径（相对仓库根，正斜杠）。
+ *
+ * 语义与 `git status --porcelain --untracked-files=all` **等价**
+ * （已修改 / 已暂存 / 已删除 / 未跟踪），但**快得多**。
+ *
+ * ── 为什么不用 `git status --untracked-files=all` ───────────────────────
+ *
+ * 实测（nimrtc-zelto，2026-11-18，刚建出来的 worktree）：
+ *
+ *     git status --porcelain --untracked-files=all   →  224 秒
+ *     git status --porcelain                        →   12 秒
+ *     git diff --name-only + git ls-files --others   →   13 秒（冷）/ 0.6 秒（热）
+ *
+ * 224 秒比任何合理超时都长 —— 基线快照直接被超时打断，
+ * 整轮开工被拒（「基线不明就不开工」，D-61）。
+ *
+ * 病根在 `--untracked-files=all`：它要把**每一个**未跟踪文件单独 stat 一遍，
+ * 而 nimrtc 带 googletest / msquic 两个大 submodule，冷缓存下遍历整棵树
+ * 要几分钟。同一条命令缓存热了只要 0.6 秒 —— 也就是说
+ * **慢的恰恰是第一次，而第一次恰恰是最不能出错的那一次**
+ * （它决定后面所有审计的基线）。
+ *
+ * 而 `git ls-files --others --exclude-standard` 走的是**索引 + 目录项**，
+ * 不逐个文件 stat，同样语义下快 17 倍。
+ *
+ * ── 为什么等价 ────────────────────────────────────────────────────────
+ *
+ * 三条命令合起来覆盖 porcelain 的全部状态：
+ *   - `git diff --name-only`         → 工作区 vs 索引（已改/已删）
+ *   - `git diff --cached --name-only` → 索引 vs HEAD（已暂存）
+ *   - `git ls-files --others --exclude-standard` → 未跟踪（且不在 ignore 里）
+ *
+ * 少一条就会漏判：只留 `diff` 会漏掉未跟踪文件（agent 新建的文件），
+ * 只留 `ls-files` 会漏掉已修改的文件 —— 两者都是越界写入的常见形态。
+ *
+ * C3: 纯 git 判定，不调模型、不触网
+ */
+export function listChangedPaths(repoRoot: string): string[] {
+  const paths = new Set<string>();
+
+  const add = (raw: string): void => {
+    for (const line of raw.split('\n')) {
+      const p = line.trim();
+      if (p) paths.add(p.replace(/\\/g, '/'));
+    }
+  };
+
+  try {
+    add(git(['diff', '--name-only'], repoRoot));
+  } catch {
+    // 读不出来就少一路 —— 调用方按「判不出来」处理（保守方向）
+  }
+  try {
+    add(git(['diff', '--cached', '--name-only'], repoRoot));
+  } catch {
+    // 同上
+  }
+  try {
+    add(git(['ls-files', '--others', '--exclude-standard'], repoRoot));
+  } catch {
+    // 同上
+  }
+
+  return [...paths].sort();
+}
+
+/**
  * 审计某个 worktree 的改动是否全部落在写集内。
  *
  * @param worktreeRoot worktree 绝对路径
@@ -370,8 +437,10 @@ export function auditWorktreeWrites(
   const changed = new Set<string>();
 
   try {
-    const status = git(['status', '--porcelain', '--untracked-files=all'], worktreeRoot);
-    for (const p of parsePorcelainStatus(status)) changed.add(p);
+    // D-63：不用 `--untracked-files=all`（它在冷 worktree 上要 224 秒）。
+    // `listChangedPaths` 用 diff + diff --cached + ls-files 三条命令，
+    // 语义等价，快 17 倍。
+    for (const p of listChangedPaths(worktreeRoot)) changed.add(p);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { changed: [], violations: [], tampered: [], error: `git status 失败: ${message}` };

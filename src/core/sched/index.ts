@@ -44,6 +44,7 @@ export {
   parsePorcelainStatus,
   hashFile,
   listFilesUnder,
+  listChangedPaths,
 } from './audit.js';
 export {
   type VersionWriteSet,
