@@ -48,8 +48,24 @@ import { collectSliceProgress } from './progress-collect.js';
 export interface FinishRunOptions {
   sliceId: string;
   sessionId: string;
-  /** agent 的退出码；null = 信号终止 / 结果不明 */
+  /**
+   * agent 的退出码；null = 信号终止 / 结果不明
+   *
+   * **D-59**：`null` 有两种含义，必须分得开：
+   *   - **被信号杀掉**（超时、被 taskkill）→ 失败，值得重试；
+   *   - **结果不明**（进程没了但退出码没落盘）→ 不知道成没成。
+   *
+   * 「结果不明」时 `outcomeUnknown: true` —— 收尾要**如实说**，
+   * 不能假装是普通失败（那是编事实），也不能假装成功。
+   */
   exitCode: number | null;
+  /**
+   * 结果不明（D-59）—— agent 进程已退出，但退出码没落下来。
+   *
+   * 为 true 时：不停机成「失败」语义，而是交回给人，
+   * 因为产物可能已经做完了 —— 人看一眼 worktree 就知道。
+   */
+  outcomeUnknown?: boolean;
   /** 本轮耗时（秒） */
   elapsedSec: number;
   /** 运行时守卫（写集审计要用） */
@@ -171,6 +187,7 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
     isHotfix,
     alreadyRecorded = false,
     alreadyStalled = false,
+    outcomeUnknown = false,
   } = options;
   const write = options.write ?? ((line: string) => console.log(line));
 
@@ -247,6 +264,21 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
       for (const line of formatProgressLines(progress)) write(line);
     }
 
+    // D-59：结果不明要说清楚 —— 它不是「失败」，是「不知道成没成」。
+    //
+    // 病灶（实测 nimrtc-zelto v3-weaknet-verdict，2026-11-18）：
+    //   agent 成功跑完了，zelto 却报「结果不明，按失败处理」→ 触发重试。
+    //   人看到的是「又跑废了」，而实际上活儿全做完了。
+    //
+    // 措辞要如实：产物**可能已经做完**（就在 worktree 里），
+    // 请人自己核对 —— 这比再赌一轮强。
+    if (outcomeUnknown) {
+      write('');
+      write('❓ 结果不明：agent 进程已退出，但退出码没有落下来。');
+      write('   产物**可能已经做完**（就在 worktree 里）—— 请先核对，再决定要不要重跑。');
+      write('   zelto 不替你赌这一把：重试一轮的代价是一整轮 token + 可能被覆盖的产物。');
+    }
+
     // 后台路径同样走「停机的唯一落点」—— 退回 frozen + 写分类 + 留痕。
     // 一次运行，它的 agent 挂了，切片不能留在 running：
     // 留在 running 就再也跑不了（ADR-047）。
@@ -261,10 +293,17 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
           sliceId,
           classifyStall({
             type: exitCode === null ? 'build_failure' : 'test_failure',
-            message: `Agent exited with code ${exitCode ?? 'signal'}`,
+            message: outcomeUnknown
+              ? 'Agent exited without a recorded exit code — outcome unknown'
+              : `Agent exited with code ${exitCode ?? 'signal'}`,
             attempts: 1,
           }),
-          { exitCode, reason: `agent failed: ${exitCode ?? 'signal'}` },
+          {
+            exitCode,
+            reason: outcomeUnknown
+              ? 'agent outcome unknown (exit code not recorded)'
+              : `agent failed: ${exitCode ?? 'signal'}`,
+          },
         );
       } catch { /* 状态被别处改过：事件照样留 */ }
     }

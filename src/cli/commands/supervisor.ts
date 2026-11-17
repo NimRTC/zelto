@@ -448,6 +448,9 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       adapter,
       isHotfix: args.isHotfix,
       alreadyStalled,
+      // D-59：退出码没落盘 = 结果不明，不是「失败」。
+      // 收尾要如实说「不知道成没成」，而不是编一个失败。
+      outcomeUnknown: exitCode === null && !processAlive,
       write: log,
     });
     log(`收尾完成：ok=${result.ok} state=${result.state} violated=${result.violated}`);
