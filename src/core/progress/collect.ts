@@ -121,7 +121,7 @@ export function runAcceptanceForProgress(input: {
  * 抄一份就会漂移：`git status --porcelain` 的状态位**可能含空格**
  * （` M file` = 工作区已改、暂存区没改），用 `\S{2}` 匹配会漏掉
  * 「只改了工作区」的文件 —— 而那恰恰是 agent 最常见的改动形态
- * （实测 D-55：` M src/util.js` 被漏掉，progress 里少列了 agent 真正做的那件事）。
+ * （实测 D-56：` M src/util.js` 被漏掉，progress 里少列了 agent 真正做的那件事）。
  */
 export function listChangedFiles(worktree: string): string[] {
   try {

@@ -103,6 +103,7 @@ import {
 } from './supervisor.js';
 import { finishRun } from './run-finish.js';
 import { SliceProgressProbe } from './progress-probe.js';
+import { collectSliceProgress } from './progress-collect.js';
 import { loadTask, mergeSessionLiveness, patchTask, saveTask, tasksDir, type TaskInfo } from './task-store.js';
 
 // 供其它命令复用（ai-pipeline.ts / question.ts）
@@ -228,6 +229,64 @@ function agentProcessAlive(sessionId: string): boolean {
  * 被执行到 —— 切片停在 running、预约锁不释放，准入永久挡。
  * 看门狗把「进程死了」变成「当场退 frozen」，而不是等人几小时后想起来 `--reap`。
  */
+/**
+ * 看门狗收走时，采集「这一轮做成了什么」（D-56）。
+ *
+ * 为什么看门狗路径要单独采集：看门狗收走时**不走 `finishRun`** ——
+ * 它自己写停机、写分类、写 `run.aborted`（这一轮已经被收走了，
+ * 再走一遍收尾流水线会重复退状态）。
+ *
+ * 于是「做成了什么」在这个路径上会漏掉 —— 而这恰恰是最需要它的时候：
+ *
+ * 实测（nimrtc-zelto v3-chrome-waterfall，2026-11-18）：
+ * agent 跑了 30 分钟被超时收走，zelto 判成 `environment_failure` 退 frozen。
+ * 但那 30 分钟里它**把活儿全做完了** —— 6 条验收标准全部通过、
+ * 4 个文件都改好了。只报「超时收走」，人看到的还是「又跑废了」。
+ *
+ * 与 D-55（进展探针）是两件事：
+ *   - D-55 回答「它还在推进吗」→ 决定**要不要收走**；
+ *   - D-56（本模块）回答「它做成了什么」→ 收走之后**告诉人留下了什么**。
+ * D-55 解决了「别砍掉还在推进的 agent」，
+ * D-56 解决了「真被砍掉时，别让人以为白砍了」。
+ *
+ * 采集失败不阻断处置：附加信息是补充，不是判据。
+ */
+async function collectWatchdogProgress(
+  sliceId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const manager = worktreeManager();
+    const worktree = manager.exists(sliceId) ? manager.pathFor(sliceId) : null;
+
+    // 与前台收尾**共用**一份采集实现（`progress-collect.ts`）——
+    // 两处各写一份必然漂移，而漂移的方向恰好是「漏掉一条路径」。
+    const progress = await collectSliceProgress({
+      sliceId,
+      worktree,
+      // 看门狗收走时门禁不会跑 —— 「哪几条断言过了」只有这里能拿到。
+      runAcceptance: true,
+    });
+
+    if (!progress) return {};
+
+    // 人也要看得见 —— 事件是追溯，输出是当场。
+    console.error(`\n  📊 这一轮的进展：${progress.summary}`);
+    if (progress.passedNames.length > 0) {
+      console.error(`     ✅ 已验证 ${progress.passedNames.length} 条验收标准`);
+    }
+    if (progress.failedNames.length > 0) {
+      console.error(`     ❌ ${progress.failedNames.length} 条断言不成立`);
+    }
+    if (progress.todo > 0) {
+      console.error(`     ⬜ ${progress.todo} 条还没写断言`);
+    }
+
+    return { progress };
+  } catch {
+    return {};
+  }
+}
+
 async function waitForExitWithWatchdog(opts: {
   sliceId: string;
   sessionId: string;
@@ -295,6 +354,13 @@ async function waitForExitWithWatchdog(opts: {
         watchdog: true,
         action: action.action,
         sessionId: internal,
+        // 「做成了什么」—— 看门狗收走恰恰是最需要它的时候。
+        //
+        // 实测（nimrtc-zelto v3-chrome-waterfall，2026-11-18）：
+        // agent 跑了 30 分钟被超时收走，zelto 判成 environment_failure 退 frozen。
+        // 但那 30 分钟里它**把活儿全做完了** —— 6 条验收标准全部通过。
+        // 只报「超时收走」，人看到的还是「又跑废了」。
+        ...(await collectWatchdogProgress(sliceId)),
       });
       // 记账：这一轮同样是一次运行（ADR-041 §3.1）
       try {

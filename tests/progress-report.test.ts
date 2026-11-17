@@ -1,19 +1,25 @@
-// 「做成了什么」—— 失败现场的可追溯性
+// D-56：失败时要能回答「agent 做成了什么」
 //
 // 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
 //
-// agent 跑完一轮，越界写了一个文件。zelto 报的是：
+//   agent 跑完一轮，越界写了一个文件。zelto 报的是：
+//     {"type":"run.aborted","payload":{"reason":"write-set violation","violations":["rt.txt"]}}
 //
-//   {"type":"run.aborted","payload":{"reason":"write-set violation","violations":["rt.txt"]}}
+//   拦得对。但**只说了「它违规了」**，没说「它做成了什么」。
+//   人看到的是「又跑废了」，而实际上是：写集内的活儿基本做完了，就差这一下。
+//   于是人只能重跑 —— 重跑会把做对的部分再做一遍。
 //
-// 拦得对。但**只说了「它违规了」**，没说「它做成了什么」。
-// 人看到的是「又跑废了」，而实际上是：写集内的活儿基本做完了，就差这一下。
-// 于是人只能重跑 —— 重跑会把做对的部分再做一遍，agent 大概率在同一处再岔一次。
+// 与 D-55（进展探针）是两件事：
+//   - D-55 回答「它还在推进吗」→ 决定**要不要收走**；
+//   - D-56 回答「它做成了什么」→ 收走之后**告诉人留下了什么**。
 //
 // 这一组用例守的是：
 //   1. 逐条用例结果能从测试运行器输出里**确定性地**读出来（不调模型，C3）；
 //   2. todo（没写断言）与真失败**分开报** —— 两者的修法完全不同；
-//   3. 判定读不出时返回「不知道」，不假装「没有」（ADR-033 的同一原则）。
+//   3. 判定读不出时返回「不知道」，不假装「没有」（ADR-033 的同一原则）；
+//   4. **每一条失败路径都要说** —— 包括看门狗收走那条
+//      （实测 v3-chrome-waterfall：看门狗路径不走 finishRun，
+//        progress 整个漏掉，单元测试却全绿）。
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,7 +31,7 @@ import {
   formatProgressLines,
 } from '../src/core/progress/report.js';
 
-describe('progress：逐条用例结果的解析', () => {
+describe('D-56 progress：逐条用例结果的解析', () => {
   it('TAP 形态：ok / not ok 都读得出来', () => {
     const tap = [
       'TAP version 13',
@@ -109,7 +115,7 @@ describe('progress：逐条用例结果的解析', () => {
   });
 });
 
-describe('progress：todo（没写断言）单独数', () => {
+describe('D-56 progress：todo（没写断言）单独数', () => {
   it('数得出验收源码里还剩几条 test.todo', () => {
     const src = [
       'const { test } = require("node:test");',
@@ -130,7 +136,7 @@ describe('progress：todo（没写断言）单独数', () => {
   });
 });
 
-describe('progress：判定「做成了什么」', () => {
+describe('D-56 progress：判定「做成了什么」', () => {
   it('全过 → verified', () => {
     const report = buildProgressReport({
       criteriaTotal: 3,
@@ -223,7 +229,7 @@ describe('progress：判定「做成了什么」', () => {
   });
 });
 
-describe('progress：渲染成人看的样子', () => {
+describe('D-56 progress：渲染成人看的样子', () => {
   it('把通过/失败/todo/改动清单都列出来', () => {
     const report = buildProgressReport({
       criteriaTotal: 4,
@@ -241,5 +247,59 @@ describe('progress：渲染成人看的样子', () => {
     assert.match(text, /还没写断言/);
     assert.match(text, /src\/a\.ts/);
     assert.match(text, /src\/b\.ts/);
+  });
+
+  it('越界文件单列 —— 「做成了什么」与「什么把这一轮废了」不能混', () => {
+    const report = buildProgressReport({
+      criteriaTotal: 2,
+      cases: [{ name: '第一条', status: 'pass' }],
+      todoCount: 0,
+      changedFiles: ['src/util.js', 'src/evil.js'],
+      outOfWriteSetFiles: ['src/evil.js'],
+    });
+
+    const text = formatProgressLines(report).join('\n');
+    // 写集内的
+    assert.match(text, /写集内改动（1）/);
+    assert.match(text, /src\/util\.js/);
+    // 写集外的
+    assert.match(text, /写集外改动（1）/);
+    assert.match(text, /src\/evil\.js/);
+    // 越界文件**不能**同时出现在「写集内」那栏里
+    const inSetSection = text.split('写集外改动')[0];
+    assert.doesNotMatch(inSetSection, /src\/evil\.js/);
+  });
+});
+
+describe('D-56 progress：看门狗路径也要说', () => {
+  it('看门狗收走时写的那条 run.aborted 里带 progress', async () => {
+    // 病灶（实测 nimrtc-zelto v3-chrome-waterfall，2026-11-18）：
+    // 看门狗路径**不走 finishRun** —— 它自己写停机、写分类、写 run.aborted。
+    // 于是 D-56 那一整套采集在看门狗路径上根本没被执行到。
+    //
+    // 而那 30 分钟里 agent 其实把活儿全做完了（6 条验收标准全过），
+    // 事件里却只有「超时收走」—— 人看到的还是「又跑废了」。
+    //
+    // 这里断言**源码层面**：看门狗写事件时必须带上 progress。
+    // 不用运行时断言 —— 那要真的触发一次看门狗收走，成本太高；
+    // 而漏这条路的形态恰恰是「代码没写」，源码断言抓得住。
+    const { readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const source = readFileSync(
+      join(process.cwd(), 'src', 'cli', 'commands', 'core-slice.ts'),
+      'utf-8',
+    );
+
+    // 看门狗写 run.aborted 的那一段
+    const marker = "'run.aborted', 'watchdog'";
+    const idx = source.indexOf(marker);
+    assert.notEqual(idx, -1, 'core-slice.ts 里应当有看门狗写 run.aborted 的地方');
+
+    const window = source.slice(idx, idx + 800);
+    assert.match(
+      window,
+      /[Pp]rogress/,
+      '看门狗写的 run.aborted 必须带上 progress（D-56）',
+    );
   });
 });

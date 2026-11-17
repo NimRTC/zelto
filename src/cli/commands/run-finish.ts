@@ -41,15 +41,8 @@ import {
 import { classifyStall } from '../../core/stall/classifier.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { isInWriteSet } from '../../core/spec/write-set.js';
-import {
-  buildProgressReport,
-  countAcceptanceCriteria,
-  countAcceptanceTodos,
-  formatProgressLines,
-  listChangedFiles,
-  runAcceptanceForProgress,
-  type ProgressReport,
-} from '../../core/progress/index.js';
+import { formatProgressLines, type ProgressReport } from '../../core/progress/index.js';
+import { collectSliceProgress } from './progress-collect.js';
 
 /** 收尾的输入 —— 前台与监督进程给的是同一组事实。 */
 export interface FinishRunOptions {
@@ -123,60 +116,18 @@ async function collectProgress(
     violations: string[];
   },
 ): Promise<ProgressReport | null> {
-  try {
-    const slice = await store.read(sliceId);
-    if (!slice) return null;
-
-    const root = worktree ?? process.cwd();
-    const specPath = slice.spec?.path
-      ? (worktree
-          ? join(worktree, slice.spec.path)
-          : resolve(process.cwd(), slice.spec.path))
-      : null;
-    const criteriaTotal = countAcceptanceCriteria(specPath);
-
-    const acceptanceDir = slice.acceptance?.dir ?? null;
-    const todoCount = countAcceptanceTodos(acceptanceDir, root);
-
-    // 跑验收只为拿逐条用例结果 —— 跑不动就少报「哪些断言过了」，其余照报。
-    const acceptanceRun = opts.runAcceptance
-      ? runAcceptanceForProgress({
-          acceptanceDir,
-          root,
-          commandTemplate: DEFAULT_ACCEPTANCE_COMMAND,
-          timeoutSec: 120,
-        })
-      : null;
-
-    const allChanged = worktree ? listChangedFiles(worktree) : [];
-
-    // 「做成了什么」只算**agent 这一轮写的**文件。
-    //
-    // 要排除两类不是 agent 写的：
-    //   - **托管文件**（zelto 自己写进 worktree 的规格副本、bundle）；
-    //   - **预置脏**（worktree 建出来时就已经脏的路径，D-29）。
-    //
-    // 不排除的话，人看到「改了 3 个文件」，
-    // 其中两个是 zelto 自己放的 —— 「做成了什么」就不准了。
-    const managed = new Set((opts.guard?.managedPaths ?? []).map((p) => p.replace(/\\/g, '/')));
-    const baseline = new Set((opts.guard?.baselineChanged ?? []).map((p) => p.replace(/\\/g, '/')));
-    const changedFiles = allChanged.filter((f) => !managed.has(f) && !baseline.has(f));
-
-    // 越界文件用**审计的结论**，不自己重算 ——
-    // 审计已经处理了托管文件、预置脏、submodule 假脏等一堆细节，
-    // 这里重算一遍必然对不上。
-    const violations = new Set(opts.violations.map((v) => v.replace(/\\/g, '/')));
-
-    return buildProgressReport({
-      criteriaTotal,
-      cases: acceptanceRun?.cases ?? [],
-      todoCount,
-      changedFiles,
-      outOfWriteSetFiles: changedFiles.filter((f) => violations.has(f)),
-    });
-  } catch {
-    return null;
-  }
+  // 实现放在 `progress-collect.ts` —— 看门狗路径也调同一份。
+  //
+  // 为什么不就地写：看门狗收走时**不走 finishRun**（它自己写停机、
+  // 写分类、写 run.aborted），所以它得自己采集一次。
+  // 两处各写一份 = 必然漂移 —— 而漂移的方向恰好是「漏掉一条路径」。
+  return collectSliceProgress({
+    sliceId,
+    worktree,
+    runAcceptance: opts.runAcceptance,
+    guard: opts.guard,
+    violations: opts.violations,
+  });
 }
 
 /**
