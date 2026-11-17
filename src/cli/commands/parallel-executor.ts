@@ -39,6 +39,7 @@ import {
   releaseGuards,
 } from './runtime-guard.js';
 import { detectQuestion, suspendSliceForQuestion } from './question.js';
+import { SliceProgressProbe } from './progress-probe.js';
 import {
   agentFailedMessage,
   budgetExhaustedMessage,
@@ -210,13 +211,41 @@ export interface ExitOrHalt {
  * 停了之后现场保留（worktree、写集预约、切片状态都还在），
  * 人处理完 `zelto halt --clear` 再重跑批次。
  *
+ * ── D-66：这里还要**喂进展** ──────────────────────────────────────────
+ * 适配器的超时是**空转超时**（没进展才杀，D-55），而「进展」不只有 stdout：
+ * Claude Code 跑 `--output-format json`，stdout 直到最后才有内容。
+ * 只看输出的话，一个正在连续调用工具的 agent 在适配器看来是「一声不吭」，
+ * 会在整整 timeoutMs 那一刻被砍掉。
+ *
+ * 病灶（实测于 nimrtc-zelto v4-ai-teammate，2026-11-18）：
+ *   `zelto version start v4` 走的就是这条并行路径。第一轮跑了整整 30 分钟，
+ *   事件流里 20:41–20:51 每分钟都有新事件（agent 一直在调工具），
+ *   但会话文件写的是 `[zelto: no progress for 1800000ms — killed]` ——
+ *   **倒计时一次都没被重置过**。
+ *
+ * 根因：D-55 把 `markProgress` 接到了**单片路径**（`core-slice.ts` 的
+ * `waitForExitWithWatchdog`）和**后台监督路径**（`supervisor.ts`），
+ * 但**并行执行路径**没接 —— 适配器的倒计时只认 `markProgress`，
+ * 没人叫它就一路数到 1800 秒。
+ *
+ * 这跟 D-56（看门狗路径漏了 progress）是同一个形态：
+ * 「每条路径都接上了」不等于「每条路径都接全了」。
+ * 两条路都在真实项目上跑一遍才看见的。
+ *
  * C3：只读文件、比对作用域，没有模型参与。
  */
 export async function waitForExitOrHalt(
-  adapter: { waitForExit(id: string): Promise<number | null>; stop(id: string): Promise<void> },
+  adapter: {
+    waitForExit(id: string): Promise<number | null>;
+    stop(id: string): Promise<void>;
+    /** D-66：报告「这一轮有进展」—— 可选能力，没实现不受影响 */
+    markProgress?(id: string): void;
+  },
   sessionId: string,
   haltStore: HaltStore,
   scope: string,
+  /** D-66：进展探针（读切片事件流大小） */
+  progressProbe?: SliceProgressProbe,
 ): Promise<ExitOrHalt> {
   let finished = false;
   let halted = false;
@@ -227,6 +256,16 @@ export async function waitForExitOrHalt(
     while (!finished) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
       if (finished) return;
+
+      // ── D-66：进展探针先行 ──────────────────────────────────────────
+      // 事件流变长了 = agent 又动了一次 = 空转倒计时重新开始。
+      // 探针只读文件大小，失败不阻断拉闸判定。
+      if (progressProbe) {
+        try {
+          if (progressProbe.poll()) adapter.markProgress?.(sessionId);
+        } catch { /* 探针失败不影响拉闸判定 */ }
+      }
+
       const req = await haltStore.isHalted(scope);
       if (!req) continue;
       halted = true;
@@ -499,6 +538,17 @@ export async function executeSlicesParallel(
     return createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
   });
 
+  // ── D-66：每片一个进展探针 ──────────────────────────────────────────
+  // agent 每调用一次工具，PreToolUse 钩子就往**切片自己的事件流**写一条。
+  // 事件流变长了 = 它还在推进 → 告诉适配器「空转倒计时重新开始」。
+  //
+  // 没有这一条，并行路径上的 agent 会在整整 timeoutMs 那一刻被砍掉，
+  // 哪怕它一分钟都没停过（实测 nimrtc-zelto v4-ai-teammate，2026-11-18）。
+  const progressProbes = new Map<string, SliceProgressProbe>();
+  for (const st of states) {
+    progressProbes.set(st.id, new SliceProgressProbe(process.cwd(), st.id));
+  }
+
   const startTime = Date.now();
   console.log(`\n${title} — starting ${ids.length} agents...`);
 
@@ -595,6 +645,7 @@ export async function executeSlicesParallel(
           st.sessionId,
           haltStore,
           haltScope,
+          progressProbes.get(st.id),
         );
         st.exitCode = exitCode.exitCode;
         st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
