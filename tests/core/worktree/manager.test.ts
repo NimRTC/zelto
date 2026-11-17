@@ -505,6 +505,116 @@ describe('WorktreeManager — submodules (ADR-044)', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  // ── 嵌套 submodule：从主仓的 module git 目录本地克隆（不触网）─────────
+  //
+  // 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+  //
+  //   `git submodule update --init` 只处理**顶层** submodule。
+  //   嵌套层（msquic 的 googletest / quictls / openssl …）在 worktree 里
+  //   就是**空目录** —— 门禁的 configure 阶段直接报「找不到 googletest」。
+  //
+  //   用 `--recursive` 会更糟：git 只认 `.gitmodules` 里写的 https URL，
+  //   于是去**联网**克隆（实测挂起 5 分钟以上，且违反 C3）。
+  //
+  // 修法：把克隆源显式指到主仓的嵌套 module git 目录。
+  // 布局（实测）：`<主仓>/.git/modules/<顶层path>/modules/<嵌套path>`
+  //
+  // 这里踩了三个坑，每一个都表现为「静默跳过」，所以必须有回归：
+  //   1. 路径多拼一层 `submodules/` → 找不到克隆源 → 跳过；
+  //   2. `-c` 放在子命令**之后** → git 报 usage 错误 → 跳过；
+  //   3. 顶层路径用 `path` 还是 `name` → 找错 module 目录。
+  it('clones nested submodules from the main repo module git dir (no network)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'zelto-wt-nested-sub-'));
+
+    // 嵌套 submodule 的源
+    const nestedOrigin = join(root, 'nested-origin');
+    mkdirSync(nestedOrigin, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: nestedOrigin, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: nestedOrigin });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: nestedOrigin });
+    writeFileSync(join(nestedOrigin, 'nested.txt'), 'nested content\n');
+    execFileSync('git', ['add', '.'], { cwd: nestedOrigin, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'nested init'], { cwd: nestedOrigin, stdio: 'ignore' });
+
+    // 顶层 submodule 的源（它自己又带一层 submodule）
+    const topOrigin = join(root, 'top-origin');
+    mkdirSync(topOrigin, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: topOrigin, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: topOrigin });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: topOrigin });
+    writeFileSync(join(topOrigin, 'top.txt'), 'top content\n');
+    execFileSync('git', ['add', '.'], { cwd: topOrigin, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'top init'], { cwd: topOrigin, stdio: 'ignore' });
+
+    // 在顶层里**正规注册**嵌套 submodule（写成 gitlink，index mode 160000）
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', nestedOrigin, 'submodules/nested'],
+      { cwd: topOrigin, stdio: 'ignore' },
+    );
+    execFileSync('git', ['commit', '-m', 'add nested submodule'], { cwd: topOrigin, stdio: 'ignore' });
+
+    // 把嵌套的克隆源改回 https —— 模拟真实工程（msquic 的 .gitmodules 就是 https）。
+    // 这样如果代码没有显式覆盖克隆源，就会去联网（C3 禁止）。
+    execFileSync(
+      'git',
+      ['config', '-f', '.gitmodules', 'submodule.submodules/nested.url', 'https://example.invalid/nested.git'],
+      { cwd: topOrigin, stdio: 'ignore' },
+    );
+    execFileSync('git', ['add', '.gitmodules'], { cwd: topOrigin, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'point nested at https'], { cwd: topOrigin, stdio: 'ignore' });
+
+    // 主仓：把顶层 submodule 加进来并初始化
+    const repo = join(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repo });
+    execFileSync('git', ['config', 'protocol.file.allow', 'always'], { cwd: repo });
+    writeFileSync(join(repo, 'README.md'), '# test\n');
+    execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'add', topOrigin, 'vendor/top'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+    execFileSync('git', ['commit', '-m', 'add top submodule'], { cwd: repo, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', 'vendor/top'],
+      { cwd: repo, stdio: 'ignore' },
+    );
+
+    // 把嵌套层也在主仓里初始化出来 —— 它的 module git 目录
+    // 会落在 `.git/modules/vendor/top/modules/submodules/nested`
+    //
+    // 覆盖克隆源为本地：嵌套的 .gitmodules 里写的是 https URL，
+    // 真按那个走会触网（C3 禁止），这里必须指到本地 origin。
+    execFileSync(
+      'git',
+      [
+        '-c', 'protocol.file.allow=always',
+        '-c', `submodule.submodules/nested.url=${nestedOrigin}`,
+        'submodule', 'update', '--init', 'submodules/nested',
+      ],
+      { cwd: join(repo, 'vendor', 'top'), stdio: 'ignore' },
+    );
+
+    try {
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('nested-sub-clone');
+
+      assert.ok(
+        existsSync(join(info.path, 'vendor', 'top', 'submodules', 'nested', 'nested.txt')),
+        'nested submodule content should be cloned into the worktree from local objects',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ── D-47：worktree 里的规格副本必须与主仓真源一致 ──────────────────────

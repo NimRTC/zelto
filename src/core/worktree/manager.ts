@@ -422,8 +422,8 @@ export class WorktreeManager {
             //      agent 只能干等，或者自己手工拷一份（把 vendor 改成
             //      「非 submodule 的普通目录」，破坏主仓的一致性）。
             //
-            // 嵌套 submodule 由 `alignNestedSubmodules` 处理 ——
-            // 直接从**主仓工作区**复制（主仓里那些目录已经有内容了）。
+            // 嵌套 submodule 由 `syncNestedSubmodules` 处理 ——
+            // 从主仓的 module git 目录**本地克隆**（不触网）。
             'submodule', 'update', '--init', sub.path,
           ],
           undefined,
@@ -436,29 +436,33 @@ export class WorktreeManager {
       }
     }
 
-    // 嵌套 submodule：主仓里已有内容 → 直接复制，不联网。
-    this.copyNestedSubmodules(worktreePath, submodules.map((s) => s.path));
+    // 嵌套 submodule：主仓的 module git 目录做本地克隆源，不联网。
+    this.syncNestedSubmodules(worktreePath, submodules.map((s) => s.path));
 
     return { initialized, skipped };
   }
 
   /**
-   * 把**嵌套** submodule 从主仓复制到 worktree（不联网）。
+   * 把**嵌套** submodule 从主仓的 module git 目录**本地克隆**到 worktree（不联网）。
    *
    * 为什么需要这一步：`git submodule update --init`（不带 `--recursive`）
    * 只处理顶层 submodule。嵌套层（msquic 的 openssl / quictls /
    * googletest 等）留在 worktree 里就是空目录 —— 门禁配置阶段就会报
    * 「找不到 googletest」。
    *
-   * 为什么是**复制**而不是 `submodule update --init`：
-   *   嵌套 submodule 的克隆源在主仓里没有对应的 module git 目录
-   *   （`.git/modules/<name>` 只有顶层那一份），git 只能按 https URL
-   *   联网克隆 —— 违反 C3，且耗时不可控（实测挂起 5 分钟以上）。
+   * 为什么是**本地克隆**而不是 `submodule update --init --recursive`：
+   *   嵌套 submodule 的克隆源在主仓里**有**对应的 module git 目录，
+   *   但 git 自己不知道 —— 它只认 `.gitmodules` 里写的 https URL，
+   *   于是去**联网**克隆（实测挂起 5 分钟以上，且违反 C3）。
    *
-   * 主仓工作区里那些目录**已经有内容**（那是能编译通过的证据），
-   * 复制它们既不触网又与主仓一致。
+   * 我们把克隆源**显式指到主仓的 module git 目录**：
+   *   - 不触网（用本地 objects）
+   *   - 保留 submodule 结构（是真正的 gitlink，不是普通目录）
+   *   - 与顶层 submodule 的处理方式一致
+   *
+   * 克隆源找不到时**跳过**（不报错）—— 缺依赖时门禁会报更明确的信息。
    */
-  private copyNestedSubmodules(worktreePath: string, topLevelPaths: string[]): void {
+  private syncNestedSubmodules(worktreePath: string, topLevelPaths: string[]): void {
     for (const topPath of topLevelPaths) {
       const mainTop = join(this.repoRoot, topPath);
       if (!existsSync(mainTop)) continue;
@@ -491,16 +495,55 @@ export class WorktreeManager {
       }
 
       for (const sub of nested) {
-        const source = join(mainTop, sub.path);
-        if (!existsSync(source)) continue;
-        if (!this.hasDirectoryContent(source)) continue;
         const dest = join(worktreePath, topPath, sub.path);
         if (existsSync(dest) && this.hasDirectoryContent(dest)) continue;
+
+        // ── 克隆源：主仓里的嵌套 module git 目录 ─────────────────────
+        //
+        // 布局是 git 的标准嵌套形态：
+        //   `<主仓>/.git/modules/<顶层path>/modules/<嵌套path>`
+        //
+        // 实测（nimrtc-zelto v2-input-binder，2026-11-17）：
+        //   顶层 = `src/third_party/msquic`，嵌套 = `submodules/googletest`
+        //   → `.git/modules/src/third_party/msquic/modules/submodules/googletest`
+        //
+        // 注意**没有**多一层 `submodules/` —— 顶层路径本身已经贡献了
+        // `msquic`，剩下的是 `modules/` + 嵌套的 path。
+        // 早先这里拼成了 `.../modules/submodules/<name>`（多一层），
+        // 两个候选都找不到 → 静默跳过 → worktree 里嵌套层仍是空目录。
+        const moduleGitDir = [
+          join(this.repoRoot, '.git', 'modules', ...topPath.split('/'), 'modules', ...sub.path.split('/')),
+          join(this.repoRoot, '.git', 'modules', ...topPath.split('/'), 'modules', ...sub.name.split('/')),
+        ].find((dir) => existsSync(dir));
+        if (!moduleGitDir) continue;
+
+        // 顶层 submodule 在 worktree 里的位置 —— 嵌套层要挂在它下面
+        const topDest = join(worktreePath, topPath);
+        if (!existsSync(topDest)) continue;
+
         try {
-          mkdirSync(join(dest, '..'), { recursive: true });
-          cpSync(source, dest, { recursive: true, force: true, errorOnExist: false });
+          this.git(
+            [
+              // ── `-c` 必须在子命令**之前** ──────────────────────────
+              // 放在 `submodule update --init` 之后 git 会直接报 usage 错误
+              // （实测：`git submodule update --init -c key=val path` → usage 报错，
+              // 什么都没做，还被 try/catch 吞掉 → 静默跳过）。
+              '-c', 'protocol.file.allow=always',
+              // 把克隆源指向主仓里已存在的 module git 目录：
+              //   - 不触网（用的是本地 objects）
+              //   - 不受 `protocol.file.allow` 限制（本地路径克隆默认被禁）
+              //
+              // 配置键用的是嵌套层 `.gitmodules` 的 **section 名**
+              // （msquic 的是 `submodules/googletest`），不是 path。
+              '-c', `submodule.${sub.name}.url=${moduleGitDir}`,
+              'submodule', 'update', '--init', sub.path,
+            ],
+            undefined,
+            false,
+            topDest,
+          );
         } catch {
-          // 复制失败不阻断 —— 门禁会因缺依赖报错，信息更明确
+          // 克隆失败不阻断 —— 门禁会因缺依赖报错，信息更明确
         }
       }
     }
