@@ -7,6 +7,7 @@
 // 见 docs/adr-012-parallel-coordination.md §3.4
 
 import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
 import type { EventStream } from '../../core/events/stream.js';
 import type { MergePhase, MergePlan } from '../../core/sched/merge.js';
 import {
@@ -15,6 +16,12 @@ import {
 } from '../../core/project/managed-paths.js';
 import { parsePorcelainStatus } from '../../core/sched/audit.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
+import {
+  branchOfVersion,
+  readVersionPlans,
+  resolveSliceOwnership,
+} from '../../core/version/branch.js';
+import { VersionStore } from '../../core/version/store.js';
 import { pathDiffersFromAnyRef } from './version-runtime.js';
 
 /** 参与合并的切片信息 */
@@ -527,7 +534,81 @@ export async function executeMergePlan(
     });
   }
 
+  // ── 同步版本计划状态 ──
+  // 切片合入的是版本分支 → 版本计划要跟着走，否则 `version status` 会一直
+  // 报 in_progress，下游版本（dependsOn）永远被挡：人找不到"还要做什么"。
+  if (merged.length > 0) {
+    await syncVersionPlanAfterMerge({ merged, targetLabel, targetRef, options, log });
+  }
+
   return { merged, conflicts, staleBase, aborted: conflicts.length > 0 };
+}
+
+/**
+ * 合并后同步版本计划：本版本的切片全部合入版本分支 → `in_progress → integrated`。
+ *
+ * 判据是**事实**（每个切片分支是否已并入版本分支），不是「刚合了几片」——
+ * 只合了 v1 的一半，v1 就还是 in_progress。
+ *
+ * 不碰 `planned`（还没开工的版本）与 `delivered`（已经交付的版本）；
+ * 已经是 `integrated` 的不重复写。
+ */
+async function syncVersionPlanAfterMerge(ctx: {
+  merged: string[];
+  targetLabel: string;
+  targetRef: string;
+  options: MergeExecutorOptions;
+  log: (message: string) => void;
+}): Promise<void> {
+  const repoRoot = ctx.options.repoRoot ?? process.cwd();
+  const versionsDir = join(repoRoot, '.zelto', 'versions');
+  const plans = readVersionPlans(versionsDir);
+  if (plans.length === 0) return;
+
+  // 只处理「刚合的切片真的属于这个版本」的情形 —— 归属解析不出来
+  //（切片不在任何计划里 / 归属歧义 / 显式合主干）就不替人做决定。
+  const mergedSet = new Set(ctx.merged);
+  const ownedPlans = new Set<string>();
+  for (const id of ctx.merged) {
+    try {
+      const owner = resolveSliceOwnership(id, { versionsDir });
+      if (owner.kind === 'version') ownedPlans.add(owner.planId);
+    } catch {
+      return;
+    }
+  }
+
+  for (const plan of plans) {
+    if (!ownedPlans.has(plan.id)) continue;
+    const version = plan.versions.find(
+      (v) => v.status === 'in_progress' && branchOfVersion(v) === ctx.targetLabel,
+    );
+    if (!version) continue;
+
+    // 每个切片：没有分支（空操作 / 已删）或分支已并入目标 ref → 算已合入
+    const allIn = version.slices.every((s) => {
+      const branch = `slice/${s.id}`;
+      if (!git(['rev-parse', '--verify', `refs/heads/${branch}`], repoRoot).ok) return true;
+      return git(['merge-base', '--is-ancestor', `refs/heads/${branch}`, ctx.targetRef], repoRoot).ok;
+    });
+    if (!allIn) continue;
+
+    version.status = 'integrated';
+    await new VersionStore(join(repoRoot, '.zelto')).updateVersionStatus(plan.id, version.version, 'integrated');
+    ctx.log(`  ℹ️  版本 ${version.version} 的切片已全部合入 ${ctx.targetLabel} → 状态 integrated`);
+
+    try {
+      await ctx.options.events.append(`version-${version.version}`, 'version.integrated', 'zelto', {
+        plan: plan.id,
+        version: version.version,
+        target: ctx.targetLabel,
+        slices: version.slices.map((s) => s.id),
+        mergedThisRound: [...mergedSet],
+      });
+    } catch {
+      // 事件写失败不阻塞合并结果 —— 计划状态已经落盘
+    }
+  }
 }
 
 async function executePhase(

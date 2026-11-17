@@ -146,6 +146,10 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
     `Version ${String(e.payload?.version ?? '?')} adopted — version branch "${String(
       e.payload?.branch ?? '?',
     )}" created at base ${String(e.payload?.baseCommit ?? '?').slice(0, 8)} (ADR-056 migration)`,
+  'version.integrated': (e) =>
+    `Version ${String(e.payload?.version ?? '?')} integrated — all slices merged into ${String(
+      e.payload?.target ?? '?',
+    )} (ADR-073)`,
   'draft.created': (e) =>
     `Draft created: ${String(e.payload?.kind ?? '?')} "${String(e.payload?.title ?? '')}" (${String(e.payload?.id ?? '?')})`,
   'draft.revised': (e) =>

@@ -51,6 +51,14 @@ export interface GateConfig {
    */
   acceptance?: GateAcceptanceConfig;
   timeoutSec: number;
+  /**
+   * 是否在跑命令前预检「子模块未初始化」（默认 true）。
+   *
+   * 预检只判断子模块目录是否为空；有些项目（如 nimrtc）的子模块 pin
+   * 被本地改动弄脏，预检会把环境噪声当成问题拦住每一次门禁。
+   * 关掉它不是跳过验证 —— 缺头文件时构建本身会失败。
+   */
+  submoduleCheck?: boolean;
   retry: {
     max: number;
     budgetStepUsd: number;

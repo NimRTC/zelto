@@ -182,6 +182,46 @@ export function judgeSliceArchGuard(
 }
 
 /**
+ * 把偏离裁剪到**本设计的模块范围**（ADR-073 §3.2）。
+ *
+ * 设计只声明了几个模块，扫描器却会看到整个仓库：
+ * 其它模块的文件全成了「文件无归属」，其它模块之间的边全成了
+ * 「未声明依赖」—— 这些**与这份设计无关**，不该算进设计的护栏结论。
+ *
+ * 不确定的偏离（`unknown_module`）保留 —— 那恰恰是「代码碰到了设计边界」的证据。
+ * `deviations` 条目仍在报告里，只是不参与结论 —— 证据不丢。
+ */
+export function filterDesignScopedDeviations(
+  deviations: Deviation[],
+  specs: ModuleSpec[],
+): Deviation[] {
+  // 完全没有模块的设计 → 无从裁剪，原样返回
+  if (specs.length === 0) return deviations;
+  const inDesign = new Set(specs.map((m) => m.name));
+
+  return deviations.filter((dev) => {
+    switch (dev.kind) {
+      case 'unmapped_file':
+        // 只有落在**设计模块声明过的文件范围里**的无归属才算设计的账：
+        // 声明了 `examples/x/**` 却让 `examples/x/a.cpp` 无归属，是设计的遗漏；
+        // 设计压根没提 `tools/`，`tools/a.py` 无归属与这份设计无关。
+        return specs.some((m) =>
+          m.filePatterns.some((p) => pathsOverlap(p, dev.to) || pathsOverlap(dev.to, p)),
+        );
+      case 'ambiguous_module':
+      case 'cycle':
+      case 'undeclared_dependency':
+      case 'missing_dependency':
+        return inDesign.has(dev.from) || inDesign.has(dev.to);
+      case 'unknown_module':
+        return true;
+      default:
+        return false;
+    }
+  });
+}
+
+/**
  * 给报告用的可复制 `arch:` 片段（Q1 省力放开：原型期先 ask，交付前收紧为 deny）。
  *
  * 只给「出现过的、且当前会被拦（deny）的」种类出片段，避免一次全放开。

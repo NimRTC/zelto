@@ -1,4 +1,4 @@
-# zelto 技术架构
+﻿# zelto 技术架构
 
 > 版本: v0.3.0 · 最后更新: 2026-11-04
 > 项目定位见 `docs/zelto-项目目标.md`；功能全貌见 `docs/zelto-场景功能地图.md`
@@ -46,7 +46,7 @@ zelto 是「一个人 + 一组 agent」做中大型项目时的**驾驶舱**，�
                                    ▼
                     ┌──────────────────────────────────────┐
                     │  core/events — append-only 事件流    │
-                    │  60 种事件 · 判定留痕 · 追溯的底座    │
+                    │  61 种事件 · 判定留痕 · 追溯的底座    │
                     └──────────────────────────────────────┘
 
      ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
@@ -187,7 +187,7 @@ interface EventEnvelope {
   runSeq: number;       // 单调递增
   slice: string;        // 切片 ID
   run: string | null;   // 运行 ID
-  type: EventType;      // 60 种之一
+  type: EventType;      // 61 种之一
   actor: string;        // 产生者
   payload: Record<string, unknown>;
 }
@@ -195,7 +195,7 @@ interface EventEnvelope {
 
 **存储**: `.zelto/events/<sliceId>/events.jsonl`
 
-**60 种事件类型**: 见场景功能地图 §5。事件类型的真源是
+**61 种事件类型**: 见场景功能地图 §5。事件类型的真源是
 `contracts/schemas/event-envelope.json` 的 enum —— 代码与契约不允许不一致。
 
 这份清单由 `stream.ts` 的 `EVENT_TYPES`（运行时数组）承载，`EventType` 联合类型派生自它，
@@ -312,7 +312,7 @@ class Scheduler {
 
 **文件**: `trail.ts`
 
-为 60 种事件各定义摘要生成器。支持：
+为 61 种事件各定义摘要生成器。支持：
 - `forSlice(sliceId)` — 获取结构化审计条目
 - `toText(sliceId)` — 生成可读文本报告
 - `latestEvent(sliceId, eventType)` — 获取最新事件

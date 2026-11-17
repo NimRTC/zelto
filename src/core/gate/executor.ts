@@ -138,7 +138,12 @@ export class GateExecutor {
     });
 
     // Check for uninitialized git submodules before running commands
-    const submoduleIssue = await this.checkSubmodules();
+    //
+    // `gate.submoduleCheck: false` 可以关掉这道预检 —— 它只检查「目录为空」，
+    // 而「子模块 pin 被本地改动弄脏」这类环境噪声也会让 `git status` 报警，
+    // 在那些项目里预检拦下的是噪声而不是问题（构建本身会发现真缺的头文件）。
+    const submoduleIssue =
+      this.config.submoduleCheck === false ? null : await this.checkSubmodules();
     if (submoduleIssue) {
       // Log as gate failure with a synthetic result
       results.push({

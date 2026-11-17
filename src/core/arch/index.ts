@@ -36,6 +36,7 @@ export { isTestFile, partitionTestFiles } from './test-files.js';
 
 export {
   buildArchRelaxSnippet,
+  filterDesignScopedDeviations,
   filterRelevantDeviations,
   HARD_DEVIATION_KINDS,
   isDeviationRelevantToSlice,

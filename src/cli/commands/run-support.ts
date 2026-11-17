@@ -276,6 +276,7 @@ export async function autoGateAfterRun(id: string): Promise<void> {
     profiles: config.gate.profiles,
     ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
     timeoutSec: config.gate.timeoutSec,
+    ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
     retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
   };
 

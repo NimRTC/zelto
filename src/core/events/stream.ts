@@ -72,6 +72,8 @@ export const EVENT_TYPES = [
   'version.accepted',
   'version.delivered',
   'version.adopted',
+  // ADR-073：切片合并后由 merge 同步版本计划状态（in_progress → integrated）
+  'version.integrated',
   'draft.created',
   'draft.revised',
   'draft.confirmed',

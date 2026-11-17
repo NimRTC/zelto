@@ -193,6 +193,8 @@ export interface ZeltoConfig {
     /** 切片级验收配置（ADR-033）。没配就退回到「跑该片的验收目录」。 */
     acceptance?: GateAcceptanceConfig;
     timeoutSec: number;
+    /** 子模块预检开关（默认 true）；`false` = 不跑 `submodule-check` 这道预检 */
+    submoduleCheck?: boolean;
     retry: { max: number };
   };
   agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
@@ -408,6 +410,8 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let acceptanceRequired = true;
   let acceptanceTimeoutSec: number | undefined;
   let acceptanceBuildDir: string | undefined;
+  /** 子模块预检开关（缺省 = 不写字段 = 预检开启） */
+  let submoduleCheck: boolean | undefined;
   let llmProvider = '';
   let llmApiKey = '';
   let llmModel = '';
@@ -604,6 +608,12 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         } else {
           timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
         }
+        continue;
+      }
+
+      // submoduleCheck：子模块预检开关（默认 true）。`false` 显式关掉。
+      if (trimmed.startsWith('submoduleCheck:')) {
+        submoduleCheck = trimmed.slice(15).trim().toLowerCase() !== 'false';
         continue;
       }
 
@@ -826,6 +836,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         ...(Object.keys(profiles).length > 0 ? { profiles } : {}),
         ...(acceptance ? { acceptance } : {}),
         timeoutSec,
+        ...(submoduleCheck !== undefined ? { submoduleCheck } : {}),
         retry: { max: retryMax },
       }
     : { commands: [], ...(acceptance ? { acceptance } : {}), timeoutSec: 120, retry: { max: 2 } };

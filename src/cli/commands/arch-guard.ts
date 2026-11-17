@@ -15,6 +15,7 @@ import { pickDefaultDesign } from '../../core/design/selection.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import {
   buildArchitectureReport,
+  filterDesignScopedDeviations,
   judgeArchGuard,
   judgeSliceArchGuard,
   scanArchitecture,
@@ -99,6 +100,22 @@ export function sliceGuardForWrites(
   writes: string[],
 ): { verdict: GuardVerdict; relevant: Deviation[] } {
   return judgeSliceArchGuard(ctx.report, ctx.specs, writes, ctx.guardRules);
+}
+
+/**
+ * 版本级（整图）护栏结论：只看**本设计声明的模块范围**（ADR-073 §3.2）。
+ *
+ * 整图判据（`ctx.guard`）会把设计之外的仓库文件算成「文件无归属」——
+ * 设计只声明了 7 个模块、仓库有 696 个其它文件，人看到的是
+ * 「文件无归属×696（deny）」这种既没法修、也不该修的结论。
+ */
+export function designGuard(ctx: WholeGraphGuard): {
+  verdict: GuardVerdict;
+  relevant: Deviation[];
+} {
+  const relevant = filterDesignScopedDeviations(ctx.report.deviations, ctx.specs);
+  const verdict = judgeArchGuard({ ...ctx.report, deviations: relevant }, ctx.guardRules);
+  return { verdict, relevant };
 }
 
 const GUARD_KIND_LABEL: Record<string, string> = {

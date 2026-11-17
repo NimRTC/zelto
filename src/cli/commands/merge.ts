@@ -448,7 +448,7 @@ register('merge', async (args) => {
   }
 
   // 合并成功的切片：清理 worktree 与分支
-  await cleanupMergedSlices(result.merged, targetBranch);
+  await cleanupMergedSlices(result.merged, targetBranch, targetDir);
 
   console.log('');
   if (result.merged.length === 0) {

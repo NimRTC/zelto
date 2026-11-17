@@ -43,6 +43,7 @@
         "version.accepted",
         "version.delivered",
         "version.adopted",
+        "version.integrated",
         "draft.created",
         "draft.revised",
         "draft.confirmed",

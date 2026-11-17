@@ -300,10 +300,13 @@ async function isNoopCandidate(
  * @param targetBranch 合并目标分支（ADR-056 §3.3）。给了就按它判
  *   「分支已合入」—— 合进版本分支时，HEAD 是主仓当前分支，
  *   `git branch -d` 会因为「没合入 HEAD」而拒绝删。
+ * @param targetDir 合并目标的工作目录（版本分支 = 版本工作目录）。
+ *   判「已合入」必须在**这个目录**里做 —— 见 D-40。
  */
 export async function cleanupMergedSlices(
   ids: string[],
   targetBranch?: string | null,
+  targetDir?: string | null,
 ): Promise<void> {
   const manager = worktreeManager();
   for (const id of ids) {
@@ -330,38 +333,50 @@ export async function cleanupMergedSlices(
       continue;
     }
 
+    // D-40：判「已合入」必须在**合并目标的工作目录**里做。
+    //
+    // 原来这里用的是 `git branch -d <切片分支> <目标分支>` —— 这个形式有
+    // 两个问题，第二个是**危险**的：
+    //
+    //   1. `git branch -d A B` 会**同时删掉 A 和 B**。实测：切片分支删掉了，
+    //      目标分支 `version/v1` 也进了删除列表 —— 只因为它正被版本 worktree
+    //      占用才没删成。哪天那个 worktree 不在了，版本分支就会被误删。
+    //   2. 「已合并」的判据仍然是 **HEAD**，不是 A 与 B 的关系 ——
+    //      所以在版本分支场景下它照样拒删，然后报出误导性的
+    //      「The slice's work is merged elsewhere」（其实没合到别处，
+    //      就合在目标分支里，是判据选错了）。
+    //
+    // 正确做法：在目标目录里做「目标分支是否已是切片分支的祖先」判定，
+    // 已合入就 `git branch -d <切片分支>`（单一参数、判据是当前 HEAD），
+    // 没合入就如实说「分支上还有未合入的内容」——
+    // 那才是真正需要人处理的情形（D-33 的两类要分开）。
+    const sliceBranch = manager.branchFor(id);
+    const dir = targetDir && existsSync(targetDir) ? targetDir : process.cwd();
+    const upstream = targetBranch ?? null;
+    const merged = upstream
+      ? isMergedIntoRef(sliceBranch, `refs/heads/${upstream}`, dir)
+      : isMergedIntoHead(sliceBranch, dir);
+
+    if (!merged) {
+      console.log(
+        `  ℹ️  Could not delete branch "${sliceBranch}": it still has changes not merged into ${upstream ?? 'HEAD'}.`,
+      );
+      console.log(`     先合或先查；确认要删再手动执行：git branch -D ${sliceBranch}`);
+      continue;
+    }
+
     try {
       const { execSync } = await import('node:child_process');
       // worktree 删掉之后 git 才肯放分支；再 prune 一次清掉残留登记。
       execSync('git worktree prune', { cwd: process.cwd(), timeout: 5000, stdio: 'ignore' });
-      if (targetBranch) {
-        // 合进版本分支时，`-d` 会以「没合入 HEAD」拒绝 —— 显式指定目标 ref。
-        execSync(`git branch -d ${manager.branchFor(id)} ${targetBranch}`, {
-          cwd: process.cwd(),
-          timeout: 5000,
-        });
-      } else {
-        execSync(`git branch -d ${manager.branchFor(id)}`, { cwd: process.cwd(), timeout: 5000 });
-      }
-      console.log(`  ✅ Deleted branch "${manager.branchFor(id)}"`);
+      // 在目标目录里执行：`git branch -d` 的「已合并」判据是**当前 HEAD**，
+      // 在版本 worktree 里跑，判据就是「已并入版本分支」。
+      execSync(`git branch -d ${sliceBranch}`, { cwd: dir, timeout: 5000 });
+      console.log(`  ✅ Deleted branch "${sliceBranch}"`);
     } catch (err) {
-      // D-33：区分「分支没合到当前分支」与「分支有未合入的改动」。
-      //
-      // 原来两种情况都是同一句「may have unmerged changes」——
-      // 而它们要人做的事完全不同：
-      //   - 「没合到当前分支」：产物已经合进**别的**分支（典型是版本分支），
-      //     这里只是 `git branch -d` 的默认判据（按 HEAD）不认。
-      //     人要做的：确认目标分支对不对，或者用 `-D` 强删。
-      //   - 「有未合并的改动」：分支上真有没合进去的东西，
-      //     人要做的：先合或先查。
       const msg = err instanceof Error ? err.message : String(err);
-      if (/not fully merged|not merged/i.test(msg)) {
-        console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}": not fully merged into ${targetBranch ?? 'HEAD'}.`);
-        console.log(`     The slice's work is merged elsewhere — delete manually if intended: git branch -D ${manager.branchFor(id)}`);
-      } else {
-        console.log(`  ℹ️  Could not delete branch "${manager.branchFor(id)}" (${msg.split('\n')[0]})`);
-        console.log(`     Delete manually: git branch -D ${manager.branchFor(id)}`);
-      }
+      console.log(`  ℹ️  Could not delete branch "${sliceBranch}" (${msg.split('\n')[0]})`);
+      console.log(`     Delete manually: git branch -D ${sliceBranch}`);
     }
   }
 }

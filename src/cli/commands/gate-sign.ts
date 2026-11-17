@@ -118,6 +118,7 @@ register('gate', async (args) => {
       profiles: gateProfiles,
       ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
       timeoutSec: config.gate.timeoutSec,
+      ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
       retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
     } satisfies GateConfig;
 

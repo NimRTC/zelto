@@ -30,7 +30,7 @@ import {
 } from './version-runtime.js';
 import { worktreeManager } from './shared.js';
 import { resolveWriteSet } from './run-support.js';
-import { describeGuardKinds, loadWholeGraphGuard } from './arch-guard.js';
+import { describeGuardKinds, designGuard, loadWholeGraphGuard } from './arch-guard.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 import { ContractBaselineStore, ContractRegistry, diffSchemas } from '../../core/contracts/index.js';
@@ -968,16 +968,19 @@ register('version', async (args) => {
       scanRoot: codeRoot,
     });
     if (archGuard) {
-      if (archGuard.guard.blocked) {
+      // 版本级看的是「本设计的模块范围」之外还是之内（ADR-073 §3.2）——
+      // 设计之外的仓库文件不属于这份设计的账。
+      const designVerdict = designGuard(archGuard);
+      if (designVerdict.verdict.blocked) {
         f.out('');
         f.out(`❌ 版本 ${versionLabel} 的架构护栏未通过 —— 状态保持 in_progress`);
-        f.out(`   ${describeGuardKinds(archGuard.guard, 'blocked')}`);
+        f.out(`   ${describeGuardKinds(designVerdict.verdict, 'blocked')}`);
         f.out(`   设计：${archGuard.designId}「${archGuard.designTitle}」`);
         f.out('');
         f.out('👉 修好偏离，或改 policy.yaml 的 arch 段后重新验收：zelto version deliver ' + versionLabel);
         return 1;
       }
-      const pending = archGuard.guard.perKind.filter((k) => k.needsConfirm && k.count > 0);
+      const pending = designVerdict.verdict.perKind.filter((k) => k.needsConfirm && k.count > 0);
       if (pending.length > 0) {
         f.out('');
         f.out(`⚠️  架构护栏待确认（不拦）：${describeGuardKinds(archGuard.guard, 'pending')}`);
