@@ -136,7 +136,7 @@ fs.writeFileSync(process.env.ZELTO_TEST_OUT, JSON.stringify(results, null, 2));
 
 describe('acceptance: runtime-guard', { concurrency: false }, () => {
   before(async () => {
-    rmSync(BASE_DIR, { recursive: true, force: true });
+    rmSync(BASE_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     mkdirSync(join(BASE_DIR, 'src', 'core'), { recursive: true });
     mkdirSync(join(BASE_DIR, 'policy'), { recursive: true });
     mkdirSync(join(BASE_DIR, 'specs', 'slices'), { recursive: true });
@@ -208,7 +208,9 @@ describe('acceptance: runtime-guard', { concurrency: false }, () => {
   });
 
   after(() => {
-    rmSync(BASE_DIR, { recursive: true, force: true });
+    // Windows 上刚退出的子进程可能还攥着目录句柄 → EPERM。
+    // maxRetries 让 Node 自己重试（只对 EPERM/EBUSY/ENOTEMPTY 生效）。
+    rmSync(BASE_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   it('the runtime guard enforces the write-set at run time', async () => {

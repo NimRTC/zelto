@@ -251,6 +251,23 @@ export async function handleVersionShip(
     return 1;
   }
 
+  // D-57：ship 是「这一版做完、、交给主干」。
+  //   版本状态说 integrated 不算数 —— 那个字段可能是**合并时误写**的
+  //   （实测 nimrtc-zelto v3，2026-11-18：一片没跑也被判成 integrated）。
+  //   这里重新核一遍切片状态：每一片都得真的 completed。
+  //
+  //   为什么必须核：ship 是**唯一**把版本推进主干的闸门。
+  //   闸门放行一个没做完的版本 → 半成品进主干，后面谁都查不出来。
+  const { allSlicesCompleted } = await import('./merge-executor.js');
+  if (!(await allSlicesCompleted(version.slices, process.cwd()))) {
+    const notDone = version.slices.map((s) => s.id).join(', ');
+    f.error(
+      'INVALID_STATE',
+      `版本 "${versionLabel}" 还没做完（切片状态未到 completed）：${notDone} —— 先把每一片跑完并合入 ${branchOfVersion(version)}。`,
+    );
+    return 1;
+  }
+
   const manager = worktreeManager();
   if (!manager.isGitRepo()) {
     f.error('INVALID_STATE', 'Not in a git repository — 版本分支不可用。');

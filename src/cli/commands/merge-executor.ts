@@ -22,6 +22,7 @@ import {
   resolveSliceOwnership,
 } from '../../core/version/branch.js';
 import { VersionStore } from '../../core/version/store.js';
+import { SliceStore } from '../../core/slice/store.js';
 import { pathDiffersFromAnyRef } from './version-runtime.js';
 
 /** 参与合并的切片信息 */
@@ -559,6 +560,40 @@ export async function executeMergePlan(
 }
 
 /**
+ * 这个版本的切片是不是**全都真的做完了**（D-57）。
+ *
+ * 判据是**切片状态文件**（`.zelto/slices/<id>.json`）：每一片都得走到 `completed`。
+ *
+ * 为什么不用「分支是否存在 / 是否已并入」：
+ *   - 切片从没跑过 → 压根没有 `slice/<id>` 分支；
+ *   - 旧的判法把「分支不存在」当「已合入」→ 于是一片都没做的版本
+ *     被判成 integrated（实测 nimrtc-zelto v3，2026-11-18）。
+ *
+ * 分支已并入目标 ref 只能证明「它的产物进去了」，
+ * 证明不了「这个版本做完了」—— 因为可能有一片根本没跑。
+ *
+ * 状态文件读不出来（文件不在 / 坏了）→ 当作**没做完**。
+ * 「不知道」不等于「做完了」（ADR-033 的同一原则）。
+ */
+export async function allSlicesCompleted(
+  slices: readonly { id: string }[],
+  repoRoot: string,
+): Promise<boolean> {
+  const store = new SliceStore(join(repoRoot, '.zelto', 'slices'));
+  for (const s of slices) {
+    let state: string | undefined;
+    try {
+      const slice = await store.read(s.id);
+      state = slice.state;
+    } catch {
+      return false;
+    }
+    if (state !== 'completed') return false;
+  }
+  return true;
+}
+
+/**
  * 合并后同步版本计划：本版本的切片全部合入版本分支 → `in_progress → integrated`。
  *
  * 判据是**事实**（每个切片分支是否已并入版本分支），不是「刚合了几片」——
@@ -599,12 +634,20 @@ async function syncVersionPlanAfterMerge(ctx: {
     );
     if (!version) continue;
 
-    // 每个切片：没有分支（空操作 / 已删）或分支已并入目标 ref → 算已合入
-    const allIn = version.slices.every((s) => {
-      const branch = `slice/${s.id}`;
-      if (!git(['rev-parse', '--verify', `refs/heads/${branch}`], repoRoot).ok) return true;
-      return git(['merge-base', '--is-ancestor', `refs/heads/${branch}`, ctx.targetRef], repoRoot).ok;
-    });
+    // 每个切片：分支已并入目标 ref → 算已合入。
+    //
+    // **分支不存在不等于已合入**（D-57，实测 nimrtc-zelto v3，2026-11-18）：
+    //   切片从没跑过 → 压根没有 `slice/<id>` 分支。
+    //   旧写法把「分支不存在」当「已合入」→ 于是一片都没做的版本
+    //   被判成 integrated，`version status` 显示「✅ integrated」，
+    //   而实际上有一片还冻着、一次都没跑。
+    //
+    //   人看到的是「这版做完了」，实际是「这版没做完但被算成做完了」——
+    //   比报错更坏：报错会让人停下，假完成会让人往前走。
+    //
+    // 判据改成**切片状态文件**：切片必须已经走到 completed，
+    // 才算「这片真的做完了」。状态文件是切片自己的真源（C1：状态只在文件里）。
+    const allIn = await allSlicesCompleted(version.slices, repoRoot);
     if (!allIn) continue;
 
     version.status = 'integrated';

@@ -790,6 +790,41 @@ register('plan', async (args) => {
 
 // ─── version ─────────────────────────────────────────────────────────────────
 
+/**
+ * 这个版本**实际**做完没有（D-57）。
+ *
+ * 病灶（实测 nimrtc-zelto v3，2026-11-18）：
+ *   合并时把「切片分支不存在」当「已合入」→ 一片都没跑的版本被判成 integrated。
+ *   `version status` 照着计划显示「✅ integrated」→ 人以为这版做完了，
+ *   实际有一片还冻着、一次都没跑。
+ *
+ * 判据：**每一片的切片状态都得是 completed**。
+ * 读不出来（文件不在 / 坏了）→ 当作没做完 —— 「不知道」不等于「做完了」。
+ *
+ * @returns 实际状态；返回 null = 计划记的没错，按计划显示。
+ */
+export async function realVersionState(
+  version: VersionPlan['versions'][number],
+  _plan: VersionPlan,
+): Promise<'planned' | 'in_progress' | 'integrated' | 'delivered' | null> {
+  if (version.status !== 'integrated' && version.status !== 'delivered') {
+    // 只在计划说「做完了」的时候才需要复核。
+    return null;
+  }
+  const store = new SliceStore(SLICES_DIR);
+  for (const s of version.slices) {
+    let state: string | undefined;
+    try {
+      const slice: SliceData = await store.read(s.id);
+      state = slice.state;
+    } catch {
+      return 'in_progress';
+    }
+    if (state !== 'completed') return 'in_progress';
+  }
+  return null;
+}
+
 register('version', async (args) => {
   const subcmd = args[0];
   const f = getDefaultFormatter();
@@ -833,9 +868,22 @@ register('version', async (args) => {
       f.out(`Plan: ${p.id} (${p.status})`);
       f.out(`  Title: ${plan.title}`);
       for (const v of plan.versions) {
-        const icon = vIcons[v.status] ?? '⏳';
+        // D-57：显示的是**事实**，不是计划里存的那个词。
+        //
+        // 病灶（实测 nimrtc-zelto v3，2026-11-18）：
+        //   合并时把「分支不存在」当「已合入」→ 一片都没做的版本被判成 integrated。
+        //   `version status` 老老实实显示「✅ integrated」——
+        //   人看到的是「这版做完了」，实际有一片还冻着、一次都没跑。
+        //
+        // 所以这里重新核一遍：标 integrated/delivered 之前，
+        // 先确认这一版的切片**真的都走到 completed**。
+        // 对不上就如实显示「实际没做完」，而不是跟着计划说谎。
+        const realState = await realVersionState(v, plan);
+        const shown = realState ?? v.status;
+        const icon = vIcons[shown] ?? '⏳';
         const slices = v.slices.map((s) => s.id).join(', ');
-        f.out(`  ${icon} ${v.version}: ${v.status} — [${slices}]`);
+        const note = realState && realState !== v.status ? ` （计划记的是 ${v.status}）` : '';
+        f.out(`  ${icon} ${v.version}: ${shown} — [${slices}]${note}`);
       }
       const nextVersion = plan.versions.find((v) => v.status === 'planned');
       if (nextVersion) {
