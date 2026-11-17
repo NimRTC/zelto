@@ -13,7 +13,7 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -210,6 +210,15 @@ describe('acceptance: runtime-guard', { concurrency: false }, () => {
   after(() => {
     // Windows 上刚退出的子进程可能还攥着目录句柄 → EPERM。
     // maxRetries 让 Node 自己重试（只对 EPERM/EBUSY/ENOTEMPTY 生效）。
+    //
+    // 先把 git worktree 元数据摘掉 —— 这个仓库里跑过 `zelto run`，
+    // 它建过 worktree（.git/worktrees/guard-test）。留着那份元数据，
+    // 目录删不干净，而且下一次 git 命令会被它绊住。
+    try {
+      execFileSync('git', ['worktree', 'prune'], { cwd: BASE_DIR, stdio: 'ignore' });
+    } catch {
+      // 仓库可能已经被删了 —— 没关系，下面照样删目录。
+    }
     rmSync(BASE_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
