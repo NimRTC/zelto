@@ -35,6 +35,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, execFileSync } from 'node:child_process';
+import { cleanupMergedSlices } from '../src/cli/commands/merge-runner.js';
 
 const TEST_DIR = join(tmpdir(), `zelto-merge-branch-cleanup-${Date.now()}`);
 const CLI_SCRIPT = join(process.cwd(), 'dist', 'cli', 'index.js');
@@ -53,6 +54,20 @@ function branches(cwd: string): string[] {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
+}
+
+/** branch 是否是 ref 的祖先（即是否已合入 ref） */
+function isAncestor(branch: string, ref: string, cwd: string): boolean {
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', branch, ref], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function runCommand(...args: string[]): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -171,6 +186,19 @@ describe('D-40：合并后的切片分支清理', () => {
     await mkdir(join(TEST_DIR, 'src'), { recursive: true });
     await writeFile(join(TEST_DIR, 'src', 'feature.ts'), 'export const x = 1;\n', 'utf-8');
 
+    // `.zelto/` 必须被忽略 —— 与真实项目一致（nimrtc-zelto 的 .gitignore:78）。
+    //
+    // 为什么这条对测试至关重要：切片 worktree 与版本 worktree 都住在
+    // `.zelto/` 下面，而它们各自是一个**独立的 git 仓库**。如果 `.zelto/`
+    // 没被忽略，`git add -A` 会把这两个目录当成「嵌入式仓库」提交进去
+    // （mode 160000 的 gitlink）。于是：
+    //   - 目标分支与待合分支在这个路径上「有差异」
+    //   - 合并守卫如实拦下（这是对的：真会冲突）
+    //   - 而这个差异纯粹是测试自己造出来的
+    //
+    // 真实项目里 `.zelto/` 是被忽略的，所以这个坑不会发生。
+    await writeFile(join(TEST_DIR, '.gitignore'), '.zelto/\n', 'utf-8');
+
     git(TEST_DIR, 'init', '-b', 'main');
     git(TEST_DIR, 'config', 'user.email', 'test@zelto.local');
     git(TEST_DIR, 'config', 'user.name', 'zelto test');
@@ -253,28 +281,58 @@ describe('D-40：合并后的切片分支清理', () => {
   });
 
   it('未合入目标分支时：不删分支，且如实说「还有未合入的内容」', async () => {
-    // 一个有独立提交、既不在 main 也不在任何版本分支上的切片分支
+    // 这一条**不能**走 `zelto merge` 走通 —— 因为 `slice/unmerged-slice`
+    // 是从 `main` 长出来的，`main` 是它的祖先 → 合并会 fast-forward 成功
+    // → 合并完之后这个分支**确实**是目标分支的祖先，删掉它是完全正确的。
     //
-    // 注意顺序：`.zelto/**` 是**未跟踪文件**，`git checkout` 切分支时
-    // 不会保留它 —— 所以切片状态必须写在切回 main **之后**。
-    git(TEST_DIR, 'checkout', '-b', 'slice/orphan-slice');
+    // 换句话说：「合并成功了但分支还没并入目标」这件事**在正常的
+    // `zelto merge` 流程里根本不存在** —— 合并要么成功（分支成了祖先），
+    // 要么冲突（走不到清理这一步）。
+    //
+    // 那 `cleanupMergedSlices` 里「没合入就不删」的那段防御代码，
+    // 守的是**别的情况**：分支被人手动改过、目标 ref 不是合并时用的那个、
+    // 或者仓库状态在合并与清理之间被外部改动了。
+    //
+    // 所以这里直接调被测函数，构造出「分支确实还没并入目标」的状态，
+    // 守住 D-40 真正要守的东西：**消息要如实**。
+    // —— 「The slice's work is merged elsewhere」（已合到别处）是**错的**：
+    //    产物既不在目标分支，也没合到别处，就是「还有未合入的内容」。
+    //    人照着错误提示去 `git branch -D`，等于绕过 git 的安全检查。
+
+    // 一个有独立提交、既不在 main 也不在任何版本分支上的切片分支
+    git(TEST_DIR, 'checkout', '-b', 'slice/unmerged-slice');
     await writeFile(join(TEST_DIR, 'src', 'feature.ts'), 'export const x = 9;\n', 'utf-8');
     git(TEST_DIR, 'add', '-A');
-    git(TEST_DIR, 'commit', '-m', 'feat: orphan work');
+    git(TEST_DIR, 'commit', '-m', 'feat: unmerged work');
     git(TEST_DIR, 'checkout', 'main');
 
-    await mkdir(join(TEST_DIR, '.zelto', 'slices'), { recursive: true });
-    await mkdir(join(TEST_DIR, '.zelto', 'locks'), { recursive: true });
-    await writeSlice('orphan-slice');
-    await writeApprovedSign('orphan-slice');
+    // main 上并没有这次提交的产物 → 分支不是 main 的祖先
+    assert.ok(
+      !isAncestor('slice/unmerged-slice', 'main', TEST_DIR),
+      '前提：slice/unmerged-slice 不是 main 的祖先',
+    );
 
     const before = branches(TEST_DIR);
-    const { stdout, stderr } = await runCommand('merge', 'orphan-slice');
-    const out = stdout + stderr;
+    const lines: string[] = [];
+    const origLog = console.log;
+    const origCwd = process.cwd();
+    console.log = (...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    };
+    // `cleanupMergedSlices` 内部用 `process.cwd()` 定位仓库与 worktree，
+    // 所以必须切到测试仓库里再调。
+    process.chdir(TEST_DIR);
+    try {
+      await cleanupMergedSlices(['unmerged-slice'], null, TEST_DIR);
+    } finally {
+      console.log = origLog;
+      process.chdir(origCwd);
+    }
+    const out = lines.join('\n');
     const after = branches(TEST_DIR);
 
     assert.ok(
-      after.includes('slice/orphan-slice'),
+      after.includes('slice/unmerged-slice'),
       `未合入的切片分支不该被删，实际分支：${after.join(', ')}；合并前：${before.join(', ')}`,
     );
     assert.ok(
