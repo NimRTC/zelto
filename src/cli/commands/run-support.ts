@@ -642,7 +642,20 @@ export async function rollbackStalledSlice(
  */
 export async function handleWriteSetViolation(
   id: string,
-  options?: { violations?: string[]; tampered?: string[]; reason?: string },
+  options?: {
+    violations?: string[];
+    tampered?: string[];
+    reason?: string;
+    /**
+     * 额外写进事件 payload 的字段。
+     *
+     * 现在带的是 `progress`（「做成了什么」）——
+     * 越界被拦下恰恰是最需要它的时候：agent 越界写了一个文件，
+     * 其余活儿基本做完了，但事件里只有 violations，
+     * 人看到「又跑废了」，实际是「差一步」。
+     */
+    [key: string]: unknown;
+  },
 ): Promise<void> {
   const violations = options?.violations ?? [];
   const tampered = options?.tampered ?? [];
@@ -655,11 +668,14 @@ export async function handleWriteSetViolation(
     // 状态已经在 frozen 或别的态 —— 留痕照样要写。
   }
 
+  const { violations: _v, tampered: _t, reason: _r, ...extra } = options ?? {};
+
   await events.append(id, 'run.aborted', 'zelto', {
     sliceId: id,
     exitCode: null,
     reason,
     violations,
     tampered,
+    ...extra,
   });
 }

@@ -26,6 +26,8 @@
 import { SignManager } from '../../core/gate/sign.js';
 import { store, events, ZELTO_DIR } from './shared.js';
 import { enforceWriteSet, type RuntimeGuard } from './runtime-guard.js';
+import { join, resolve } from 'node:path';
+import { DEFAULT_ACCEPTANCE_COMMAND } from '../../core/gate/acceptance.js';
 import {
   autoGateAfterRun,
   markSliceStalled,
@@ -38,6 +40,16 @@ import {
 } from './run-messages.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
+import { isInWriteSet } from '../../core/spec/write-set.js';
+import {
+  buildProgressReport,
+  countAcceptanceCriteria,
+  countAcceptanceTodos,
+  formatProgressLines,
+  listChangedFiles,
+  runAcceptanceForProgress,
+  type ProgressReport,
+} from '../../core/progress/index.js';
 
 /** 收尾的输入 —— 前台与监督进程给的是同一组事实。 */
 export interface FinishRunOptions {
@@ -77,6 +89,94 @@ export interface FinishRunOptions {
    * 默认 stdout。
    */
   write?: (line: string) => void;
+}
+
+/**
+ * 收集「这一轮做成了什么」。
+ *
+ * 收集的是**事实**，不是判断 —— 判断在 `core/progress/report.ts`。
+ *
+ * 三件事实：
+ *   1. 规格里的验收标准有几条（真源，人写的）；
+ *   2. 验收测试跑出来的逐条用例结果（真跑，不是 todo）；
+ *   3. worktree 里实际改了哪些文件（git 事实）。
+ *
+ * `runAcceptance` 决定要不要真的跑一遍验收：
+ *
+ *   - **失败路径**（`exitCode !== 0`）→ 跑。此时门禁不会跑，
+ *     「哪几条断言过了」是最该留下的信息，且只有这里能拿到。
+ *   - **成功路径** → 不跑。门禁②紧接着就会跑同一份验收命令，
+ *     这里再跑一遍是白等一次构建（有时是几分钟）。
+ *     成功路径的验收结论由门禁事件自己留痕。
+ *
+ * 采集失败**不阻断收尾** —— 这是给人看的补充信息，不是判据。
+ * 采集不到就少报一项，不假装有。
+ */
+async function collectProgress(
+  sliceId: string,
+  worktree: string | null,
+  opts: {
+    runAcceptance: boolean;
+    /** 守卫 —— 提供托管文件与预置脏清单 */
+    guard: RuntimeGuard | null;
+    /** 审计判定的越界文件（审计的结论，不是重新算的） */
+    violations: string[];
+  },
+): Promise<ProgressReport | null> {
+  try {
+    const slice = await store.read(sliceId);
+    if (!slice) return null;
+
+    const root = worktree ?? process.cwd();
+    const specPath = slice.spec?.path
+      ? (worktree
+          ? join(worktree, slice.spec.path)
+          : resolve(process.cwd(), slice.spec.path))
+      : null;
+    const criteriaTotal = countAcceptanceCriteria(specPath);
+
+    const acceptanceDir = slice.acceptance?.dir ?? null;
+    const todoCount = countAcceptanceTodos(acceptanceDir, root);
+
+    // 跑验收只为拿逐条用例结果 —— 跑不动就少报「哪些断言过了」，其余照报。
+    const acceptanceRun = opts.runAcceptance
+      ? runAcceptanceForProgress({
+          acceptanceDir,
+          root,
+          commandTemplate: DEFAULT_ACCEPTANCE_COMMAND,
+          timeoutSec: 120,
+        })
+      : null;
+
+    const allChanged = worktree ? listChangedFiles(worktree) : [];
+
+    // 「做成了什么」只算**agent 这一轮写的**文件。
+    //
+    // 要排除两类不是 agent 写的：
+    //   - **托管文件**（zelto 自己写进 worktree 的规格副本、bundle）；
+    //   - **预置脏**（worktree 建出来时就已经脏的路径，D-29）。
+    //
+    // 不排除的话，人看到「改了 3 个文件」，
+    // 其中两个是 zelto 自己放的 —— 「做成了什么」就不准了。
+    const managed = new Set((opts.guard?.managedPaths ?? []).map((p) => p.replace(/\\/g, '/')));
+    const baseline = new Set((opts.guard?.baselineChanged ?? []).map((p) => p.replace(/\\/g, '/')));
+    const changedFiles = allChanged.filter((f) => !managed.has(f) && !baseline.has(f));
+
+    // 越界文件用**审计的结论**，不自己重算 ——
+    // 审计已经处理了托管文件、预置脏、submodule 假脏等一堆细节，
+    // 这里重算一遍必然对不上。
+    const violations = new Set(opts.violations.map((v) => v.replace(/\\/g, '/')));
+
+    return buildProgressReport({
+      criteriaTotal,
+      cases: acceptanceRun?.cases ?? [],
+      todoCount,
+      changedFiles,
+      outOfWriteSetFiles: changedFiles.filter((f) => violations.has(f)),
+    });
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -133,7 +233,32 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
   }
 
   // ── 2. 写集审计（ADR-014 §5）──────────────────────────────────────────
-  const withinBounds = await enforceWriteSet(sliceId, guard);
+  //
+  // 「做成了什么」由惰性回调在**审计之后**采集 —— 采集要跑验收，
+  // 会动工作区；放在审计前面跑，验收的产物会被算成越界写入。
+  //
+  // 惰性还保证了它只在**真的要写事件**时才跑：
+  // 审计通过（没有越界）时，事件由下面的失败分支/成功分支写，
+  // 那两条路径各自需要时才采集。
+  let progress: ProgressReport | null = null;
+  let progressCollected = false;
+  const progressPayload = async (
+    violations: string[] = [],
+  ): Promise<Record<string, unknown> | null> => {
+    if (!progressCollected) {
+      progressCollected = true;
+      // 只在**失败路径**跑验收（exitCode !== 0）：成功路径门禁②紧接着就会跑
+      // 同一份验收命令，这里再跑一遍是白等一次构建。
+      progress = await collectProgress(sliceId, guard?.hookRoot ?? null, {
+        runAcceptance: exitCode !== 0,
+        guard,
+        violations,
+      });
+    }
+    return progress ? { progress } : null;
+  };
+
+  const withinBounds = await enforceWriteSet(sliceId, guard, progressPayload);
 
   // ── 3. agent 失败：停机（ADR-047）─────────────────────────────────────
   if (exitCode !== 0) {
@@ -149,8 +274,21 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
       // 有越界时 `enforceWriteSet` 已经写过一条（reason: write-set violation），
       // 再写一条只会让人误以为发生了两次。
       try {
-        await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+        await events.append(sliceId, 'run.aborted', 'zelto', {
+          sliceId,
+          exitCode,
+          // 「做成了什么」—— 事件流是追溯的唯一载体（ADR-004），
+          // 所以这一项不能只留在终端输出里。
+          ...((await progressPayload()) ?? {}),
+        });
       } catch { /* 留痕失败不阻断停机 */ }
+    }
+
+    // 「做成了什么」—— 失败现场最该留下的信息。
+    await progressPayload();
+    if (progress) {
+      write('');
+      for (const line of formatProgressLines(progress)) write(line);
     }
 
     // 后台路径同样走「停机的唯一落点」—— 退回 frozen + 写分类 + 留痕。
@@ -216,6 +354,17 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
     // 后者是「越界已证实」，下一步是扩写集。混着说会让人白跑一轮。
     write('');
     printOutcome(writeSetOutcomeLines({ sliceId }, withinBounds), write);
+
+    // 「做成了什么」—— 越界恰恰是最需要它的时候。
+    //
+    // 只说「它越界了」，人只能重跑；重跑会把做对的部分再做一遍，
+    // agent 大概率在同一个地方再岔一次（实测 v2-input-binder）。
+    await progressPayload();
+    if (progress) {
+      write('');
+      for (const line of formatProgressLines(progress)) write(line);
+    }
+
     return {
       ok: false,
       state: 'frozen',
@@ -235,6 +384,9 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
     sliceId,
     exitCode: 0,
     costUsd: cost.costUsd,
+    // 「做成了什么」—— 成功的那轮同样要留痕，
+    // 否则事后复盘只能看到「过了」，看不到「过了什么」。
+    ...((await progressPayload()) ?? {}),
   });
   write(`✅ Agent completed successfully (${elapsedSec}s)`);
 

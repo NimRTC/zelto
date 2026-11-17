@@ -103,6 +103,16 @@ const CONFIG = [
 ].join('\n');
 
 describe('acceptance: 写集越界后的恢复', { concurrency: false }, () => {
+  /**
+   * 第一轮运行（真正越界的那一轮）的输出。
+   *
+   * 为什么存下来：第二轮跑**不会**再越界 ——
+   * `src/evil.js` 在第一轮已经被写进 worktree，
+   * 于是第二轮开工时它是「预置脏」（D-29），不算本轮的越界。
+   * 所以「输出里说了什么」只能在第一轮验。
+   */
+  let firstRunOutput = '';
+
   before(async () => {
     await rm(TEST_DIR, { recursive: true, force: true });
     await mkdir(join(TEST_DIR, 'src'), { recursive: true });
@@ -148,8 +158,9 @@ describe('acceptance: 写集越界后的恢复', { concurrency: false }, () => {
 
   it('越界时不进 gate，退出码非 0', async () => {
     const result = await runCli('run', 'offender');
+    firstRunOutput = result.stdout + result.stderr;
     assert.notEqual(result.code, 0, '越界应当以非 0 退出码结束');
-    assert.match(result.stdout + result.stderr, /写集越界/);
+    assert.match(firstRunOutput, /写集越界/);
   });
 
   it('越界后切片退回 frozen，不卡死在 running', async () => {
@@ -167,6 +178,65 @@ describe('acceptance: 写集越界后的恢复', { concurrency: false }, () => {
     const types = await readEventTypes('offender');
     assert.ok(types.includes('run.aborted'), '缺少 run.aborted 事件');
     assert.ok(types.includes('policy.violation'), '缺少 policy.violation 事件');
+  });
+
+  it('越界时事件里带上「做成了什么」—— 只说违规，人只能重跑', async () => {
+    // 病灶（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+    // agent 越界写了一个文件，事件里只有 violations。
+    // 人看到的是「又跑废了」，看不到「写集内的活儿其实做完了大半」。
+    // 于是只能重跑 —— 重跑会把做对的部分再做一遍。
+    const file = join(TEST_DIR, '.zelto', 'events', 'offender', 'events.jsonl');
+    const content = await readFile(file, 'utf-8');
+    const events = content
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { type: string; payload: Record<string, unknown> });
+
+    // 取**第一条** run.aborted —— 那是越界那一刻写的那条。
+    // 后面的 run.aborted 来自重跑，写集已扩，不再越界。
+    const aborted = events.find((e) => e.type === 'run.aborted');
+    assert.ok(aborted, '缺少 run.aborted 事件');
+
+    const progress = aborted.payload.progress as
+      | {
+          criteriaTotal: number | null;
+          changedFiles: string[];
+          outOfWriteSetFiles: string[];
+          verdict: string;
+        }
+      | undefined;
+    assert.ok(progress, 'run.aborted 事件里应当带 progress（做成了什么）');
+    assert.equal(progress.criteriaTotal, 1, '规格里有一条验收标准');
+    assert.ok(
+      progress.changedFiles.includes('src/util.js'),
+      `progress 应当列出 agent 真正改的写集内文件，实际是 ${JSON.stringify(progress.changedFiles)}`,
+    );
+    // 越界文件要单列 —— 「做成了什么」与「什么把这一轮废了」不能混
+    assert.deepEqual(
+      progress.outOfWriteSetFiles,
+      ['src/evil.js'],
+      '越界文件应当单列出来',
+    );
+    // zelto 自己写进 worktree 的文件（规格副本、bundle）不算 agent 的成果
+    assert.ok(
+      !progress.changedFiles.some((f) => f.includes('offender-bundle')),
+      'zelto 自己写的 bundle 不该算成 agent 的成果',
+    );
+  });
+
+  it('越界时终端输出里也说清「做成了什么」', async () => {
+    // 用**第一轮**的输出 —— 第二轮不会再越界（`src/evil.js` 已是预置脏）。
+    assert.match(firstRunOutput, /写集越界/);
+    assert.match(
+      firstRunOutput,
+      /进展|做成了什么/,
+      '输出里应当有「这一轮做成了什么」',
+    );
+    assert.match(
+      firstRunOutput,
+      /src\/util\.js/,
+      '输出里应当列出 agent 真正做完的事（写集内改动）',
+    );
   });
 
   it('扩写集后重跑能走完门禁并发签字请求', async () => {

@@ -92,6 +92,19 @@ export interface RuntimeGuard {
   hookRoot: string;
   /** hook 的 exec 形式（给 SDK 的 hooks 选项用） */
   exec: { command: string; args: string[] };
+  /**
+   * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
+   *
+   * 这些文件不是 agent 写的（规格副本、约束包、bundle）——
+   * 报「做成了什么」时不该把它们算成 agent 的成果。
+   */
+  managedPaths: string[];
+  /**
+   * 运行开始时 worktree 就已经脏的路径（D-29 预置脏）。
+   *
+   * 同样不是 agent 这一轮写的 —— 报进展时要排除。
+   */
+  baselineChanged: string[];
   /** 运行后的写集审计；没有 worktree 时返回 null（无从审计） */
   audit(): WriteAuditResult | null;
   /** 释放预约并撤掉 zelto 装的那条钩子 */
@@ -188,6 +201,8 @@ export async function installRuntimeGuard(
     reservation,
     hookRoot,
     exec,
+    managedPaths: managed.map((m) => m.path),
+    baselineChanged,
 
     audit(): WriteAuditResult | null {
       // 没有 worktree 就没有隔离，也就没有「这次运行改了什么」可查 ——
@@ -315,6 +330,26 @@ export interface WriteSetVerdict {
 export async function enforceWriteSet(
   sliceId: string,
   guard: RuntimeGuard | null,
+  /**
+   * 额外写进 `run.aborted` 事件 payload 的字段（惰性求值）。
+   *
+   * 为什么要传进来：`handleWriteSetViolation` 在**越界被拦下**的那一刻
+   * 写 `run.aborted` 事件 —— 那正是最需要「做成了什么」的时刻
+   * （实测 v2-input-binder：agent 越界写了一个文件，其余活儿基本做完了，
+   * 事件里却只有 violations，人只能重跑）。
+   *
+   * 事件流是追溯的唯一载体（ADR-004），所以这个信息不能只留在终端输出。
+   *
+   * 之所以是**函数**而不是对象：审计结果算完之后才写事件，
+   * 而「做成了什么」要在审计之后才采集（采集要跑验收，会动工作区 ——
+   * 放在审计前面跑，验收的产物会被算成越界写入）。
+   * 惰性求值保证它只在真的要写事件时才跑，且**跑在审计之后**。
+   *
+   * 回调会收到**审计判定的越界文件** —— 「什么把这一轮废了」
+   * 要用审计的结论，不能自己重算一遍（审计处理了托管文件、预置脏、
+   * submodule 假脏等一堆细节，重算必然对不上）。
+   */
+  extraPayload?: (violations: string[]) => Promise<Record<string, unknown> | null>,
 ): Promise<WriteSetVerdict> {
   const pass: WriteSetVerdict = { ok: true, violations: [], tampered: [] };
   if (!guard) return pass;
@@ -332,6 +367,7 @@ export async function enforceWriteSet(
       violations: [],
       tampered: [],
       reason: 'write-set audit failed',
+      ...(await resolveExtraPayload(extraPayload, [])),
     });
     return { ok: false, violations: [], tampered: [], error: result.error };
   }
@@ -345,6 +381,7 @@ export async function enforceWriteSet(
   await handleWriteSetViolation(sliceId, {
     violations: result.violations,
     tampered: result.tampered,
+    ...(await resolveExtraPayload(extraPayload, result.violations)),
   });
 
   return {
@@ -352,4 +389,22 @@ export async function enforceWriteSet(
     violations: result.violations,
     tampered: result.tampered,
   };
+}
+
+/**
+ * 求值额外的事件 payload。
+ *
+ * 求值失败**不阻断**：附加信息是补充，不是判据 ——
+ * 采集不到就少写一个字段，不能因此让整条审计路径失败。
+ */
+async function resolveExtraPayload(
+  fn: ((violations: string[]) => Promise<Record<string, unknown> | null>) | undefined,
+  violations: string[],
+): Promise<Record<string, unknown>> {
+  if (!fn) return {};
+  try {
+    return (await fn(violations)) ?? {};
+  } catch {
+    return {};
+  }
 }
