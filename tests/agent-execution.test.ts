@@ -19,7 +19,9 @@ describe('agent execution', () => {
   });
 
   after(async () => {
-    await rm(TEST_DIR, { recursive: true, force: true });
+    // Windows 上刚退出的子进程还可能攥着 cwd 句柄 → EBUSY。
+    // maxRetries 让 Node 自己重试（只对 EPERM/EBUSY/ENOTEMPTY 生效）。
+    await rm(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   });
 
   function runCommand(...args: string[]): Promise<{ stdout: string; code: number }> {

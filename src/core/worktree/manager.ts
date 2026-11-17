@@ -81,6 +81,13 @@ export class WorktreeError extends Error {
 export class WorktreeManager {
   private readonly repoRoot: string;
 
+  /**
+   * 移除 worktree 时的重试间隔（毫秒）。
+   *
+   * 可被测试改小 —— 生产值 3s 是为了让 Windows 上的文件句柄有时间释放。
+   */
+  removeRetryDelayMs = 3_000;
+
   constructor(repoRoot: string = process.cwd()) {
     this.repoRoot = repoRoot;
   }
@@ -200,7 +207,7 @@ export class WorktreeManager {
     if (options.force) args.push('--force');
     args.push(target);
 
-    this.git(args, `移除版本工作目录失败: ${this.versionRelativePathFor(label)}`);
+    this.removeWithRetry(args, target, `移除版本工作目录失败: ${this.versionRelativePathFor(label)}`);
     this.git(['worktree', 'prune'], '清理 worktree 登记失败');
   }
 
@@ -748,7 +755,7 @@ export class WorktreeManager {
     if (options.force) args.push('--force');
     args.push(target);
 
-    this.git(args, `移除 worktree 失败: ${relative(this.repoRoot, target)}`);
+    this.removeWithRetry(args, target, `移除 worktree 失败: ${relative(this.repoRoot, target)}`);
     this.git(['worktree', 'prune'], '清理 worktree 登记失败');
   }
 
@@ -900,6 +907,68 @@ export class WorktreeManager {
     } catch {
       // 摘不掉不算致命：交给 git worktree remove 报错，信息更明确
     }
+  }
+
+  /**
+   * `git worktree remove` 带重试。
+   *
+   * 为什么需要重试（D-65，nimrtc-zelto v4 实测）：
+   *
+   * Windows 上 worktree 里常驻着构建产物（`build/tests/Debug/*.exe`、
+   * `msquic.dll`）。agent 刚跑完验收时，这些 exe 进程**可能还没退干净**，
+   * 文件句柄还开着 —— `git worktree remove` 于是报：
+   *
+   * ```
+   * error: failed to delete '...': Invalid argument
+   * ```
+   *
+   * 几秒后句柄释放，目录其实完全可删。zelto 之前只尝试一次，失败就打印
+   * 「请手动删除」—— 但 worktree 里躺着一整棵构建树（几个 GB），
+   * 人得自己 `rmdir /s /q`。实测就是**等 20 秒后一条 rmdir 就干净了**。
+   *
+   * 修法：失败且报错像「文件被占用 / Invalid argument / directory not empty」时，
+   * 退避重试若干次；仍失败才报错（保留原语义：不静默吞掉）。
+   *
+   * 判据只看**是不是占用类错误** —— 真失败（比如分支被占用）重试也没用，
+   * 不该浪费人的时间。
+   */
+  private removeWithRetry(args: string[], target: string, errorMessage: string): void {
+    const MAX_ATTEMPTS = 5;
+    const RETRY_DELAY_MS = this.removeRetryDelayMs;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        this.git(args, errorMessage);
+        return;
+      } catch (err) {
+        lastError = err;
+        const detail = err instanceof WorktreeError ? (err.stderr ?? '') : String(err);
+        const busy =
+          /Invalid argument|being used by another process|cannot access|directory not empty|资源正被|另一个程序/i.test(
+            detail,
+          );
+        // 不是占用类错误 → 重试也没用，立刻抛出（保留原始报错）
+        if (!busy) throw err;
+        // 目录已经真的不在了 → 视为成功
+        if (!existsSync(target)) {
+          this.git(['worktree', 'prune'], undefined, true);
+          return;
+        }
+        if (attempt === MAX_ATTEMPTS) break;
+        this.sleep(RETRY_DELAY_MS * attempt);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new WorktreeError(errorMessage, args.join(' '), String(lastError));
+  }
+
+  /** 同步阻塞等待（Node 内置，无第三方依赖） */
+  private sleep(ms: number): void {
+    const shared = new SharedArrayBuffer(4);
+    Atomics.wait(new Int32Array(shared), 0, 0, ms);
   }
 
   // ─── git 辅助 ────────────────────────────────────────────────────────────
