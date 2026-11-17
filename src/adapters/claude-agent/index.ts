@@ -20,7 +20,7 @@ import {
 import { tmpdir, platform } from 'node:os';
 import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../../core/ports/executor.js';
 import type { EventEnvelope } from '../../core/events/index.js';
-import { extractClaudeJson, parseClaudeUsage } from '../usage-parse.js';
+import { extractClaudeJson, extractClaudeResult, parseClaudeUsage } from '../usage-parse.js';
 import { killProcessTree, killProcessTreeGracefully } from '../process-tree.js';
 
 // ─── Session Persistence ─────────────────────────────────────────────────────
@@ -600,11 +600,9 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
    */
   getOutput(sessionId: string): string {
     const raw = this.getRawOutput(sessionId);
-    const json = extractClaudeJson(raw);
-    if (json) {
-      const result = json.result;
-      if (typeof result === 'string') return result;
-    }
+    // 回答与成本是两个独立需求，各走各的提取器 —— 免得「拿到了成本、丢了答案」。
+    const result = extractClaudeResult(raw);
+    if (result !== null) return result;
     return raw;
   }
 

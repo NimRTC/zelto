@@ -465,9 +465,18 @@ async function viewOverview(target) {
     cost.appendChild(el('dd', null, v));
   };
   ckv('已花费', formatUsd(s.spentUsd));
-  // 没记账的切片列出来 —— 否则「已花费」看起来像完整总额，实际只算了一半的账
+  // 没记账的切片列出来 —— 否则「已花费」看起来像完整总额，实际只算了一半的账。
+  //
+  // 三态分开（ADR-035 §3.5）：
+  // - 「未记账切片」= 压根没查（一条成本事件都没有）
+  // - 「未测到切片」= 查过了，但 agent 没报出用量
+  //
+  // 两者混在一行会让人以为「账是完整的」—— 那不是事实。
   if (s.unmeasuredSlices && s.unmeasuredSlices.length > 0) {
     ckv('未记账切片', el('span', 'muted', s.unmeasuredSlices.join('、') + '（无成本事件，未计入上面金额）'));
+  }
+  if (s.checkedNoUsageSlices && s.checkedNoUsageSlices.length > 0) {
+    ckv('未测到切片', el('span', 'muted', s.checkedNoUsageSlices.join('、') + '（已核查，agent 未报出用量）'));
   }
   // 上限可能是「不限」（ADR-035 §3.6：budgetLimitUsd: 0 = 不限）。
   // 不限时服务端给 null + unlimited:true —— 不能显示成「$null」。
@@ -592,9 +601,23 @@ function livenessCell(s) {
  * 老切片（事件流没保留）根本没有成本事件，服务端给 costMeasured=false。
  * 显示 $0.0000 等于告诉人「这片没花钱」，
  * 而真相是「账本里没有这片」—— 那是假数据。
+ *
+ * 三态（服务端给 costMeasurement）：
+ * - unmeasured —— 压根没查 → 「未记账」
+ * - unavailable —— 查过了但 agent 没报出用量 → 「未测到」
+ * - measured —— 测到了 → 显示金额（哪怕正好是 $0.0000）
+ *
+ * unavailable 与 measured 差在「$0.0000」和「未测到」之间 ——
+ * 一个说「确实没花钱」，一个说「没测出来」。混同就是假账。
  */
 function costCell(s) {
-  if (!s.costMeasured) return el('span', 'muted', '未记账');
+  var state = s.costMeasurement;
+  // 老服务端没有 costMeasurement 字段 → 退回布尔判据。
+  if (state === undefined || state === null) {
+    state = s.costMeasured ? 'measured' : 'unmeasured';
+  }
+  if (state === 'unmeasured') return el('span', 'muted', '未记账');
+  if (state === 'unavailable') return el('span', 'muted', '未测到');
   return document.createTextNode(formatUsd(s.spentUsd));
 }
 

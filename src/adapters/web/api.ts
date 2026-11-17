@@ -21,7 +21,7 @@ import { collectSignReviewFacts } from '../../core/sign-review/collect.js';
 import { evaluateSignChecks } from '../../core/sign-review/evaluate.js';
 import type { SignCheck, SignReviewFacts } from '../../core/sign-review/types.js';
 import { WorktreeManager } from '../../core/worktree/manager.js';
-import { BudgetCollector, UNLIMITED_BUDGET } from '../../core/budget/collector.js';
+import { BudgetCollector, UNLIMITED_BUDGET, type CostMeasurement } from '../../core/budget/collector.js';
 import { MetricsCollector } from '../../core/metrics/collector.js';
 import { isSliceStalled } from '../../core/stall/classifier.js';
 import { classifyLiveness, lastOutputLine, readRecoveries, readSliceLivenessRecord } from '../../core/activity/index.js';
@@ -78,6 +78,19 @@ export interface SliceSummary {
    * 「测到 0」与「没测到」严格分开）。
    */
   costMeasured: boolean;
+  /**
+   * 成本的**三态**（ADR-035 §3.5）。
+   *
+   * - `unmeasured` —— 压根没有成本证据，不知道花了多少 → 界面显示「未记账」
+   * - `unavailable` —— **核查过**，但 agent 没报出用量 → 界面显示「未测到」
+   * - `measured` —— 测到了（金额可能正好是 0）→ 界面显示金额
+   *
+   * 为什么 `costMeasured` 不够：它是布尔的，容不下「查过了但没测到」这一态。
+   * 回填时会给那些 agent 输出为空、拿不到用量的切片补一条
+   * `budget.spent`（`measured: false`）标记 —— 它们**不是**「压根没查」，
+   * 也不该显示成「$0.0000（真的没花钱）」。
+   */
+  costMeasurement: CostMeasurement;
   /**
    * 被动活性（D-30）—— running 片才有意义，非 running 为 finished/null。
    * 服务端现场读会话/任务文件 + kill(pid,0)，不信 status: running。
@@ -409,7 +422,15 @@ export class WebApi {
     const spentUsd = slices.reduce((sum, s) => sum + s.spentUsd, 0);
     // 没记账的切片 = 有切片但一条成本证据都没有 —— 总额要标注「部分未记账」，
     // 否则人会把「只算了一半的账」当成完整总额（ADR-035 §3.5）。
-    const unmeasuredSlices = slices.filter((s) => !s.costMeasured).map((s) => s.id);
+    //
+    // 三态（ADR-035 §3.5）：「压根没查」与「查过但没测到」分开报。
+    // 混在一起会让人以为「查过了，账是完整的」—— 那不是事实。
+    const unmeasuredSlices = slices
+      .filter((s) => s.costMeasurement === 'unmeasured')
+      .map((s) => s.id);
+    const checkedNoUsageSlices = slices
+      .filter((s) => s.costMeasurement === 'unavailable')
+      .map((s) => s.id);
 
     // 花费最高的几片 —— 人最需要知道「钱花在哪了」
     const topSpenders = slices
@@ -426,6 +447,7 @@ export class WebApi {
       spendRatio: unlimited ? null : rawLimit > 0 ? spentUsd / rawLimit : 0,
       topSpenders,
       unmeasuredSlices,
+      checkedNoUsageSlices,
     };
   }
 
@@ -782,7 +804,8 @@ async function toSummary(
     escalated = r.escalated;
   } catch { /* 没有计数文件就是 0 */ }
 
-  const { spent: spentUsd, measured: costMeasured } = await budget.getSpentDetail(slice.id);
+  const { spent: spentUsd, measured: costMeasured, measurement: costMeasurement } =
+    await budget.getSpentDetail(slice.id);
   return {
     id: slice.id,
     title: slice.title,
@@ -808,6 +831,8 @@ async function toSummary(
     spentUsd,
     /** 是否测到过成本证据；false = 没记账，界面不能显示成 $0 */
     costMeasured,
+    /** 三态：unmeasured（压根没查）/ zero（查过但没测到）/ measured（测到了） */
+    costMeasurement,
     liveness,
     liveReason,
     idleMs,

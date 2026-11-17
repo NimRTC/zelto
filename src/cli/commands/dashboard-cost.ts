@@ -46,6 +46,15 @@ export interface SliceCost {
   llmCalls: number;
   /** 是否测到过用量 —— false 是「没测到」，与 0 严格分开 */
   measured: boolean;
+  /**
+   * 是否「核查过但没测到」—— 回填时给那些 agent 没报出用量的切片补的标记。
+   *
+   * 与 `measured` 的区别：
+   * - `measured=false, checked=false` —— 压根没查（没跑过 / 事件流里啥都没有）
+   * - `measured=false, checked=true` —— 查过了，agent 没报出用量
+   * - `measured=true` —— 测到了（金额可能正好是 0）
+   */
+  checked: boolean;
   /** 逐模型明细 —— 钱花在哪个模型上 */
   models: ModelCost[];
 }
@@ -65,7 +74,9 @@ export interface CostTotals {
   llmCalls: number;
   /** 测到用量的切片数 */
   measuredSlices: number;
-  /** 没测到用量的切片数（有切片但一条成本事件都没有） */
+  /** 核查过但 agent 没报出用量的切片数（回填补的标记） */
+  checkedNoUsageSlices: number;
+  /** 压根没核查过的切片数（有切片但一条成本事件都没有） */
   unmeasuredSlices: number;
 }
 
@@ -115,6 +126,7 @@ function emptyCost(): SliceCost {
     agentCalls: 0,
     llmCalls: 0,
     measured: false,
+    checked: false,
     models: [],
   };
 }
@@ -186,6 +198,13 @@ export function collectCosts(): Map<string, SliceCost> {
             m.outputTokens += c;
             m.tokens += num(e.payload?.totalTokens) || p + c;
           } else if (e.type === 'budget.spent') {
+            // `measured: false` = 已核查但没测到成本（回填补的标记）。
+            // 它不计入花费、不算「测到」，但证明有人查过这一片 ——
+            // 所以它进 map（带 zeroMeasurement），不跟「压根没查」混同。
+            if (e.payload?.measured === false) {
+              cost.checked = true;
+              continue;
+            }
             cost.measured = true;
             const amount = num(e.payload?.amount);
             if (e.payload?.source === 'agent') {
@@ -227,7 +246,9 @@ export function collectCosts(): Map<string, SliceCost> {
     }
 
     // 从来没测到过用量 → 不进 map。这跟「测到 0」是两回事。
-    if (!cost.measured) continue;
+    // 但「已核查、没测到」（回填补的标记）要进 —— 否则它会跟
+    // 「压根没查」一起被算成「未记账」，回填就白做了。
+    if (!cost.measured && !cost.checked) continue;
 
     cost.agentTokens = cost.agentInputTokens + cost.agentOutputTokens;
     cost.totalCost = cost.agentCost + cost.llmCost;
@@ -285,6 +306,7 @@ export function sumCosts(costMap: Map<string, SliceCost>, totalSlices = 0): Cost
     agentCalls: 0,
     llmCalls: 0,
     measuredSlices: 0,
+    checkedNoUsageSlices: 0,
     unmeasuredSlices: 0,
   };
 
@@ -301,11 +323,22 @@ export function sumCosts(costMap: Map<string, SliceCost>, totalSlices = 0): Cost
     t.totalTokens += c.totalTokens;
     t.agentCalls += c.agentCalls;
     t.llmCalls += c.llmCalls;
-    if (c.measured) t.measuredSlices++;
   }
 
-  // 只统计「确实有切片」的分母 —— 否则 version-* 事件目录会让数字失真
-  t.unmeasuredSlices = Math.max(0, totalSlices - t.measuredSlices);
+  // 只统计「确实有切片」的分母 —— 否则 version-* 事件目录会让数字失真。
+  //
+  // 「未测到」现在分两层：
+  // - `measuredSlices` —— 测到了金额（含测得 0）
+  // - `checkedNoUsageSlices` —— 查过了但 agent 没报出用量（回填补的标记）
+  // - `unmeasuredSlices` —— 压根没查
+  //
+  // 三者不能混：把「查过但没测到」算进「压根没查」，回填就没有意义；
+  // 把「测得 0」算进「没测到」，又是拿假数据撑门面。
+  for (const c of costMap.values()) {
+    if (c.measured) t.measuredSlices++;
+    else if (c.checked) t.checkedNoUsageSlices++;
+  }
+  t.unmeasuredSlices = Math.max(0, totalSlices - t.measuredSlices - t.checkedNoUsageSlices);
   return t;
 }
 

@@ -21,6 +21,30 @@ const DEFAULT_BUDGET_LIMIT = 1.0; // USD
  */
 export const UNLIMITED_BUDGET = Number.POSITIVE_INFINITY;
 
+/**
+ * 成本的「测没测到」——三态，不是布尔。
+ *
+ * 为什么不能是布尔：布尔只能表达「测到 / 没测到」，
+ * 而真相有三种（ADR-035 §3.5 的同一原则）：
+ *
+ * | 状态 | 含义 | 界面显示 |
+ * |---|---|---|
+ * | `unmeasured` | 压根没有成本证据 —— 不知道花了多少 | 「未记账」 |
+ * | `unavailable` | 核查过，但**拿不到**金额 | 「未测到」 |
+ * | `measured` | 测到了金额（金额可能就是 0） | 「$X.XXXX」 |
+ *
+ * `unavailable` 与 `unmeasured` 混同的后果很具体：把「没测到」显示成 $0.0000，
+ * 人会以为这片没花钱；反过来把「测得 0」显示成「未记账」，
+ * 人会以为账丢了。两者都不是事实。
+ *
+ * 判定靠 `budget.spent` 事件的 payload：
+ * - 有 `budget.spent` 且 `measured !== false` → 测到了（金额可能是 0）
+ * - 有 `budget.spent` 且 `measured === false` → **核查过但拿不到金额**
+ *   （回填时给那些 agent 输出为空、拿不到用量的切片补的标记）
+ * - 一条成本事件都没有 → 压根没核查
+ */
+export type CostMeasurement = 'unmeasured' | 'unavailable' | 'measured';
+
 export class BudgetCollector {
   private readonly events: EventStream;
   private readonly zeltoDir: string;
@@ -45,17 +69,32 @@ export class BudgetCollector {
    * 「真的没花钱」和「压根没记账」在界面上都是 $0.0000 —— 那是在
    * 用假数据撑门面。`measured=false` 时界面必须显示「未记账」而不是金额。
    *
-   * 判据：事件流里出现过任何一条成本证据（`budget.spent` 或 `llm.called`）。
+   * 判据：事件流里出现过任何一条**有效**的成本证据
+   * （`budget.spent` 且 `measured !== false`，或 `llm.called`）。
    * 只读 `budget.spent` 不够 —— LLM 调用先写 `llm.called`，成本事件
    * 万一写失败，token 花掉了但账没记上，那也是「有证据但没金额」。
+   *
+   * 三态（`CostMeasurement`）：
+   * - `unmeasured` —— 一条有效证据都没有（压根没核查）
+   * - `unavailable` —— 有 `budget.spent` 但标了 `measured: false`
+   *   （核查过了，agent 没报出用量，拿不到金额）
+   * - `measured` —— 测到了（金额可能正好是 0）
    */
-  async getSpentDetail(sliceId: string): Promise<{ spent: number; measured: boolean }> {
+  async getSpentDetail(sliceId: string): Promise<{ spent: number; measured: boolean; measurement: CostMeasurement }> {
     const evts = await this.events.read(sliceId);
     let total = 0;
     let measured = false;
+    // 「核查过但拿不到金额」—— 与「压根没核查」分开。
+    let unavailable = false;
 
     for (const evt of evts) {
       if (evt.type === 'budget.spent') {
+        // `measured: false` 的事件是「已核查但拿不到金额」的标记，
+        // 不计入花费，也不算「测到」—— 但它证明有人核查过这一片。
+        if (evt.payload?.measured === false) {
+          unavailable = true;
+          continue;
+        }
         total += this.extractAmount(evt);
         measured = true;
       } else if (evt.type === 'llm.called') {
@@ -63,7 +102,8 @@ export class BudgetCollector {
       }
     }
 
-    return { spent: total, measured };
+    const measurement: CostMeasurement = measured ? 'measured' : unavailable ? 'unavailable' : 'unmeasured';
+    return { spent: total, measured, measurement };
   }
 
   /**
