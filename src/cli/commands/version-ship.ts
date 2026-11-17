@@ -76,7 +76,37 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
   mergeCommit: string | null;
   conflicts: string[];
   error: string | null;
+  /**
+   * 实际合进的分支名（D-63）。
+   *
+   * ship 合的是**主仓当前检出的分支**（ADR-056 §3.5），不一定是 `main`。
+   * 事件里必须写真实的那个 —— 写死 `'main'` 会让追溯链说谎。
+   */
+  targetBranch: string | null;
 } {
+  // ── D-63：合进「主仓当前检出的分支」，并记住它到底是哪个 ──────────
+  //
+  // ship 合的是**主仓当前检出的分支**（ADR-056 §3.5：「版本分支合入主干」，
+  // 「主干」在 ADR 的语境里 = 主仓当前分支，不特指 `main`）。
+  //
+  // 之前的写法把 `target` 算出来就扔了，而事件里写死 `target: 'main'`：
+  // 于是主仓停在 `feat/xxx` 上跑 ship 时，
+  // **事件说「已合入 main」，实际上合的是 feat/xxx** ——
+  // 追溯链（C4：事件是追溯的唯一证据载体）在这里说了假话。
+  //
+  // 实测（nimrtc-zelto v3，2026-11-18）：`version.delivered` 事件写着
+  // `shippedTo: "main"`，而 tag `v3` 实际打在 `feat/remote-desktop-m1-m4` 上，
+  // `git merge-base --is-ancestor v3 main` 返回假 —— v3 从来没进过 main。
+  //
+  // 后果：以后查「v3 进主干了吗」，事件说进了，git 说没进。**两个证据打架，
+  // 人只能靠猜** —— 这比「没合」更坏，因为追溯链看起来是完整的。
+  //
+  // 修法：把真实的分支名带出去，写进事件。
+  //
+  // （放在守卫之前算：守卫失败时也要知道「本来要合到哪」）
+  const current = git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot);
+  const targetBranch = current.ok ? current.stdout.trim() : null;
+
   // 主干工作区必须干净
   //
   // 例外：zelto 自己管理的规格文件（`specs/slices/**`）与**验收骨架**
@@ -144,12 +174,9 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
       for (const d of dirty.slice(0, 10)) log(`     ${d}`);
       if (dirty.length > 10) log('     …（只列前 10 条）');
       log('     先提交或暂存这些改动，再重新跑 zelto version ship。');
-      return { ok: false, mergeCommit: null, conflicts: [], error: '主仓工作区不干净' };
+      return { ok: false, mergeCommit: null, conflicts: [], error: '主仓工作区不干净', targetBranch };
     }
   }
-
-  const current = git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot);
-  const target = current.ok ? current.stdout.trim() : 'HEAD';
 
   // ── D-62：清掉「未跟踪的 zelto 规格文件副本」 ────────────────────────
   //
@@ -200,7 +227,7 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
     const files = conflictedFiles(repoRoot);
     git(['merge', '--abort'], repoRoot);
     const message = res.stderr.trim() || res.stdout.trim() || '合并失败';
-    return { ok: false, mergeCommit: null, conflicts: files, error: message };
+    return { ok: false, mergeCommit: null, conflicts: files, error: message, targetBranch };
   }
 
   const commitRes = git(['rev-parse', 'HEAD'], repoRoot);
@@ -209,6 +236,7 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
     mergeCommit: commitRes.ok ? commitRes.stdout.trim() : (head ?? null),
     conflicts: [],
     error: null,
+    targetBranch,
   };
 }
 
@@ -314,19 +342,23 @@ export async function handleVersionShip(
     if (asJson) {
       console.log(JSON.stringify({ version: versionLabel, branch: versionBranch, dryRun: true }, null, 2));
     } else {
+      // D-63：dry-run 也要说真名 —— 人要在**动手前**知道会合到哪。
+      const cur = git(['rev-parse', '--abbrev-ref', 'HEAD'], process.cwd());
       f.out(`🔍 Dry-run —— 不会真的合入。`);
       f.out(`   版本分支：${versionBranch}`);
-      f.out(`   合入目标：主仓当前分支`);
+      f.out(`   合入目标：${cur.ok ? cur.stdout.trim() : '（未知）'}`);
       f.out(`   标签：${noTag ? '（不打）' : versionTagName(versionLabel)}`);
     }
     return 0;
   }
 
+  const result = shipBranch(versionBranch, process.cwd(), (m) => f.out(m));
+
   f.out(`── ship 版本 ${versionLabel} ──`);
   f.out(`   版本分支：${versionBranch}`);
-  f.out(`   合入目标：主仓当前分支`);
-
-  const result = shipBranch(versionBranch, process.cwd(), (m) => f.out(m));
+  // D-63：把真实的目标分支名打出来 —— 人一眼就能看出「这一版合到哪了」，
+  // 不用去翻 git。写死「主仓当前分支」这种话，人得自己去看当前检出的是什么。
+  f.out(`   合入目标：${result.targetBranch ?? '（未知）'}`);
 
   if (!result.ok) {
     f.out('');
@@ -344,7 +376,7 @@ export async function handleVersionShip(
       files: result.conflicts,
       resolution: result.conflicts.length > 0 ? 'conflict' : 'failed',
       message: result.error ?? 'ship 失败',
-      target: 'main',
+      target: result.targetBranch ?? 'main',
     });
     return 1;
   }
@@ -356,24 +388,26 @@ export async function handleVersionShip(
     tagged = tagVersion(tag, result.mergeCommit, process.cwd(), (m) => f.out(m));
   }
 
-  // ── D3-C：ship 后在主干重跑版本级验收（只提示不阻断）────────────
+  // ── D3-C：ship 后在合入目标上重跑版本级验收（只提示不阻断）────────
   //
-  // 版本分支上验过一遍了；主干合入时可能撞出集成缺口。
-  // 这里在主干再跑一次，把结论记进事件 —— 提示，不阻断。
+  // 版本分支上验过一遍了；合入时可能撞出集成缺口。
+  // 这里在合入目标上再跑一次，把结论记进事件 —— 提示，不阻断。
   const cfg = loadConfigSafe();
   let mainAcceptance: { passed: boolean; results: Array<{ name: string; passed: boolean; code: number | null }> } | null = null;
   if (cfg && cfg.gate.commands.length > 0) {
+    // D-63：标题里说真名 —— 「合入 main」在主仓停在 feat/xxx 时是假的。
+    const targetLabel = result.targetBranch ?? '目标分支';
     f.out('');
-    f.out('── 主干验收（D3-C：只提示，不阻断）──');
+    f.out(`── 合入后验收（${targetLabel}）──`);
     mainAcceptance = await runAcceptanceOnMain(cfg.gate.commands, cfg.gate.timeoutSec);
     if (!mainAcceptance.passed) {
       f.out('');
-      f.out('⚠️  合入主干后门禁没过 —— 集成缺口，主干已改动（ship 不回滚）：');
+      f.out(`⚠️  合入 ${targetLabel} 后门禁没过 —— 集成缺口，已改动不回滚（ship 不回滚）：`);
       for (const r of mainAcceptance.results.filter((r) => !r.passed)) {
         f.out(`   - ${r.name}（exit ${r.code ?? 'signal'}）`);
       }
       f.out('');
-      f.out('   这是「版本分支验过、主干合入时撞出缺口」的典型情况。');
+      f.out(`   这是「版本分支验过、合入时撞出缺口」的典型情况。`);
       f.out('   处理：git revert 或修好后重新合。zelto 不自动回滚（ADR-018：合并不自动撤销）。');
     }
   }
@@ -394,7 +428,7 @@ export async function handleVersionShip(
     version: versionLabel,
     branch: versionBranch,
     tag: tagged ? tag : null,
-    shippedTo: 'main',
+    shippedTo: result.targetBranch ?? 'main',
     mergeCommit: result.mergeCommit,
     mainAcceptance: mainAcceptance
       ? {
@@ -426,7 +460,8 @@ export async function handleVersionShip(
   }
 
   f.out('');
-  f.out(`✅ 版本 ${versionLabel} 已合入主干${tagged ? `，tag "${tag}"` : ''}`);
+  // D-63：说真名 —— 「已合入主干」在主仓停在 feat/xxx 时是假的。
+  f.out(`✅ 版本 ${versionLabel} 已合入 ${result.targetBranch ?? '目标分支'}${tagged ? `，tag "${tag}"` : ''}`);
   f.out(`   版本工作目录可清理：zelto version cleanup ${versionLabel}`);
 
   return 0;
