@@ -184,6 +184,59 @@ export function parsePorcelainStatus(output: string): string[] {
   return paths;
 }
 
+/**
+ * 判断一个「脏」路径是不是**只有 submodule 的 `-dirty` 标记**。
+ *
+ * 病灶（实测于 nimrtc-zelto，2026-11-17）：
+ *   `git status --porcelain` 报 ` M src/third_party/msquic`，
+ *   但 `git diff` 显示的只有：
+ *
+ *     -Subproject commit a5ae3a06ed6e3c054c251892370801db98d85174
+ *     +Subproject commit a5ae3a06ed6e3c054c251892370801db98d85174-dirty
+ *
+ *   **指针一模一样**，只多了 `-dirty` —— 意思是「submodule 内部有未提交的
+ *   改动」（nimrtc 的 msquic 里嵌着 quictls，CRLF 换行导致的经典假脏）。
+ *
+ *   这不是「人改了代码还没提交」—— 主仓的 gitlink 指针没动，
+ *   合并**不会碰它**，也不会盖掉任何东西。
+ *
+ *   但合并守卫只看 `git status --porcelain`，于是判成「工作区不干净」→
+ *   合并被拦下 → **每一片都合不进去**（实测：v2-input-binder 签字通过却合不了）。
+ *
+ * 判据：diff 里只有 `-dirty` 后缀，commit 指针不变 → 判「不算脏」。
+ *
+ * **保守方向**：指针变了（真的换了 submodule 版本）→ 判「脏」（拦住）。
+ * 判不出来（git 调用失败 / 路径不是 submodule）→ 判「脏」（拦住）。
+ * 误报（拦住一次本来能合的）比漏报（盖掉人的未提交改动）便宜。
+ *
+ * @param repoRoot git 仓库根
+ * @param path 相对仓库根的路径（正斜杠）
+ */
+export function isSubmoduleOnlyDirty(repoRoot: string, path: string): boolean {
+  try {
+    // 只看这一个路径的 diff；--submodule=short 给出 `Subproject commit ...` 形态
+    const out = execFileSync(
+      'git',
+      ['-c', 'core.quotePath=false', 'diff', '--submodule=short', '--', path],
+      { cwd: repoRoot, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const lines = out
+      .split('\n')
+      .map((l) => l.trim())
+      // diff 里这两行带前导的 `-` / `+`（`-Subproject commit X` / `+Subproject commit X`）
+      .filter((l) => l.startsWith('-Subproject commit ') || l.startsWith('+Subproject commit '))
+      .map((l) => l.slice(1).trim());
+    if (lines.length !== 2) return false;
+
+    const before = lines[0].replace('Subproject commit ', '');
+    const after = lines[1].replace('Subproject commit ', '');
+    // 只多了一个 `-dirty` 后缀，commit 指针没变 → 不算脏
+    return after === `${before}-dirty`;
+  } catch {
+    return false;
+  }
+}
+
 /** 计算文件内容哈希（`sha256:<hex>`）；文件不存在时返回 null。 */
 export function hashFile(path: string): string | null {
   try {

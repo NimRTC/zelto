@@ -96,6 +96,13 @@ import {
   installRuntimeGuard,
   releaseGuards,
 } from './runtime-guard.js';
+import {
+  spawnSupervisor,
+  supervisorEntryPath,
+  supervisorLogPath,
+} from './supervisor.js';
+import { finishRun } from './run-finish.js';
+import { loadTask, mergeSessionLiveness, patchTask, saveTask, tasksDir, type TaskInfo } from './task-store.js';
 
 // 供其它命令复用（ai-pipeline.ts / question.ts）
 export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
@@ -1508,6 +1515,82 @@ register('run', async (args) => {
     const agentTimeout = sliceData.agentTimeout;
     const workDir = worktree?.path ?? process.cwd();
 
+    // ── Detach mode: 把整个运行交给独立进程 ────────────────────────────
+    //
+    // D-50：**监视器必须是独立进程**，而且不只是「等 agent 结束」那一段。
+    //
+    // 原来的做法是「主进程里一个没 await 的 Promise」——
+    // 主进程 `process.exit()` 时它跟着死，于是：
+    //   - agent 变孤儿（还在改文件、还在烧 token）；
+    //   - 没人跑写集审计 → 越界写入不会被发现；
+    //   - 没人跑门禁 → 没有签字请求 → 切片永远卡在 frozen；
+    //   - 没人释放写集预约 → 下一片撞写集冲突；
+    //   - 适配器住在主进程里 → agent 退出时**没人记录退出码**。
+    //
+    // 人看到的是「切片在跑」，实际是**一个没人管的孤儿 agent**。
+    //
+    // 所以 detach 模式下，主进程只做**准入与准备**（解析写集、建 worktree、
+    // 拉起监督进程），**不起 agent、不装守卫** —— 那些都在监督进程里做。
+    // 谁装守卫谁放守卫，才不会漏（C9）。
+    if (isDetach) {
+      const taskId = `task-${id}-${Date.now()}`;
+      const taskInfo: TaskInfo = {
+        taskId,
+        sliceId: id,
+        // 监督进程会起自己的会话 —— 这里先占位，等监督进程写回
+        sessionId: '',
+        agentName,
+        startedAt: new Date().toISOString(),
+        status: 'running' as const,
+      };
+
+      // 任务文件**先写后拉**监督进程：
+      //
+      // 顺序很重要（D-53）：监督进程起 agent 后会立刻往任务文件写 sessionId。
+      // 如果主进程在监督进程之后才 `saveTask`（整份覆盖），它手里那份
+      // 「sessionId: ''」的旧快照会把监督进程刚写的真会话 id 冲掉。
+      // 所以顺序是：写任务文件 → 拉监督进程 → 只**补**两个字段（不覆盖别的）。
+      taskInfo.supervisorLog = supervisorLogPath(process.cwd(), taskId);
+      taskInfo.lastActivityAt = taskInfo.startedAt;
+      saveTask(taskInfo);
+
+      // 拉起独立监督进程
+      //
+      // D-53：`spawnSupervisor` 现在**做启动存活确认** —— 监督进程如果参数
+      // 不全、入口缺失，会在一秒内退出，而这里已经打算告诉人「已在后台跑」。
+      // 那种情况下界面显示 running、实际一个 agent 都没起 —— 最坏的假象。
+      // 所以这里必须拿到「确实活着」的确认，拿不到就把原因原样交回。
+      const launch = await spawnSupervisor({
+        projectRoot: process.cwd(),
+        taskId,
+        sliceId: id,
+        sessionId: '',
+        agentCommand: agentName,
+        workDir,
+        timeoutMs: (agentTimeout ?? loadConfig().agent.timeout ?? 1800) * 1000,
+        isHotfix,
+        adapterType,
+      });
+
+      if (!launch.ok) {
+        // 监督进程没起来 → 没人跑这一轮 → 不能假装「已经在后台跑了」——
+        // 那是把「没人管」说成「有人在管」。
+        console.error(`zelto run ${id} — ❌ 无法拉起后台监督进程，这一轮没有在后台跑`);
+        console.error(`     ${launch.reason}`);
+        console.error(`     监督进程入口：${supervisorEntryPath()}`);
+        console.error(`     请改用前台运行： zelto run ${id}`);
+        return 1;
+      }
+
+      // 只补 pid —— 不整份覆盖（会把监督进程写的 sessionId 冲掉，D-53）
+      patchTask(taskId, { supervisorPid: launch.pid });
+
+      console.log(`zelto run ${id} — ✅ Detached (task: ${taskId})`);
+      console.log(`  Supervisor: pid ${launch.pid}（独立进程：起 agent + 等它结束 + 写收尾）`);
+      console.log(`  Run: zelto status ${taskId}`);
+      return 0;
+    }
+
     // 运行时守卫（C9）：取写集预约 + 装 PreToolUse 钩子。
     // 钩子装在 agent 真正工作的那个目录里 —— Claude Code 只读 cwd 下的
     // .claude/settings.local.json；预约与策略仍在主仓库（命令行里给了 --project-root）。
@@ -1546,45 +1629,6 @@ register('run', async (args) => {
       worktree: worktree?.relativePath ?? null,
     });
 
-    // ── Detach mode ─────────────────────────────────────────────────
-    if (isDetach) {
-      // Save task tracking info and return immediately.
-      // D-30：任务文件也要记心跳 + pid —— 监视器随主进程退出后，
-      // 后来的任何 zelto 调用（tasks / task-status / wait）都要能回答
-      // 「它多久没动了、进程还在不在」，不能只信 status: running。
-      const taskId = `task-${id}-${Date.now()}`;
-      const taskInfo: TaskInfo = {
-        taskId,
-        sliceId: id,
-        sessionId,
-        agentName,
-        startedAt: new Date().toISOString(),
-        status: 'running' as const,
-      };
-      try {
-        const sessRaw = readSessionLiveness(process.cwd(), sessionId);
-        if (sessRaw) {
-          if (typeof sessRaw.pid === 'number') taskInfo.pid = sessRaw.pid;
-          if (sessRaw.lastActivityAt) taskInfo.lastActivityAt = sessRaw.lastActivityAt;
-          if (sessRaw.lastOutputAt) taskInfo.lastOutputAt = sessRaw.lastOutputAt;
-        }
-      } catch { /* 心跳回填失败不阻断 detach —— 判定侧会回读会话文件兜底 */ }
-      if (!taskInfo.lastActivityAt) taskInfo.lastActivityAt = taskInfo.startedAt;
-      const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
-      const { join } = await import('node:path');
-      const tasksDir = join(ZELTO_DIR, 'tasks');
-      if (!existsSync(tasksDir)) mkdirSync(tasksDir, { recursive: true });
-      writeFileSync(join(tasksDir, `${taskId}.json`), JSON.stringify(taskInfo, null, 2), 'utf-8');
-
-      // Spawn background monitor to update task status
-      guardTransferred = true;
-      monitorTaskInBackground(taskId, sessionId, adapter, id, startTime, isHotfix, activeGuard);
-      console.log(`zelto run ${id} — ✅ Detached (task: ${taskId})`);
-      console.log(`  Session: ${sessionId}`);
-      console.log(`  Run: zelto status ${taskId}`);
-      return 0;
-    }
-
     // Start progress display
     progressTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -1600,6 +1644,8 @@ register('run', async (args) => {
     let finalExitCode: number | null = null;
     let attempt = 0;
     let watchdogRecorded = false;
+    // 切片是否已经停机过（ADR-047 §2.1.1：停机只做一次）
+    let alreadyStalled = false;
 
     while (attempt <= maxRetries) {
       // 活进程看门狗（ADR-074）：CLI 先死、agent 变孤儿、会话文件换壳……
@@ -1645,8 +1691,7 @@ register('run', async (args) => {
       if (attempt < maxRetries) {
         const result = await handleAgentFailure(id, exitCode, { maxRetries });
         if (result.action === 'retry') {
-          attempt = result.retryCount ?? attempt + 1;
-          // Re-create adapter and re-start agent for retry
+          attempt = result.retryCount ?? attempt + 1;          // Re-create adapter and re-start agent for retry
           adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
           // 超时重试要**接着上一次跑**，不是从头再来（ADR-055）。
           //
@@ -1684,12 +1729,15 @@ register('run', async (args) => {
       if (!stalled) {
         await handleAgentFailure(id, exitCode, { maxRetries });
       }
+      alreadyStalled = true;
       finalExitCode = exitCode;
       break;
     }
 
-    // 记账（ADR-041 §3.1）：一次 agent 运行 = 一条运行记录。
-    // 记在写集审计之前 —— 审计只判「有没有越界」，不改变「agent 跑没跑完」这个事实。
+    // ── 收尾 ──────────────────────────────────────────────────────────
+    //
+    // 前台与后台监督进程**走同一条流水线**（./run-finish.ts）。
+    // 两份实现必然漂移（一处跑门禁、一处忘了）—— 见 run-finish.ts 的说明。
     //
     // 看门狗收走的那一轮已经记过账（exitCode=null）—— 不再记第二次，
     // 否则一次运行会变成两条记录。
@@ -1697,83 +1745,31 @@ register('run', async (args) => {
       await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
     }
 
-    // 写集审计（ADR-014 §5）：agent 跑完了，拿 git 的真实改动再对一次写集。
-    // 静态分析拦不住的写（`node -e "fs.writeFileSync(...)"` 之类）到这里兜住。
     if (watchdogRecorded) {
       // 这一轮被看门狗收走（退 frozen + 分类已写）—— 现场已经交回给人。
       // 跑门禁 / 审计越界都没有意义（而且 enforceWriteSet 会再退一次状态）。
       return 1;
     }
-    const withinBounds = await enforceWriteSet(id, activeGuard);
 
-    if (finalExitCode === 0) {
-      // 提问回路：agent 以问题收尾时，不算「运行成功」——挂起切片等人回答
-      // （ADR-013 §3.6）。检测是确定性字符串解析，不调用模型。
-      const question = await detectQuestion(id, adapter, sessionId);
-      if (question) {
-        await suspendSliceForQuestion(id, question);
-        const elapsed = Math.floor((Date.now() - startTime) / 1000);
-        console.log(`\n❓ Agent asked a question (${question.type}) after ${elapsed}s:`);
-        console.log(`   ${question.question}`);
-        if (question.options.length > 0) {
-          console.log(`   Options: ${question.options.join(' | ')}`);
-        }
-        console.log(`   Slice "${id}" is suspended — answer with:`);
-        console.log(`   zelto answer ${question.id} "<your answer>"`);
-        return 0;
-      }
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const finished = await finishRun({
+      sliceId: id,
+      sessionId,
+      exitCode: finalExitCode,
+      elapsedSec: elapsed,
+      guard: activeGuard,
+      adapter,
+      isHotfix,
+      alreadyRecorded: true, // 上面已经记过账
+      alreadyStalled,       // 重试预算耗尽时 handleAgentFailure 已经停过一次
+    });
 
-      if (!withinBounds.ok) {
-        // 越界：不进 gate、不自动签字 —— 等人处理。
-        // `enforceWriteSet` 已经把切片退回 frozen（可重跑）并写了 run.aborted 事件。
-        //
-        // 审计失败与越界分开说 —— 前者是「边界未知」，下一步是修环境；
-        // 后者是「越界已证实」，下一步是扩写集。混着说会让人白跑一轮。
-        console.log('');
-        printOutcome(writeSetOutcomeLines({ sliceId: id }, withinBounds));
-        return 1;
-      }
-
-      await store.transit(id, 'RUN_FINISH');
-      // 花费结算（ADR-035）：先记账，再复判预算。
-      // 超预算的切片**不进 gate、不发签字请求** —— 现场交回给人（与 ADR-020 一致）。
-      const cost = await settleRunCost(id, adapter, sessionId);
-      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0, costUsd: cost.costUsd });
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      console.log(`✅ Agent completed successfully (${elapsed}s)`);
-
-      if (cost.exhausted) {
-        printOutcome(budgetExhaustedMessage({ sliceId: id }, cost.spent, cost.limit));
-        return 0;
-      }
-
-      if (isHotfix) {
-        // Hotfix: skip gate, auto-sign, write hotfix event
-        await store.transit(id, 'GATE_PASS');
-        await events.append(id, 'slice.hotfix', 'zelto', {
-          sliceId: id, elapsed, note: 'hotfix — gate skipped, auto-approved',
-        });
-        const signManager = new SignManager(ZELTO_DIR, events, store);
-        const signReq = await signManager.request(id, 'zelto');
-        await signManager.approve(signReq.id, 'zelto');
-        console.log(`  ?? Hotfix: gate skipped, auto-approved (${signReq.id})`);
-      } else {
-        // Auto-run gate and create sign request on pass
-        await autoGateAfterRun(id);
-      }
-    } else {
+    if (!finished.ok && finalExitCode !== 0) {
       // All retries exhausted or non-resolvable — already handled by handleAgentFailure
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log('');
       printOutcome(agentFailedMessage({ sliceId: id }, finalExitCode, attempt + 1, elapsed));
-      // agent 失败 ≠ 没有越界 —— 失败的那一轮同样可能写了越界的文件。
-      // 越界文件清单是人决定「扩写集还是重做规格」的唯一依据；
-      // 只报 agent 失败，人会以为「只是没写完」，白跑一轮。
-      const outcomeLines = writeSetOutcomeLines({ sliceId: id }, withinBounds);
-      if (outcomeLines.length > 0) {
-        printOutcome(outcomeLines);
-      }
     }
+    if (finished.violated) return 1;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Error running slice "${id}": ${msg}`);
@@ -2218,77 +2214,37 @@ register('start', async (args) => {
 });
 
 // ─── Background task tracking ────────────────────────────────────────────
-
-interface TaskInfo {
-  taskId: string;
-  sliceId: string;
-  sessionId: string;
-  agentName: string;
-  startedAt: string;
-  status: 'running' | 'completed' | 'failed' | 'timeout';
-  completedAt?: string;
-  exitCode?: number;
-  elapsedSec?: number;
-  /** 心跳 —— D-30：detach 任务也要能回答「多久没动了」。spawn 后从会话文件回填 pid。 */
-  pid?: number;
-  lastActivityAt?: string;
-  lastOutputAt?: string;
-}
-
-function tasksDir(): string {
-  return join(ZELTO_DIR, 'tasks');
-}
-
-function taskPath(taskId: string): string {
-  return join(tasksDir(), `${taskId}.json`);
-}
-
-async function saveTask(info: TaskInfo): Promise<void> {
-  const { writeFileSync, mkdirSync, existsSync } = await import('node:fs');
-  if (!existsSync(tasksDir())) mkdirSync(tasksDir(), { recursive: true });
-  writeFileSync(taskPath(info.taskId), JSON.stringify(info, null, 2), 'utf-8');
-}
-
-async function loadTask(taskId: string): Promise<TaskInfo | null> {
-  const { readFileSync, existsSync } = await import('node:fs');
-  const p = taskPath(taskId);
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, 'utf-8')) as TaskInfo;
-  } catch {
-    return null;
-  }
-}
+//
+// 任务文件的存取在 ./task-store.ts —— `--detach` 的监督进程
+// （独立进程，见 supervisor.ts，D-50）也要读写同一份文件。
 
 /**
- * 被动式活性检查（D-30）。
+ * 被动式活性检查（D-30 / D-51）。
  *
- * `--detach` 的内存监视器随主进程退出而死 —— 这里不依赖任何后台进程：
- * 每次 `tasks` / `task-status` / `wait` / Web 查询时，现场读文件 + `kill(pid,0)`
- * 判定进程死活。任务文件缺心跳字段时（老任务），回读会话文件兜底并回填。
+ * `--detach` 的监视器是一个**独立进程**（见 supervisor.ts，D-50）——
+ * 这里不依赖任何后台进程：每次 `tasks` / `task-status` / `wait` / Web 查询时，
+ * 现场读文件 + `kill(pid,0)` 判定进程死活。任务文件缺心跳字段时（老任务），
+ * 回读会话文件兜底并回填。
+ *
+ * **D-51：必须带上 `agentPid`。**
+ *
+ * 会话文件里有两个 pid：
+ *   - `pid`      —— 包装进程（Windows 上是 `cmd.exe`），它负责转发信号；
+ *   - `agentPid` —— 真正的 agent 进程（`node.exe` / `claude.exe`）。
+ *
+ * 只看 `pid` 会误判：包装进程在 agent 启动后就退了（它不是常驻的），
+ * 于是「包装进程没了」被当成「agent 死了」—— 一个**活着的 agent**
+ * 被判成死的，然后被 `stall --reap` 收走（切片退回 frozen），
+ * 而那个 agent 还在改文件。
+ *
+ * 判据要跟 `core/activity/liveness.ts` 一致：`agentPid ?? pid`。
  */
 function taskLiveRecord(task: TaskInfo): import('../../core/activity/index.js').LivenessRecord {
-  const merged: import('../../core/activity/index.js').LivenessRecord = {
-    status: task.status,
-    startedAt: task.startedAt,
-    lastActivityAt: task.lastActivityAt,
-    lastOutputAt: task.lastOutputAt,
-    pid: task.pid,
-  };
+  let session: import('../../core/activity/index.js').LivenessRecord | null = null;
   try {
-    const sess = readSessionLiveness(process.cwd(), task.sessionId);
-    if (sess) {
-      if (merged.pid === undefined && typeof sess.pid === 'number') merged.pid = sess.pid;
-      const taskLast = lastActivityOf(merged);
-      const sessLast = lastActivityOf(sess);
-      if (sessLast !== null && (taskLast === null || sessLast > taskLast)) {
-        merged.lastActivityAt = sess.lastActivityAt ?? sess.lastOutputAt ?? sess.startedAt;
-        merged.lastOutputAt = sess.lastOutputAt;
-      }
-      if (!merged.startedAt && sess.startedAt) merged.startedAt = sess.startedAt;
-    }
+    session = readSessionLiveness(process.cwd(), task.sessionId);
   } catch { /* 会话文件读不到就用任务文件本身 */ }
-  return merged;
+  return mergeSessionLiveness(task, session);
 }
 
 function taskLiveness(task: TaskInfo): import('../../core/activity/index.js').LivenessInfo {
@@ -2359,125 +2315,6 @@ function taskLiveBadge(task: TaskInfo): string {
   if (live.state === 'stale') return `⚠️ stale（${formatIdle(live.idleMs ?? 0)}没动静）`;
   if (live.state === 'dead') return `💀 dead（${live.reason}）`;
   return task.status;
-}
-
-/**
- * Monitor a background task and update its status.
- * Runs asynchronously (not awaited) to allow immediate CLI return.
- */
-async function monitorTaskInBackground(
-  taskId: string,
-  sessionId: string,
-  adapter: ReturnType<typeof createExecutorAdapter>,
-  sliceId: string,
-  startTime: number,
-  isHotfix: boolean,
-  guard?: RuntimeGuard,
-): Promise<void> {
-  try {
-    // 活进程看门狗（ADR-074）：后台监视器同样要能认出「这一轮已经没有进程在管」
-    const runStartedAt = readSessionLiveness(process.cwd(), sessionId)?.startedAt
-      ?? new Date(startTime).toISOString();
-    const waited = await waitForExitWithWatchdog({
-      sliceId,
-      sessionId,
-      adapter,
-      runStartedAt,
-      maxRetries: loadConfig().agent.maxRetries ?? 2,
-    });    const exitCode = waited.exitCode;
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const status = exitCode === 0 ? 'completed' : 'failed';
-
-    // 记账（ADR-041 §3.1）：后台运行同样是一次运行。
-    // 看门狗收走的那一轮已经记过账 —— 不再记第二次。
-    if (!waited.watchdogReaped) {
-      await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
-    }
-
-    // Update task file
-    const task = await loadTask(taskId);
-    if (task) {
-      task.status = status;
-      task.exitCode = exitCode ?? undefined;
-      task.elapsedSec = elapsed;
-      task.completedAt = new Date().toISOString();
-      await saveTask(task);
-    }
-
-    if (waited.watchdogReaped) {
-      // 停机（frozen + 分类 + 事件）已由看门狗写好，现场交回给人。
-      // 但预约钩子是挂在**这个进程**里的 —— 它退出前必须摘掉，
-      // 否则 agent 原样再起时会被一个指向死进程的钩子挡住每一次写。
-      return;
-    }
-
-    // 写集审计（ADR-014 §5）
-    const verdict = await enforceWriteSet(sliceId, guard ?? null);
-
-    // Process result as if foreground (state transition, gate, etc.)
-    if (exitCode === 0 && verdict.ok) {
-      await store.transit(sliceId, 'RUN_FINISH');
-      // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
-      const cost = await settleRunCost(sliceId, adapter, sessionId);
-      await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd });
-      if (cost.exhausted) {
-        // 超预算：停在 frozen 等人 —— 不进 gate、不发签字请求。
-        console.error('');
-        printOutcome(budgetExhaustedMessage({ sliceId }, cost.spent, cost.limit));
-      } else if (isHotfix) {
-        await store.transit(sliceId, 'GATE_PASS');
-        await events.append(sliceId, 'slice.hotfix', 'zelto', {
-          sliceId, elapsed, note: 'hotfix — gate skipped, auto-approved',
-        });
-        const signManager = new SignManager(ZELTO_DIR, events, store);
-        const signReq = await signManager.request(sliceId, 'zelto');
-        await signManager.approve(signReq.id, 'zelto');
-      } else {
-        await autoGateAfterRun(sliceId);
-      }
-    } else if (exitCode === 0) {
-      // 越界 / 审计失败：不进 gate、不自动签字 —— 等人处理。
-      // `enforceWriteSet` 已经退回 frozen 并写了 run.aborted 事件，这里不重复写。
-      console.error('');
-      printOutcome(writeSetOutcomeLines({ sliceId }, verdict));
-    } else {
-      // agent 失败。若同一轮还发生了越界 / 审计失败，两件事都要说 ——
-      // 只说 agent 失败，人会以为「只是没写完」，越界文件清单就丢了。
-      const outcomeLines = writeSetOutcomeLines({ sliceId }, verdict);
-      if (outcomeLines.length > 0) {
-        console.error('');
-        printOutcome(outcomeLines);
-      } else {
-        // 只有「没有越界」时才由这里写 run.aborted。
-        // 有越界时 `enforceWriteSet` 已经写过一条（reason: write-set violation），
-        // 再写一条只会让人误以为发生了两次。
-        await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
-      }
-      // Background tasks: write stall info without auto-retry (adapter already finished)
-      const stallClass = classifyStall({
-        type: exitCode === null ? 'build_failure' : 'test_failure',
-        message: `Agent exited with code ${exitCode ?? 'signal'}`,
-        attempts: 1,
-      });
-      // 后台路径同样走「停机的唯一落点」—— 退回 frozen + 写分类 + 留痕。
-      // 后台任务也是一次运行，它的 agent 挂了，切片不能留在 running：
-      // 留在 running 就再也跑不了（ADR-047）。
-      await markSliceStalled(sliceId, stallClass, {
-        exitCode,
-        reason: `background agent failed: ${exitCode ?? 'signal'}`,
-      });
-    }
-  } catch {
-    // Background monitor failure is non-fatal
-    const task = await loadTask(taskId);
-    if (task && task.status === 'running') {
-      task.status = 'failed';
-      await saveTask(task);
-    }
-  } finally {
-    // 后台任务结束 —— 预约与钩子在这里收尾
-    if (guard) await guard.release();
-  }
 }
 
 // ─── task: list background tasks ──────────────────────────────────────────

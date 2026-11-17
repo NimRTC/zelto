@@ -199,7 +199,12 @@ export function writeSetOutcomeLines(ctx: MessageContext, outcome: WriteSetOutco
  * 单片路径用 `console.log`（与既有的运行输出混在一条流里），
  * 批量路径也用 `console.log`（每片一行，紧凑）——
  * 两者都走 stdout，避免人重定向 stderr 时丢线索。
+ *
+ * `write` 可选：后台监督进程是 detached 的，没人接它的 stdout ——
+ * 那边的输出必须落到日志文件（见 supervisor.ts，D-50）。
+ * 默认仍是 stdout。
  */
-export function printOutcome(lines: string[]): void {
-  for (const line of lines) console.log(line);
+export function printOutcome(lines: string[], write?: (line: string) => void): void {
+  const emit = write ?? ((line: string) => console.log(line));
+  for (const line of lines) emit(line);
 }

@@ -94,6 +94,18 @@ export interface LivenessRecord {
    */
   agentPid?: number;
   /**
+   * agent 的退出码。
+   *
+   * 谁写它：适配器（adapters/claude-agent）的 `handleExit` —— agent 退出那一刻
+   * 它把退出码落到会话文件里。没有它，「成功」与「失败」无法区分。
+   *
+   * 为什么重要（实测于 nimrtc-zelto v2-input-binder，2026-11-17）：
+   * `--detach` 时监视器住在**另一个进程**里，适配器也在那个进程里 ——
+   * 主进程退出不影响它写这个字段。若适配器还在主进程里，主进程一退
+   * 就没人记录了：退出码永远拿不到，会话文件永远停在 `status: "running"`。
+   */
+  exitCode?: number | null;
+  /**
    * agent 的累计输出（会话文件里保存的是分块字符串数组；任务文件可能没有）。
    *
    * 驾驶舱要靠它回答「它现在在干什么」——「最后活动时间」只能说明

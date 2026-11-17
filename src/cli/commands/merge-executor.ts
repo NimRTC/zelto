@@ -14,7 +14,7 @@ import {
   isZeltoManagedSpecPath,
   isZeltoStatePath,
 } from '../../core/project/managed-paths.js';
-import { parsePorcelainStatus } from '../../core/sched/audit.js';
+import { parsePorcelainStatus, isSubmoduleOnlyDirty } from '../../core/sched/audit.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import {
   branchOfVersion,
@@ -403,6 +403,7 @@ export async function executeMergePlan(
     const managedSpecs: string[] = [];
     const managedSkeletons: string[] = [];
     const managedState: string[] = [];
+    const submoduleDirtyOnly: string[] = [];
     // 待合分支（合并会碰到的来源）—— 用来判断 zelto 状态文件会不会被覆盖
     //
     // ADR-071：**空操作切片没有分支** —— 它的产物本来就在目标分支上，
@@ -427,6 +428,13 @@ export async function executeMergePlan(
         !pathDiffersFromAnyRef(path, targetRef, candidateRefs, repoRoot)
       ) {
         managedState.push(entry);
+      } else if (isSubmoduleOnlyDirty(targetDir, path)) {
+        // submodule 只有 `-dirty` 标记（指针没变）→ 合并碰不到它，不算脏。
+        //
+        // 实测（nimrtc-zelto，2026-11-17）：msquic 的嵌套 submodule 被 CRLF
+        // 弄脏，主仓 gitlink 指针一模一样 —— 守卫判成「工作区不干净」→
+        // **每一片都合不进去**。这不是「人改了代码还没提交」，不该拦。
+        submoduleDirtyOnly.push(entry);
       } else {
         dirty.push(entry);
       }
@@ -448,6 +456,12 @@ export async function executeMergePlan(
       log(`  ℹ️  ${managedState.length} 个 zelto 运行时状态未提交（不影响合并）：`);
       for (const m of managedState.slice(0, 5)) log(`     ${m}`);
       if (managedState.length > 5) log('     …');
+    }
+
+    if (submoduleDirtyOnly.length > 0) {
+      log(`  ℹ️  ${submoduleDirtyOnly.length} 个 submodule 只有内部脏标记（指针未变，不影响合并）：`);
+      for (const m of submoduleDirtyOnly.slice(0, 5)) log(`     ${m}`);
+      if (submoduleDirtyOnly.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {
