@@ -519,10 +519,30 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     child.on('exit', cleanup);
     child.on('error', cleanup);
 
-    // Track exit
-    child.on('close', (code) => {
+    // 记录退出码 —— 记在 `exit` 上，**不是** `close`（D-59）。
+    //
+    // 病灶（实测 nimrtc-zelto v3-weaknet-verdict，2026-11-18）：
+    //   agent **成功跑完了**（活干完、总结也写了），但监督进程判它「结果不明」，
+    //   按失败处理 → 重试一轮 → 白烧一轮 token。
+    //
+    // 根因：`close` 事件要等 **stdio 全部关闭**（stdout/stderr 的 EOF）。
+    //   而 agent 在 worktree 里起了**后台进程**（ctest / cmake），
+    //   那些进程**继承了 agent 的 stdout 管道** —— 它们不退出，管道就不 EOF，
+    //   `close` 永远不来。
+    //
+    //   `exit` 事件只等**进程本身**退出，stdio 还没关时就到了。
+    //   这才是「agent 跑完了」的正确信号。
+    //
+    // 两个都挂：`close` 作为兜底（万一 `exit` 没来），
+    // 但用 `exited` 守卫，保证只处理一次。
+    let exitHandled = false;
+    const onExit = (code: number | null): void => {
+      if (exitHandled) return;
+      exitHandled = true;
       this.handleExit(sessionId, code);
-    });
+    };
+    child.on('exit', onExit);
+    child.on('close', onExit);
 
     return { sessionId };
   }
