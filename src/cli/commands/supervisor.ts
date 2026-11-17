@@ -300,6 +300,8 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
 
   let sessionId = args.sessionId;
   let exitCode: number | null = null;
+  /** agent 进程是否还活着（D-59：用来区分「结果不明」与「还在跑」） */
+  let processAlive = false;
   let guard: import('./runtime-guard.js').RuntimeGuard | null = null;
 
   try {
@@ -370,8 +372,29 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     let alreadyStalled = false;
 
     for (;;) {
-      exitCode = await waitForAgentExit(args, sessionId, log, adapter);
+      const waitResult = await waitForAgentExit(args, sessionId, log, adapter);
+      exitCode = waitResult.exitCode;
+      processAlive = waitResult.processAlive;
       if (exitCode === 0) break;
+
+      // D-59：**结果不明 ≠ 失败** → 不重试。
+      //
+      // 病灶（实测 nimrtc-zelto v3-weaknet-verdict，2026-11-18）：
+      //   agent 成功跑完了，退出码没落盘 → 判成「结果不明，按失败处理」
+      //   → 触发重试 → 白烧一轮 token（agent 明明已经把活干完了）。
+      //
+      // 「不明」的含义是「不知道成没成」：
+      //   - 它可能成功了（退出码没写下来）；
+      //   - 它也可能失败了。
+      // 两种情况下重试都是**赌**：赌它失败。
+      // 而赌错的代价是整轮 token + 一份可能被覆盖的产物。
+      //
+      // 不重试，把现场如实交回给人 —— 产物还在 worktree 里，
+      // 人看一眼就知道成没成。这比赌一把强。
+      if (exitCode === null && !processAlive) {
+        log('结果不明 → 不重试，把现场交回给人（产物在 worktree 里，可自行核对）');
+        break;
+      }
 
       // 只有「可自动恢复」的停机类别才值得重试（环境抖动、上下文超限…）。
       // agent 主动报错、预算耗尽这类重试也白搭。
@@ -490,14 +513,30 @@ async function waitForAgentExit(
   sessionId: string,
   log: (line: string) => void,
   adapter?: import('../../core/ports/executor.js').ExecutorAdapter,
-): Promise<number | null> {
+): Promise<{ exitCode: number | null; processAlive: boolean }> {
   const { readSessionLiveness } = await import('../../core/activity/index.js');
   const { isProcessAlive, isProcessTreeAlive } = await import('../../core/sched/index.js');
   const { SliceProgressProbe } = await import('./progress-probe.js');
 
-  const deadline = Date.now() + args.timeoutMs + 60_000;
+  // D-55：等待的截止时间也是**空转**判据，不是绝对上限。
+  //
+  // 病灶（实测 nimrtc-zelto v3-weaknet-verdict，2026-11-18）：
+  // agent 连续推进了 31 分钟（事件流每几秒就多一条），
+  // 却在 `timeoutMs + 60_000`（= 30min + 1min = 31min）那一刻被砍掉 ——
+  // 判成 `environment_failure`，退出去重试。
+  //
+  // 根因：D-55 只改了**适配器**那一层的倒计时（`markProgress`），
+  // 监督进程自己的等待截止时间还是一刀切的绝对上限。
+  // **两层各有一个倒计时，只改一层 = 没改。**
+  //
+  // 这跟 D-56（看门狗路径漏了 progress）是同一个形态：
+  // 「每条路径都接上了」不等于「每条路径都测过了」。
+  // 两处都是在真实项目上跑一遍才看见的。
+  //
+  // 修法：截止时间**有进展就往后推** —— 与适配器的空转倒计时同一口径。
+  // 进展一直有 → 一直等。
+  let deadline = Date.now() + args.timeoutMs + 60_000;
   let goneSince: number | null = null;
-
   // D-55：进展探针 —— agent 每调用一次工具，hook 就往事件流写一条。
   // 有新事件 = 它还在推进 → 适配器的空转倒计时重新开始。
   //
@@ -507,7 +546,11 @@ async function waitForAgentExit(
 
   while (Date.now() < deadline) {
     try {
-      if (progress.poll()) adapter?.markProgress?.(sessionId);
+      if (progress.poll()) {
+        adapter?.markProgress?.(sessionId);
+        // 监督进程这一层的截止时间也推后 —— 同一个「有进展就别砍」的判据。
+        deadline = Date.now() + args.timeoutMs + 60_000;
+      }
     } catch { /* 探针失败不影响等待 */ }
 
     const rec = readSessionLiveness(args.projectRoot, sessionId);
@@ -554,10 +597,62 @@ async function waitForAgentExit(
   const rec = readSessionLiveness(args.projectRoot, sessionId);
   if (rec && (rec.status === 'completed' || rec.status === 'failed' || rec.status === 'timeout')) {
     log(`agent 已退出，退出码 ${rec.exitCode ?? 'null'}（会话状态 ${rec.status}）`);
-    return typeof rec.exitCode === 'number' ? rec.exitCode : null;
+    return {
+      exitCode: typeof rec.exitCode === 'number' ? rec.exitCode : null,
+      processAlive: false,
+    };
   }
+
+  // D-59：会话文件还是「running」但进程已经没了 —— 说明**退出码没被写下来**，
+  // 不是「agent 没跑完」。
+  //
+  // 病灶（实测 nimrtc-zelto v3-weaknet-verdict，2026-11-18）：
+  //   agent 成功跑完（活干完、总结也写了），监督进程却判「结果不明」→
+  //   按失败处理 → 重试一轮 → 白烧一轮 token。
+  //
+  // 为什么会没写下来：退出码记在 `close` 事件上，而 `close` 要等 stdio EOF；
+  // agent 起的后台进程（ctest/cmake）继承了 stdout 管道 → 管道不关 → `close` 不来。
+  // （根因已在适配器那侧修掉：改记 `exit` 事件。）
+  //
+  // 但「进程确实已经不在了」这件事本身是**事实** —— 由活性判定给出。
+  // 事实与「会话文件还写着 running」冲突时，信事实：
+  // 进程都没了，agent 一定已经结束了，只是退出码没来得及落盘。
+  //
+  // 那退出码是多少？不知道 —— 「不知道」不等于「失败」。
+  // 所以返回 `exitCode: null` + `processAlive: false`：
+  // 调用方据此**不重试**，但在收尾里如实说「结果不明」，让人自己看产物决定。
+  const alive = await anyProcessAlive(args.projectRoot, sessionId);
+  if (!alive) {
+    log('agent 进程已退出但退出码没落盘 —— 结果不明（不重试，收尾如实报告）');
+    return { exitCode: null, processAlive: false };
+  }
+
   log('agent 已退出，但会话文件里没有退出码 —— 结果不明，按失败处理');
-  return null;
+  return { exitCode: null, processAlive: true };
+}
+
+/**
+ * 这个会话的 agent 进程还在不在（包装 pid 或真正的 agent pid）。
+ *
+ * 找不到 pid 时返回 true —— 「不知道」不等于「死了」，
+ * 让调用方继续按「还在跑」处理（宁可多等一会儿）。
+ */
+async function anyProcessAlive(
+  projectRoot: string,
+  sessionId: string,
+): Promise<boolean> {
+  const { readSessionLiveness } = await import('../../core/activity/index.js');
+  const { isProcessAlive, isProcessTreeAlive } = await import('../../core/sched/index.js');
+  const rec = readSessionLiveness(projectRoot, sessionId);
+  const pids = [rec?.agentPid, rec?.pid].filter(
+    (p): p is number => typeof p === 'number' && p > 0,
+  );
+  if (pids.length === 0) return true;
+  for (const pid of pids) {
+    if (isProcessAlive(pid)) return true;
+    if (await isProcessTreeAlive(pid)) return true;
+  }
+  return false;
 }
 
 /**
