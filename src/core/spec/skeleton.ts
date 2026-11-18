@@ -80,7 +80,7 @@ export function acceptanceSkeletonTarget(acceptanceDir: string, root: string = p
  */
 export const WRITE_SET_ASSERTION_GUIDE = `// ─── 写集边界断言（ADR-075）────────────────────────────────────────────────
 //
-// 如果你要断言「本片改了哪些文件」，**不要用 \`git diff\`**。
+// 如果你要断言「本片的产物落了没有」，**不要用 \`git diff\`**。
 //
 //   错（只在未合并状态成立）：
 //     const changed = gitDiff('--name-only');
@@ -89,7 +89,7 @@ export const WRITE_SET_ASSERTION_GUIDE = `// ─── 写集边界断言（ADR-
 //   → 门禁在 worktree 里跑时绿；切片合并、worktree 清理后，主干复跑变红。
 //     同一份产品代码，两种状态两个结论 —— 追溯链断在这里。
 //
-//   对（任何状态都成立）：判「产物在不在树上」
+//   对（任何状态都成立）：判「产物在树上」
 //     const tracked = new Set(gitLsFiles());
 //     assert.ok(tracked.has('xxx'), 'xxx 必须在树上');
 //
@@ -104,11 +104,21 @@ export const WRITE_SET_ASSERTION_GUIDE = `// ─── 写集边界断言（ADR-
 //     return (r.stdout || '').split(/\\r?\\n/).filter(Boolean);
 //   }
 //
-// 越界守卫（写集外的文件不该由本片引入）也写成状态式：
-//   const base = gitOut(['merge-base', 'HEAD', '<切片基点 commit>']);
-//   const touched = gitOut(['diff', '--name-only', '<基点>', 'HEAD']);
-//   → 用「基点之后的提交改了什么」而不是「当前工作区脏不脏」
-//   （后者会误伤别的切片留下的合法改动）。
+// ── 越界守卫**不要**写在这个文件里 ──────────────────────────────────────
+//
+// 「本片有没有动写集外的文件」已经由 zelto 运行时守卫负责：
+//   · PreToolUse 钩子**逐写判定** —— agent 写越界的那一刻就被拒；
+//   · 运行后 git 审计兜底 —— 结论落进 policy.violation 事件流。
+//
+// 在验收测试里再写一遍越界守卫是**冗余且必然脆弱**的：
+//   · 「当前工作区有没有写集外的改动」会误伤别的切片留下的合法改动；
+//   · 本片合并之后那些改动已经变成历史，这条判据判不出来；
+//   · 多片共享基点时，「基点之后的提交动了什么」会把别的切片也算进来
+//     （实测：两片共享基点，基点之后 HEAD 上有 200+ 文件的改动，
+//       其中只有 3 个属于这两片 —— 必然误报）。
+//
+// 验收测试只判**正向量**：本片的产物在不在树上、对不对。
+// 越界由 C9 的运行时守卫负责 —— 职责不重叠。
 `;
 
 /**

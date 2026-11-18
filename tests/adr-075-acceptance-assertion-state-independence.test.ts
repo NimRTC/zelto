@@ -48,9 +48,12 @@ describe('ADR-075 · 骨架带「写集边界断言的正确写法」', () => {
     assert.match(skeleton, /spawnSync\('git'/);
   });
 
-  it('越界守卫也写成状态式（基点之后的提交，而不是工作区脏不脏）', () => {
-    assert.match(skeleton, /merge-base/);
-    assert.match(skeleton, /基点/);
+  it('越界守卫明确交给运行时守卫（C9），不在验收测试里重做', () => {
+    // 必须说清「越界由 C9 负责」——否则 agent 会自己写一个必然误报的版本
+    assert.match(skeleton, /越界/);
+    assert.match(skeleton, /PreToolUse/);
+    // 明确劝退「基点之后的提交动了什么」这条脆判据
+    assert.match(skeleton, /不要/);
   });
 
   it('导出的指南与骨架里嵌的那份一致', () => {
