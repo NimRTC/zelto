@@ -96,7 +96,14 @@ export class WebServer {
 
   /** 服务的实际地址（用于打印给用户）。 */
   get url(): string {
-    return `http://${this.host}:${this.port}`;
+    // 端口 0 = 让系统分配一个 —— 那时 `this.port` 是 0，不是真正绑定的端口。
+    //
+    // 必须从 server 里读实际值：`server.address().port`。
+    // 否则 `zelto web --port 0` 会打印出一个连不上的地址，
+    // 而测试里 `fetch(server.url)` 直接 ECONNREFUSED / EADDRNOTAVAIL。
+    const actual = this.server?.address();
+    const port = actual && typeof actual === 'object' ? actual.port : this.port;
+    return `http://${this.host}:${port}`;
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -136,6 +143,20 @@ export class WebServer {
     //
     // 顺序很重要：**先校验，后分发**。
     // 校验没过就绝不能碰到任何 handler。
+    //
+    // 三道防线（ADR-084 §5）：
+    //   1. Origin —— 浏览器发起的必须同源
+    //   2. token  —— 每次启动随机生成，第三方网页拿不到
+    //   3. Content-Type —— 必须是 application/json
+    //
+    // 第 3 道为什么必需：token + Origin 已经挡住跨站了，
+    // 但 `fetch(..., {mode:'no-cors'})` 能发 `text/plain` 的 body ——
+    // 那种请求的 Content-Type 不是 application/json。
+    // 显式要求 JSON，就把它挡在外面。
+    //
+    // 为什么这道防线是必需的：驾驶舱**持有项目目录的写权限**。
+    // 一个恶意网页如果能让它跨站 POST，就等于拿到了
+    // 「在你的项目里签字」的权限。
     if (req.method === 'POST') {
       if (!this.checkOrigin(req)) {
         sendJson(res, 403, {
@@ -146,6 +167,12 @@ export class WebServer {
       if (!this.checkToken(req)) {
         sendJson(res, 403, {
           error: '会话 token 无效或缺失：写操作必须带 X-Zelto-Token',
+        });
+        return;
+      }
+      if (!this.checkContentType(req)) {
+        sendJson(res, 415, {
+          error: 'Content-Type 必须是 application/json',
         });
         return;
       }
@@ -188,6 +215,24 @@ export class WebServer {
     const b = Buffer.from(this.token);
     if (a.length !== b.length) return false;
     return timingSafeEqual(a, b);
+  }
+
+  /**
+   * Content-Type 校验：写操作必须带 `application/json`（ADR-084 §5）。
+   *
+   * 为什么不能省：跨站表单提交发的是
+   * `application/x-www-form-urlencoded`；`fetch` 的 `no-cors` 模式能发
+   * `text/plain` 的 body。两者都能带着一个 JSON 文本打到本服务。
+   *
+   * 显式要求 JSON，就把「不是从驾驶舱页面发起的写操作」挡在外面 ——
+   * 这是 token 与 Origin 之外的第三道防线。
+   */
+  private checkContentType(req: IncomingMessage): boolean {
+    const raw = req.headers['content-type'];
+    if (typeof raw !== 'string') return false;
+    // 允许带 charset：application/json; charset=utf-8
+    const mime = raw.split(';')[0]?.trim().toLowerCase();
+    return mime === 'application/json';
   }
 }
 

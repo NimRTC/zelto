@@ -45,6 +45,10 @@ ${renderStyles()}
       <button data-view="pipeline">全链</button>
       <button data-view="budget">预算</button>
       <button data-view="policy">策略</button>
+      <!-- ADR-084：拉闸按钮放在导航末尾 ——
+           「交回控制权」是一个**随时可能需要**的动作，
+           不该藏在某个视图里让人先找到那个视图。 -->
+      <button id="halt-btn" class="danger" title="暂停批次并交回控制权">⏸ 拉闸</button>
     </nav>
   </header>
   <main id="main"><p class="muted">加载中…</p></main>

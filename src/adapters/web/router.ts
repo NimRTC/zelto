@@ -20,9 +20,18 @@
 //   GET  /api/pipeline     （需求→设计→版本→切片 全链状态）
 //   POST /api/sign-requests/:id/approve
 //
-// **没有** run / gate / freeze / admit / abandon / resume ——
+// ADR-084 把驾驶舱从「只读 + 一个签字动作」扩成「可接管」，
+// 新增三个**接管**动作：
+//   POST /api/sign-requests/:id/reject   拒签
+//   POST /api/slices/:id/answer          回答 agent 的提问（只记录，不续跑）
+//   POST /api/halt                      拉闸
+//
+// **仍然没有** run / gate / freeze / admit / abandon / resume ——
 // 理由见 ADR-072 §4：那些动作在 CLI 侧有完整实现，
 // Web 侧再实现一份会分叉判定（C3 的隐患）。
+//
+// 三个新动作的共同纪律（ADR-084 §2）：
+// **Web 侧不重写判定，只调 core** —— 每一件都复用 CLI 侧同一个实现。
 
 import type { ServerResponse } from 'node:http';
 import { sendJson, validId } from './server.js';
@@ -151,6 +160,99 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       // 浏览器里签完字，人很容易以为「完事了」。
       nextStep: `签字不等于合并：合入主干需另跑 zelto merge ${(result.request as { sliceId: string }).sliceId}`,
     });
+    return;
+  }
+
+  // ── GET /api/questions ───────────────────────────────────────────────
+  // ADR-084：agent 的待答提问 —— 驾驶舱要能「就地回答」
+  //
+  // 之前没有这个端点，于是 agent 一提问，人就得切回终端去 `zelto ask` 看。
+  // 驾驶舱在最该起作用的时候把人赶走了（ADR-084 背景）。
+  if (method === 'GET' && path === '/api/questions') {
+    const sliceId = ctx.query.get('slice') ?? undefined;
+    const status = ctx.query.get('status') ?? undefined;
+    sendJson(res, 200, await api.listQuestions(sliceId, status));
+    return;
+  }
+
+  // ── POST /api/sign-requests/:id/reject ──────────────────────────────
+  // ADR-084：拒签 —— 与 CLI 侧 `zelto sign <id> --reject` 同一套实现。
+  //
+  // 为什么驾驶舱要能拒签：签字队列是「人在被交还控制权的那一刻」看的页面。
+  // 只能签不能拒，就等于把人赶回终端 —— 驾驶舱在最该起作用的时候失效。
+  const rejectMatch = path.match(/^\/api\/sign-requests\/([^/]+)\/reject$/);
+  if (rejectMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const signId = validId(rejectMatch[1]);
+    if (!signId) {
+      sendJson(res, 400, { error: '签字请求 id 非法' });
+      return;
+    }
+    const body = ctx.body as { comment?: unknown } | undefined;
+    const comment = typeof body?.comment === 'string' ? body.comment : null;
+    const result = await api.rejectSign(signId, comment);
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, { ok: true, request: result.request });
+    return;
+  }
+
+  // ── POST /api/slices/:id/answer ─────────────────────────────────────
+  // ADR-084 §1.1：回答 agent 的提问 —— **只记录答案，不续跑**。
+  //
+  // 续跑要调 adapter.resume() 拉起 agent 会话，会让 HTTP 请求长时间挂着，
+  // 还可能留下孤儿进程。CLI 侧本来就有完整实现 —— Web 侧再写一份就分叉了（C3）。
+  // 分工：驾驶舱负责「把答案记下来」，CLI 负责「让 agent 接着跑」。
+  const answerMatch = path.match(/^\/api\/slices\/([^/]+)\/answer$/);
+  if (answerMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const id = validId(answerMatch[1]);
+    if (!id) {
+      sendJson(res, 400, { error: '切片 id 非法' });
+      return;
+    }
+    const body = ctx.body as { answer?: unknown } | undefined;
+    if (typeof body?.answer !== 'string' || !body.answer.trim()) {
+      sendJson(res, 400, { error: '答案为空' });
+      return;
+    }
+    const result = await api.answerQuestion(id, body.answer);
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      questionId: result.questionId,
+      nextStep: result.nextStep,
+    });
+    return;
+  }
+
+  // ── POST /api/halt ──────────────────────────────────────────────────
+  // ADR-084：拉闸 —— 与 CLI 侧 `zelto halt` 同一套实现（ADR-020）。
+  //
+  // 驾驶舱只提供「刹车」，不提供「油门」——
+  // resume 会改切片状态机、走重试预算、可能触发 gate，
+  // 那是「推进」动作，不是「接管」动作。
+  if (method === 'POST' && path === '/api/halt') {
+    const body = ctx.body as { scope?: unknown; reason?: unknown } | undefined;
+    const scope = typeof body?.scope === 'string' ? body.scope : 'all';
+    const reason = typeof body?.reason === 'string' ? body.reason : '人工拉闸';
+    const result = await api.haltBatch(scope, reason);
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, { ok: true, halt: result.halt });
     return;
   }
 

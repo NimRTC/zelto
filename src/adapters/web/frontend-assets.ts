@@ -161,6 +161,25 @@ tr.clickable:hover td { background: #161b22; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 .btn.ok { background: #1a7f37; border-color: #2ea043; }
 .btn.ok:hover:not(:disabled) { background: #2ea043; }
+/* ADR-084：拒签 / 拉闸 —— 「危险」类动作，视觉上要与「批准」分开。
+   批准是绿色（推进），拒签与拉闸是红色（收回控制权）。 */
+.btn.bad { background: #8b2c2c; border-color: #da3633; }
+.btn.bad:hover:not(:disabled) { background: #da3633; }
+/* 顶栏的拉闸按钮 —— 跟导航按钮同排，但要一眼看出是「刹车」 */
+nav button.danger { color: var(--bad); border-color: var(--bad); margin-left: auto; }
+nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
+/* ADR-084：回答提问的输入行 */
+.answer-row { display: flex; gap: 8px; margin-top: 8px; }
+.answer-input {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 6px 10px;
+  font: inherit;
+}
+.answer-input:focus { outline: none; border-color: var(--accent); }
 .notice {
   border-left: 3px solid var(--warn);
   background: #1c2128;
@@ -957,6 +976,37 @@ async function showSliceDetail(id, forSign) {
   kv('更新', new Date(slice.updatedAt).toLocaleString());
   main.appendChild(dl);
 
+  // ── 回答 agent 的提问（ADR-084）────────────────────────────────────
+  //
+  // 只在**有提问时**才显示 —— 没有提问就摆一个空输入框，
+  // 是在给界面加噪音（而驾驶舱的噪音就是「看不出哪儿需要你」）。
+  //
+  // 答案只**记录**，不续跑：续跑要拉起 agent 会话，
+  // 驾驶舱不该在 HTTP 请求里挂着它（ADR-084 §1.1）。
+  try {
+    const pending = await apiGet('/api/questions?status=pending&slice=' + encodeURIComponent(id));
+    if (pending && pending.length > 0) {
+      main.appendChild(el('h2', null, 'agent 在问你'));
+      for (const q of pending) {
+        const box = el('div', 'notice');
+        box.appendChild(el('div', null, q.question || q.text || q.prompt || '(问题内容为空)'));
+        const row = el('div', 'answer-row');
+        const input = el('input', 'answer-input');
+        input.type = 'text';
+        input.placeholder = '你的回答…';
+        const send = el('button', 'btn', '提交答案');
+        send.addEventListener('click', function () { doAnswer(id, input, send); });
+        row.appendChild(input);
+        row.appendChild(send);
+        box.appendChild(row);
+        main.appendChild(box);
+      }
+    }
+  } catch (err) {
+    // 拿不到提问不致命 —— 详情页其它内容照常显示
+    void err;
+  }
+
   // ── 签字前确认项 ────────────────────────────────────────────────────
   main.appendChild(el('h2', null, '签字前请确认四件事'));
   const allOk = d.checks.every(function (c) { return c.ok; });
@@ -982,6 +1032,15 @@ async function showSliceDetail(id, forSign) {
     // 没带就说明人没在页面上看过这四项（ADR-072 §5.2）。
     btn.addEventListener('click', function () { doApprove(id, btn, d.checks); });
     main.appendChild(btn);
+
+    // ADR-084：**拒签** —— 驾驶舱要能拒签，否则只能签不能拒，
+    // 等于把人赶回终端（驾驶舱在最该起作用的时候失效）。
+    //
+    // 注意它**不受确认项的约束**：确认项是「批准前要核对的四件事」，
+    // 拒签是「不批准」—— 没有要核对的东西。
+    const rejBtn = el('button', 'btn bad', '拒签');
+    rejBtn.addEventListener('click', function () { doReject(id, rejBtn); });
+    main.appendChild(rejBtn);
   }
 
   // ── 追溯链 ──────────────────────────────────────────────────────────
@@ -1088,6 +1147,103 @@ async function doApprove(sliceId, btn, checks) {
   showBanner('notice bad', '签字被拒绝：' + msg);
   btn.disabled = false;
   btn.textContent = '确认签字';
+}
+
+// ── ADR-084：可接管的三个动作 ───────────────────────────────────────────
+//
+// 共同纪律：调用的是**服务端已有的 core 实现**，前端不重写任何判定。
+// 前端只负责收集输入、发请求、把结果说清楚。
+
+/**
+ * **拒签** —— 签字卡片上「确认签字」旁边的第二个按钮。
+ *
+ * 为什么驾驶舱要能拒签：签字队列是「人在被交还控制权的那一刻」看的页面。
+ * 只能签不能拒，就等于把人赶回终端 —— 驾驶舱在最该起作用的时候失效。
+ */
+async function doReject(sliceId, btn) {
+  btn.disabled = true;
+  btn.textContent = '拒签中…';
+
+  const reqs = await apiGet('/api/sign-requests?status=pending');
+  const req = reqs.find(function (r) { return r.sliceId === sliceId; });
+  if (!req) {
+    showBanner('notice bad', '找不到这条切片的待签字请求。');
+    btn.disabled = false;
+    btn.textContent = '拒签';
+    return;
+  }
+
+  const comment = window.prompt('拒签理由（可留空）：') || null;
+  const res = await apiPost(
+    '/api/sign-requests/' + encodeURIComponent(req.id) + '/reject',
+    { comment: comment }
+  );
+  if (res.ok && res.body && res.body.ok) {
+    await render('signs');
+    showBanner('notice ok', '⛔ 已拒签' + (comment ? '：' + comment : '。'));
+    return;
+  }
+  const msg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
+  showBanner('notice bad', '拒签失败：' + msg);
+  btn.disabled = false;
+  btn.textContent = '拒签';
+}
+
+/**
+ * **回答 agent 的提问** —— 切片详情页里的一个输入框。
+ *
+ * 只**记录**答案，不续跑（ADR-084 §1.1）：
+ * 续跑要拉起 agent 会话，驾驶舱不该在 HTTP 请求里挂着它。
+ * 答案记下后，提示人去终端跑 zelto answer 完成续跑。
+ */
+async function doAnswer(sliceId, input, btn) {
+  const text = input.value.trim();
+  if (!text) {
+    showBanner('notice bad', '答案为空。');
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = '提交中…';
+
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/answer', {
+    answer: text
+  });
+  if (res.ok && res.body && res.body.ok) {
+    input.value = '';
+    showBanner('notice ok', '✅ 答案已记录。');
+    showBanner('notice', res.body.nextStep || '');
+    await render(currentView);
+    return;
+  }
+  const msg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
+  showBanner('notice bad', '提交答案失败：' + msg);
+  btn.disabled = false;
+  btn.textContent = '提交答案';
+}
+
+/**
+ * **拉闸** —— 顶栏按钮（ADR-084）。
+ *
+ * 驾驶舱只提供「刹车」，不提供「油门」——
+ * resume 会改切片状态机、走重试预算、可能触发 gate，
+ * 那是「推进」动作，不是「接管」动作（ADR-084 §1）。
+ */
+async function doHalt(btn) {
+  const reason = window.prompt('拉闸原因（可留空）：', '人工拉闸');
+  // prompt 返回 null = 人点了「取消」—— 那就不该有任何副作用。
+  if (reason === null) return;
+
+  btn.disabled = true;
+  const res = await apiPost('/api/halt', { scope: 'all', reason: reason || '人工拉闸' });
+  if (res.ok && res.body && res.body.ok) {
+    showBanner('notice ok', '⏸ 已拉闸 —— 批次暂停，控制权交回给你。');
+    showBanner('notice', '处理完现场后：zelto halt --clear 解除暂停。');
+    await render(currentView);
+    return;
+  }
+  const msg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
+  showBanner('notice bad', '拉闸失败：' + msg);
+  btn.disabled = false;
 }
 
 /**
@@ -1278,6 +1434,13 @@ async function loadProjectInfo() {
 
 for (const b of document.querySelectorAll('nav button')) {
   b.addEventListener('click', function () { render(b.getAttribute('data-view')); });
+}
+
+// ADR-084：顶栏的拉闸按钮 —— 交回控制权是**随时可能需要**的动作，
+// 不该藏在某个视图里让人先找到那个视图。
+const haltBtn = document.getElementById('halt-btn');
+if (haltBtn) {
+  haltBtn.addEventListener('click', function () { doHalt(haltBtn); });
 }
 
 // 工程名先于一切加载 —— 标题得先正确，别让人看到「…」几分钟

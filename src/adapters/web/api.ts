@@ -38,6 +38,8 @@ import { DesignStore } from '../../core/design/store.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { resolveSliceOwnership } from '../../core/version/branch.js';
 import type { Version } from '../../core/version/types.js';
+import { HaltStore } from '../../core/halt/index.js';
+import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
 
 /** 一片切片的总览行 —— 前端列表用。 */
 export interface SliceSummary {
@@ -165,6 +167,10 @@ export class WebApi {
   private readonly versions: VersionStore;
   private readonly designs: DesignStore;
   private readonly requirements: RequirementStore;
+  /** 拉闸请求（ADR-084） */
+  private readonly halts: HaltStore;
+  /** agent 提问（ADR-084） */
+  private readonly questions: QuestionStore;
 
   constructor(repoRoot: string) {
     this.repoRoot = repoRoot;
@@ -183,6 +189,9 @@ export class WebApi {
     this.versions = new VersionStore(zeltoDir);
     this.designs = new DesignStore(zeltoDir);
     this.requirements = new RequirementStore(zeltoDir);
+    // ADR-084：拉闸与提问的 store —— 与 CLI 侧同一套实现
+    this.halts = new HaltStore(zeltoDir);
+    this.questions = new QuestionStore({ baseDir: join(zeltoDir, 'questions') });
   }
 
   /** 切片总览列表。 */
@@ -739,6 +748,176 @@ export class WebApi {
       const message = err instanceof Error ? err.message : String(err);
       return { ok: false, reason: `批准失败：${message}`, checks };
     }
+  }
+
+  // ── ADR-084：驾驶舱从「只读 + 签字」扩展为「可接管」 ────────────────
+  //
+  // 下面三个动作的共同纪律（ADR-084 §2）：
+  // **Web 侧不重写判定，只调 core** ——
+  // 每一件都复用 CLI 侧同一个 core 实现，
+  // 否则「浏览器里点的」和「终端里跑的」会得出不同结论（C3 的隐患）。
+
+  /**
+   * **agent 的待答提问**（ADR-084）。
+   *
+   * 之前没有这个能力，于是 agent 一提问，人就得切回终端去 `zelto ask` 看 ——
+   * 驾驶舱在最该起作用的时候把人赶走了。
+   */
+  async listQuestions(sliceId?: string, status?: string): Promise<unknown[]> {
+    try {
+      const pending = await this.questions.listPending(sliceId);
+      if (!status || status === 'pending') return pending;
+      // 其它状态目前不查 —— QuestionStore 的 listPending 只给待答的。
+      // 「查不到」比「假装有」好（不编数据）。
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * **拒签** —— 与 `zelto sign <id> --reject` 同一套实现。
+   *
+   * 为什么驾驶舱要能拒签：签字队列是「人在被交还控制权的那一刻」看的页面。
+   * 只能签不能拒，就等于把人赶回终端 —— 驾驶舱在最该起作用的时候失效。
+   */
+  async rejectSign(signId: string, comment?: string | null): Promise<
+    | { ok: true; request: unknown }
+    | { ok: false; reason: string }
+  > {
+    let request;
+    try {
+      request = await this.signs.get(signId);
+    } catch {
+      return { ok: false, reason: `签字请求不存在：${signId}` };
+    }
+
+    if (request.status !== 'pending') {
+      return { ok: false, reason: `签字请求已是 ${request.status} 状态，不能再拒绝` };
+    }
+
+    try {
+      const rejected = await this.signs.reject(signId, 'human', comment ?? null);
+      return { ok: true, request: rejected };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `拒绝失败：${message}` };
+    }
+  }
+
+  /**
+   * **回答 agent 的提问** —— 只**记录**答案，**不续跑**（ADR-084 §1.1）。
+   *
+   * 为什么不在 Web 侧续跑：续跑要调 `adapter.resume()` 拉起 agent 会话，
+   * 会让一个 HTTP 请求长时间挂着，还可能留下孤儿进程。
+   * 而 CLI 侧本来就有完整实现 —— Web 侧再写一份就分叉了（C3）。
+   *
+   * 分工：**驾驶舱负责「把答案记下来」，CLI 负责「让 agent 接着跑」。**
+   */
+  async answerQuestion(
+    sliceId: string,
+    answer: string,
+  ): Promise<
+    | { ok: true; questionId: string; nextStep: string }
+    | { ok: false; reason: string }
+  > {
+    const text = (answer ?? '').trim();
+    if (!text) {
+      return { ok: false, reason: '答案为空' };
+    }
+
+    // 找这片待答的问题 —— 认问题 id 与认切片 id 都支持。
+    let pending: QuestionRecord[];
+    try {
+      pending = await this.questions.listPending(sliceId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `读待答问题失败：${message}` };
+    }
+
+    if (pending.length === 0) {
+      return { ok: false, reason: `切片 "${sliceId}" 没有待答的问题` };
+    }
+    // 多于一个待答问题时不能猜 —— 让人明确指定。
+    if (pending.length > 1) {
+      return {
+        ok: false,
+        reason:
+          `切片 "${sliceId}" 有 ${pending.length} 个待答问题，无法确定回答哪一个` +
+          `（${pending.map((q) => q.id).join(', ')}）`,
+      };
+    }
+
+    const question = pending[0];
+    try {
+      await this.questions.answer(question.id, text);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `记录答案失败：${message}` };
+    }
+
+    // 事件流（C4）：驾驶舱里的操作**也是「人做的决定」** ——
+    // 追溯链要能回答「当时是谁在浏览器里回答了这个问题」。
+    //
+    // actor 与 via 是**两个维度**：actor 说「人做的」，via 说「在哪儿做的」。
+    await this.events.append(sliceId, 'question.answered', 'human', {
+      sliceId,
+      questionId: question.id,
+      answer: text,
+      answeredBy: 'human',
+      via: 'web',
+    });
+
+    return {
+      ok: true,
+      questionId: question.id,
+      nextStep:
+        `答案已记录。续跑请在终端执行：zelto answer ${question.id} "${text}"`,
+    };
+  }
+
+  /**
+   * **拉闸** —— 与 `zelto halt` 同一套实现（ADR-020）。
+   *
+   * 驾驶舱只提供「刹车」，不提供「油门」——
+   * `resume` 会改切片状态机、走重试预算、可能触发 gate，
+   * 那是「推进」动作，不是「接管」动作（ADR-084 §1）。
+   */
+  async haltBatch(
+    scope: string,
+    reason: string,
+  ): Promise<
+    | { ok: true; halt: { id: string; scope: string; requestedAt: string; reason: string } }
+    | { ok: false; reason: string }
+  > {
+    const haltScope = (scope ?? '').trim() || 'all';
+    const haltReason = (reason ?? '').trim() || '人工拉闸';
+
+    let req;
+    try {
+      req = await this.halts.request(haltScope, 'human', haltReason);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `拉闸失败：${message}` };
+    }
+
+    await this.events.append('batch', 'batch.halted', 'human', {
+      scope: haltScope,
+      reason: haltReason,
+      haltId: req.id,
+      requestedAt: req.requestedAt,
+      via: 'web',
+    });
+
+    return {
+      ok: true,
+      halt: {
+        id: req.id,
+        scope: req.scope,
+        requestedAt: req.requestedAt,
+        reason: req.reason,
+      },
+    };
   }
 }
 
