@@ -1,6 +1,8 @@
 node_modules
 dist
 dist-test
+# 构建锁（ADR-080）—— 临时目录，进程退出就没了
+.build-lock
 .zelto/
 .DS_Store
 *.log

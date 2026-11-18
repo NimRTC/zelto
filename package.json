@@ -14,11 +14,11 @@
     "zelto-hook": "dist/hook/index.js"
   },
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc",
+    "build": "node scripts/build.mjs",
     "check:encoding": "node scripts/check-encoding.mjs",
     "check:credentials": "node scripts/scan-credentials.mjs",
     "dev": "tsc --watch",
-    "test": "node scripts/check-encoding.mjs && tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
+    "test": "node scripts/test.mjs",
     "test:quick": "node --test \"dist-test/tests/**/*.test.js\"",
     "test:unit": "tsc -p tsconfig.test.json && node scripts/filter-tests.mjs",
     "test:acceptance": "node --test \"dist-test/tests/acceptance/**/*.test.js\"",
