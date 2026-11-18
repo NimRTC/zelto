@@ -240,13 +240,17 @@
   unmapped — the report was misleading and the guard could block legitimate
   write sets. Other confirmed designs are listed in the report so `--design
   <id>` is discoverable.
-- **Published to npm.** `npm install -g zelto` installs the CLI and the
-  standalone hook. npm is the only distribution channel — the repository's
-  `Dockerfile` and `docker-compose.yml` stay as development conveniences and
-  do not carry releases. Releases run from a tag: `v<version>` must match the
-  version in `package.json`, the tarball is installed into a clean directory
-  and exercised (`zelto init` + policy-anchor self-check) before
-  `npm publish --provenance` runs.
+- **npm is the only distribution channel — but the first publish has not
+  happened yet.** The release pipeline is wired up (releases run from a tag:
+  `v<version>` must match the version in `package.json`, the tarball is
+  installed into a clean directory and exercised — `zelto init` + policy-anchor
+  self-check — before `npm publish --provenance` runs), and the repository's
+  `Dockerfile` and `docker-compose.yml` stay as development conveniences that
+  do not carry releases. **As of this writing `npm view zelto` still returns
+  404**, so install from source for now
+  (`git clone` + `pnpm install && pnpm build && pnpm link --global`).
+  `release-status.json` is the single source of truth for whether the package
+  is actually on the registry — the README and this changelog both follow it.
 
 ### Fixed
 - **The installed package was never actually exercised.** The `files`

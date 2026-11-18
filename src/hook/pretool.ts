@@ -1,14 +1,26 @@
-// zelto pretool hook — Claude Code PreToolUse 运行时策略判定
+// zelto pretool hook — 运行时策略判定（多 harness，ADR-083）
 //
 // 作用：agent 每次写文件的那一刻就过一遍策略判定，而不是等到提交时（ADR-014）。
 // 判定不触网、不调模型（C3）；每次判定写一条 append-only 事件（C4）。
 //
-// 协议（Claude Code hooks）：
+// 协议（Claude Code / Codex）：
 //   stdin  ← {"tool_name":"Write","tool_input":{"file_path":"..."},...}
 //   stdout → {"hookSpecificOutput":{"hookEventName":"PreToolUse",
 //              "permissionDecision":"allow|deny|ask",
 //              "permissionDecisionReason":"..."}}
 //   exit 0 = 已判定；exit 2 = 阻断错误（stderr 回灌给模型）
+//
+// 协议（Cursor）：
+//   stdin  ← {"hook_event_name":"preToolUse","tool_name":"edit_file",
+//              "tool_input":{"path":"..."},...}
+//   stdout → {"permission":"allow|deny","userMessage":"...","agentMessage":"..."}
+//   exit 0 = 已判定；exit 2 = 阻断
+//
+// **判定内核与 harness 无关**（ADR-083 §1）：
+// 各 harness 的输入先经 `harness.ts` 归一化成统一载荷，
+// 判决再经它渲染回各 harness 的信封。
+// 判定本身（judgeWriteTargets）一行都不因 harness 而变 ——
+// 否则「越界」就变成了「取决于用什么 agent」的函数。
 //
 // 失败一律 fail closed：判定不了就拒绝写。
 
@@ -71,6 +83,12 @@ export interface PreToolPayload {
 
 import { isProtectedPath, matchPath, toPosix } from './protected.js';
 import { isZeltoManagedSpecPath } from './managed-spec.js';
+import {
+  normalizePayload,
+  renderDecision,
+  type HarnessName,
+  type NormalizedPayload,
+} from './harness.js';
 
 export { isProtectedPath, matchPath } from './protected.js';
 
@@ -606,18 +624,28 @@ interface HookArgs {
   projectRoot: string;
   worktreeRoot: string;
   sliceId: string | null;
+  /** 哪个 harness 触发的这次判定（ADR-083） */
+  harness: HarnessName;
 }
 
 export function parseArgs(argv: string[]): HookArgs {
   let projectRoot = process.env.ZELTO_PROJECT_ROOT ?? process.cwd();
   let worktreeRoot = '';
   let sliceId: string | null = process.env.ZELTO_SLICE_ID ?? null;
+  // 默认 Claude Code —— 保持旧调用方式（不带 --harness）的行为不变。
+  let harness: HarnessName = 'claude-code';
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--project-root' && argv[i + 1]) projectRoot = argv[++i];
     else if (arg === '--worktree' && argv[i + 1]) worktreeRoot = argv[++i];
     else if (arg === '--slice' && argv[i + 1]) sliceId = argv[++i];
+    else if (arg === '--harness' && argv[i + 1]) {
+      const value = argv[++i];
+      if (value === 'cursor' || value === 'codex' || value === 'claude-code') {
+        harness = value;
+      }
+    }
   }
 
   const root = resolve(projectRoot);
@@ -625,6 +653,7 @@ export function parseArgs(argv: string[]): HookArgs {
     projectRoot: root,
     worktreeRoot: worktreeRoot ? resolve(worktreeRoot) : root,
     sliceId,
+    harness,
   };
 }
 
@@ -801,9 +830,15 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
   const args = parseArgs(argv);
   const raw = await readStdin();
 
-  let payload: PreToolPayload;
+  // 归一化：各 harness 的输入翻译成统一载荷（ADR-083）。
+  //
+  // 输入解析失败 → **拒绝**（fail closed）。
+  // 注意：这里判的是「输入是不是 JSON」，不是「工具认不认识」——
+  // 不认识时归一化会退回「找路径字段」，仍然判定（见 harness.ts）。
+  let normalized: NormalizedPayload;
   try {
-    payload = JSON.parse(raw) as PreToolPayload;
+    const parsed = JSON.parse(raw) as unknown;
+    normalized = normalizePayload(args.harness, parsed);
   } catch {
     return {
       decision: 'deny',
@@ -815,7 +850,7 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
   }
 
   const ctx = buildContext(args);
-  const targets = extractWriteTargets(payload);
+  const targets = extractWriteTargets(normalized);
   const verdict = judgeWriteTargets(targets, ctx);
 
   const eventSlice = ctx.sliceId ?? POLICY_ONLY_SLICE;
@@ -826,9 +861,11 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
     reason: verdict.reason,
     path: verdict.path,
     targets: verdict.targets,
-    tool: payload.tool_name ?? 'unknown',
+    tool: normalized.raw_tool_name ?? normalized.tool_name ?? 'unknown',
     policyVersion: ctx.policyVersion,
-    harness: 'claude-code',
+    // 记录**真实来源**，不硬编码（ADR-083 §6）——
+    // 追溯链要能回答「这次判定是哪个 agent 触发的」。
+    harness: args.harness,
     sliceId: ctx.sliceId,
   });
 
@@ -841,7 +878,7 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
   };
 }
 
-/** CLI 入口：读 stdin，输出 Claude Code 契约 JSON。 */
+/** CLI 入口：读 stdin，输出该 harness 的契约 JSON。 */
 export async function main(argv: string[]): Promise<number> {
   let response: HookResponse;
   try {
@@ -853,13 +890,12 @@ export async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: response.decision,
-      permissionDecisionReason: response.reason,
-    },
-  };
+  // 渲染成对应 harness 的信封（ADR-083 §3）
+  const harness = parseArgs(argv).harness;
+  const output = renderDecision(harness, {
+    decision: response.decision,
+    reason: response.reason,
+  });
   process.stdout.write(`${JSON.stringify(output)}\n`);
   return 0;
 }

@@ -25,6 +25,38 @@ import { join } from 'node:path';
 const REPO_ROOT = process.cwd();
 const PACKAGE_NAME = 'zelto';
 
+/**
+ * 读发布状态的真源。
+ *
+ * **为什么不用 `package.json` 的 `private` 字段**：
+ * `private: false` 只表示「允许发到 npm」，不表示「已经发出去了」。
+ * D4 决策翻转 `private` 时发布还没发生 —— 于是 README 与 CHANGELOG
+ * 都写下了「已发布到 npm」，而 npm 上是 404。
+ *
+ * 这跟 D-63（ship 说合入 main 其实是假的）、D-73（事件记 `tag: null`
+ * 而 git 里 tag 好好地在那儿）、README 那句假话是**同一个形状**：
+ * **两个证据打架，而打架的那一方是文档。**
+ *
+ * C1 的精神是「状态只在文件里」—— 发布状态是状态，
+ * 所以它的真源是仓库里的一个文件，而不是某个字段的语义推断。
+ */
+interface ReleaseStatus {
+  published: boolean;
+  publishedAt: string | null;
+  npmVersion: string | null;
+}
+
+function readReleaseStatus(): ReleaseStatus {
+  const path = join(REPO_ROOT, 'release-status.json');
+  assert.ok(existsSync(path), `缺少发布状态真源：${path}`);
+  const raw = JSON.parse(readFileSync(path, 'utf-8')) as Partial<ReleaseStatus>;
+  return {
+    published: raw.published === true,
+    publishedAt: raw.publishedAt ?? null,
+    npmVersion: raw.npmVersion ?? null,
+  };
+}
+
 interface PackEntry {
   path: string;
 }
@@ -167,35 +199,71 @@ describe('发布产物装出来能用', () => {
 
   it('README 说的安装方式与 package.json 一致', () => {
     const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as {
-      private?: boolean;
       version: string;
     };
     const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8');
-    // private 为 true 时 README 必须说「还没发布」，不能反过来；
-    // 不是 private 时 README 必须说「已发布」—— 发布状态与 README 反着写，
-    // 用户照着 README 装不上，是最直接的事故。
-    if (pkg.private) {
-      assert.match(readme, /Not published to npm yet/);
+    // 发布状态的真源是 `release-status.json`，**不是** `package.json` 的 `private`。
+    //
+    // 为什么不能用 `private` 当代理：`private: false` 只表示「允许发到 npm」，
+    // 不表示「已经发出去了」。D4 决策把 `private` 翻成 false 时，发布还没发生 ——
+    // 于是 README 写下「已发布到 npm」，而 npm 上是 404。
+    // **发布状态与 README 反着写，用户照着 README 装不上，是最直接的事故。**
+    //
+    // C1 要求状态只在文件里 —— 发布状态是状态，所以它的真源是仓库里的
+    // 一个文件（C1 的精神），而不是某个字段的语义推断。
+    const status = readReleaseStatus();
+    if (status.published) {
+      assert.match(readme, /Published to npm/i);
+      assert.doesNotMatch(readme, /not.{0,20}npm.{0,30}yet/i);
     } else {
-      assert.match(readme, /Published to npm/);
-      assert.doesNotMatch(readme, /Not published to npm yet/);
+      // 措辞可以变（「Not yet on npm」「Not published to npm yet」…），
+      // 但**意思必须只有一个**：还没发布。
+      assert.match(readme, /not.{0,30}npm/i, 'README 必须说清楚还没发布到 npm');
+      assert.doesNotMatch(
+        readme,
+        /npm install -g zelto/,
+        '还没发布时 README 不能教用户 `npm install -g zelto` —— 那条命令现在会失败',
+      );
     }
     assert.match(readme, new RegExp(`v${pkg.version.replace(/\./g, '\\.')}`));
   });
 
   it('中英文 README 的发布状态一致 —— 两版漂移了用户就会照着错的那版装', () => {
-    const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf-8')) as {
-      private?: boolean;
-    };
     const readmeZh = readFileSync(join(REPO_ROOT, 'README.zh-CN.md'), 'utf-8');
-    if (pkg.private) {
-      assert.match(readmeZh, /尚未发布|还没发布/);
+    const status = readReleaseStatus();
+    if (status.published) {
+      assert.match(readmeZh, /已发布到 npm|已发布到\s*npm/);
+      assert.match(readmeZh, /npm install -g zelto/);
     } else {
-      assert.match(readmeZh, /已发布到 npm/);
+      assert.match(readmeZh, /尚未发布|还没发布|未发布/);
+      // 还没发布时，README 必须给出一条**现在就能用**的安装路径 ——
+      // 不能只说「还没发布」就完事（那是把问题推给用户）。
+      assert.match(readmeZh, /pnpm link --global|git clone/);
+      assert.doesNotMatch(
+        readmeZh,
+        /npm install -g zelto/,
+        '还没发布时 README 不能教用户 `npm install -g zelto` —— 那条命令现在会失败',
+      );
     }
-    // 两版都得给出可用的安装命令
-    assert.match(readmeZh, /npm install -g zelto/);
     const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf-8');
-    assert.match(readme, /npm install -g zelto/);
+    if (status.published) {
+      assert.match(readme, /npm install -g zelto/);
+    } else {
+      assert.match(readme, /pnpm link --global|git clone/);
+    }
+  });
+
+  it('CHANGELOG 的发布措辞与 release-status 一致 —— 两处都说假话等于没说', () => {
+    // README 与 CHANGELOG 是**两个地方**。
+    // 只修一个的话，剩下那个仍然在说「已发布」。
+    const changelog = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8');
+    const status = readReleaseStatus();
+    if (!status.published) {
+      assert.doesNotMatch(
+        changelog,
+        /\*\*Published to npm\.\*\*/,
+        'CHANGELOG 仍写着「Published to npm」—— 但实际上还没发布',
+      );
+    }
   });
 });

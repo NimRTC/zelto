@@ -206,6 +206,233 @@ export function claudeCodeHookInstalled(root: string): boolean {
   }
 }
 
+// ─── Cursor / Codex 钩子（ADR-083）───────────────────────────────────────────
+//
+// 两者都用 `hooks.json`，但**信封不同**：
+//
+//   Cursor  .cursor/hooks.json
+//     { "version": 1, "hooks": { "preToolUse": [ { command, matcher, failClosed } ] } }
+//     输出 { "permission": "allow|deny", "userMessage", "agentMessage" }
+//
+//   Codex   .codex/hooks.json
+//     { "hooks": { "PreToolUse": [ { command, matcher } ] } }
+//     输出 { "hookSpecificOutput": { hookEventName, permissionDecision } }
+//
+// **Cursor 的 `failClosed: true` 是必须显式写的**（ADR-083 §4）：
+// Cursor 默认 fail open —— hook 崩溃/超时时动作照常执行。
+// 而 C9 要求「判定不了就拒绝」。不写这一条，
+// zelto 在 Cursor 下就是默认放行，而文档写着「判定不了就拒绝」——
+// **声称的强度与实际的强度不一致**（README 那句「已发布到 npm」同形状）。
+
+/** Cursor 的项目级 hook 配置（不进版本库的建议由用户自行决定）。 */
+export const CURSOR_HOOKS_RELATIVE = join('.cursor', 'hooks.json');
+/** Codex 的项目级 hook 配置。 */
+export const CODEX_HOOKS_RELATIVE = join('.codex', 'hooks.json');
+
+/** Cursor / Codex 的工具匹配串 —— 与 Claude Code 的等价。 */
+export const CURSOR_PRETOOL_MATCHER = 'create_file|edit_file|write_file|replace|search_replace|terminal|run_terminal_cmd|apply_patch|shell';
+
+interface CursorHookEntry {
+  command: string;
+  matcher?: string;
+  /** Cursor 特有：hook 失败时是否阻断（默认 false = fail open） */
+  failClosed?: boolean;
+  timeout?: number;
+}
+
+interface CursorHooksFile {
+  version?: number;
+  hooks?: Record<string, CursorHookEntry[]>;
+  [key: string]: unknown;
+}
+
+interface CodexHooksFile {
+  hooks?: Record<string, CursorHookEntry[]>;
+  [key: string]: unknown;
+}
+
+function isZeltoCursorEntry(entry: CursorHookEntry): boolean {
+  return typeof entry.command === 'string' && entry.command.includes(HOOK_MARKER_ARG);
+}
+
+function readHooksFile<T extends { hooks?: Record<string, CursorHookEntry[]> }>(
+  path: string,
+): T {
+  if (!existsSync(path)) return {} as T;
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    return (raw.trim() ? JSON.parse(raw) : {}) as T;
+  } catch {
+    return {} as T;
+  }
+}
+
+function writeHooksFile(path: string, data: unknown): { ok: boolean; message: string } {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, 'utf-8');
+    return { ok: true, message: '已安装' };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `写入失败: ${message}` };
+  }
+}
+
+/**
+ * 拼出某个 harness 的 hook 命令行。
+ *
+ * 与 Claude Code 的差别只有一个：多了 `--harness <name>`。
+ * 判定内核完全共用。
+ */
+export function buildHarnessHookCommand(
+  harness: 'cursor' | 'codex',
+  options: ClaudeHookOptions,
+): string {
+  const exec = buildPreToolHookExec(options);
+  const args = [...exec.args];
+  // 插在标记之前 —— 无所谓位置，但放前面便于人读命令时一眼看出 harness。
+  const markerIdx = args.indexOf(HOOK_MARKER_ARG);
+  const withHarness = [
+    ...args.slice(0, markerIdx),
+    '--harness',
+    harness,
+    ...args.slice(markerIdx),
+  ];
+  return [exec.command, ...withHarness].map(quoteArg).join(' ');
+}
+
+/** 安装 Cursor 的 preToolUse 钩子。 */
+export function installCursorHook(options: ClaudeHookOptions): {
+  installed: boolean;
+  path: string;
+  message: string;
+} {
+  const hooksPath = join(options.root, CURSOR_HOOKS_RELATIVE);
+  const file = readHooksFile<CursorHooksFile>(hooksPath);
+
+  const hooks = { ...(file.hooks ?? {}) };
+  const preToolUse = (hooks.preToolUse ?? []).filter((entry) => !isZeltoCursorEntry(entry));
+  preToolUse.push({
+    command: buildHarnessHookCommand('cursor', options),
+    matcher: CURSOR_PRETOOL_MATCHER,
+    // **必须显式 fail closed** —— Cursor 默认 fail open（ADR-083 §4）。
+    failClosed: true,
+  });
+  hooks.preToolUse = preToolUse;
+  file.hooks = hooks;
+  if (file.version === undefined) file.version = 1;
+
+  const result = writeHooksFile(hooksPath, file);
+  return { installed: result.ok, path: hooksPath, message: result.message };
+}
+
+/** 卸载 Cursor 的钩子；其它 hook 原样保留。 */
+export function removeCursorHook(root: string): { removed: boolean; path: string } {
+  const hooksPath = join(root, CURSOR_HOOKS_RELATIVE);
+  if (!existsSync(hooksPath)) return { removed: false, path: hooksPath };
+  try {
+    const file = readHooksFile<CursorHooksFile>(hooksPath);
+    const hooks = { ...(file.hooks ?? {}) };
+    const before = hooks.preToolUse?.length ?? 0;
+    const after = (hooks.preToolUse ?? []).filter((entry) => !isZeltoCursorEntry(entry));
+    if (after.length === before) return { removed: false, path: hooksPath };
+
+    if (after.length > 0) hooks.preToolUse = after;
+    else delete hooks.preToolUse;
+    file.hooks = hooks;
+    writeFileSync(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf-8');
+    return { removed: true, path: hooksPath };
+  } catch {
+    return { removed: false, path: hooksPath };
+  }
+}
+
+/** Cursor 钩子是否已安装。 */
+export function cursorHookInstalled(root: string): boolean {
+  const hooksPath = join(root, CURSOR_HOOKS_RELATIVE);
+  if (!existsSync(hooksPath)) return false;
+  try {
+    const file = readHooksFile<CursorHooksFile>(hooksPath);
+    return (file.hooks?.preToolUse ?? []).some((entry) => isZeltoCursorEntry(entry));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cursor 的 zelto hook 是否**显式 fail closed**。
+ *
+ * 单独暴露一个判据 —— 因为「装上了但没写 failClosed」是**看不见的失效**：
+ * 配置文件里有 zelto 的条目，看起来一切正常，
+ * 但 hook 崩了就会放行。这是 ADR-083 §4 要求守住的点。
+ */
+export function cursorHookFailsClosed(root: string): boolean {
+  const hooksPath = join(root, CURSOR_HOOKS_RELATIVE);
+  if (!existsSync(hooksPath)) return false;
+  try {
+    const file = readHooksFile<CursorHooksFile>(hooksPath);
+    const entry = (file.hooks?.preToolUse ?? []).find((e) => isZeltoCursorEntry(e));
+    return entry?.failClosed === true;
+  } catch {
+    return false;
+  }
+}
+
+/** 安装 Codex 的 PreToolUse 钩子。 */
+export function installCodexHook(options: ClaudeHookOptions): {
+  installed: boolean;
+  path: string;
+  message: string;
+} {
+  const hooksPath = join(options.root, CODEX_HOOKS_RELATIVE);
+  const file = readHooksFile<CodexHooksFile>(hooksPath);
+
+  const hooks = { ...(file.hooks ?? {}) };
+  const preToolUse = (hooks.PreToolUse ?? []).filter((entry) => !isZeltoCursorEntry(entry));
+  preToolUse.push({
+    command: buildHarnessHookCommand('codex', options),
+    matcher: CURSOR_PRETOOL_MATCHER,
+  });
+  hooks.PreToolUse = preToolUse;
+  file.hooks = hooks;
+
+  const result = writeHooksFile(hooksPath, file);
+  return { installed: result.ok, path: hooksPath, message: result.message };
+}
+
+/** 卸载 Codex 的钩子；其它 hook 原样保留。 */
+export function removeCodexHook(root: string): { removed: boolean; path: string } {
+  const hooksPath = join(root, CODEX_HOOKS_RELATIVE);
+  if (!existsSync(hooksPath)) return { removed: false, path: hooksPath };
+  try {
+    const file = readHooksFile<CodexHooksFile>(hooksPath);
+    const hooks = { ...(file.hooks ?? {}) };
+    const before = hooks.PreToolUse?.length ?? 0;
+    const after = (hooks.PreToolUse ?? []).filter((entry) => !isZeltoCursorEntry(entry));
+    if (after.length === before) return { removed: false, path: hooksPath };
+
+    if (after.length > 0) hooks.PreToolUse = after;
+    else delete hooks.PreToolUse;
+    file.hooks = hooks;
+    writeFileSync(hooksPath, `${JSON.stringify(file, null, 2)}\n`, 'utf-8');
+    return { removed: true, path: hooksPath };
+  } catch {
+    return { removed: false, path: hooksPath };
+  }
+}
+
+/** Codex 钩子是否已安装。 */
+export function codexHookInstalled(root: string): boolean {
+  const hooksPath = join(root, CODEX_HOOKS_RELATIVE);
+  if (!existsSync(hooksPath)) return false;
+  try {
+    const file = readHooksFile<CodexHooksFile>(hooksPath);
+    return (file.hooks?.PreToolUse ?? []).some((entry) => isZeltoCursorEntry(entry));
+  } catch {
+    return false;
+  }
+}
+
 // ─── git hooks ──────────────────────────────────────────────────────────────
 
 export interface HookScriptOptions {
@@ -420,6 +647,105 @@ export async function hookCommand(args: string[]): Promise<number> {
   const wantClaude = args.includes('--claude');
   const onlyClaude = args.includes('--claude-only');
 
+  // 多 harness（ADR-083）。
+  //
+  // 默认装**全部**已知的 harness —— 一个项目里往往同时开着好几种 agent。
+  // `--all` 显式声明「全装」，供脚本使用（默认值将来变化时行为不漂移）。
+  const wantCursor = args.includes('--cursor');
+  const wantCodex = args.includes('--codex');
+  const wantAllHarnesses = args.includes('--all');
+  const anyHarnessFlag = wantClaude || wantCursor || wantCodex || wantAllHarnesses;
+  const onlyHarness =
+    args.includes('--claude-only') ||
+    args.includes('--cursor-only') ||
+    args.includes('--codex-only');
+
+  /** 要装/卸的 harness 列表。 */
+  const harnesses: Array<'claude-code' | 'cursor' | 'codex'> = [];
+  if (wantCursor || (anyHarnessFlag && !wantClaude)) harnesses.push('cursor');
+  if (wantCodex || (anyHarnessFlag && !wantClaude)) harnesses.push('codex');
+  if (wantClaude || (anyHarnessFlag && !wantCursor && !wantCodex)) harnesses.push('claude-code');
+  // 没有任何旗标 → 默认全装（ADR-083 §5）
+  if (harnesses.length === 0) harnesses.push('cursor', 'codex', 'claude-code');
+
+  /** 装某个 harness 的 hook。 */
+  function installHarnessHook(harness: 'claude-code' | 'cursor' | 'codex'): void {
+    const opts = { root: process.cwd() };
+    if (harness === 'claude-code') {
+      const result = installClaudeCodeHook(opts);
+      if (result.installed) {
+        console.log(`  ✅ Claude Code PreToolUse hook installed → ${result.path}`);
+      } else {
+        console.error(`  ❌ Claude Code hook install failed: ${result.message}`);
+      }
+      return;
+    }
+    if (harness === 'cursor') {
+      const result = installCursorHook(opts);
+      if (result.installed) {
+        console.log(`  ✅ Cursor preToolUse hook installed → ${result.path}`);
+        console.log(`     (failClosed: true —— hook 出错也阻断，与 C9 一致)`);
+      } else {
+        console.error(`  ❌ Cursor hook install failed: ${result.message}`);
+      }
+      return;
+    }
+    const result = installCodexHook(opts);
+    if (result.installed) {
+      console.log(`  ✅ Codex PreToolUse hook installed → ${result.path}`);
+    } else {
+      console.error(`  ❌ Codex hook install failed: ${result.message}`);
+    }
+  }
+
+  /** 卸某个 harness 的 hook。 */
+  function uninstallHarnessHook(harness: 'claude-code' | 'cursor' | 'codex'): void {
+    const root = process.cwd();
+    if (harness === 'claude-code') {
+      const result = removeClaudeCodeHook(root);
+      console.log(
+        result.removed
+          ? `  ✅ Claude Code PreToolUse hook uninstalled`
+          : `  ⬜ Claude Code PreToolUse hook — not installed`,
+      );
+      return;
+    }
+    if (harness === 'cursor') {
+      const result = removeCursorHook(root);
+      console.log(
+        result.removed ? `  ✅ Cursor preToolUse hook uninstalled` : `  ⬜ Cursor preToolUse hook — not installed`,
+      );
+      return;
+    }
+    const result = removeCodexHook(root);
+    console.log(
+      result.removed ? `  ✅ Codex PreToolUse hook uninstalled` : `  ⬜ Codex PreToolUse hook — not installed`,
+    );
+  }
+
+  /** 某个 harness 的安装状态。 */
+  function harnessStatus(harness: 'claude-code' | 'cursor' | 'codex'): string {
+    const root = process.cwd();
+    if (harness === 'claude-code') {
+      return claudeCodeHookInstalled(root)
+        ? `  ✅ claude-code PreToolUse — installed (${CLAUDE_SETTINGS_RELATIVE})`
+        : `  ⬜ claude-code PreToolUse — not installed`;
+    }
+    if (harness === 'cursor') {
+      if (!cursorHookInstalled(root)) {
+        return `  ⬜ cursor preToolUse — not installed`;
+      }
+      // 「装上了但没 failClosed」是**看不见的失效** —— 必须单独说。
+      if (!cursorHookFailsClosed(root)) {
+        return `  ⚠️  cursor preToolUse — installed but NOT failClosed（hook 出错会放行）`;
+      }
+      return `  ✅ cursor preToolUse — installed (failClosed) (${CURSOR_HOOKS_RELATIVE})`;
+    }
+    return codexHookInstalled(root)
+      ? `  ✅ codex PreToolUse — installed (${CODEX_HOOKS_RELATIVE})`
+      : `  ⬜ codex PreToolUse — not installed`;
+  }
+
   // git hooks 的作用域：只装在被管理的项目里。
   const scope = resolveHookInstallRoot(process.cwd());
   const GIT_HOOKS_DIR = scope.root ? gitHooksDir(scope.root) : null;
@@ -481,19 +807,15 @@ export async function hookCommand(args: string[]): Promise<number> {
   }
 
   if (action === '--install') {
-    if (wantClaude || onlyClaude) {
-      const result = installClaudeCodeHook({ root: process.cwd() });
-      if (result.installed) {
-        console.log(`  ✅ Claude Code PreToolUse hook installed → ${result.path}`);
-      } else {
-        console.error(`  ❌ Claude Code hook install failed: ${result.message}`);
-      }
-      if (onlyClaude) return 0;
+    // agent harness 的写前钩子（ADR-083）
+    for (const harness of harnesses) {
+      installHarnessHook(harness);
     }
+    if (onlyHarness) return 0;
 
     if (!scope.root || !GIT_HOOKS_DIR) {
       console.log(`  ℹ️  ${scope.reason}`);
-      console.log(`     Claude Code 钩子仍然安装在当前目录（agent 实际工作的地方）。`);
+      console.log(`     agent 钩子仍然安装在当前目录（agent 实际工作的地方）。`);
       return 0;
     }
 
@@ -511,12 +833,10 @@ export async function hookCommand(args: string[]): Promise<number> {
   }
 
   if (action === '--uninstall') {
-    if (wantClaude || onlyClaude) {
-      const result = removeClaudeCodeHook(process.cwd());
-      if (result.removed) console.log(`  ✅ Claude Code PreToolUse hook uninstalled`);
-      else console.log(`  ⬜ Claude Code PreToolUse hook — not installed`);
-      if (onlyClaude) return 0;
+    for (const harness of harnesses) {
+      uninstallHarnessHook(harness);
     }
+    if (onlyHarness) return 0;
 
     if (!scope.root || !GIT_HOOKS_DIR) {
       console.log(`  ℹ️  ${scope.reason}`);
@@ -557,12 +877,11 @@ export async function hookCommand(args: string[]): Promise<number> {
       }
     }
 
-    const claudeInstalled = claudeCodeHookInstalled(process.cwd());
-    console.log(
-      claudeInstalled
-        ? `  ✅ claude-code PreToolUse — installed (${join(CLAUDE_SETTINGS_RELATIVE)})`
-        : `  ⬜ claude-code PreToolUse — not installed`,
-    );
+    // agent harness 的写前钩子状态（ADR-083）
+    console.log('');
+    for (const harness of harnesses) {
+      console.log(harnessStatus(harness));
+    }
     return 0;
   }
 
@@ -577,9 +896,11 @@ export async function hookCommand(args: string[]): Promise<number> {
     return 0;
   }
 
-  console.error('Usage: zelto hook --install [pre-commit|pre-push|all] [--claude]');
-  console.error('       zelto hook --uninstall [pre-commit|pre-push|all] [--claude]');
+  console.error('Usage: zelto hook --install [pre-commit|pre-push|all] [--claude] [--cursor] [--codex] [--all]');
+  console.error('       zelto hook --uninstall [pre-commit|pre-push|all] [--claude] [--cursor] [--codex] [--all]');
   console.error('       zelto hook --check [pre-commit|pre-push|all]');
   console.error('       zelto hook <file-path>');
+  console.error('');
+  console.error('  不带 harness 旗标时默认装全部已知 agent（claude-code / cursor / codex）。');
   return 1;
 }

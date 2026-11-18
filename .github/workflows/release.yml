@@ -90,6 +90,31 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public
 
+      # 发布状态的真源是仓库里的 `release-status.json`（C1：状态只在文件里）。
+      #
+      # 为什么要有这一步：README 与 CHANGELOG 的发布措辞都跟它对齐。
+      # 少了这一步，「发布完了但文档还说没发布」就会发生 ——
+      # 而那种不一致已经害过人（README 写着「已发布到 npm」时，npm 上是 404）。
+      - name: 更新发布状态并提交
+        if: ${{ !inputs.dry-run }}
+        run: |
+          set -euo pipefail
+          PKG=$(node -p "require('./package.json').version")
+          node -e "
+            const fs = require('fs');
+            const p = 'release-status.json';
+            const s = JSON.parse(fs.readFileSync(p, 'utf-8'));
+            s.published = true;
+            s.publishedAt = new Date().toISOString();
+            s.npmVersion = process.argv[1];
+            fs.writeFileSync(p, JSON.stringify(s, null, 2) + '\n', 'utf-8');
+          " "$PKG"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add release-status.json
+          git commit -m "chore(release): 标记 v${PKG} 已发布到 npm" || echo "（无改动，跳过）"
+          git push || echo "⚠️  推送失败 —— 请手动把 published 置为 true"
+
       - name: 仅打包（dry run）
         if: ${{ inputs.dry-run }}
         run: npm publish --dry-run
