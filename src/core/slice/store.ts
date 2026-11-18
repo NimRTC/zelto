@@ -113,6 +113,37 @@ function normalizeRuns(raw: unknown): SliceRun[] {
   );
 }
 
+/**
+ * 把 `stall` 归一化成完整的 StallInfo。
+ *
+ * 为什么需要：老状态文件里 `stall` 被写成过 `null`（不是 `{class: null}`）——
+ * 那是停机分类落地**之前**的写法。类型上 `stall: StallInfo` 是必填的，
+ * 但磁盘上确实存在 `stall: null` 的文件（实测 130 个切片里有 17 个）。
+ *
+ * 不归一化的后果很具体：`slice.stall.class` 在 `stall` 为 null 时抛
+ * `Cannot read properties of null (reading 'class')`，
+ * 而调用方（Web 的 listSlices、CLI 的多处）大多用 try/catch 兜着 ——
+ * 于是这一片**静默消失**：文件在磁盘上、切片已完成交付，
+ * 但人看的列表里查不到。追溯链少了一环，且没人知道少了。
+ *
+ * 为什么归一化成「没停机」而不是保留 null：
+ * `stall: null` 的语义就是「这片没停机」—— 停机分类规则那时还没存在。
+ * 归一化成 `{class: null, autoResolved: 0, gateRetries: 0}` 是**如实**的翻译，
+ * 不是编造。而且 `class: null` 就是「没有停机分类」的正统写法
+ * （`create()` 里的默认值也是它）。
+ */
+function normalizeStall(raw: unknown): StallInfo {
+  if (!raw || typeof raw !== 'object') {
+    return { class: null, autoResolved: 0, gateRetries: 0 };
+  }
+  const s = raw as Partial<StallInfo>;
+  return {
+    class: typeof s.class === 'string' ? s.class : null,
+    autoResolved: typeof s.autoResolved === 'number' && Number.isFinite(s.autoResolved) ? s.autoResolved : 0,
+    gateRetries: typeof s.gateRetries === 'number' && Number.isFinite(s.gateRetries) ? s.gateRetries : 0,
+  };
+}
+
 export class SliceStore {
   private readonly baseDir: string;
 
@@ -131,6 +162,10 @@ export class SliceStore {
     // 归一化：老状态文件里 `runs` 从未被写入过（永远是空数组），
     // `clarifyRounds` 也不存在。读的时候补齐，避免各处散着做兜底。
     slice.runs = normalizeRuns(slice.runs);
+    // `stall` 同样归一化 —— 老文件里它是 `null`（停机分类落地之前的写法）。
+    // 不归一化的话，下面的 `slice.stall.class` 会抛，而调用方的 try/catch
+    // 会把这一片**静默吞掉**：文件在、切片已交付，但列表里查不到。
+    slice.stall = normalizeStall(slice.stall);
     if (typeof slice.clarifyRounds !== 'number' || !Number.isFinite(slice.clarifyRounds)) {
       slice.clarifyRounds = 0;
     }
@@ -152,6 +187,10 @@ export class SliceStore {
   async write(slice: SliceData): Promise<void> {
     const p = this.path(slice.id);
     await mkdir(dirname(p), { recursive: true });
+    // 写之前也归一化 —— 不让 `stall: null` 这种老形态**再落回磁盘**。
+    // 读时归一化 + 写时归一化 = 闭环：老文件进来一次就变成正统写法，
+    // 之后不再产生新的坏文件。
+    slice.stall = normalizeStall(slice.stall);
     slice.updatedAt = new Date().toISOString();
     await writeFile(p, JSON.stringify(slice, null, 2), 'utf-8');
   }
