@@ -31,6 +31,7 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
         go: 0,
         rust: 0,
         java: 0,
+        csharp: 0,
         build: 0,
         doc: 0,
         config: 0,

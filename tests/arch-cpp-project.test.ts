@@ -45,10 +45,12 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     await mkdir(join(TEST_DIR, 'src', 'core'), { recursive: true });
     await mkdir(join(TEST_DIR, 'src', 'engine'), { recursive: true });
 
-    // src/core —— Java 代码（扫描器读不懂）+ 文档 + 配置
+    // src/core —— C# 代码（扫描器读不懂）+ 文档 + 配置
     //
-    // ADR-069 起 Go / Rust 都验得了，所以「有代码但验不了」的代表换成 Java。
-    await writeFile(join(TEST_DIR, 'src', 'core', 'Api.java'), 'package core;\n', 'utf-8');
+    // ADR-069 起 Go / Rust 都验得了，D-75 起 Java 也验得了，
+    // 所以「有代码但验不了」的代表换成 C#（ADR-061：它有 `using` 语义，
+    // 但扫描器还没实现解析）。
+    await writeFile(join(TEST_DIR, 'src', 'core', 'Api.cs'), 'namespace Core;\n', 'utf-8');
     await writeFile(join(TEST_DIR, 'src', 'core', 'README.md'), '# core\n', 'utf-8');
     await writeFile(join(TEST_DIR, 'src', 'core', 'config.json'), '{}\n', 'utf-8');
 
@@ -68,16 +70,16 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     await rm(TEST_DIR, { recursive: true, force: true });
   });
 
-  it('D-13：代码文件数不限语言，Java 也算代码', () => {
+  it('D-13：代码文件数不限语言，C# 也算代码', () => {
     const scan = scanArchitecture(TEST_DIR, MODULES);
     const report = buildArchitectureReport(MODULES, scan);
 
     const core = report.modules.find((m) => m.name === 'src/core');
     assert.ok(core, '应该有 src/core 模块');
 
-    // src/core 有 3 个文件：1 个代码（.java）+ 1 个文档 + 1 个配置
+    // src/core 有 3 个文件：1 个代码（.cs）+ 1 个文档 + 1 个配置
     assert.equal(core.fileCount, 3, 'src/core 的总文件数');
-    assert.equal(core.codeFileCount, 1, 'Java 也算「代码」');
+    assert.equal(core.codeFileCount, 1, 'C# 也算「代码」');
   });
 
   it('D-13：已验证文件数只数扫描器读得懂的', () => {
@@ -87,11 +89,11 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     const core = report.modules.find((m) => m.name === 'src/core');
     assert.ok(core);
 
-    // Java 的依赖语义还没支持 → 扫描器读不懂 → 不计入「已验证」。
+    // C# 的依赖语义还没支持 → 扫描器读不懂 → 不计入「已验证」。
     //
     // 这个断言原来锁的是「Go/Rust 读不懂」—— 那是在 ADR-069 之前的**事实**，
-    // 不是永远成立的不变量。现在 Go/Rust 验得了，Java 还没有。
-    assert.equal(core.verifiedFileCount, 0, 'Java 扫描器还读不懂');
+    // 不是永远成立的不变量。现在 Go/Rust/Java 都验得了，C# 还没有。
+    assert.equal(core.verifiedFileCount, 0, 'C# 扫描器还读不懂');
     assert.ok(
       core.codeFileCount > core.verifiedFileCount,
       '「代码」与「已验证」必须是两个数 —— 否则报告会显示误导性的「0 源码」',
@@ -130,7 +132,7 @@ describe('ADR-061：「代码」与「扫描器读得懂」要分开', () => {
     const report = buildArchitectureReport(MODULES, scan);
 
     // src/engine 是纯 TS（1 个代码文件，0 个非代码文件）
-    // src/core 是 Java（1 个代码文件 + 2 个非代码文件）
+    // src/core 是 C#（1 个代码文件 + 2 个非代码文件）
     //
     // 如果分母用全部文件，src/core 的可读比例 = 0/3 = 0
     // 如果分母用代码文件，比例 = 0/1 = 0 —— 两者都是 0。

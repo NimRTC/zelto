@@ -29,7 +29,7 @@ export interface ModuleSpec {
  * Go 的依赖表达是 `import "..."`（模块路径，无相对路径），
  * Rust 的是 `use ...;` / `extern crate ...;`（crate 内部路径）。
  */
-export type SourceLang = 'ts' | 'python' | 'cpp' | 'go' | 'rust';
+export type SourceLang = 'ts' | 'python' | 'cpp' | 'go' | 'rust' | 'java';
 
 /**
  * 语言类别（报告用，比 `SourceLang` 粗）。
@@ -44,6 +44,7 @@ export type LangCategory =
   | 'go'
   | 'rust'
   | 'java'
+  | 'csharp'
   | 'build'
   | 'doc'
   | 'config'
@@ -235,6 +236,7 @@ export const LANG_CATEGORY_LABELS: Record<LangCategory, string> = {
   go: 'Go',
   rust: 'Rust',
   java: 'Java / Kotlin',
+  csharp: 'C#',
   build: '构建脚本',
   doc: '文档',
   config: '配置文件',

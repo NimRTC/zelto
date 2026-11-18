@@ -6,7 +6,7 @@
 // 只做「够用」的解析：能分清相对路径、包名、内置模块三类，
 // 够用来算模块之间的依赖关系就够了。
 
-import type { ImportRef, SourceLang } from './types.js';
+import type { ImportRef, LangCategory, SourceLang } from './types.js';
 
 /** Node 内置模块（够用的那一批） */
 const NODE_BUILTINS = new Set([
@@ -34,6 +34,7 @@ const PYTHON_STDLIB = new Set([
  * （真实项目 `src/core` 的 13 个代码文件里 10 个是 `.hpp`）。
  *
  * ADR-069：Go（`.go`）与 Rust（`.rs`）也参与。
+ * ADR-082：Java（`.java`）与 Kotlin（`.kt` / `.kts`）也参与。
  */
 export function detectLang(filePath: string): SourceLang | null {
   const lower = filePath.toLowerCase();
@@ -43,6 +44,7 @@ export function detectLang(filePath: string): SourceLang | null {
   if (CPP_EXTENSIONS.has(lower.slice(lower.lastIndexOf('.')))) return 'cpp';
   if (lower.endsWith('.go')) return 'go';
   if (lower.endsWith('.rs')) return 'rust';
+  if (lower.endsWith('.java') || lower.endsWith('.kt') || lower.endsWith('.kts')) return 'java';
   return null;
 }
 
@@ -64,17 +66,16 @@ const CPP_EXTENSIONS = new Set([
  *
  * ADR-060 §4 方案 A：把「验不了」变成一句明说的话。
  */
-export type LangCategory =
-  | 'typescript'    // TS / JS —— 有 import 语义，已支持
-  | 'python'        // Python —— 有 import 语义，已支持
-  | 'cpp'           // C / C++ —— 有 include 语义，**尚未支持**
-  | 'go'            // Go —— 有 import 语义，尚未支持
-  | 'rust'          // Rust —— 有 use/mod 语义，尚未支持
-  | 'java'          // Java / Kotlin —— 有 import 语义，尚未支持
-  | 'build'         // 构建脚本 —— 不产生模块依赖边
-  | 'doc'           // 文档 —— 不产生模块依赖边
-  | 'config'        // 配置文件 —— 不产生模块依赖边
-  | 'other';        // 其余
+/**
+ * 语言类别（报告用，比 `SourceLang` 粗）。
+ *
+ * **真源在 `types.ts`** —— 这里是重新导出，不是另抄一份。
+ *
+ * 为什么要合并：这两份定义曾经各写各的，加一种语言时只改一处
+ * 就会漂 —— TypeScript 会报「类型不兼容」，或者更糟：
+ * 静默地把某个类别算错。**单一真源**比注释提醒可靠。
+ */
+export type { LangCategory } from './types.js';
 
 /** 文件扩展名 → 语言类别 */
 const LANG_BY_EXTENSION: Record<string, LangCategory> = {
@@ -93,6 +94,12 @@ const LANG_BY_EXTENSION: Record<string, LangCategory> = {
   rs: 'rust',
   // Java / Kotlin
   java: 'java', kt: 'java', kts: 'java',
+  // C# —— **有依赖语义但扫描器读不懂**
+  //
+  // 它是「代码类但验不了」的代表（ADR-061）：
+  // 报告必须能把「这是代码」与「依赖已验证」分开说，
+  // 否则一个 C# 项目会显示成「没有源码」或「全部验过」。
+  cs: 'csharp',
   // 构建脚本
   cmake: 'build', mk: 'build', bzl: 'build', bazel: 'build', ninja: 'build',
   gyp: 'build', gypi: 'build', gradle: 'build',
@@ -165,6 +172,7 @@ export function classifyLangCategory(filePath: string): LangCategory {
  *
  * ADR-062：C/C++ 也算 —— `#include` 语义已支持。
  * ADR-069：Go / Rust 也算 —— `import` / `use` 语义已支持。
+ * ADR-082：Java / Kotlin 也算 —— `import` 语义已支持。
  */
 export function isVerifiableLang(category: LangCategory): boolean {
   return (
@@ -172,7 +180,8 @@ export function isVerifiableLang(category: LangCategory): boolean {
     category === 'python' ||
     category === 'cpp' ||
     category === 'go' ||
-    category === 'rust'
+    category === 'rust' ||
+    category === 'java'
   );
 }
 
@@ -185,6 +194,11 @@ export function isVerifiableLang(category: LangCategory): boolean {
  * ADR-061：模块概况里的「代码文件数」用它判定 ——
  * `.cpp` / `.hpp` 是代码（扫描器只是读不懂），
  * `README.md` / `config.json` 不是代码。
+ *
+ * **C# 在这里但不在 `isVerifiableLang`** —— 它是「代码类但验不了」
+ * 的代表：`.cs` 有 `using` 依赖语义，但扫描器还没实现解析。
+ * 少了它，报告就没法区分「这是代码」与「依赖已验证」，
+ * 一个 C# 项目会显示成「没有源码」。
  */
 export function isCodeLangCategory(category: LangCategory): boolean {
   return (
@@ -193,7 +207,8 @@ export function isCodeLangCategory(category: LangCategory): boolean {
     category === 'cpp' ||
     category === 'go' ||
     category === 'rust' ||
-    category === 'java'
+    category === 'java' ||
+    category === 'csharp'
   );
 }
 
@@ -206,12 +221,15 @@ export function isCodeLangCategory(category: LangCategory): boolean {
  * C/C++ 覆盖（ADR-062）：#include "x"（项目内）、#include <x>（系统头）。
  * Go 覆盖（ADR-069）：import "x"、import ( ... ) 块、带别名的 import。
  * Rust 覆盖（ADR-069）：use ...;、extern crate ...;。
+ * Java / Kotlin 覆盖（ADR-082）：import a.b.C;、import static a.b.C;、
+ * import a.b.*;、import a.b.C as D;。
  */
 export function parseImports(source: string, lang: SourceLang): ImportRef[] {
   if (lang === 'python') return parsePythonImports(source);
   if (lang === 'cpp') return parseCppIncludes(source);
   if (lang === 'go') return parseGoImports(source);
   if (lang === 'rust') return parseRustImports(source);
+  if (lang === 'java') return parseJavaImports(source);
   return parseTsImports(source);
 }
 
@@ -349,6 +367,48 @@ export function findCppConditionalBlocks(
   }
 
   return blocks;
+}
+
+// ─── Java / Kotlin（ADR-082）──────────────────────────────────────────────
+
+/**
+ * Java / Kotlin 的 import 解析。
+ *
+ * Java：
+ * ```java
+ * import a.b.C;              // 类型导入
+ * import static a.b.C;       // 静态成员导入
+ * import a.b.*;              // 通配符导入
+ * import a.b.C as D;         // 别名（Kotlin 写法，Java 17 预览亦支持）
+ * ```
+ *
+ * Kotlin：
+ * ```kotlin
+ * import a.b.C
+ * import a.b.C as D
+ * import a.b.*
+ * ```
+ *
+ * **别名不是路径的一部分** —— `import a.b.C as D` 的依赖是 `a.b.C`。
+ *
+ * 归类：Java / Kotlin 的 import 都是**全限定包名**，
+ * 所以一律归 `package`；解析阶段再判断它是不是项目内部。
+ */
+function parseJavaImports(source: string): ImportRef[] {
+  const refs: ImportRef[] = [];
+  const pattern = /^[ \t]*import[ \t]+(?:static[ \t]+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*(?:\.\*)?)(?:[ \t]+as[ \t]+[A-Za-z_$][\w$]*)?[ \t]*;?/gm;
+
+  for (const match of source.matchAll(pattern)) {
+    const specifier = match[1];
+    if (!specifier) continue;
+    refs.push({
+      specifier,
+      kind: 'package',
+      line: lineOf(source, match.index ?? 0),
+    });
+  }
+
+  return dedupe(refs);
 }
 
 // ─── Go（ADR-069）─────────────────────────────────────────────────────

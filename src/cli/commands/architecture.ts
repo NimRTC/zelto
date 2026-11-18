@@ -27,6 +27,7 @@ import type { DesignDoc, DesignSummary } from '../../core/design/types.js';
 import {
   buildArchitectureReport,
   buildArchRelaxSnippet,
+  isCodeLangCategory,
   judgeArchGuard,
   LANG_CATEGORY_LABELS,
   scanArchitecture,
@@ -154,16 +155,12 @@ function formatModuleFiles(fileCount: number, codeFileCount: number, verifiedFil
  *
  * 与之相对的是构建脚本 / 文档 / 配置 —— 那些文件不产生依赖边，
  * 「没验」是正常的，不该混进「验不了」的警告里稀释掉重点。
+ *
+ * **直接用 core 的 `isCodeLangCategory`** —— 不在这里另抄一份：
+ * 抄一份就会漂（加一种语言时忘了改这里，报告会说「不产生依赖边」）。
  */
 function isCodeLang(category: LangCategory): boolean {
-  return (
-    category === 'typescript' ||
-    category === 'python' ||
-    category === 'cpp' ||
-    category === 'go' ||
-    category === 'rust' ||
-    category === 'java'
-  );
+  return isCodeLangCategory(category);
 }
 
 /**

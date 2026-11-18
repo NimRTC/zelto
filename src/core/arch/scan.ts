@@ -315,7 +315,7 @@ export function resolveCppInclude(
 /** C/C++ 头文件在省略扩展名时尝试的后缀 */
 const CPP_RESOLVE_EXTENSIONS = ['.hpp', '.h', '.hh', '.hxx', '.ipp', '.inl', '.c', '.cc', '.cpp'];
 
-// ─── Go / Rust 的解析（ADR-069）─────────────────────────────────────────
+// ─── Go / Rust / Java / Kotlin 的解析（ADR-069 / ADR-082）──────────────────
 
 /**
  * 找出 Go 模块的**模块路径**（`go.mod` 的第一行）。
@@ -371,6 +371,65 @@ export function resolveGoImport(
   const rest = specifier.slice(goModulePath.length).replace(/^\/+/, '');
   // 正好是模块根（如 `github.com/foo/bar`）→ 根目录
   return rest === '' ? '.' : rest;
+}
+
+/**
+ * Go 的**平台后缀**（文件名以 `_平台.go` 结尾）。
+ *
+ * Go 官方约定：`_GOOS.go`、`_GOARCH.go`、`_GOOS_GOARCH.go` 是文件级构建约束。
+ * 例如 `foo_linux.go` 只在 Linux 构建，`foo_windows.go` 只在 Windows 构建。
+ *
+ * 为什么要单独识别：同一个包里可能有平台专属实现。
+ * 若把 `foo_linux.go` 与 `foo_windows.go` 的依赖都无条件算进去，
+ * 两个互斥实现会形成**假的依赖环**。
+ *
+ * 判据：**只有文件名的最后一个下划线段**是已知平台名时才认 ——
+ * `foo_bar_linux.go` 仍认（`linux` 是最后一段），
+ * 但 `linux_helper.go` 不认（最后一段是 `helper`）。
+ */
+const GO_PLATFORM_SUFFIXES = new Set([
+  'aix', 'android', 'darwin', 'dragonfly', 'freebsd', 'hurd', 'illumos', 'ios',
+  'js', 'linux', 'nacl', 'netbsd', 'openbsd', 'plan9', 'solaris', 'wasip1', 'windows',
+  'unix',
+]);
+
+/** Go 的架构后缀 */
+const GO_ARCH_SUFFIXES = new Set([
+  '386', 'amd64', 'amd64p32', 'arm', 'arm64', 'arm64be', 'armbe', 'loong64', 'mips',
+  'mips64', 'mips64le', 'mips64p32', 'mips64p32le', 'mipsle', 'ppc', 'ppc64',
+  'ppc64le', 'riscv', 'riscv64', 's390', 's390x', 'sparc', 'sparc64', 'wasm',
+]);
+
+/**
+ * 解析 Go 文件名上的平台 / 架构后缀。
+ *
+ * @returns 命中的约束名（如 `linux`、`amd64`、`linux_amd64`）；没有则返回 null
+ */
+export function parseGoFileConstraints(filePath: string): string | null {
+  const fileName = filePath.slice(filePath.lastIndexOf('/') + 1);
+  if (!fileName.endsWith('.go')) return null;
+
+  const stem = fileName.slice(0, -'.go'.length);
+  const parts = stem.split('_');
+  if (parts.length < 2) return null;
+
+  const constraints: string[] = [];
+  for (let i = parts.length - 1; i >= 1; i--) {
+    const part = parts[i];
+    if (GO_PLATFORM_SUFFIXES.has(part)) {
+      constraints.unshift(part);
+      continue;
+    }
+    if (GO_ARCH_SUFFIXES.has(part)) {
+      constraints.unshift(part);
+      continue;
+    }
+    break;
+  }
+
+  if (constraints.length === 0) return null;
+  // 约束段必须连续贴着文件名末尾
+  return constraints.join('_');
 }
 
 /**
@@ -436,15 +495,27 @@ export function findCargoRoot(root: string): string | null {
  *
  * `crate::core::registry` → 找 `src/core/registry.rs` 或 `src/core/registry/mod.rs`。
  *
- * `super::` / `self::` 相对于**当前文件**的模块位置 ——
- * 解析需要当前文件的模块层级，判不准时**宁可漏**（ADR-069 §6 的已知局限）。
+ * `super::` / `self::` 相对于**当前文件**的模块位置（ADR-082）：
  *
+ * - `self::sibling` —— 当前文件所在模块下的 `sibling`
+ *   （`src/foo/mod.rs` 里的 `self::bar` → `src/foo/bar.rs`）
+ * - `super::parent` —— 上一级模块
+ *   （`src/foo/bar.rs` 里的 `super::baz` → `src/foo/baz.rs`）
+ *
+ * Rust 的模块层级 ≠ 目录层级：`mod.rs` 代表目录，`foo.rs` + `foo/` 是同一模块的两种布局，
+ * 两种都要认。
+ *
+ * @param specifier - import 说明符
+ * @param fileSet - 项目里的源文件集合
+ * @param cargoRoot - crate 根目录（相对项目根；null = 没找到）
+ * @param fromFile - 引用该 import 的文件（解析 `self::` / `super::` 时需要）
  * @returns 解析到的文件路径（相对项目根）；解析不到返回 null
  */
 export function resolveRustImport(
   specifier: string,
   fileSet: Set<string>,
   cargoRoot: string | null,
+  fromFile?: string | null,
 ): string | null {
   // crate 根相对于项目根，可能是空串（crate 就在项目根）
   const srcRoots = cargoRoot === null ? ['src', ''] : [cargoRoot === '' ? 'src' : `${cargoRoot}/src`];
@@ -458,6 +529,12 @@ export function resolveRustImport(
       }
     }
     return null;
+  }
+
+  // `self::` / `super::` —— 相对于当前文件解析（ADR-082）
+  if (specifier.startsWith('self::') || specifier.startsWith('super::')) {
+    if (!fromFile) return null;
+    return resolveRustRelativeImport(specifier, fromFile, fileSet);
   }
 
   // 只处理 `crate::` 开头的绝对路径
@@ -480,8 +557,35 @@ export function resolveRustImport(
   const segments = relPath.split('::').filter(Boolean);
   if (segments.length === 0) return null;
 
-  const modulePath = segments.join('/');
+  // 路径可能指向**模块**，也可能指向**模块里的类型**：
+  //   `use crate::core::registry;`        → 模块 `core::registry`
+  //   `use crate::core::registry::Reg;`   → 类型 `Reg`（在模块 `core::registry` 里）
+  //
+  // 所以从长到短**逐级缩短**尝试：先试完整路径，再去掉最后一段。
+  // 先命中的就是**最具体**的那个模块 —— 这与 Rust 的名字解析一致
+  // （同名模块与类型同时存在时，`use` 指的是模块）。
+  for (let take = segments.length; take >= 1; take--) {
+    const modulePath = segments.slice(0, take).join('/');
+    const hit = findRustModuleFile(modulePath, fileSet, srcRoots, cargoRoot);
+    if (hit) return hit;
+  }
 
+  return null;
+}
+
+/**
+ * 找 Rust 模块对应的文件。
+ *
+ * 候选形态：
+ *   - `<src>/<modulePath>.rs`（`foo.rs` 布局）
+ *   - `<src>/<modulePath>/mod.rs`（`foo/mod.rs` 布局）
+ */
+function findRustModuleFile(
+  modulePath: string,
+  fileSet: Set<string>,
+  srcRoots: string[],
+  cargoRoot: string | null,
+): string | null {
   for (const srcRoot of srcRoots) {
     // ① 精确匹配：`<src>/<modulePath>.rs`
     const direct = srcRoot ? `${srcRoot}/${modulePath}.rs` : `${modulePath}.rs`;
@@ -499,6 +603,185 @@ export function resolveRustImport(
       if (path.endsWith(`/${modulePath}/mod.rs`)) return path;
     }
   }
+
+  return null;
+}
+
+/**
+ * 解析 Rust 的 `self::` / `super::` 相对路径。
+ *
+ * **Rust 模块层级 ≠ 目录层级**，这是本函数的核心难点：
+ *
+ * - `src/foo/mod.rs` —— 模块 `foo`；其子模块在 `src/foo/` 下
+ * - `src/foo.rs`     —— 模块 `foo`（文件本身）；其子模块在 `src/foo/` 下
+ * - `src/foo/bar.rs` —— 模块 `foo::bar`
+ *
+ * 规则（Rust 官方模块树的镜像）：
+ * 1. 算出「当前文件所属模块的**目录**」：
+ *    - `mod.rs` → 它所在的目录（`src/foo/mod.rs` → `src/foo`）
+ *    - `foo.rs` → 它自己构成模块目录（`src/foo.rs` → `src/foo`）
+ *    - `bar.rs` → 它所在的目录（`src/foo/bar.rs` → `src/foo`）
+ * 2. `self::x` 在这个目录里找 `x.rs` 或 `x/mod.rs`；
+ * 3. `super::x` 在**上一级模块目录**里找 `x.rs` 或 `x/mod.rs`；
+ * 4. 多个 `super::` 逐级上跳。
+ *
+ * 找不到就返回 null（宁可漏边，不猜错边）。
+ */
+function resolveRustRelativeImport(
+  specifier: string,
+  fromFile: string,
+  fileSet: Set<string>,
+): string | null {
+  const segments = specifier.split('::').filter(Boolean);
+  if (segments.length === 0) return null;
+
+  // 前缀可能是 `self` / `super` / `super::super` —— 逐段剥掉
+  let baseDir = moduleDirOfRustFile(fromFile);
+  let rest = segments;
+
+  while (rest.length > 0 && (rest[0] === 'self' || rest[0] === 'super')) {
+    const prefix = rest[0];
+    rest = rest.slice(1);
+    if (prefix === 'super') {
+      baseDir = parentModuleDir(baseDir);
+    }
+    // `self` 不改变基准目录
+  }
+
+  if (rest.length === 0) {
+    // `super` / `self` 指向模块本身 —— 找 `mod.rs`
+    const modFile = baseDir ? `${baseDir}/mod.rs` : 'mod.rs';
+    return fileSet.has(modFile) ? modFile : null;
+  }
+
+  // 路径可能指向**模块**，也可能指向**模块里的类型** ——
+  // 从长到短逐级缩短尝试（与 `crate::` 同口径）。
+  for (let take = rest.length; take >= 1; take--) {
+    const path = modulePath(rest.slice(0, take));
+    const hit = findRustModuleInDir(path, baseDir, fileSet);
+    if (hit) return hit;
+  }
+
+  // 相对路径只在**模块上下文**里解析 —— 不做 crate 根兜底，
+  // 否则 `src/foo/bar.rs` 里的 `super::baz` 会错误地落到 `src/baz.rs`。
+  return null;
+}
+
+/** 把段数组拼成路径 */
+function modulePath(segments: string[]): string {
+  return segments.join('/');
+}
+
+/** 在指定目录里找 Rust 模块文件 */
+function findRustModuleInDir(
+  modulePath: string,
+  dir: string,
+  fileSet: Set<string>,
+): string | null {
+  const direct = dir ? `${dir}/${modulePath}.rs` : `${modulePath}.rs`;
+  if (fileSet.has(direct)) return direct;
+
+  const modFile = dir ? `${dir}/${modulePath}/mod.rs` : `${modulePath}/mod.rs`;
+  if (fileSet.has(modFile)) return modFile;
+
+  return null;
+}
+
+/**
+ * Rust 文件所属模块的**目录**。
+ *
+ * - `src/foo/mod.rs` → `src/foo`（模块 `foo` 的目录就是它所在的目录）
+ * - `src/foo.rs`     → `src/foo`（模块 `foo` 由这个文件构成，
+ *                      它的子模块在 `src/foo/` 下）
+ * - `src/foo/bar.rs` → `src/foo`（模块 `foo::bar` 在目录 `src/foo` 下）
+ */
+function moduleDirOfRustFile(fromFile: string): string {
+  const dir = fromFile.includes('/') ? fromFile.slice(0, fromFile.lastIndexOf('/')) : '';
+  const base = fromFile.slice(fromFile.lastIndexOf('/') + 1);
+  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
+  // 普通文件：文件名（去扩展名）就是模块名，模块目录 = 目录 + 文件名
+  const stem = base.replace(/\.rs$/, '');
+  return dir ? `${dir}/${stem}` : stem;
+}
+
+/**
+ * 上一级模块目录。
+ *
+ * `src/foo/bar` → `src/foo`；
+ * `src/foo`     → `src`；
+ * `src`         → `''`（crate 根）。
+ */
+function parentModuleDir(dir: string): string {
+  if (!dir) return '';
+  const index = dir.lastIndexOf('/');
+  if (index === -1) return '';
+  return dir.slice(0, index);
+}
+
+/**
+ * Java / Kotlin 的包路径 → 项目内部文件。
+ *
+ * Java / Kotlin 的 import 是**全限定包名**（如 `com.example.core.Foo`），
+ * 它与文件系统的对应关系取决于布局：
+ *
+ * - Gradle / Maven 常规布局：`src/main/java/<pkg>/<Class>.java`
+ * - Kotlin 常见布局：`src/<pkg>/<Class>.kt`
+ *
+ * **判不准时宁可漏边，也不要判错边** —— 判错边会产生假的「环」。
+ * 所以这里只做**确定性的路径候选匹配**：
+ *
+ * 1. 包名最后一段是类名 → 前面是包路径；
+ * 2. 候选目录按约定枚举：`src/main/java`、`src/main/kotlin`、`src/test/java`、
+ *    `src/test/kotlin`、`src`；
+ * 3. 候选文件名依次试 `.java` / `.kt`；
+ * 4. 全部命中不了就返回 null（漏边，不猜）。
+ *
+ * 通配符 import（`a.b.*`）解析不到具体类 —— 返回 null（漏边，不猜）。
+ */
+export function resolveJavaImport(
+  specifier: string,
+  fileSet: Set<string>,
+): string | null {
+  if (!specifier || specifier.endsWith('.*')) return null;
+
+  const segments = specifier.split('.').filter(Boolean);
+  if (segments.length < 2) return null;
+
+  const className = segments[segments.length - 1];
+  const packagePath = segments.slice(0, -1).join('/');
+  if (!packagePath) return null;
+
+  // 约定的源码根目录（Gradle / Maven / Kotlin 常见布局）
+  const sourceRoots = [
+    'src/main/java',
+    'src/main/kotlin',
+    'src/test/java',
+    'src/test/kotlin',
+    'src',
+  ];
+
+  for (const sourceRoot of sourceRoots) {
+    const dir = `${sourceRoot}/${packagePath}`;
+    for (const ext of ['.java', '.kt']) {
+      const candidate = `${dir}/${className}${ext}`;
+      if (fileSet.has(candidate)) return candidate;
+    }
+  }
+
+  // 兜底：按**路径后缀**匹配 —— 包路径后缀 + 类名。
+  //
+  // 真实项目的源码根不一定在 `src/main/java`（多模块 Gradle 常见
+  // `core/src/main/java/...`，也可能直接 `core/com/example/...`）。
+  // 这里只认**唯一命中**的后缀 —— 多个候选说明布局有歧义，
+  // 宁可漏边也不猜错边（假边会产生假的「环」）。
+  const suffixes = ['.java', '.kt'].map((ext) => `/${packagePath}/${className}${ext}`);
+  let matched: string | null = null;
+  for (const path of fileSet) {
+    if (!suffixes.some((suffix) => path.endsWith(suffix))) continue;
+    if (matched !== null) return null; // 多个命中 → 歧义，不猜
+    matched = path;
+  }
+  if (matched) return matched;
 
   return null;
 }
@@ -716,6 +999,15 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
         // 去掉前缀得到包目录路径 → 按目录匹配模块归属。
         //
         // 匹配不到就是外部依赖（第三方库）—— 不进模块图。
+        //
+        // ADR-082：**平台专属文件**（`_linux.go` / `_windows.go`）产生的边
+        // 只在对应平台成立。同一个包里若两个平台专属实现互指，
+        // 它们在各自平台上是**互斥**的 —— 算成无条件边会误报「环」。
+        //
+        // 判据：「这条边是否在**所有平台**都成立」。
+        //   - 源文件没有平台约束 → 边无条件成立；
+        //   - 源文件有平台约束 → 边只在该平台成立。
+        // 目标文件也有平台约束时同理。
         const packageDir = resolveGoImport(ref.specifier, goModulePath);
         if (packageDir === null) continue; // 外部依赖
 
@@ -738,8 +1030,18 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
           // `std::` 走 builtin 分支；`package`（外部 crate）不进模块图
           continue;
         }
-        const resolved = resolveRustImport(ref.specifier, fileSet, cargoRoot);
+        const resolved = resolveRustImport(ref.specifier, fileSet, cargoRoot, path);
         if (!resolved) continue; // 解析不到 → 不进模块图
+        const targetModuleOwner = ownerOf.get(resolved) ?? null;
+        if (!targetModuleOwner) continue;
+        targetModule = targetModuleOwner;
+      } else if (file.lang === 'java') {
+        // Java / Kotlin 的 import —— 全限定包名 → 约定布局下的类文件
+        //
+        // ADR-082：包路径 → 目录 → 类文件。
+        // 判不准时**宁可漏边**，不猜错边（假边会产生假的「环」）。
+        const resolved = resolveJavaImport(ref.specifier, fileSet);
+        if (!resolved) continue; // 解析不到 → 外部依赖或通配符，不进模块图
         const targetModuleOwner = ownerOf.get(resolved) ?? null;
         if (!targetModuleOwner) continue;
         targetModule = targetModuleOwner;
@@ -789,10 +1091,14 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
       // ADR-069：`condition` 是通用字段（Go 的 `//go:build`、Rust 的 `#[cfg]`）；
       // `cppCondition` 是 C++ 的旧名，保留为兼容别名。
       //
+      // ADR-082：Go 的**平台专属文件**（`_linux.go` / `_windows.go`）
+      // 同样按「条件」处理：这条边只在对应平台成立，
+      // 不是「所有平台都成立」的边 —— 否则互斥的平台实现会误报成环。
+      //
       // 区分两种情况：
       //   - 边同时有无条件的和条件的来源 → 不是「条件边」
       //   - 边**只有**条件来源 → 「条件边」（conditionalOnly）
-      const condition = ref.condition ?? ref.cppCondition;
+      const condition = ref.condition ?? ref.cppCondition ?? goFileConstraint(path, file.lang);
       if (condition) {
         edge.conditions ??= [];
         if (!edge.conditions.includes(condition)) {
@@ -902,7 +1208,7 @@ function computeCoverage(
     return scanned.some((f) => classifyLangCategory(f.path) === category);
   });
 
-  // 代码类但验不了的：C++ / Go / Rust / Java
+  // 代码类但验不了的：C#（有 `using` 语义，扫描器还没实现解析）
   const unverifiableCodeFiles = LANG_CATEGORY_KEYS.filter((category) =>
     isCodeLangCategory(category) && !isVerifiableLang(category),
   ).reduce((sum, category) => sum + (counts[category] ?? 0), 0);
@@ -933,6 +1239,16 @@ function computeCoverage(
 }
 
 /**
+ * Go 文件的平台专属约束（ADR-082）。
+ *
+ * 非 Go 文件或没有平台后缀时返回 null（= 无条件）。
+ */
+function goFileConstraint(path: string, lang: string): string | null {
+  if (lang !== 'go') return null;
+  return parseGoFileConstraints(path);
+}
+
+/**
  * 全部语言类别（顺序即报告里的顺序） */
 const LANG_CATEGORY_KEYS: LangCategory[] = [
   'typescript',
@@ -941,6 +1257,7 @@ const LANG_CATEGORY_KEYS: LangCategory[] = [
   'go',
   'rust',
   'java',
+  'csharp',
   'build',
   'doc',
   'config',
