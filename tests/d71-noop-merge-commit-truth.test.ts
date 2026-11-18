@@ -218,19 +218,17 @@ describe('D-71：ship 的 mergeCommit 必须是「本次合并产生的」，空
     );
   });
 
-  it('两个版本的 tag 不会撞在同一个提交上（v1 病灶的复现）', () => {
+  it('空操作的第二次 ship：tag 锚在版本分支 tip 上，不认领第一次 ship 的提交', () => {
     // v1 病灶：v1 ship 是空操作，HEAD 停在 v4 ship 留下的提交上 →
     // tag v1 与 tag v4 指向同一个提交。
     //
     // 这里复现：先 ship 一次（留下提交 X），再让版本分支的产物落到主干，
-    // 第二次 ship 走空操作 —— 第二次的 tag 绝不能是 X。
+    // 第二次 ship 走空操作 —— 第二次不能把 X 记成自己的 mergeCommit。
     makeProject(repo, { noop: false });
 
     const first = runShip(repo);
     assert.equal(first.code, 0, `第一次 ship 应当成功：${first.stdout}\n${first.stderr}`);
     const firstCommit = git(['rev-parse', 'HEAD'], repo).trim();
-    const firstTag = (readEvents(repo, 'version.delivered')[0].payload as Record<string, unknown>)
-      .tag as string | null;
 
     git(['reset', '-q', '--hard', 'HEAD~1'], repo);
     git(['merge', '-q', '--no-ff', 'version/vx', '-m', 'hand landed'], repo);
@@ -246,7 +244,6 @@ describe('D-71：ship 的 mergeCommit 必须是「本次合并产生的」，空
 
     const delivered = readEvents(repo, 'version.delivered');
     const last = delivered[delivered.length - 1].payload as Record<string, unknown>;
-    const secondTag = last.tag as string | null;
 
     assert.notEqual(
       last.mergeCommit,
@@ -254,11 +251,121 @@ describe('D-71：ship 的 mergeCommit 必须是「本次合并产生的」，空
       '空操作的第二次 ship 不能把第一次 ship 的提交记成自己的 mergeCommit',
     );
     assert.equal(last.mergeCommit, null, '空操作合并的 mergeCommit 必须是 null');
-    assert.notEqual(
-      secondTag,
-      firstTag,
-      '两次 ship 的 tag 不能指向同一个提交（那正是 v1 与 v4 撞车的病灶）',
+    assert.equal(last.noop, true, '第二次 ship 应标记 noop=true');
+
+    // ── D-76 D2：空操作时 tag 锚在**版本分支 tip**上 ──────────────
+    //
+    // 注意比的是**tag 指向的提交**，不是 tag 的名字 ——
+    // 同一个版本 ship 两次，tag 名字本来就该一样（都是 "vx"）。
+    //
+    // 早先这条断言写的是 `assert.notEqual(secondTag, firstTag)`：
+    // 它比的是 tag 名字，而同一个版本的两次 ship 名字必然相同。
+    // 它之所以「通过」，是因为二次 ship 时 `tagVersion()` 返回 false
+    // → 事件里记 `tag: null` → null ≠ "vx" → 断言成立。
+    //
+    // 也就是说：**D-73 的缺陷恰好满足了一条写错的断言**。
+    // D-73 修好（tag 名不再被抹成 null）后，这条断言就露馅了。
+    //
+    // 病灶的实质不是「tag 名字一样」—— 同一个版本本来就该用同一个 tag 名。
+    // 实质是「tag 指向了**别的版本**留下的提交」。
+    // 所以判据是：空操作时锚点 = 版本分支 tip（这一版的产物汇聚点）。
+    const versionTip = git(['rev-parse', 'version/vx'], repo).trim();
+    assert.equal(
+      last.anchorCommit,
+      versionTip,
+      '空操作合并的 tag 必须锚在版本分支 tip 上（ADR-076 D2）',
     );
+
+    const tagName = last.tag as string | null;
+    assert.ok(tagName, '事件里应记下 tag 名');
+    assert.equal(
+      git(['rev-parse', `${tagName}^{}`], repo).trim(),
+      versionTip,
+      'git 里这个 tag 必须指向版本分支 tip',
+    );
+  });
+
+  it('两个**不同**版本的 tag 不会撞在同一个提交上（v1 与 v4 撞车的病灶）', () => {
+    // 真正的撞车场景：**版本 A** 的 ship 是空操作，
+    // HEAD 停在**版本 B** ship 留下的提交上 ——
+    // 如果空操作时锚点取 HEAD，tag A 与 tag B 就指向同一个提交。
+    //
+    // 这里造两个版本：v1 与 v2，各有自己的版本分支与提交。
+    makeProject(repo, { noop: false });
+
+    // 加一个 v2 版本：分支与提交都与 v1 不同
+    git(['checkout', '-q', '-b', 'version/vy'], repo);
+    mkdirSync(join(repo, 'src'), { recursive: true });
+    writeFileSync(join(repo, 'src', 'other.txt'), 'other\n', 'utf-8');
+    // 只 add 这一个文件 —— `git add -A` 会把未跟踪的 `.zelto/` 状态目录
+    // 一起提交进去，切回 main 时那些文件就跟着消失了。
+    git(['add', '--', 'src/other.txt'], repo);
+    git(['commit', '-q', '-m', 'version vy work'], repo);
+    const vyTip = git(['rev-parse', 'HEAD'], repo).trim();
+    git(['checkout', '-q', 'main'], repo);
+
+    const planPath = join(repo, '.zelto', 'versions', 'plan-1.json');
+    const plan = JSON.parse(readFileSync(planPath, 'utf-8')) as Record<string, unknown>;
+    const versions = plan.versions as Array<Record<string, unknown>>;
+    versions.push({
+      version: 'vy',
+      dependsOn: [],
+      description: '第二版',
+      slices: [{ id: 'vy-slice', title: '片', module: 'm', writes: [] }],
+      integrationTestDir: 'tests/integration/vy',
+      status: 'integrated',
+      branch: 'version/vy',
+      baseCommit: git(['rev-parse', 'HEAD'], repo).trim(),
+    });
+    writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf-8');
+    writeFileSync(
+      join(repo, '.zelto', 'slices', 'vy-slice.json'),
+      JSON.stringify({
+        id: 'vy-slice',
+        title: '片',
+        state: 'completed',
+        spec: { path: 'specs/slices/vy-slice.md', frozenHash: null, frozenAt: null },
+        acceptance: { dir: 'tests/acceptance/vy-slice/', frozenHash: null, oracleSrc: null },
+        baseCommit: null,
+        drift: { detected: false, reason: null, at: null },
+        trace: { requirements: [], contracts: [], tests: [] },
+        traceWaiver: null,
+        baseline: false,
+        writes: [],
+        runs: [],
+        clarifyRounds: 0,
+        stall: { class: null, autoResolved: 0, gateRetries: 0 },
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+      'utf-8',
+    );
+
+    // 先 ship v1（正常合并，产生提交 X）
+    const cli = join(process.cwd(), 'dist', 'cli', 'index.js');
+    const shipV1 = spawnSync('node', [cli, 'version', 'ship', 'vx'], { cwd: repo, encoding: 'utf-8' });
+    assert.equal(shipV1.status, 0, `v1 ship 应当成功：${shipV1.stdout}\n${shipV1.stderr}`);
+
+    // 再 ship v2 —— 它的产物也已经在 main 上（空操作）
+    git(['merge', '-q', '--no-ff', 'version/vy', '-m', 'vy landed'], repo);
+    const plan2 = JSON.parse(readFileSync(planPath, 'utf-8')) as Record<string, unknown>;
+    (plan2.versions as Array<Record<string, unknown>>).forEach((v) => {
+      v.status = 'integrated';
+    });
+    writeFileSync(planPath, JSON.stringify(plan2, null, 2), 'utf-8');
+
+    const shipV2 = spawnSync('node', [cli, 'version', 'ship', 'vy'], { cwd: repo, encoding: 'utf-8' });
+    assert.equal(shipV2.status, 0, `v2 ship 应当成功：${shipV2.stdout}\n${shipV2.stderr}`);
+
+    const tagV1 = git(['rev-parse', 'vx^{}'], repo).trim();
+    const tagV2 = git(['rev-parse', 'vy^{}'], repo).trim();
+
+    assert.notEqual(
+      tagV1,
+      tagV2,
+      '两个版本的 tag 不能指向同一个提交（那正是 v1 与 v4 撞车的病灶）',
+    );
+    assert.equal(tagV2, vyTip, '空操作的 v2 tag 必须锚在自己的版本分支 tip 上');
   });
 
   it('空操作合并 → 输出明说「没有产生新提交」', () => {

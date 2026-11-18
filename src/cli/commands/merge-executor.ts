@@ -575,6 +575,13 @@ export async function executeMergePlan(
       phases: plan.phases.length,
       mergeCommit: commit,
       mode: noop ? 'noop' : 'merged',
+      // D-74：合并到**哪个**目标 —— 必须记。
+      //
+      // 判据「这个切片合过没有」要按目标对齐：
+      // 合进 `version/v1` 不等于合进 `main`。
+      // 缺了这个字段，D-74 的判据只能按「合过任意目标」算，
+      // 就会把「合进版本分支、还没进主干」的切片误判成「已合完」。
+      target: targetLabel,
       ...(noop
         ? {
             reason: '产物已在目标分支（无 slice 分支，按写集路径核实）',

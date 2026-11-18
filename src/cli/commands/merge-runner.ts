@@ -10,9 +10,11 @@
 // 见 docs/adr-018-no-auto-merge-on-sign.md
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { SignManager } from '../../core/gate/sign.js';
 import { branchExists, isMergedIntoHead, isMergedIntoRef, verifyArtifactsInRef, type MergeSliceInfo } from './merge-executor.js';
+import { resolveSliceOwnership } from '../../core/version/branch.js';
 import { store, events, ZELTO_DIR, worktreeManager, removeWorktree } from './shared.js';
 
 /**
@@ -217,6 +219,24 @@ export async function collectMergeCandidates(
     const manager = worktreeManager();
     const branch = manager.branchFor(req.sliceId);
 
+    // ── D-74：合过的切片不再列为候选 ──────────────────────────
+    //
+    // 判据是**事件 + git 事实双证**（详见 `alreadyLandedIn`）：
+    // 这个切片合过没有，且产物确实落在**它自己的合并目标**上。
+    //
+    // 为什么不能用「产物在不在目标上」单条判据：
+    // 那条判据（ADR-071）是为「无分支切片」设计的 ——
+    // 产物由人直接提交到目标分支，合并是空操作。
+    // 它有致命漏洞：**产物一旦在目标上，就永远在**。
+    //
+    // 实测（nimrtc-zelto，2026-11-18）：8 个**已经交付**的切片
+    // 被列为「待合并」—— 因为它们的产物在 main 上（ship 时带过去的），
+    // 而收集候选时按 main 判「产物在不在」→ 在 → 判成「还没合」。
+    //
+    // 目标要**按切片自己的归属**比 —— 合进 `version/v1` ≠ 合进 `main`。
+    const ownTarget = resolveEffectiveTarget(req.sliceId, target);
+    if (await alreadyLandedIn(req.sliceId, ownTarget)) continue;
+
     // ADR-071：**没有分支的切片**也要纳入候选 —— 它可能是
     // 「产物已由人直接提交到目标分支」的切片，合并对它是空操作。
     //
@@ -256,6 +276,230 @@ export async function collectMergeCandidates(
   }
 
   return candidates;
+}
+
+/**
+ * 这个切片对**它自己的合并目标**来说，还合不合并。（D-74）
+ *
+ * 判据是**事件流**（这个切片合过没有），不是「产物在不在目标上」。
+ *
+ * ── 病灶（实测 nimrtc-zelto，2026-11-18）────────────────────
+ *
+ * `collectMergeCandidates()` 判断「这个切片还合不合并」时，
+ * 只看**产物在不在目标 ref 上**（ADR-071 的空操作判据）。
+ * 这条判据有一个致命的漏洞：**产物一旦在目标上，就永远在**。
+ *
+ * 而切片合入的**目标**（`version/v1` / `version/v2` …）与
+ * 收集候选时判的那个目标（默认 = 主仓 HEAD = `main`）**不是同一个**。
+ *
+ * 于是：
+ *   1. v1-game-source 的产物被合进 `version/v1`（产物确实在 `version/v1` 上）；
+ *   2. `version/v1` 后来 ship 进了 main（squash 合并后产物也在 main 上）；
+ *   3. 收集候选时按 **main** 判「产物在不在」→ 在 → 判成「还没合」；
+ *   4. 但它**明明已经合进版本分支、并且版本已经交付了**。
+ *
+ * 实测后果：`zelto merge --list` 列出 8 个「待合并」的切片，
+ * 而这 8 个**全部已经交付**（v1 / v2 / v3 / v4 的切片）。
+ * 人看到「待合并 8 个」，会以为还有活没干；
+ * 实际去合，还会撞上「这批切片归属不同的合并目标，不能一次合」。
+ *
+ * 精确对应关系（实测）：
+ *
+ * | 切片的 merge.completed mode | 是否被列为待合并 |
+ * |---------------------------|----------------|
+ * | `merged`（合进版本分支）    | **是** ❌        |
+ * | `noop`（产物已在目标上）     | 否 ✅            |
+ * | 无事件（从没合过）           | 否 ✅            |
+ *
+ * 规律精确到「有没有 noop 事件」——
+ * 因为 `hasNoopMergeEvent` 恰好把 noop 的排除了，而 merged 的没排除。
+ *
+ * ── 修法 ────────────────────────────────────────────────────
+ *
+ * 判据改成：**这个切片合过没有**（事件流里有 `merge.completed`），
+ * 而不是「产物在不在目标上」。
+ *
+ * 目标要**按切片自己的归属**对齐 ——
+ * 合进 `version/v1` 不等于合进 `main`。
+ * 事件里记了 `target`，用它比。
+ *
+ * 为什么事件是可靠的判据：合并动作**必然**写 `merge.completed`
+ * （ADR-071 §3 D3：空操作也写 —— 追溯链不因为「这次没搬东西」而断）。
+ * 所以「有没有这个事件」就是「合过没有」的事实。
+ *
+ * C4：事件流是追溯的唯一证据载体，这里只读不算新判定。
+ */
+async function mergeHistoryFor(
+  sliceId: string,
+): Promise<Array<{ target?: string; mode?: string; mergeCommit?: string }>> {
+  const list = await events.read(sliceId);
+  return list
+    .filter((e) => e.type === 'merge.completed')
+    .map((e) => ({
+      target: typeof e.payload?.target === 'string' ? e.payload.target : undefined,
+      mode: typeof e.payload?.mode === 'string' ? e.payload.mode : undefined,
+      mergeCommit:
+        typeof e.payload?.mergeCommit === 'string' ? e.payload.mergeCommit : undefined,
+    }));
+}
+
+/**
+ * 这个切片**自己的**合并目标是哪个分支。
+ *
+ * 归属解析（ADR-056 §3.2）：版本计划成员扫描 → 规格 frontmatter → 兜底主干。
+ *
+ * 为什么要按切片**自己**的归属判「合过没有」（D-74）：
+ * 切片合进的是 `version/v1`，而收集候选时可能正按 `main` 判。
+ * 拿 `main` 去比 `version/v1` 的合并记录，当然对不上 ——
+ * 于是已经合完的切片被反复列为「待合并」。
+ *
+ * 归属解析不出来 → null（= 兜底主干）→ 与事件里缺 `target` 的历史事件对齐。
+ */
+function ownMergeTargetOf(sliceId: string): string | null {
+  try {
+    const slice = storeSyncRead(sliceId);
+    const ownership = resolveSliceOwnership(sliceId, {
+      versionsDir: join(ZELTO_DIR, 'versions'),
+      specPath: slice?.spec.path ?? null,
+    });
+    return ownership.branch;
+  } catch {
+    // 归属解析不出来（歧义 / 计划坏了）→ 按主干判。
+    // 不猜 —— 归属不明时，最保守的读法是「合到主干」。
+    return null;
+  }
+}
+
+/** 同步读一个切片（只拿规格路径）。读不到就返回 null。 */
+function storeSyncRead(sliceId: string): { spec: { path: string } } | null {
+  const path = join(ZELTO_DIR, 'slices', `${sliceId}.json`);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = readFileSync(path, 'utf-8');
+    return JSON.parse(raw.replace(/^\uFEFF/, '')) as { spec: { path: string } };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 这个切片**合过没有**，且产物**确实落在**该落的地方。（D-74 判据）
+ *
+ * @param sliceId 切片 id
+ * @param ownTarget 该切片**自己**的合并目标（由归属解析得出）
+ */
+async function alreadyLandedIn(
+  sliceId: string,
+  ownTarget: string | null,
+): Promise<boolean> {
+  const history = await mergeHistoryFor(sliceId);
+  if (history.length === 0) return false; // 从没合过
+
+  const label = ownTarget ?? 'main';
+  for (const h of history) {
+    // 事件记了落点 → 直接比
+    if (h.target !== undefined) {
+      if (h.target === label) return true;
+      continue;
+    }
+
+    // 历史事件没记落点 → 用 mergeCommit 的祖先关系验证（git 事实，不猜）
+    if (h.mergeCommit) {
+      if (isAncestorOfRef(h.mergeCommit, ownTarget)) return true;
+      // mergeCommit 不在目标上 —— 可能是历史重写/rebase 导致的孤儿 commit。
+      //
+      // 此时的兜底判据是**产物是否在目标 ref 的树上**（写集核实）——
+      // 这是 git 事实，与 ADR-071 的空操作判据同源，但只在这里
+      // 作为「历史事件 + 孤儿 commit」的**降级**用。
+      //
+      // 注意它与 ADR-071 的差别：那边是**唯一**判据（所以漏判），
+      // 这边是**降级**判据（前面已经有「合过没有」这个前提把着）。
+      if (await artifactsPresentOn(sliceId, ownTarget)) return true;
+      continue;
+    }
+
+    // 又没落点又没 commit → 只剩空操作事件可作证
+    if (h.mode === 'noop' && label === 'main') return true;
+  }
+  return false;
+}
+
+/**
+ * 切片的写集产物是不是已经在目标 ref 的树上。
+ *
+ * 与 `isNoopCandidate` 同源，但判的是**自己的归属目标**，
+ * 且不要求分支缺失 —— 它是「历史事件 + 孤儿 commit」的降级判据。
+ */
+async function artifactsPresentOn(
+  sliceId: string,
+  ownTarget: string | null,
+): Promise<boolean> {
+  let writes: string[] = [];
+  try {
+    const slice = await store.read(sliceId);
+    writes = slice.writes;
+  } catch {
+    return false;
+  }
+  if (writes.length === 0) return false;
+
+  const repoRoot = process.cwd();
+  const ref = ownTarget ? `refs/heads/${ownTarget}` : 'HEAD';
+  const { missing } = verifyArtifactsInRef(writes, ref, repoRoot);
+  return missing.length === 0;
+}
+
+/**
+ * 一个 commit 是不是某个 ref 的祖先。
+ *
+ * ref 用分支名（`version/v1`）或 null（= 主仓 HEAD）。
+ * 分支不存在时退化到同名 tag（版本交付后分支可能被删）。
+ */
+function isAncestorOfRef(commit: string, ref: string | null): boolean {
+  const repoRoot = process.cwd();
+  const candidates =
+    ref === null ? ['HEAD'] : [`refs/heads/${ref}`, ...versionTagRefsFor(ref)];
+
+  for (const candidate of candidates) {
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', commit, candidate], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 15_000,
+      });
+      return true;
+    } catch {
+      // 不是祖先 —— 试下一个候选 ref
+    }
+  }
+  return false;
+}
+
+/** `version/<label>` 分支对应的 tag ref 候选（版本交付后分支可能被删）。 */
+function versionTagRefsFor(branch: string): string[] {
+  if (!branch.startsWith('version/')) return [];
+  const label = branch.slice('version/'.length).trim();
+  if (!label) return [];
+  return [`refs/tags/${label}`];
+}
+
+/**
+ * 这个切片**本次应该合到哪**（D-74）。
+ *
+ * 显式给了 `--target` → 就按它判（人的显式意图最高）。
+ * 没给 → 按切片**自己的归属**判（版本计划成员扫描 → 规格 frontmatter → 兜底主干）。
+ *
+ * 为什么不能一律按「本次收集的默认目标」判：
+ * 那正是 D-74 的病灶 —— 收集时默认按主仓 HEAD（`main`）判，
+ * 而切片合进的是 `version/v1`。两个目标对不上，
+ * 已经交付的切片就被反复列为「待合并」。
+ */
+function resolveEffectiveTarget(
+  sliceId: string,
+  target?: { branch: string | null; dir: string },
+): string | null {
+  if (target?.branch) return target.branch;
+  return ownMergeTargetOf(sliceId);
 }
 
 /**
