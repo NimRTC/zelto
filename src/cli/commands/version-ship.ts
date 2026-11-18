@@ -71,7 +71,12 @@ function conflictedFiles(repoRoot: string): string[] {
  * 走的是与 `zelto merge` 同一套机制（策略选择、冲突处理、`--abort` 保护），
  * 但目标反过来：这里是把**版本分支**合进**主干**。
  */
-function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) => void): {
+function shipBranch(
+  versionBranch: string,
+  repoRoot: string,
+  log: (m: string) => void,
+  versionBaseCommit: string | null = null,
+): {
   ok: boolean;
   mergeCommit: string | null;
   conflicts: string[];
@@ -219,7 +224,64 @@ function shipBranch(versionBranch: string, repoRoot: string, log: (m: string) =>
     : ['merge', '--no-ff', versionBranch, '-m', `Ship version ${versionBranch}`];
 
   if (!canFf) {
-    log('  ℹ️  主干已前进，改用合并提交（--no-ff）。');
+    // ── D-70：分叉 ≠ 主干前进 ──────────────────────────────────
+    //
+    // 「主干已前进」与「主干历史被改写」是两回事，
+    // 但合并前的提示只说了前者 —— 人在真正撞上冲突之前
+    // 得到的诊断是**错的**。
+    //
+    // 实测（nimrtc-zelto v5，2026-11-18）：
+    // v1–v4 的 PR 是 **squash 合并**进 main 的 —— squash 重写了 main 的历史，
+    // 于是从 squash 前的分支建出来的 `version/v5` 与 main 有了**两套祖先**：
+    //
+    //   $ git merge-base --is-ancestor HEAD version/v5 ; echo $?
+    //   1                     ← 不是快进
+    //   $ git merge-base main version/v5
+    //   b4c66de…              ← 共同祖先在 squash 之前
+    //
+    // 提示说「主干已前进，改用合并提交」—— 但真正的问题是
+    // **两套历史**：合并会产生 40+ 文件的冲突，
+    // 而版本分支里的产物其实早已在 main 上（squash 带过去了）。
+    //
+    // ── 判据 ──────────────────────────────────────────────────
+    //
+    // 用**版本分支记录的基点**（`version.baseCommit`）判，而不是用祖先关系：
+    //
+    //   - 基点仍是主干 HEAD 的祖先 → 主干只是前进，历史没被动过 → 正常 --no-ff；
+    //   - 基点**不再**是主干 HEAD 的祖先 → 主干历史被改写过（squash / rebase /
+    //     filter-branch）→ 版本分支挂在旧历史上，合并必然大面积冲突。
+    //
+    // 为什么不用祖先关系判（`is-ancestor versionBranch HEAD`）：
+    // 那判的是「版本分支的提交有没有进主干」，而**正常流程里答案本来就是「没有」**
+    // —— 版本分支的产物正是要靠这次 ship 才进主干。
+    // 用它当判据会把每一次正常的 ship 都误报成分叉。
+    //
+    // 为什么必须区分这两种情况：
+    // 这是**人做决定前**唯一拿到的信号。提示说「改用合并提交」时，
+    // 人以为 --no-ff 就行；真撞上 40 文件冲突时，
+    // 人完全不知道该 rebase 版本分支还是该从主干重建。
+    const baseAncestor =
+      versionBaseCommit !== null &&
+      git(['merge-base', '--is-ancestor', versionBaseCommit, 'HEAD'], repoRoot).ok;
+
+    if (versionBaseCommit === null) {
+      // 没有基点可判 → 不乱说（保守方向：宁可说「已前进」让人撞一次，
+      // 也不要误报「分叉」把人引去 rebase 一条本来干净的历史）。
+      log('  ℹ️  主干已前进，改用合并提交（--no-ff）。');
+      log('     ℹ️  版本基点未记录，无法判断主干历史是否被改写过。');
+    } else if (baseAncestor) {
+      log('  ℹ️  主干已前进，改用合并提交（--no-ff）。');
+    } else {
+      const mb = git(['merge-base', 'HEAD', versionBranch], repoRoot);
+      const mbShort = mb.ok ? mb.stdout.trim().slice(0, 8) : '未知';
+      log('  ⚠️  版本分支与主干**已分叉**（主干历史被改写过，不是单纯的主干前进）。');
+      log(`     版本基点：${versionBaseCommit ? versionBaseCommit.slice(0, 8) : '（未记录）'}`);
+      log(`     共同祖先：${mbShort}`);
+      log('     主干历史被改写过（常见于 squash 合并 PR），版本分支还挂在旧历史上。');
+      log('     直接合并会产生大量冲突 —— 先把版本分支对齐到主干：');
+      log(`       git rebase --onto ${targetBranch ?? 'main'} ${mbShort} ${versionBranch}`);
+      log('     对齐后再重跑 zelto version ship。');
+    }
   }
 
   const res = git(args, repoRoot);
@@ -352,7 +414,12 @@ export async function handleVersionShip(
     return 0;
   }
 
-  const result = shipBranch(versionBranch, process.cwd(), (m) => f.out(m));
+  const result = shipBranch(
+    versionBranch,
+    process.cwd(),
+    (m) => f.out(m),
+    version.baseCommit ?? null,
+  );
 
   f.out(`── ship 版本 ${versionLabel} ──`);
   f.out(`   版本分支：${versionBranch}`);
