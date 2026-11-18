@@ -82,6 +82,22 @@ function shipBranch(
   conflicts: string[];
   error: string | null;
   /**
+   * 本次 ship **产生**的提交（空操作合并时为 null）。
+   *
+   * D-71：空操作时**不能**拿 HEAD 顶替 —— 那可能是上一次 ship 留下的提交，
+   * 事件与 tag 会因此指向别的版本。
+   */
+  mergeCommitProduced: boolean;
+  /**
+   * 可以代表「这一版整体长什么样」的提交（tag 打在它上面）。
+   *
+   * 空操作时是「包含本版本内容的那个提交」；版本内容不在目标分支上时为 null
+   * —— 没有诚实锚点就不打 tag。
+   */
+  anchorCommit: string | null;
+  /** 本次合并是空操作（没产生新提交） */
+  noop: boolean;
+  /**
    * 实际合进的分支名（D-63）。
    *
    * ship 合的是**主仓当前检出的分支**（ADR-056 §3.5），不一定是 `main`。
@@ -179,7 +195,16 @@ function shipBranch(
       for (const d of dirty.slice(0, 10)) log(`     ${d}`);
       if (dirty.length > 10) log('     …（只列前 10 条）');
       log('     先提交或暂存这些改动，再重新跑 zelto version ship。');
-      return { ok: false, mergeCommit: null, conflicts: [], error: '主仓工作区不干净', targetBranch };
+      return {
+        ok: false,
+        mergeCommit: null,
+        mergeCommitProduced: false,
+        anchorCommit: null,
+        noop: false,
+        conflicts: [],
+        error: '主仓工作区不干净',
+        targetBranch,
+      };
     }
   }
 
@@ -284,18 +309,100 @@ function shipBranch(
     }
   }
 
+  // ── 合并前的 HEAD ──────────────────────────────────────────
+  //
+  // 记下来，是为了判断「这次合并到底有没有产生新提交」。
+  const headBefore = head;
+
   const res = git(args, repoRoot);
   if (!res.ok) {
     const files = conflictedFiles(repoRoot);
     git(['merge', '--abort'], repoRoot);
     const message = res.stderr.trim() || res.stdout.trim() || '合并失败';
-    return { ok: false, mergeCommit: null, conflicts: files, error: message, targetBranch };
+    return {
+      ok: false,
+      mergeCommit: null,
+      mergeCommitProduced: false,
+      anchorCommit: null,
+      noop: false,
+      conflicts: files,
+      error: message,
+      targetBranch,
+    };
   }
 
   const commitRes = git(['rev-parse', 'HEAD'], repoRoot);
+  const headAfter = commitRes.ok ? commitRes.stdout.trim() : null;
+
+  // ── D-71：合并没产生新提交时，mergeCommit 不能是「HEAD 恰好是啥」 ──
+  //
+  // 合并「什么都没做」有两种：
+  //   1. 版本分支的产物早已在目标分支上（切片的产物被人直接提交到了主干，
+  //      或者上一版 ship 已经把它带进去了）→ `git merge` 报 "Already up to date"，
+  //      HEAD 不动；
+  //   2. 快进合并失败但内容一致 —— 同上，HEAD 不动。
+  //
+  // 之前的写法：`mergeCommit = rev-parse HEAD` —— **不管这次合并有没有动 HEAD**。
+  // 于是当 HEAD 恰好停在**上一次** ship 留下的提交上时，
+  // 这次 ship 的事件与 tag 就指向了**别的版本**的提交。
+  //
+  // 实测（nimrtc-zelto v1，2026-11-17）：
+  //
+  //   v4 delivered at 22:27:04  mergeCommit=5e6e0abc  （Ship version version/v4）
+  //   v1 delivered at 22:35:26  mergeCommit=5e6e0abc  ← 同一个提交！
+  //
+  // v1 的 ship 实际**没有产生新提交**（产物早就在分支上了），
+  // 但它记下了 HEAD 当时的位置 —— 那是 v4 留下的 5e6e0abc。
+  // 结果 tag `v1` 和 tag `v4` 指向**同一个提交**，
+  // `git merge-base --is-ancestor v1 main` 说「v1 不在主干里」——
+  // **追溯链在这里说了假话**（C4：事件是追溯的唯一证据载体）。
+  //
+  // 修法：合并前后 HEAD 没变 → 这次合并是空操作，
+  // mergeCommit 记 **null**，并明确说「产物早已在目标分支上」。
+  // 事件里 mergeCommit=null 是**真话**；写一个别人的提交是假话。
+  const producedCommit = headBefore !== null && headAfter !== null && headBefore !== headAfter;
+
+  // ── tag 该打在哪个提交上 ────────────────────────────────────
+  //
+  // tag 的语义（D6-C）：「**这个版本整体长什么样**」的不可变锚点。
+  // 版本分支是可变的（会被 rebase、会被删），所以要把它钉在某个提交上。
+  //
+  // 正常合并时：钉在**本次合并产生的新提交**上（那个提交只属于这一版）。
+  //
+  // 空操作合并时：本次没有新提交。剩下的候选只有两个：
+  //   - 目标分支当前位置（HEAD）—— **不能选**。
+  //     HEAD 可能是**别的版本** ship 留下的提交（实测：v1 的 ship 是空操作，
+  //     HEAD 停在 v4 的 ship 提交 5e6e0abc 上 → tag v1 与 tag v4 撞在一起）。
+  //   - **版本分支的 tip**（version/vN）—— 选它。
+  //     它是这一版的产物汇聚点，**每个版本各不相同**，
+  //     而且内容正好是「这一版整体长什么样」。
+  //
+  // 版本分支的 tip 不是 HEAD 的祖先时（内容压根没过去），没有诚实锚点 → 不打 tag。
+  const versionTipRes = git(['rev-parse', versionBranch], repoRoot);
+  const versionTip = versionTipRes.ok ? versionTipRes.stdout.trim() : null;
+  const versionIsAncestor = git(['merge-base', '--is-ancestor', versionBranch, 'HEAD'], repoRoot).ok;
+  const anchorCommit = producedCommit
+    ? headAfter
+    : (versionIsAncestor && versionTip
+      ? versionTip
+      : (versionIsAncestor ? headAfter : null));
+
+  if (!producedCommit) {
+    log('  ℹ️  合并是空操作 —— 版本分支的产物早已在目标分支上，本次没有产生新提交。');
+    log(`     目标分支当前位置：${(headAfter ?? '未知').slice(0, 8)}（不是本次合并产生的）`);
+    if (anchorCommit) {
+      log(`     tag 将打在 ${anchorCommit.slice(0, 8)}（版本分支 tip —— 这一版的产物汇聚点）。`);
+    } else {
+      log('     ⚠️  版本分支的内容不在目标分支上 —— 不打 tag（没有诚实的锚点）。');
+    }
+  }
+
   return {
     ok: true,
-    mergeCommit: commitRes.ok ? commitRes.stdout.trim() : (head ?? null),
+    mergeCommit: producedCommit ? headAfter : null,
+    mergeCommitProduced: producedCommit,
+    anchorCommit,
+    noop: !producedCommit,
     conflicts: [],
     error: null,
     targetBranch,
@@ -449,10 +556,20 @@ export async function handleVersionShip(
   }
 
   // ── D6-C：打不可变 tag ──
+  //
+  // tag 打在**锚点**上，不是「本次合并产生的提交」上：
+  // 空操作合并时本次没有新提交，但 tag 仍要能代表「这一版整体长什么样」。
+  // 前提是版本内容确实在那个提交上（anchorCommit）。
+  //
+  // D-71：没有诚实锚点（anchorCommit 为 null）时**不打 tag** ——
+  // 打一个指向别的提交的 tag，比没有 tag 更坏：
+  // `git merge-base --is-ancestor <tag> main` 会说假话。
   const tag = version.tag ?? versionTagName(versionLabel);
   let tagged = false;
-  if (!noTag && result.mergeCommit) {
-    tagged = tagVersion(tag, result.mergeCommit, process.cwd(), (m) => f.out(m));
+  if (!noTag && result.anchorCommit) {
+    tagged = tagVersion(tag, result.anchorCommit, process.cwd(), (m) => f.out(m));
+  } else if (!noTag) {
+    f.out(`  ⚠️  没有诚实的锚点可打 —— 不打 tag "${tag}"（版本内容不在目标分支上）。`);
   }
 
   // ── D3-C：ship 后在合入目标上重跑版本级验收（只提示不阻断）────────
@@ -496,7 +613,13 @@ export async function handleVersionShip(
     branch: versionBranch,
     tag: tagged ? tag : null,
     shippedTo: result.targetBranch ?? 'main',
+    // D-71：mergeCommit 只在**本次合并真的产生了提交**时才有值。
+    // 空操作合并记 null —— 那是真话；拿 HEAD 顶替是假话。
     mergeCommit: result.mergeCommit,
+    // 锚点：tag 打在哪个提交上（空操作时 = 包含本版本内容的那个提交）
+    anchorCommit: result.anchorCommit,
+    // 本次合并是空操作（没产生新提交）
+    noop: result.noop,
     mainAcceptance: mainAcceptance
       ? {
           passed: mainAcceptance.passed,
@@ -517,6 +640,8 @@ export async function handleVersionShip(
           branch: versionBranch,
           tag: tagged ? tag : null,
           mergeCommit: result.mergeCommit,
+          anchorCommit: result.anchorCommit,
+          noop: result.noop,
           mainAcceptance,
         },
         null,
@@ -529,6 +654,10 @@ export async function handleVersionShip(
   f.out('');
   // D-63：说真名 —— 「已合入主干」在主仓停在 feat/xxx 时是假的。
   f.out(`✅ 版本 ${versionLabel} 已合入 ${result.targetBranch ?? '目标分支'}${tagged ? `，tag "${tag}"` : ''}`);
+  // D-71：空操作合并要说真话 —— 本次没产生新提交。
+  if (result.noop) {
+    f.out(`   本次合并是空操作 —— 产物早已在 ${result.targetBranch ?? '目标分支'} 上，没有产生新提交。`);
+  }
   f.out(`   版本工作目录可清理：zelto version cleanup ${versionLabel}`);
 
   return 0;
