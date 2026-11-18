@@ -1,4 +1,4 @@
-// 合并运行时辅助 —— 合并真正需要的 git 动作
+﻿// 合并运行时辅助 —— 合并真正需要的 git 动作
 //
 // 这些函数原先住在 `gate-sign.ts` 里，跟着「签字即合并」一起长大。
 // ADR-018 把合并从签字路径里拆出来之后，它们跟着合并走，签字不再碰它们。
@@ -21,11 +21,12 @@ import { store, events, ZELTO_DIR, worktreeManager, removeWorktree } from './sha
  * 路径可能不存在（比如切片没改那个文件），所以逐个 add 并忽略失败。
  */
 export async function stagePaths(addPaths: string[], cwd: string): Promise<boolean> {
-  const { execSync } = await import('node:child_process');
   let staged = false;
   for (const p of addPaths) {
     try {
-      execSync(`git add -- ${p}`, { cwd, timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
+      // D-69：同样不用 execSync。路径里带空格 / 特殊字符时，
+      // shell 字符串会被拆成多个参数，add 的就不是那个路径了。
+      execFileSync('git', ['add', '--', p], { cwd, timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
       staged = true;
     } catch {
       // 路径可能不存在 —— 跳过
@@ -75,7 +76,6 @@ export async function buildAddPaths(sliceId: string): Promise<string[]> {
  * 这里多一道**提交时**的判据，两道独立。
  */
 export async function commitWorktreeChanges(sliceId: string, worktreePath: string): Promise<void> {
-  const { execSync } = await import('node:child_process');
   const manager = worktreeManager();
   const branch = manager.branchFor(sliceId);
   const addPaths = await buildAddPaths(sliceId);
@@ -83,16 +83,30 @@ export async function commitWorktreeChanges(sliceId: string, worktreePath: strin
   console.log(`  Staging: committing changes in worktree (${manager.relativePathFor(sliceId)})...`);
   const staged = await stagePaths(addPaths, worktreePath);
   if (!staged) {
-    execSync('git add -A', { cwd: worktreePath, timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
+    execFileSync('git', ['add', '-A'], { cwd: worktreePath, timeout: 15000, stdio: ['pipe', 'pipe', 'pipe'] });
   }
 
   try {
-    execSync(
-      `git commit -m "feat(${sliceId}): slice approved
-
-Auto-commit from zelto run
-
-Refs-Slice: ${sliceId}"`,
+    // D-69：这里必须用 execFileSync + 参数数组，不能用 execSync + shell 字符串。
+    //
+    // execSync 在 Windows 上走 cmd.exe，命令里的换行会被 cmd 吞掉：
+    // `git commit -m "a\n\nb"` 实际提交的信息只剩第一行 `a`，
+    // trailer（Refs-Slice: <id>）被静默丢掉 —— 追溯链断在这里，
+    // 而提交照样成功，没人看得见（slice commit 的 trailer 缺失实测）。
+    //
+    // 追溯是这个工具的立身之本，trailer 丢了不能只是"少一行字"。
+    // 多个 -m 参数由 git 自己拼段落，同样能避开 cmd 的换行处理。
+    execFileSync(
+      'git',
+      [
+        'commit',
+        '-m',
+        `feat(${sliceId}): slice approved`,
+        '-m',
+        'Auto-commit from zelto run',
+        '-m',
+        `Refs-Slice: ${sliceId}`,
+      ],
       {
         cwd: worktreePath,
         timeout: 15000,
@@ -371,7 +385,7 @@ export async function cleanupMergedSlices(
       execSync('git worktree prune', { cwd: process.cwd(), timeout: 5000, stdio: 'ignore' });
       // 在目标目录里执行：`git branch -d` 的「已合并」判据是**当前 HEAD**，
       // 在版本 worktree 里跑，判据就是「已并入版本分支」。
-      execSync(`git branch -d ${sliceBranch}`, { cwd: dir, timeout: 5000 });
+      execFileSync('git', ['branch', '-d', sliceBranch], { cwd: dir, timeout: 5000 });
       console.log(`  ✅ Deleted branch "${sliceBranch}"`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -402,7 +416,7 @@ export async function pushCurrentBranch(): Promise<void> {
       encoding: 'utf-8', timeout: 5000,
     }).trim();
 
-    execSync(`git push origin ${currentBranch}`, {
+    execFileSync('git', ['push', 'origin', currentBranch], {
       cwd: process.cwd(), timeout: 30000, stdio: 'pipe',
     });
     console.log(`  ✅ Pushed "${currentBranch}" → origin/${currentBranch}`);
