@@ -40,6 +40,7 @@ export {
   type ManagedFile,
   type AuditOptions,
   type WriteAuditResult,
+  type SliceCommits,
   auditWorktreeWrites,
   parsePorcelainStatus,
   hashFile,

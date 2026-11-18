@@ -74,14 +74,19 @@ export interface WriteAuditResult {
   /**
    * 审计**没能覆盖到本片已提交改动**时的说明（D-69）。
    *
-   * 为什么要有这个字段：审计按提交过滤后，如果本片的提交**一个都认不出**
-   * （trailer 与标题都没命中），那「已提交部分」的 diff 就是空的 ——
-   * violations 也是空的，但那是**因为看不见**才空，不是真的没有越界。
+   * 非 null 有两种含义，**必须分清**：
    *
-   * 这与「没有越界」在结果上无法区分，所以必须**显式说出来**：
-   * 否则审计就变成了 fail open —— 越界提交被放行，而所有记录都说「正常」。
+   *  1. `error` 非 null —— 提交历史**读不出来**（git 调用失败）。
+   *     此时「已提交部分」确实没被审计，**必须 fail closed**：
+   *     看不见不等于没有（fail open）。
    *
-   * 非 null 时调用方**必须**按 fail closed 处理（拒绝放行）。
+   *  2. `error` 为 null、只有本字段非 null —— 有提交**没写明归属**
+   *     （既没有 trailer 也没有标题约定）。
+   *     这些提交的改动**已经按「疑似本片」纳入审计范围**，
+   *     所以边界是**确定**的 —— 此时**不该**拒绝放行：
+   *     否则一次成功的运行会被误判成越界（ADR-067 D3 的正常场景里
+   *     基点之后本来就有别片的提交）。
+   *     本字段此时只表达「**追溯链有断节**」，用于留痕与提示。
    */
   coverageGap?: string | null;
 }
@@ -336,17 +341,65 @@ export function commitsOfSlice(
   headCommit: string,
   sliceId: string,
 ): string[] {
+  return sliceCommits(repoRoot, baseCommit, headCommit, sliceId).own;
+}
+
+/**
+ * 基点之后的提交，按归属分类（D-69）。
+ *
+ * 「本片的」= 提交信息明确声明了本片 id（trailer 或标题约定）。
+ * 「别人的」= 明确声明了**别的**切片 id —— 这些不是本片 agent 写的，
+ *   不该算成「本片的越界写入」（ADR-067 D3，实测 D-28）。
+ * 「说不清的」= 提交信息里**没有任何切片声明** —— 这才是真正的盲区：
+ *   它的改动既可能是本片的，也可能不是。审计必须**把它也纳入范围**
+ *   （宁可多看，不可漏看），而不是当作「不是本片的」放过去。
+ */
+export interface SliceCommits {
+  /** 明确声明了本片 id 的提交 */
+  own: string[];
+  /** 明确声明了别的切片 id 的提交 */
+  foreign: string[];
+  /** 没有任何切片声明的提交（盲区） */
+  unattributed: string[];
+  /** git log 读不出来时的说明（null = 读到了） */
+  error: string | null;
+}
+
+/**
+ * 分类基点之后的提交。
+ *
+ * 与 `commitsOfSlice` 的区别：后者只回答「哪些是本片的」，
+ * 这一个额外回答「哪些是别的片的」与「哪些说不清」——
+ * 后两者合起来正好是「基点之后的全部提交」。
+ */
+export function sliceCommits(
+  repoRoot: string,
+  baseCommit: string,
+  headCommit: string,
+  sliceId: string,
+): SliceCommits {
   let log: string;
   try {
     log = git(
       ['log', '--format=%H%x00%B%x00%x00', `${baseCommit}..${headCommit}`],
       repoRoot,
     );
-  } catch {
-    return [];
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // 读不出来**必须**说出来 —— 静默返回空 = 「已提交部分没被审计」
+    // 却被当成「没有越界」（fail open）。见 D-69。
+    return {
+      own: [],
+      foreign: [],
+      unattributed: [],
+      error: `读取提交历史失败: ${message}`,
+    };
   }
 
-  const result: string[] = [];
+  const own: string[] = [];
+  const foreign: string[] = [];
+  const unattributed: string[] = [];
+
   // 格式：<hash>\0<body>\0\0<hash>\0<body>\0\0 ...
   const records = log.split('\0\0');
   for (const record of records) {
@@ -356,11 +409,61 @@ export function commitsOfSlice(
     const hash = record.slice(0, sep).trim();
     const body = record.slice(sep + 1);
     if (!hash) continue;
-    if (isSliceCommit(body, sliceId)) result.push(hash);
+
+    const ids = declaredSliceIds(body);
+    if (ids.length === 0) {
+      unattributed.push(hash);
+    } else if (ids.includes(sliceId)) {
+      own.push(hash);
+    } else {
+      foreign.push(hash);
+    }
   }
+
   // git log 是从新到旧；反转成从旧到新（diff 累积时顺序不影响结果，
   // 但可读性与调试体验更好）
-  return result.reverse();
+  const rev = (a: string[]): string[] => a.reverse();
+  return { own: rev(own), foreign: rev(foreign), unattributed: rev(unattributed), error: null };
+}
+
+/**
+ * 提交信息里声明的切片 id（全部）。
+ *
+ * 两种声明形态：
+ *
+ *  1. `Refs-Slice: <id>` trailer（也可写成 `Refs-Slices: <id>, <id>`）
+ *  2. zelto 自己的提交约定：`feat(<id>): slice approved` 标题
+ *     与 `Merge slice <id>` 标题
+ *
+ * 为什么 trailer 也要认复数形态（`Refs-Slices:`）：
+ * squash 合并会把多片的提交压成一条，那条提交里写的是复数 trailer。
+ * 它是**明确声明**了归属，不能当成「认不出来」。
+ *
+ * trailer 的值可能是一串（`v1-a, v2-b`），要拆开逐个比对 ——
+ * 精确匹配，`v1-a` 不能匹配 `v1-ab`。
+ */
+export function declaredSliceIds(message: string): string[] {
+  const ids: string[] = [];
+  const text = message ?? '';
+
+  // 1. trailer：`Refs-Slice:` / `Refs-Slices:`
+  const trailerPattern = /^Refs-Slices?:\s*(.+)$/gim;
+  let match: RegExpExecArray | null;
+  while ((match = trailerPattern.exec(text)) !== null) {
+    for (const part of match[1].split(/[,;\s]+/)) {
+      const id = part.trim();
+      if (id) ids.push(id);
+    }
+  }
+
+  // 2. 标题约定
+  const subject = text.split('\n', 1)[0].trim();
+  const feat = /^feat\(([^)]+)\): slice approved$/.exec(subject);
+  if (feat) ids.push(feat[1].trim());
+  const merge = /^Merge slice (.+)$/.exec(subject);
+  if (merge) ids.push(merge[1].trim());
+
+  return ids;
 }
 
 /**
@@ -370,12 +473,7 @@ export function commitsOfSlice(
  * 值精确匹配 —— `v1-a` 不能匹配 `v1-ab`）。
  */
 export function hasRefsSlice(message: string, sliceId: string): boolean {
-  const pattern = /^Refs-Slice:\s*(.+)$/gim;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(message)) !== null) {
-    if (match[1].trim() === sliceId) return true;
-  }
-  return false;
+  return declaredSliceIds(message).includes(sliceId);
 }
 
 /**
@@ -385,7 +483,7 @@ export function hasRefsSlice(message: string, sliceId: string): boolean {
  *
  *  1. `Refs-Slice: <id>` trailer —— 精确声明，但**会丢**
  *     （Windows 上 cmd.exe 吞掉提交信息里的换行）；
- *  2. 标题 `feat(<id>): slice approved` —— zelto 自己的提交约定，
+ *  2. 标题 `feat(<id>): ...` —— zelto 自己的提交约定，
  *     标题就是提交信息的第一行，**不会被 cmd 吃掉**。
  *
  * 为什么必须有第 2 个：只认 trailer 时，trailer 一丢，
@@ -397,6 +495,8 @@ export function hasRefsSlice(message: string, sliceId: string): boolean {
 export function isSliceCommit(message: string, sliceId: string): boolean {
   if (hasRefsSlice(message, sliceId)) return true;
   const subject = (message || '').split('\n', 1)[0].trim();
+  // 标题约定只认「精确的切片 id」—— 但标题后面的说明文字随意
+  // （`feat(v1-a): slice approved` 与 `feat(v1-a): agent 产出` 都算）。
   if (subject.startsWith(`feat(${sliceId}):`)) return true;
   // 合并提交也算本片的产物 —— `Merge slice <id>`（merge-executor 写的）
   if (subject === `Merge slice ${sliceId}`) return true;
@@ -525,11 +625,33 @@ export function auditWorktreeWrites(
     // 那些东西会被算成「本片的越界写入」（实测 D-28：上一片的三个文件
     // 经一次事后快进进了本片分支，被判成本片越界）。
     //
-    // 所以给了 sliceId 就按 `Refs-Slice:` trailer 过滤，只算本片的提交。
+    // 所以给了 sliceId 就按归属分类提交（ADR-067 D3 + D-69）：
+    //
+    //   - **本片的**（声明了本片 id）→ 算进审计范围
+    //   - **别片的**（声明了别的切片 id）→ 不算（不是本片 agent 写的）
+    //   - **说不清的**（没有任何切片声明）→ **也算进审计范围**
+    //
+    // 最后一条是关键：说不清的提交，它的改动既可能是本片的、也可能不是。
+    // 把它排除 = 有可能放过真越界（fail open）；
+    // 把它算进去 = 最坏是多看几个文件（误报比漏报贵，C9 的方向）。
     const sliceId = options.sliceId ?? null;
     if (sliceId) {
-      const sliceCommits = commitsOfSlice(worktreeRoot, baseCommit, 'HEAD', sliceId);
-      for (const commit of sliceCommits) {
+      const classified = sliceCommits(worktreeRoot, baseCommit, 'HEAD', sliceId);
+
+      if (classified.error) {
+        // 提交历史读不出来 → 「已提交部分」根本没被审计到。
+        // 这与「没有越界」在结果上无法区分，必须显式说出来（fail closed）。
+        return {
+          changed: [...changed],
+          violations: [],
+          tampered: [],
+          error: classified.error,
+          coverageGap: null,
+        };
+      }
+
+      const audited = [...classified.own, ...classified.unattributed];
+      for (const commit of audited) {
         try {
           const diff = git(['diff', '--name-only', `${commit}^..${commit}`], worktreeRoot);
           for (const line of diff.split('\n')) {
@@ -540,19 +662,17 @@ export function auditWorktreeWrites(
           // 单个提交读不出来（根提交没有父提交等）——跳过，不影响其余
         }
       }
-      // D-69：认不出本片的提交 → 「已提交部分」根本没被审计到。
+
+      // D-69：认不出归属的提交**已经纳入审计范围**了 ——
+      // 所以这里不再报缺口（那会把一次成功的运行误判成越界）。
       //
-      // 此刻 violations 是空的，但那**不是**「没有越界」，
-      // 是「看不见所以没报」—— fail open。
-      //
-      // 所以显式记下这个缺口，让调用方按 fail closed 处理。
-      // 判据：基点之后有提交，但一个都没认出来。
-      // （基点之后没有提交是正常态 —— agent 还没提交任何东西。）
-      if (sliceCommits.length === 0 && hasCommitsBetween(worktreeRoot, baseCommit, 'HEAD')) {
+      // 但「说不清」这件事本身要留痕：它说明追溯链有断节
+      // （提交信息里没写自己属于哪片）。这不是越界，是**追溯不全**。
+      if (classified.unattributed.length > 0) {
         coverageGap =
-          `本片的提交一个都认不出来（既没有 \`Refs-Slice: ${sliceId}\` trailer，` +
-          `也没有 \`feat(${sliceId}): slice approved\` 标题）—— ` +
-          `已提交部分的改动**没有被审计**，不能据此说「没有越界」`;
+          `基点之后有 ${classified.unattributed.length} 条提交没写明归属` +
+          `（既没有 \`Refs-Slice: <id>\` trailer，也没有 \`feat(<id>)\` 标题）—— ` +
+          `它们的改动已按「疑似本片」纳入审计（保守方向），但追溯链在这里有断节`;
       }
     } else {
       try {
@@ -587,23 +707,4 @@ export function auditWorktreeWrites(
     (p) => !managedPaths.has(p) && !baseline.has(p) && !pathInWriteSet(p, writes),
   );
   return { changed: all, violations, tampered, error: null, coverageGap };
-}
-
-/**
- * 基点之后有没有提交（D-69）。
- *
- * 用来区分两种「本片提交认不出来」的情况：
- *  - 基点之后**没有**提交 → 正常态（agent 还没提交东西），不是缺口；
- *  - 基点之后**有**提交 → 缺口：那些改动没被审计到。
- *
- * 读不出来（基点不可达等）时返回 false —— 不因为读不到就报缺口，
- * 那是另一个错误（基点错位），不该在这里混成一句话。
- */
-function hasCommitsBetween(repoRoot: string, baseCommit: string, headCommit: string): boolean {
-  try {
-    const out = git(['rev-list', '--count', `${baseCommit}..${headCommit}`], repoRoot).trim();
-    return Number(out) > 0;
-  } catch {
-    return false;
-  }
 }

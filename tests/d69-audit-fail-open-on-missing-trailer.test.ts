@@ -19,10 +19,14 @@
 // 这一组用例守的是：
 //   1. trailer 丢了，标题 `feat(<id>): slice approved` 仍能认出本片的提交；
 //   2. 认出来之后，越界写入**照常被抓到**（兜底判据没有变成放行）；
-//   3. trailer 与标题**都**认不出时 → 审计必须**显式报覆盖缺口**
-//      （fail closed），不能返回空 violations 就装作「一切正常」；
+//   3. trailer 与标题**都**认不出时 → 那些改动**仍要纳入审计**
+//      （不能说「说不清」就不看 —— 那是 fail open）；
+//      同时留痕「追溯链有断节」，但**不拦下**这一轮
+//      （边界是确定的，只是归属没写明）；
 //   4. 基点之后**没有**提交（agent 还没提交）→ 不是缺口，正常放行；
-//   5. 别片的提交仍**不计入**本片（ADR-067 D3 的原意不能被破坏）。
+//   5. 别片的提交仍**不计入**本片（ADR-067 D3 的原意不能被破坏），
+//      且**不能**被误判成「缺口」—— 那是 D-28 的正常场景；
+//   6. 提交历史**读不出来**时 → 必须 fail closed（边界未知 ≠ 没有越界）。
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -99,7 +103,7 @@ describe('D-69：认不出本片的提交时，审计必须 fail closed', () => 
     assert.equal(res.coverageGap, null, '认出来了就不该有覆盖缺口');
   });
 
-  it('trailer 与标题都认不出 → 审计必须报覆盖缺口（fail closed）', () => {
+  it('trailer 与标题都认不出 → 改动仍纳入审计（不能因为说不清就放过）', () => {
     const base = git(['rev-parse', 'HEAD'], repo).trim();
     // 既没有 trailer，也没有 feat(<id>): 标题 —— 纯普通提交
     commitFile('out-of-scope.txt', 'oops\n', ['-m', 'chore: 说不清是谁写的']);
@@ -109,9 +113,30 @@ describe('D-69：认不出本片的提交时，审计必须 fail closed', () => 
       sliceId: 'v9-demo',
     });
 
-    assert.ok(res.coverageGap, '必须报覆盖缺口 —— 看不见不等于没有');
-    assert.match(res.coverageGap, /Refs-Slice: v9-demo/);
-    assert.match(res.coverageGap, /feat\(v9-demo\): slice approved/);
+    // 关键：说不清的提交 = 盲区，但它的改动**必须**被审计到。
+    // 排除它 = 有可能放过真越界（fail open）。
+    assert.ok(
+      res.violations.includes('out-of-scope.txt'),
+      `说不清归属的提交也必须被抓到，实际：${JSON.stringify(res.violations)}`,
+    );
+    // 同时留痕：追溯链有断节（这**不是**越界，也不该拦下这一轮）
+    assert.ok(res.coverageGap, '追溯链断节必须留痕');
+    assert.match(res.coverageGap, /没写明归属/);
+  });
+
+  it('说不清归属的提交也不该把这一轮判成越界（边界是确定的）', () => {
+    const base = git(['rev-parse', 'HEAD'], repo).trim();
+    // 说不清归属，但改的文件**在写集内**
+    commitFile('in-set.txt', 'ok\n', ['-m', 'chore: 说不清是谁写的']);
+
+    const res = auditWorktreeWrites(repo, ['in-set.txt'], {
+      baseCommit: base,
+      sliceId: 'v9-demo',
+    });
+
+    assert.deepEqual(res.violations, [], '写集内的改动不该算越界');
+    assert.equal(res.error, null, '审计本身没失败');
+    assert.ok(res.coverageGap, '但追溯链断节要留痕');
   });
 
   it('基点之后没有提交 → 不是缺口，正常放行', () => {
@@ -143,6 +168,54 @@ describe('D-69：认不出本片的提交时，审计必须 fail closed', () => 
 
     // 别片的提交不该算成本片的越界
     assert.ok(!res.violations.includes('other.txt'), '别片的提交不算本片越界');
+    assert.equal(res.coverageGap, null, '别片的提交不是「说不清归属」');
+  });
+
+  it('只有别片的提交、本片还没提交 → 不该被误判成缺口（D-28 的正常场景）', () => {
+    // 这是我上一版判据的真缺陷：
+    // 「基点之后有提交、但一个都认不出来」→ 报缺口 → 把一次成功的运行作废。
+    //
+    // 而 ADR-067 D3 的**正常场景**恰好就是这样：基点漂移 / 事后快进，
+    // 让别片的提交出现在本片分支上，而本片 agent 还没提交任何东西。
+    // 那时既不该报缺口，也不该把别片的提交算成本片越界。
+    const base = git(['rev-parse', 'HEAD'], repo).trim();
+    commitFile('other.txt', 'other\n', [
+      '-m',
+      'feat(v8-other): slice approved',
+      '-m',
+      'Refs-Slice: v8-other',
+    ]);
+
+    const res = auditWorktreeWrites(repo, ['in-set.txt'], {
+      baseCommit: base,
+      sliceId: 'v9-demo',
+    });
+
+    assert.deepEqual(res.violations, [], '别片的提交不算本片越界');
+    assert.equal(res.coverageGap, null, '认得出归属（别片）就不是缺口');
+    assert.equal(res.error, null, '审计本身没失败');
+  });
+
+  it('squash 合并的复数 trailer 也算明确声明（不算「说不清」）', () => {
+    const base = git(['rev-parse', 'HEAD'], repo).trim();
+    // squash 合并会把多片提交压成一条，写的是复数 trailer
+    commitFile('squashed.txt', 'x\n', [
+      '-m',
+      'feat(demo): 端到端演示',
+      '-m',
+      'Refs-Slices: v8-other, v9-demo',
+    ]);
+
+    const res = auditWorktreeWrites(repo, ['allowed/**'], {
+      baseCommit: base,
+      sliceId: 'v9-demo',
+    });
+
+    assert.equal(res.coverageGap, null, '复数 trailer 是明确声明，不是断节');
+    assert.ok(
+      res.violations.includes('squashed.txt'),
+      '声明了本片 id 的提交要纳入审计',
+    );
   });
 
   it('isSliceCommit：标题精确匹配切片 id', () => {
@@ -164,5 +237,30 @@ describe('D-69：认不出本片的提交时，审计必须 fail closed', () => 
     assert.equal(hasRefsSlice('feat(x)\n\nRefs-Slice: v1-a', 'v1-a'), true);
     assert.equal(hasRefsSlice('feat(x)\n\nRefs-Slice: v1-ab', 'v1-a'), false);
     assert.equal(hasRefsSlice('没有 trailer', 'v1-a'), false);
+  });
+
+  it('基点不可达 → 提交历史读不出来 → 必须报 error（fail closed）', () => {
+    // 基点指向一个不存在的 commit → `git log` 失败。
+    //
+    // 这时「已提交部分」根本没被审计到 —— 但结果与「没有越界」无法区分。
+    // 静默返回空 = fail open（越界提交被放行，所有记录都说正常）。
+    const res = auditWorktreeWrites(repo, ['allowed/**'], {
+      baseCommit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      sliceId: 'v9-demo',
+    });
+
+    assert.ok(res.error, '读不出来必须说出来 —— 边界未知 ≠ 没有越界');
+    assert.match(res.error, /读取提交历史失败/);
+  });
+
+  it('基点不可达时的 error 不得被 coverageGap 掩盖', () => {
+    const res = auditWorktreeWrites(repo, ['allowed/**'], {
+      baseCommit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      sliceId: 'v9-demo',
+    });
+
+    // error 是「fail closed」的路，coverageGap 是「只留痕」的路 —— 不能混
+    assert.ok(res.error);
+    assert.equal(res.coverageGap, null);
   });
 });

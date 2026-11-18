@@ -338,7 +338,12 @@ export async function reportAuditResult(
     return;
   }
 
-  // D-69：审计覆盖缺口 —— 结论是「没看见」而不是「没有」，必须留痕。
+  // D-69：追溯链有断节（有提交没写明归属）。
+  //
+  // 这些提交的改动**已经纳入审计范围**（按「疑似本片」处理），
+  // 所以边界是确定的 —— 这里只留痕，**不拦下**。
+  //
+  // 拦下的是 `result.error` 那条路（提交历史读不出来 → 边界未知）。
   if (result.coverageGap) {
     await events.append(sliceId, 'policy.violation', 'zelto', {
       sliceId,
@@ -346,7 +351,7 @@ export async function reportAuditResult(
       error: result.coverageGap,
       changed: result.changed,
     });
-    return;
+    // 不 return —— 还要继续看 violations（可能有真越界）
   }
 
   if (result.violations.length > 0 || result.tampered.length > 0) {
@@ -431,28 +436,13 @@ export async function enforceWriteSet(
     return { ok: false, violations: [], tampered: [], error: result.error };
   }
 
-  // D-69：审计**没能覆盖到本片已提交改动** —— 也按 fail closed 处理。
+  // D-69：追溯链有断节（有提交没写明归属）—— **不拦下**。
   //
-  // 此刻 result.violations 是空的，但那不是「没有越界」，
-  // 是「本片的提交没认出来 → 那些改动根本没被审计」。
-  // 放行 = fail open：越界提交进主干，而所有记录都说「正常」。
+  // 这些提交的改动已经按「疑似本片」纳入审计范围，边界是确定的；
+  // 拦下来只会把一次成功的运行误判成越界。
+  // 真正需要 fail closed 的是上一条（`result.error`：提交历史读不出来）。
   //
-  // 保守方向：**看不见 ≠ 没有**。
-  if (result.coverageGap) {
-    await reportAuditResult(sliceId, result);
-    await handleWriteSetViolation(sliceId, {
-      violations: [],
-      tampered: [],
-      reason: `write-set audit coverage gap: ${result.coverageGap}`,
-      ...(await resolveExtraPayload(extraPayload, [])),
-    });
-    return {
-      ok: false,
-      violations: [],
-      tampered: [],
-      error: result.coverageGap,
-    };
-  }
+  // 留痕在 reportAuditResult 里已经做了。
 
   if (result.violations.length === 0 && result.tampered.length === 0) return pass;
 
