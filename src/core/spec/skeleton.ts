@@ -56,10 +56,69 @@ export function acceptanceSkeletonTarget(acceptanceDir: string, root: string = p
 }
 
 /**
+ * 写集边界断言的**正确写法**（ADR-075）。
+ *
+ * 病灶（实测于 nimrtc-zelto，2026-11-18）：
+ *
+ *   agent 常在验收测试里加一条「写集边界」断言，判据写成
+ *   「`git diff --name-only` 的结果非空」「必须包含某个文件」。
+ *   这种判据**只在切片尚未合并时成立** ——
+ *   门禁在 agent 的 worktree 里跑时看到的是未提交改动，断言成立；
+ *   切片合并进版本分支、worktree 被清理之后，在主干复跑同一份验收，
+ *   `git diff` 为空，**断言红**。
+ *
+ *   而「这次切片改了哪些文件」是一个**历史事件**（合并前后不一样），
+ *   「这次切片的产物在不在树上」是一个**状态**（合并前后一样）。
+ *   追溯链（C4：事后可审计）要求结论可复现，所以断言必须判**状态**。
+ *
+ * 为什么放在骨架里：ADR-034 的骨架负责「每条验收标准一条用例」，
+ * 但从来没人告诉 agent「这条断言该怎么写才不出错」——
+ * 真空在这里被填上，而不是等每个 agent 各踩一次。
+ *
+ * 模板给出的是**可直接抄的形态**，不是散文描述：
+ * agent 只要把路径换成自己写集里的具体路径即可。
+ */
+export const WRITE_SET_ASSERTION_GUIDE = `// ─── 写集边界断言（ADR-075）────────────────────────────────────────────────
+//
+// 如果你要断言「本片改了哪些文件」，**不要用 \`git diff\`**。
+//
+//   错（只在未合并状态成立）：
+//     const changed = gitDiff('--name-only');
+//     assert.ok(changed.length >= 1, '写集内必须存在已追踪文件的改动');
+//     assert.ok(changed.includes('xxx'), '本片必须改 xxx');
+//   → 门禁在 worktree 里跑时绿；切片合并、worktree 清理后，主干复跑变红。
+//     同一份产品代码，两种状态两个结论 —— 追溯链断在这里。
+//
+//   对（任何状态都成立）：判「产物在不在树上」
+//     const tracked = new Set(gitLsFiles());
+//     assert.ok(tracked.has('xxx'), 'xxx 必须在树上');
+//
+// 「这次切片改了哪些文件」是**历史事件**（合并前后不一样）；
+// 「这次切片的产物在不在树上」是**状态**（合并前后一样）。
+// 追溯链要求结论可复现 → 断言必须判状态。
+//
+// 附：两个可直接用的辅助函数
+//   function gitLsFiles() { return gitOut(['ls-files']); }        // 树上所有已追踪文件
+//   function gitOut(args) {
+//     const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
+//     return (r.stdout || '').split(/\\r?\\n/).filter(Boolean);
+//   }
+//
+// 越界守卫（写集外的文件不该由本片引入）也写成状态式：
+//   const base = gitOut(['merge-base', 'HEAD', '<切片基点 commit>']);
+//   const touched = gitOut(['diff', '--name-only', '<基点>', 'HEAD']);
+//   → 用「基点之后的提交改了什么」而不是「当前工作区脏不脏」
+//   （后者会误伤别的切片留下的合法改动）。
+`;
+
+/**
  * 生成验收测试骨架的正文。
  *
  * 每条验收标准一条 `todo` 用例，用例名就是验收标准原文 —— 人和 agent
  * 都能一眼看出「这条验收标准对应哪个用例、还没写」。
+ *
+ * 末尾附「写集边界断言的正确写法」（ADR-075）—— 骨架是 agent 抄的东西，
+ * 缺的说明它就自己发明，于是发明出只在一种状态下成立的断言。
  */
 export function buildAcceptanceSkeleton(sliceId: string, criteria: string[]): string {
   const lines: string[] = [
@@ -80,6 +139,7 @@ export function buildAcceptanceSkeleton(sliceId: string, criteria: string[]): st
   }
 
   lines.push('');
+  lines.push(WRITE_SET_ASSERTION_GUIDE);
   return lines.join('\n');
 }
 
