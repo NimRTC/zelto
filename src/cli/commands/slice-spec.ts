@@ -15,8 +15,9 @@
 // C7: llm/ 只产草稿 —— 草稿不参与任何判定，进下游必须经人 confirm。
 // C2: 这一层只做参数装配与文件搬运，规格内容逻辑在 llm/ 与 core/ 里。
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { register, events, store, ZELTO_DIR, createLlmFromConfig } from './shared.js';
 import { generateSliceSpec, type SliceSpecInput } from '../../llm/generators/slice-spec.js';
@@ -117,7 +118,8 @@ export async function createSpecDraft(id: string): Promise<SpecDraftResult | nul
   const content = await generateSliceSpec(llm, input);
 
   mkdirSync(dirname(draftPath), { recursive: true });
-  writeFileSync(draftPath, content, 'utf-8');
+  // ADR-082：原子写入 + 写完读回验证；失败必抛（命令据此返回非 0）。
+  await atomicWriteText(draftPath, content);
 
   await events.append(id, 'draft.created', 'zelto', {
     kind: 'spec',
@@ -376,7 +378,25 @@ async function handleConfirm(args: string[]): Promise<number> {
   }
 
   mkdirSync(dirname(specPath), { recursive: true });
-  writeFileSync(specPath, draft, 'utf-8');
+  // ADR-082：原子写入 + 写完读回验证。
+  // **内容没变 = 失败** —— 报告「规格已确认」但文件没变，就是 D-31 那类静默失败。
+  let receipt;
+  try {
+    receipt = await atomicWriteText(specPath, draft);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    f.error('WRITE_FAILED', `写入正式规格失败：${msg}`);
+    return 1;
+  }
+
+  if (!receipt.changed) {
+    f.error(
+      'NO_CHANGE',
+      `正式规格 ${specPath} 的内容与草稿完全一致 —— 没有任何改动，未写入。` +
+      `若规格本就已正确，请直接冻结；否则请修改草稿后重试。`,
+    );
+    return 1;
+  }
 
   await events.append(id, 'draft.confirmed', 'zelto', {
     kind: 'spec',

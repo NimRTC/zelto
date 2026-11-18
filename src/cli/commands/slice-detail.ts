@@ -3,8 +3,9 @@
 
 import { register, store, events, hashSpecFile, resolveSpecDir } from './shared.js';
 import { getDefaultFormatter } from '../output-formatter.js';
-import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 
 // ─── slice (detail) ────────────────────────────────────────────────────────
 
@@ -121,6 +122,23 @@ register('slice', async (args) => {
 
 // ─── slice set (edit slice fields) ─────────────────────────────────────────
 
+/**
+ * 读一个可设置字段的当前值（ADR-082：用来判断「有没有真的改」）。
+ */
+function readFieldValue(slice: Awaited<ReturnType<typeof store.read>>, field: string): unknown {
+  if (field === 'writes') return slice.writes;
+  if (field === 'trace.requirements') return slice.trace.requirements;
+  if (field === 'trace.contracts') return slice.trace.contracts;
+  if (field === 'trace.tests') return slice.trace.tests;
+  if (field === 'baseline') return slice.baseline;
+  if (field === 'title') return slice.title;
+  if (field === 'traceWaiver') return slice.traceWaiver;
+  if (field === 'acceptance.dir') return slice.acceptance.dir;
+  if (field === 'baseCommit') return slice.baseCommit;
+  if (field === 'spec.gateCommands') return slice.spec.gateCommands;
+  return undefined;
+}
+
 const SLICE_SETTABLE_FIELDS = new Set([
   'title', 'traceWaiver', 'writes', 'acceptance.dir',
   'trace.requirements', 'trace.contracts', 'trace.tests',
@@ -171,6 +189,10 @@ register('set', async (args) => {
   try {
     const slice = await store.read(id);
     const prevState = slice.state;
+    // ADR-082：写前留一份**字段值**快照 —— 写完若目标字段没变，
+    // 就不能报告成功。（不能比整个 JSON：`store.write` 会刷新 `updatedAt`，
+    // 整个 JSON 永远会「变」。）
+    const beforeValue = readFieldValue(slice, field);
 
     // Parse value: comma-separated for array fields, boolean for boolean fields
     if (field === 'writes' || field === 'trace.requirements' || field === 'trace.contracts' || field === 'trace.tests') {
@@ -242,6 +264,17 @@ register('set', async (args) => {
     }
 
     await store.write(slice);
+
+    // ADR-082：目标字段没变 = 失败 —— 不能报「✅ Updated」，也不能写成功事件。
+    const afterValue = readFieldValue(slice, field);
+    if (JSON.stringify(beforeValue) === JSON.stringify(afterValue)) {
+      f.error(
+        'NO_CHANGE',
+        `切片 "${id}" 的 ${field} 已经是这个值 —— 没有任何改动，未写入。`,
+      );
+      return 1;
+    }
+
     await events.append(id, 'spec.drafted', 'cli', {
       sliceId: id, field, fromValue: prevState, action: 'slice.set',
     });
@@ -316,7 +349,8 @@ async function handleSliceCreate(args: string[], f: ReturnType<typeof getDefault
   }
 
   const content = generateSpecTemplate(id, title);
-  writeFileSync(specPath, content, 'utf-8');
+  // ADR-082：原子写入 + 写完读回验证；失败必抛（不报告成功）。
+  await atomicWriteText(specPath, content);
 
   f.out(`zelto slice create ${id} — ✅ Created`);
   f.out(`  File:  ${specPath}`);

@@ -24,7 +24,8 @@
  * C6: cli/policy/ 可依赖 core/，不可反向。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { atomicWriteText } from '../../../core/io/atomic-write.js';
 import { validateArchGuardRule } from '../../../core/policy/validator.js';
 import {
   appendToSection,
@@ -85,7 +86,7 @@ export interface ArchEditOptions {
  * 校验走 core 的 `validateArchGuardRule`（与 `policy validate` 同一判据）——
  * 不在这里另写一套，否则两处判据会漂。
  */
-export function addArchGuard(options: ArchAddOptions): ArchHandlerResult {
+export async function addArchGuard(options: ArchAddOptions): Promise<ArchHandlerResult> {
   const { kind, action, basis, guidance } = options;
 
   const errors: ArchHandlerError[] = [];
@@ -121,7 +122,26 @@ export function addArchGuard(options: ArchAddOptions): ArchHandlerResult {
 
   // 4. 追加到 `arch:` 段（只动那一段）
   const updated = appendToSection(yaml, 'arch', buildArchBlock(candidate));
-  writePolicyYaml(updated);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updated);
+    if (!changed) {
+      errors.push({
+        message: `Arch guard for kind "${kind}" already has identical content — nothing was changed.`,
+        code: 'E_NO_CHANGE',
+        path: 'kind',
+      });
+      return { success: false, kind, errors, arch: current, anchorNeedsUpdate: false };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    errors.push({
+      message: `Write failed: ${message}`,
+      code: 'E_WRITE_FAILED',
+      path: 'policy.yaml',
+    });
+    return { success: false, kind, errors, arch: current, anchorNeedsUpdate: false };
+  }
 
   return {
     success: true,
@@ -135,7 +155,7 @@ export function addArchGuard(options: ArchAddOptions): ArchHandlerResult {
 /**
  * 改一条护栏规则。只改显式传入的字段。
  */
-export function editArchGuard(options: ArchEditOptions): ArchHandlerResult {
+export async function editArchGuard(options: ArchEditOptions): Promise<ArchHandlerResult> {
   const { kind, action, basis, guidance } = options;
   const errors: ArchHandlerError[] = [];
 
@@ -191,7 +211,26 @@ export function editArchGuard(options: ArchEditOptions): ArchHandlerResult {
     kind,
     buildArchBlock(updatedRule),
   );
-  writePolicyYaml(updatedYaml);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updatedYaml);
+    if (!changed) {
+      errors.push({
+        message: `Arch guard for kind "${kind}" was not changed — the requested values already match.`,
+        code: 'E_NO_CHANGE',
+        path: 'kind',
+      });
+      return { success: false, kind, errors, arch: current, anchorNeedsUpdate: false };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    errors.push({
+      message: `Write failed: ${message}`,
+      code: 'E_WRITE_FAILED',
+      path: 'policy.yaml',
+    });
+    return { success: false, kind, errors, arch: current, anchorNeedsUpdate: false };
+  }
 
   return {
     success: true,
@@ -205,7 +244,7 @@ export function editArchGuard(options: ArchEditOptions): ArchHandlerResult {
 /**
  * 删掉一条护栏规则。
  */
-export function removeArchGuard(kind: string): ArchHandlerResult {
+export async function removeArchGuard(kind: string): Promise<ArchHandlerResult> {
   const yaml = readPolicyYaml();
   const current = listArchGuards(yaml);
 
@@ -246,7 +285,40 @@ export function removeArchGuard(kind: string): ArchHandlerResult {
     };
   }
 
-  writePolicyYaml(updatedYaml);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updatedYaml);
+    if (!changed) {
+      return {
+        success: false,
+        kind,
+        errors: [
+          {
+            message: `Arch guard for kind "${kind}" was not changed — nothing was written.`,
+            code: 'E_NO_CHANGE',
+            path: 'kind',
+          },
+        ],
+        arch: current,
+        anchorNeedsUpdate: false,
+      };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      kind,
+      errors: [
+        {
+          message: `Write failed: ${message}`,
+          code: 'E_WRITE_FAILED',
+          path: 'policy.yaml',
+        },
+      ],
+      arch: current,
+      anchorNeedsUpdate: false,
+    };
+  }
 
   return {
     success: true,
@@ -298,9 +370,14 @@ function readPolicyYaml(): string {
   return readFileSync(POLICY_PATH, 'utf-8');
 }
 
-/** 写 policy.yaml 全文 */
-function writePolicyYaml(content: string): void {
-  writeFileSync(POLICY_PATH, content, 'utf-8');
+/**
+ * 写 policy.yaml 全文（ADR-082：原子写入 + 写完读回验证；失败必抛）。
+ *
+ * 返回 `changed` —— 「内容没变」是失败，调用方据此不能报告成功。
+ */
+async function writePolicyYaml(content: string): Promise<boolean> {
+  const receipt = await atomicWriteText(POLICY_PATH, content);
+  return receipt.changed;
 }
 
 /**

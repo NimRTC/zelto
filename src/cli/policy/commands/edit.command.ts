@@ -44,7 +44,7 @@ export interface EditOptions {
 export async function editPolicyRule(options: EditOptions): Promise<number> {
   const { ruleId, path, operation, action, basis, guidance, description, priority, json: isJson } = options;
 
-  const result: EditHandlerResult = handlerEdit({
+  const result: EditHandlerResult = await handlerEdit({
     ruleId, path, operation, action, basis, guidance, description, priority,
   });
 

@@ -23,6 +23,7 @@
 // C4: 事件是追溯的唯一证据载体 —— 这次修正也必须留痕。
 
 import { createInterface } from 'node:readline';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { VersionStore } from '../../core/version/store.js';
 import {
   applyPlanPatch,
@@ -287,7 +288,19 @@ export async function planPatch(args: string[]): Promise<number> {
     }
   }
 
-  await versionStore.save(patched);
+  // ADR-082：写完必须能核对 —— 内容没变就是失败，不能报成功。
+  let receipt;
+  try {
+    receipt = await atomicWriteText(versionStore.pathFor(id), JSON.stringify(patched, null, 2));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    f.error('WRITE_FAILED', `写入版本计划失败：${msg}`);
+    return 1;
+  }
+  if (!receipt.changed) {
+    f.error('NO_CHANGE', '版本计划文件内容没有变化 —— 未写入任何内容。');
+    return 1;
+  }
 
   // C4：每次修正都写 append-only 事件
   await events.append(draftEventKey('plan', id), 'draft.revised', 'zelto', {

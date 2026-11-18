@@ -1,8 +1,9 @@
 // VersionStore — file-based persistence for version plans
 // Stored as JSON in .zelto/versions/<id>.json
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteText } from '../io/atomic-write.js';
 import type { VersionPlan, VersionStatus, VersionSummary } from './types.js';
 
 export class VersionStore {
@@ -18,10 +19,16 @@ export class VersionStore {
     }
   }
 
+  /** 计划文件的路径（ADR-082：调用方需要可核对的写入凭据） */
+  pathFor(id: string): string {
+    return join(this.dir, `${id}.json`);
+  }
+
   async save(plan: VersionPlan): Promise<void> {
     this.ensureDir();
-    const filePath = join(this.dir, `${plan.id}.json`);
-    writeFileSync(filePath, JSON.stringify(plan, null, 2), 'utf-8');
+    const filePath = this.pathFor(plan.id);
+    // ADR-082：原子写入 + 写完读回验证；失败必抛，不静默。
+    await atomicWriteText(filePath, JSON.stringify(plan, null, 2));
   }
 
   async read(id: string): Promise<VersionPlan> {

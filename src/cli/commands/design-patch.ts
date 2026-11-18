@@ -23,6 +23,7 @@
 // C4: 每次修正写 append-only 事件（`draft.revised`）
 
 import { createInterface } from 'node:readline';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { DesignStore } from '../../core/design/store.js';
 import { applyPatch, type ModulePatch } from '../../core/design/patch.js';
 import { register, events, ZELTO_DIR } from './shared.js';
@@ -194,7 +195,19 @@ export async function designPatch(args: string[]): Promise<number> {
     }
   }
 
-  await designStore.save(patched);
+  // ADR-082：写完必须能核对 —— 内容没变就是失败，不能报成功。
+  let receipt;
+  try {
+    receipt = await atomicWriteText(designStore.pathFor(id), JSON.stringify(patched, null, 2));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    f.error('WRITE_FAILED', `写入设计失败：${msg}`);
+    return 1;
+  }
+  if (!receipt.changed) {
+    f.error('NO_CHANGE', '设计文件内容没有变化 —— 未写入任何内容。');
+    return 1;
+  }
 
   // C4：每次修正都写 append-only 事件
   await events.append(draftEventKey('design', id), 'draft.revised', 'zelto', {

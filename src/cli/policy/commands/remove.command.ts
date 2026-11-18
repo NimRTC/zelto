@@ -30,7 +30,7 @@ export interface RemoveOptions {
 export async function removePolicyRule(options: RemoveOptions): Promise<number> {
   const { ruleId, json: isJson } = options;
 
-  const result: RemoveHandlerResult = handlerRemove({ ruleId });
+  const result: RemoveHandlerResult = await handlerRemove({ ruleId });
 
   if (!result.success) {
     if (isJson) {

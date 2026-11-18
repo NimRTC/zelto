@@ -46,7 +46,7 @@ export interface AddOptions {
 export async function addPolicyRule(options: AddOptions): Promise<number> {
   const { ruleId, path, operation, action, basis, guidance, description, priority } = options;
 
-  const result: AddHandlerResult = handlerAdd({
+  const result: AddHandlerResult = await handlerAdd({
     id: ruleId,
     path,
     ...(operation ? { operation } : {}),

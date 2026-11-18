@@ -186,6 +186,20 @@ export function listSectionEntries(
       }
     }
 
+    // **条目不吞掉尾部的空行**（ADR-082）。
+    //
+    // 段在文件末尾时，`range.end` = `lines.length`，
+    // 而 `split('\n')` 会在文件末尾的换行符之后多出一个空串。
+    // 不裁掉的话，`replaceSectionEntry` 把条目块换回去时
+    // 会把那个空串**一起吃掉** —— 文件末尾的换行没了，
+    // 于是「内容其实没变」也会被判定成「变了」。
+    //
+    // 这是 D-31 / ADR-082 那族「静默失败」的变种：
+    // 工具报告成功，文件却被悄悄改了一个字节。
+    while (end > i + 1 && lines[end - 1].trim() === '') {
+      end -= 1;
+    }
+
     entries.push({ id, start: i, end });
     i = end - 1;
   }

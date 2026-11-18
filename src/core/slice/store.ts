@@ -1,8 +1,9 @@
 // Slice persistence — read/write .zelto/slices/<id>.json
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { atomicWriteText } from '../io/atomic-write.js';
 import { type SliceState, transitionSlice, isTerminalState, type SliceEvent } from './state.js';
 import type { StallInfo } from '../stall/types.js';
 import type { SliceType } from './kind.js';
@@ -192,7 +193,8 @@ export class SliceStore {
     // 之后不再产生新的坏文件。
     slice.stall = normalizeStall(slice.stall);
     slice.updatedAt = new Date().toISOString();
-    await writeFile(p, JSON.stringify(slice, null, 2), 'utf-8');
+    // ADR-082：统一写入原语 —— 原子替换 + 写完读回验证 + 失败必抛。
+    await atomicWriteText(p, JSON.stringify(slice, null, 2));
   }
 
   async exists(id: string): Promise<boolean> {

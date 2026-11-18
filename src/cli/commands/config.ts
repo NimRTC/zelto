@@ -1,8 +1,9 @@
 // Config command — view and modify zelto configuration
 // Usage: zelto config [get|set] [key] [value]
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { register, ZELTO_DIR, loadConfig } from './shared.js';
 
 register('config', async (args) => {
@@ -163,8 +164,29 @@ real value — use it only when a script needs the actual credential.
       }
     }
 
-    writeFileSync(configPath, newLines.join('\n'), 'utf-8');
+    const updatedContent = newLines.join('\n');
+
+    // ADR-082：写完必须**读回验证**，而且「内容没变」就是失败 ——
+    // 报告「✅ 已设置」但文件没变，就是 D-31 那类静默失败。
+    let receipt;
+    try {
+      receipt = await atomicWriteText(configPath, updatedContent);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Config write failed: ${msg}`);
+      return 1;
+    }
+
+    if (!receipt.changed) {
+      console.error(
+        `Config key "${key}" already has that value — nothing was changed. ` +
+        `Nothing was written.`,
+      );
+      return 1;
+    }
+
     console.log(isSecretKey(key) ? `✅ ${key} = ${maskSecret(value)}` : `✅ ${key} = ${value}`);
+    console.log(`   Written: ${receipt.bytes} bytes, ${receipt.hash}`);
     return 0;
   }
 

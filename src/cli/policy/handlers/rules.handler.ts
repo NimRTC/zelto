@@ -29,7 +29,8 @@
  * C6: cli/policy/ 可依赖 core/，不可反向。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { atomicWriteText } from '../../../core/io/atomic-write.js';
 import { validateRule } from '../../../core/policy/validator.js';
 import {
   appendToSection,
@@ -107,7 +108,7 @@ export interface EditHandlerResult {
  * 校验走 core 的 `validateRule`（与 `policy validate` 同一判据）——
  * 不在这里另写一套，否则两处判据会漂。
  */
-export function addPolicyRule(options: AddPolicyRuleOptions): AddHandlerResult {
+export async function addPolicyRule(options: AddPolicyRuleOptions): Promise<AddHandlerResult> {
   const errors: AddRuleError[] = [];
 
   // 1. 单条规则的合法性
@@ -147,7 +148,32 @@ export function addPolicyRule(options: AddPolicyRuleOptions): AddHandlerResult {
 
   // 4. 追加到 `rules:` 段（**只动那一段** —— 其余逐字节保留）
   const updated = appendToSection(yaml, 'rules', buildRuleBlock(options));
-  writePolicyYaml(updated);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updated);
+    if (!changed) {
+      return {
+        success: false,
+        ruleId: options.id,
+        errors: [
+          {
+            message: `Rule "${options.id}" already exists with identical content — nothing was changed.`,
+            code: 'NO_CHANGE',
+            path: 'id',
+          },
+        ],
+        totalRulesAfter: current.length,
+      };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      ruleId: options.id,
+      errors: [{ message: `Write failed: ${message}`, code: 'WRITE_FAILED', path: 'policy.yaml' }],
+      totalRulesAfter: current.length,
+    };
+  }
 
   return {
     success: true,
@@ -162,7 +188,7 @@ export function addPolicyRule(options: AddPolicyRuleOptions): AddHandlerResult {
  *
  * **只删那一块** —— `arch:` 段、`anchors:` 段、注释一律保留。
  */
-export function removePolicyRule(options: RemoveOptions): RemoveHandlerResult {
+export async function removePolicyRule(options: RemoveOptions): Promise<RemoveHandlerResult> {
   const { ruleId } = options;
 
   const yaml = readPolicyYaml();
@@ -195,7 +221,26 @@ export function removePolicyRule(options: RemoveOptions): RemoveHandlerResult {
   }
 
   const updated = removeSectionEntry(yaml, 'rules', 'id', ruleId);
-  writePolicyYaml(updated);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updated);
+    if (!changed) {
+      return {
+        success: false,
+        ruleId,
+        message: `Rule "${ruleId}" was not changed — nothing was written.`,
+        totalRulesAfter: current.length,
+      };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      ruleId,
+      message: `Write failed: ${message}`,
+      totalRulesAfter: current.length,
+    };
+  }
 
   return {
     success: true,
@@ -208,7 +253,7 @@ export function removePolicyRule(options: RemoveOptions): RemoveHandlerResult {
 /**
  * 改一条规则的字段。只改显式传入的字段。
  */
-export function editPolicyRule(options: EditOptions): EditHandlerResult {
+export async function editPolicyRule(options: EditOptions): Promise<EditHandlerResult> {
   const { ruleId, path, operation, action, basis, guidance, description, priority } = options;
 
   const yaml = readPolicyYaml();
@@ -324,7 +369,26 @@ export function editPolicyRule(options: EditOptions): EditHandlerResult {
     fields,
     matchFields,
   );
-  writePolicyYaml(updated);
+  // ADR-082：写失败或内容没变 → 不能报告成功。
+  try {
+    const changed = await writePolicyYaml(updated);
+    if (!changed) {
+      return {
+        success: false,
+        ruleId,
+        message: `Rule "${ruleId}" was not changed — the requested values already match. Nothing was written.`,
+        changes: {},
+      };
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      ruleId,
+      message: `Write failed: ${message}`,
+      changes: {},
+    };
+  }
 
   return {
     success: true,
@@ -347,9 +411,14 @@ function readPolicyYaml(): string {
   return readFileSync(POLICY_PATH, 'utf-8');
 }
 
-/** 写 policy.yaml 全文 */
-function writePolicyYaml(content: string): void {
-  writeFileSync(POLICY_PATH, content, 'utf-8');
+/**
+ * 写 policy.yaml 全文（ADR-082：原子写入 + 写完读回验证；失败必抛）。
+ *
+ * 「内容没变」也算失败 —— 调用方据此**不能**报告成功。
+ */
+async function writePolicyYaml(content: string): Promise<boolean> {
+  const receipt = await atomicWriteText(POLICY_PATH, content);
+  return receipt.changed;
 }
 
 /**

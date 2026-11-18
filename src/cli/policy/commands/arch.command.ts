@@ -102,7 +102,7 @@ export async function listArchGuardsCommand(options: ArchListOptions): Promise<n
 
 /** `zelto policy arch add` */
 export async function addArchGuardCommand(options: ArchAddOptions): Promise<number> {
-  const result = addArchGuard({
+  const result = await addArchGuard({
     kind: options.kind,
     action: options.action,
     basis: options.basis,
@@ -114,7 +114,7 @@ export async function addArchGuardCommand(options: ArchAddOptions): Promise<numb
 
 /** `zelto policy arch edit` */
 export async function editArchGuardCommand(options: ArchEditOptions): Promise<number> {
-  const result = editArchGuard({
+  const result = await editArchGuard({
     kind: options.kind,
     ...(options.action !== undefined ? { action: options.action } : {}),
     ...(options.basis !== undefined ? { basis: options.basis } : {}),
@@ -126,7 +126,7 @@ export async function editArchGuardCommand(options: ArchEditOptions): Promise<nu
 
 /** `zelto policy arch remove` */
 export async function removeArchGuardCommand(options: ArchRemoveOptions): Promise<number> {
-  const result = removeArchGuard(options.kind);
+  const result = await removeArchGuard(options.kind);
   return reportArchResult(result, options.json, `arch 规则 "${options.kind}" 已删除。`);
 }
 

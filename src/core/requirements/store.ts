@@ -1,8 +1,9 @@
 // RequirementStore — file-based persistence for requirement documents
 // Stored as Markdown files in .zelto/requirements/<id>.md with YAML frontmatter
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { atomicWriteText } from '../io/atomic-write.js';
 import type { RequirementDoc, RequirementStatus, RequirementSummary } from './types.js';
 
 const FRONTMATTER_REGEX = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/;
@@ -100,7 +101,8 @@ export class RequirementStore {
   async save(doc: RequirementDoc): Promise<void> {
     this.ensureDir();
     const filePath = join(this.dir, `${doc.id}.md`);
-    writeFileSync(filePath, this.docToMarkdown(doc), 'utf-8');
+    // ADR-082：原子写入 + 写完读回验证；失败必抛，不静默。
+    await atomicWriteText(filePath, this.docToMarkdown(doc));
   }
 
   async read(id: string): Promise<RequirementDoc> {

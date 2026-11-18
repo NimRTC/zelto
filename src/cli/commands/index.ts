@@ -153,8 +153,15 @@ export async function runCLI(argv: string[]): Promise<number> {
 
   // 近形命令别名（D-5）：`requirement` → `require` 这类拼法先查表，
   // 命中就直接跑真命令 —— 不该为「命令名拼错」付一次 LLM 调用的代价。
+  //
+  // **但真命令优先**（ADR-082）：`slice` 本身就是命令
+  // （`slice create` / `slice validate` / `slice <id>` 详情），
+  // 而别名表里 `slice → slices`。别名只该在**真命令不存在时**兜底，
+  // 否则别名会把真命令**整个遮住** —— `zelto slice create s1`
+  // 会跑到 `slices`（列表）上去，输出「No slices found.」还退出码 0。
+  // 这正是「工具报告成功、实际什么都没做」那族缺陷。
   const alias = COMMAND_ALIASES[cmd.toLowerCase()];
-  const resolvedCmd = alias && commands[alias] ? alias : cmd;
+  const resolvedCmd = commands[cmd] ? cmd : alias && commands[alias] ? alias : cmd;
 
   const handler = commands[resolvedCmd];
   if (!handler) {

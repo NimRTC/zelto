@@ -11,9 +11,10 @@
  * C6: cli/ depends on shared utilities from shared.ts
  */
 
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { execSync } from 'node:child_process';
+import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { register, SLICES_DIR, ZELTO_DIR } from './shared.js';
 import { colors } from '../color.js';
 
@@ -345,6 +346,9 @@ export async function writePatchFiles(
   }
 
   // Write patch files
+  //
+  // ADR-082：统一走原子写入原语 —— 写完读回验证，失败必抛。
+  // 写失败不能继续往下走（更不能写「成功」事件）。
   const writtenFiles: string[] = [];
   let seq = 1;
   for (const sliceId of orderedSliceIds) {
@@ -354,7 +358,7 @@ export async function writePatchFiles(
     const seqStr = String(seq).padStart(3, '0');
     const filename = `${sliceId}-${seqStr}.patch`;
     const filePath = join(PATCHES_DIR, filename);
-    writeFileSync(filePath, patchContent, 'utf-8');
+    await atomicWriteText(filePath, patchContent);
     writtenFiles.push(filename);
     seq++;
   }
@@ -377,7 +381,7 @@ export async function writePatchFiles(
       },
     });
     const eventFile = join(eventsDir, `patch-content-${Date.now()}.jsonl`);
-    writeFileSync(eventFile, eventEntry + '\n', 'utf-8');
+    await atomicWriteText(eventFile, eventEntry + '\n');
   } catch {
     // Non-fatal
   }
