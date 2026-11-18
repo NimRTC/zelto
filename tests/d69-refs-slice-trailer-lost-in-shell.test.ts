@@ -67,6 +67,34 @@ afterEach(() => {
 
 describe('D-69：Refs-Slice trailer 不能被 shell 吞掉', () => {
   it('execSync + 多行 shell 字符串会丢 trailer（这就是病灶本身）', () => {
+    // 这个 bug 是 **Windows 特有**的：execSync 在 Windows 上走 cmd.exe，
+    // cmd.exe 把命令里的换行当成命令分隔符；Linux/macOS 上走 /bin/sh，
+    // 引号内的换行原样传给 git —— 旧写法在那边是好的。
+    //
+    // 所以这条用例**只在 Windows 上有意义**。
+    // 钉住「旧写法在 Windows 上会坏」的价值是：
+    // 一旦 cmd.exe 的行为变了（或有人把这段搬到别的平台），它会主动报错提醒重写。
+    if (process.platform !== 'win32') {
+      // 非 Windows：反向断言 —— 旧写法在 POSIX shell 下**不会**丢 trailer。
+      // 这不是「跳过」，是把平台差异记进测试。
+      writeFileSync(join(repo, 'a.txt'), 'a\n');
+      git(['add', '-A'], repo);
+      execSync(
+        `git commit -m "feat(v9-demo): slice approved
+
+Auto-commit from zelto run
+
+Refs-Slice: v9-demo"`,
+        { cwd: repo, stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const msg = git(['log', '-1', '--format=%B'], repo);
+      assert.ok(
+        msg.includes('Refs-Slice'),
+        'POSIX shell 下旧写法不该丢 trailer —— 若这条失败，说明 execSync 的行为变了',
+      );
+      return;
+    }
+
     writeFileSync(join(repo, 'a.txt'), 'a\n');
     git(['add', '-A'], repo);
 
