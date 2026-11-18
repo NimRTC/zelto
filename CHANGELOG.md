@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-18
+
+### Published
+- **First release on npm.** `npm install -g zelto` installs the CLI and the
+  standalone hook. This is the first release that actually reached the
+  registry — the 0.5.0 entry below was written before the publish had
+  happened, and it has been corrected rather than left to mislead.
+  `release-status.json` records the state; the release pipeline maintains it.
+
 ### Added
+- **The write-set reservation is now enforced at runtime for Cursor and Codex, not just Claude Code** (ADR-083). C9 says the reservation is enforced "primarily by a per-write PreToolUse hook, with a post-run git audit as backstop" — but the audit backstop is **fail open** (it reports, it doesn't block). So "the hook isn't installed" meant "the only hard gate is off, and all that remains is a witness who reports but doesn't stop". The judgment core (`judgeWriteTargets`) is **untouched**: each harness's input is normalized into a unified payload, and the verdict is rendered back into that harness's envelope. `preToolUse` for Cursor, `PreToolUse` for Codex, `zelto hook --install` now installs all three by default, and the `harness` field in the event stream records the **real** source instead of a hardcoded `claude-code`. Cursor's hook **fails open by default**, so the config must set `failClosed: true` explicitly — the status command reports "installed but NOT failClosed" rather than a reassuring "installed". DeepSeek Harness needs no code: its bridge reads the very same `hooks.json`.
+- **The cockpit can now be taken over** (ADR-084). ADR-072 promised "read-only view + one sign action" and the sign action was already there — but the gap was real: you could approve but not reject, could not answer an agent's question, and could not pull the emergency brake. Those are exactly the moments the cockpit exists for: an agent blocked on a question sent you back to the terminal. Now the sign card has a "reject" button, the slice detail page has an answer box, and the top bar carries a permanent "halt" button — handing control back should never require hunting for a view first. **All four actions call the same core implementations the CLI uses** (no re-implementation, so no forked verdicts). "Answer" only **records** the answer; resuming the agent stays in the CLI, because a live agent session does not belong inside an HTTP request. The cockpit has the brakes, not the accelerator: `run` / `gate` / `freeze` / `resume` are still CLI-only. A third layer of defense was added to the write endpoints: `Content-Type: application/json` is now required, since `fetch(mode:'no-cors')` can send a `text/plain` body that token + Origin alone will not stop.
+- **The publish status has a single source of truth** (`release-status.json`). The README and this changelog used to claim "Published to npm" while `npm view zelto` returned 404 — the same shape as D-63 and D-73: **the claim and the reality disagree, and the document is the one that is wrong.** The release pipeline now flips `published: true` after a successful `npm publish`, and both documents follow that file instead of being updated by hand.
 - **Dead slices can now be cleaned up in one command** (ADR-053). ADR-047 made
   a failed agent stop stranding its slice in `running`, but the leftovers from
   before that fix were still sitting there: they occupied the "running" count
@@ -240,15 +252,15 @@
   unmapped — the report was misleading and the guard could block legitimate
   write sets. Other confirmed designs are listed in the report so `--design
   <id>` is discoverable.
-- **npm is the only distribution channel — but the first publish has not
-  happened yet.** The release pipeline is wired up (releases run from a tag:
-  `v<version>` must match the version in `package.json`, the tarball is
-  installed into a clean directory and exercised — `zelto init` + policy-anchor
-  self-check — before `npm publish --provenance` runs), and the repository's
-  `Dockerfile` and `docker-compose.yml` stay as development conveniences that
-  do not carry releases. **As of this writing `npm view zelto` still returns
-  404**, so install from source for now
-  (`git clone` + `pnpm install && pnpm build && pnpm link --global`).
+- **npm is the only distribution channel.** The release pipeline is wired up
+  (releases run from a tag: `v<version>` must match the version in
+  `package.json`, the tarball is installed into a clean directory and
+  exercised — `zelto init` + policy-anchor self-check — before
+  `npm publish --provenance` runs), and the repository's `Dockerfile` and
+  `docker-compose.yml` stay as development conveniences that do not carry
+  releases. **At the time this entry was written the first publish had not
+  happened yet** (`npm view zelto` returned 404) and installation was
+  from source; the actual first release is 0.6.0 above.
   `release-status.json` is the single source of truth for whether the package
   is actually on the registry — the README and this changelog both follow it.
 
