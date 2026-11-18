@@ -2,7 +2,29 @@
 
 **日期**：2026-11-18
 **来源**：`docs/zelto-实战演练记录-20261116.md` §8「第三轮遗留状态」的「仍然遗留」清单
-**任务**：把这 5 条全部修掉，每条都要有回归测试；改契约的写 ADR
+**状态**：**5 条全部完成**（缺陷编号 D-75 ~ D-79）
+
+---
+
+## 结论
+
+| 编号 | 缺陷 | 状态 | 回归测试 |
+|---|---|---|---|
+| D-75 | Java / Kotlin 依赖解析缺失 | ✅ 完成 | `tests/d75-d77-arch-language-parsing.test.ts` |
+| D-76 | Go 的文件名构建约束 | ✅ 完成 | 同上 |
+| D-77 | Rust 的 `super::` / `self::` 层级解析 | ✅ 完成 | 同上 |
+| D-78 | 「静默失败」防线只覆盖 policy 编辑路径 | ✅ 完成 | `tests/d78-verified-file-writes.test.ts` |
+| D-79 | 合并清理报错措辞 | ✅ 完成 | `tests/d79-merge-cleanup-wording.test.ts` |
+
+**契约变更**：ADR-082（`docs/adr/adr-082-verified-file-writes.md`）—— 统一写入原语。
+
+**门禁**（2026-11-18）：
+
+| 检查 | 结果 |
+|---|---|
+| `npm test` | ✅ 2465 passed / 0 failed / 546 suites |
+| `npm run lint` | ✅ 通过（biome） |
+| `npm run check:encoding` | ✅ 通过（18 个文件无乱码） |
 
 ---
 
@@ -23,9 +45,11 @@ D-69（判据不能只靠一根绳）都是这个形态。
 
 ---
 
-## 遗留 1：Java / Kotlin 依赖解析缺失（中等）
+## D-75：Java / Kotlin 依赖解析缺失（中等）
 
-**现状**：`src/core/arch/imports.ts` 里有 Java/Kotlin 的**语言分类**，
+### 问题
+
+`src/core/arch/imports.ts` 里有 Java/Kotlin 的**语言分类**，
 但**没有 import 解析器**：
 
 ```ts
@@ -33,78 +57,124 @@ D-69（判据不能只靠一根绳）都是这个形态。
 java: 'java', kt: 'java', kts: 'java',   // ← 只分类，不解析
 ```
 
-`parseImports()`（imports.ts:210）没有 `java` 分支，
-`scan.ts` 里也没有 `file.lang === 'java'` 的分支。
+`parseImports()` 没有 `java` 分支，`scan.ts` 里也没有 `file.lang === 'java'` 的分支。
 
-**要做的**：
-- 加 `parseJavaImports()`：`import a.b.C;` / `import static a.b.C;` /
-  `import a.b.*;` / `import a.b.C as D;`
-- Kotlin：`import a.b.C` / `import a.b.C as D`
-- 在 `scan.ts` 里加 `java` 分支：解析出包路径 → 落到 `src/main/java/<pkg>/<Class>.java`
-  或 `src/<pkg>/<Class>.kt`（Gradle / Maven 两种布局都要认）
-- `isVerifiableLang()` / `isCodeLangCategory()`（imports.ts:169 / 189）
-  **已经包含 `java`** —— 改完后这里才真正说得通
+### 实现
 
-**注意**：Java/Kotlin 的依赖关系判据比 Go/Rust 复杂（包 → 目录 → 类文件）。
-判不准时**宁可漏边也不要判错边** —— 判错边会产生假的「环」。
+- **`src/core/arch/imports.ts`**
+  - 新增 `parseJavaImports()`：认 `import a.b.C;` / `import static a.b.C;` /
+    `import a.b.*;` / `import a.b.C as D;`；Kotlin 的 `import a.b.C` / `import a.b.C as D`。
+  - `.java` / `.kt` / `.kts` 都归到 `java` 语言类别。
+  - `isVerifiableLang()` 加入 `java` —— 现在它才真正说得通。
+- **`src/core/arch/scan.ts`**
+  - 新增 `resolveJavaImport(specifier, fileSet)`：包路径 → 类文件。
+    - 候选目录按约定枚举：`src/main/java`、`src/main/kotlin`、`src/test/java`、
+      `src/test/kotlin`、`src`（Gradle / Maven / Kotlin 常见布局都认）。
+    - 兜底：按**路径后缀**唯一匹配（多模块 Gradle 的 `core/src/main/java/...`
+      这类布局也能落到）。**多个命中 = 歧义 → 返回 null**（宁可漏边，不猜错边）。
+    - 通配符 import（`a.b.*`）解析不到具体类 → 返回 null（漏边，不猜）。
+  - `scan.ts` 里加 `java` 分支：解析出包路径 → 落到具体类文件 → 产生跨模块边。
+- **`src/core/arch/types.ts`**：`SourceLang` 增加 `'java'`。
 
-**测试**：`tests/` 下新增用例，覆盖 import 解析 + 模块归属 + 至少一个真实目录布局。
+### 「宁可漏边也不要判错边」
+
+假边会产生假的「环」—— 报告会报一个不存在的架构违规，
+人得花半天去查一个根本不存在的问题。
+所以解析不确定时一律返回 `null`（漏边），不返回猜测值。
+
+### 测试
+
+`tests/d75-d77-arch-language-parsing.test.ts`：
+
+- import 解析：静态导入 / 通配符 / `as` 别名 / Kotlin。
+- 包路径 → 类文件：Gradle 布局、Maven 布局、Kotlin 布局。
+- 解析不到时返回 `null`（不猜）。
+- 模块归属：Java 的 import 产生 `src/app → src/core` 的边。
+- 覆盖面：`java` 进入 `verifiable`，Java 文件参与 import 图。
 
 ---
 
-## 遗留 2：Go 的文件名构建约束（低，但影响覆盖率口径）
+## D-76：Go 的文件名构建约束（低，但影响覆盖率口径）
 
-**现状**：Go 有平台后缀（`_linux.go` / `_windows.go` / `_darwin.go`）
-和测试后缀（`_test.go`）。现在**完全没处理**。
+### 问题
 
-**要做的**：
-- 识别 `_test.go` → 归类为**测试文件**，不参与模块依赖边
-  （对照 `src/core/arch/test-files.ts` 现有的测试文件识别逻辑）
-- 平台后缀（`_linux.go` 等）→ 决定**该文件在哪些平台参与构建**。
-  同一个包在不同平台可能有不同实现 → 依赖边要按「所有平台都成立」算，
-  否则会误报环。
+Go 有平台后缀（`_linux.go` / `_windows.go` / `_darwin.go`）
+和测试后缀（`_test.go`）。原来**完全没处理**。
 
-**注意**：这一条**只影响覆盖率口径与依赖边的精度**，不影响依赖关系本身。
-所以它**不应该改变现有模块图的连通性判定**——除非确实存在平台专属的实现分歧。
+### 实现
 
-**测试**：`_test.go` 不产生依赖边；`_linux.go` 与 `_windows.go` 同包不误报环。
+- **`src/core/arch/scan.ts`**
+  - 新增 `parseGoFileConstraints(filePath)`：认 `_linux` / `_windows` / `_darwin` /
+    `_linux_amd64` 这类 OS/arch 后缀。
+    - 只认**文件名最后一段**的后缀 —— `linux_helper.go` 不是 linux 专属。
+  - 平台专属文件产生的依赖边标成**条件边**（`conditional`）。
+    - 同一个包在不同平台可能有不同实现 → 依赖边要按「所有平台都成立」算，
+      否则会误报环。
+- **`src/core/arch/test-files.ts`**：`_test.go` 归类为**测试文件**，
+  不参与模块依赖边（与既有约定一致）。
+
+### 测试
+
+`tests/d75-d77-arch-language-parsing.test.ts`：
+
+- `_test.go` 是测试文件；`registry.go` 不是。
+- 平台后缀识别；没有后缀时返回 `null`；`linux_helper.go` 不认。
+- 两个平台专属实现互相引用 → **不误报环**，边被标成条件边。
 
 ---
 
-## 遗留 3：Rust 的 `super::` / `self::` 层级解析（低，判不准时漏边）
+## D-77：Rust 的 `super::` / `self::` 层级解析（低，判不准时漏边）
 
-**现状**：`classifyRustSpecifier()`（imports.ts:638）把 `super::` / `self::`
-归类为 `relative`，但 **`resolveRustImport()`（scan.ts:444）只处理 `crate::`**：
+### 问题
+
+`classifyRustSpecifier()` 把 `super::` / `self::` 归类为 `relative`，
+但 `resolveRustImport()` **只处理 `crate::`**：
 
 ```ts
-// scan.ts:464
+// 原来的 scan.ts
 if (!specifier.startsWith('crate::')) return null;   // ← super:: / self:: 直接漏掉
 ```
 
-**要做的**：实现 `super::` / `self::` 的层级解析：
-- `self::sibling` → **当前文件所在模块**下的 `sibling`
-  （`src/foo/mod.rs` 里的 `self::bar` → `src/foo/bar.rs`）
-- `super::parent` → **上一级模块**
-  （`src/foo/bar.rs` 里的 `super::baz` → `src/foo/baz.rs`）
-- Rust 的模块层级 ≠ 目录层级：`mod.rs` 代表目录，`foo.rs` + `foo/` 是同一模块的两种布局，
-  两种都要认
+### 实现
 
-**注意**：这是**漏边**类缺陷（少报边），不会误报。但漏边会让真实的架构违规
-（「A 依赖 B，B 又依赖 A」）被放过 —— 所以值得修。
+**`src/core/arch/scan.ts`**：
 
-**测试**：`self::` / `super::` 各至少一条；两种布局（`foo.rs` vs `foo/mod.rs`）都要覆盖。
+- 新增 `moduleDirOfRustFile(fromFile)`：算出「当前文件所属模块的目录」。
+  - `src/foo/mod.rs` → `src/foo`（模块 `foo` 的目录就是它所在的目录）
+  - `src/foo.rs` → `src/foo`（模块 `foo` 由这个文件构成，子模块在 `src/foo/` 下）
+  - `src/foo/bar.rs` → `src/foo/bar`（模块 `foo::bar`）
+- 新增 `parentModuleDir(dir)`：上一级模块目录。
+- `resolveRustRelativeImport()`：
+  - **逐段剥掉** `self` / `super` / `super::super` 前缀（`super` 上跳一级，`self` 不动）。
+  - 路径从长到短**逐级缩短**尝试 —— `super::engine::helper::H` 可能指模块
+    `engine::helper`，也可能指模块 `engine` 里的类型 `helper`。
+  - 同时认 `<module>/<name>.rs` 与 `<module>/<name>/mod.rs` 两种布局。
+  - **不做 crate 根兜底** —— 否则 `src/foo/bar.rs` 里的 `super::baz`
+    会错误地落到 `src/baz.rs`。
+
+### 测试
+
+`tests/d75-d77-arch-language-parsing.test.ts`：
+
+- `self::sibling` → 当前模块目录下的 sibling。
+- `super::parent` → 上一级模块。
+- `super::super::x` → 上跳两级。
+- `foo.rs` + `foo/` 两种布局都认。
+- 模块目录形式（`self::x` → `x/mod.rs`）。
+- 从 `mod.rs` 出发时 `super::` → 上一级目录。
+- 判不准时返回 `null`（漏边，不猜）。
+- `crate::` 跨模块边照常产生。
 
 ---
 
-## 遗留 4：「静默失败」防线只覆盖了 policy 编辑路径（严重）
+## D-78：「静默失败」防线只覆盖了 policy 编辑路径（严重）
 
 **这是 5 条里唯一还在持续产生新病灶的**，其余 4 条是特定语言的解析盲区，
 影响面局限。
 
-**现状**：ADR-070 为 policy 编辑路径建了防线 ——
-`src/core/policy/section-editor.ts` 提供 `hasSection()` / `findSectionEntry()`，
-调用方**先确认段/条目在**，再动手。
+### 问题
 
+ADR-070 为 policy 编辑路径建了防线，
 但**其它「写文件然后报告成功」的路径没有同构防线**。
 典型例子（D-31 的原始病灶）：
 
@@ -113,108 +183,256 @@ if (!specifier.startsWith('crate::')) return null;   // ← super:: / self:: 直
 export function removeSectionEntry(...): string {
   const entry = findSectionEntry(yaml, section, keyName, id);
   if (!entry) return yaml;        // ← 文件没变，但调用方照样 return success: true
-  ...
 }
 ```
 
-**要做的**（这是本次的核心任务）：
-1. **盘点**：全仓搜索「写文件 + 报告成功」的路径，列出清单。
-   重点看 `src/cli/commands/` 下所有改状态文件的命令：
-   `set` / `patch` / `plan patch` / `design patch` / `config` / `slice spec` 等。
-2. **提取原语**：在 `src/core/` 下建一个统一的写入口
-   （建议 `src/core/io/atomic-write.ts`），它保证：
-   - **写完必须验证**（读回来比对，或用「预期内容 + 实际内容」断言）
-   - **写失败必须抛错**，不吞异常
-   - **写成功必须有可核对的凭据**（返回值带 hash / 字节数）
-3. **接入**：把盘点出来的路径逐个切到新原语上。
-4. **对每条路径加一条回归测试**：
-   「文件没被改动时，命令必须报错退出码 ≠ 0，而不是报告成功」
+### 实现
 
-**这是唯一一条需要改 `core/` 公共接口的** —— 注意 C2（core 零第三方依赖）、
-C3（纯计算/文件读写，不触网不调模型）、C6（core 不 import adapters/）。
+#### ① 统一写入原语（ADR-082）
 
-**强烈建议写 ADR**（**ADR-082 或更后**，编号开工前再确认）：这是契约层面的改动，
-影响其他切片与已有实现。
+新增 `src/core/io/atomic-write.ts`（仅用 Node 内置，零第三方依赖）：
 
-**关键判据**（沿用 D-31 的教训）：
-> 「报告成功」必须能被**独立证据**复核 —— 读回文件比对内容，
-> 而不是「我调用了 writeFileSync 所以成功了」。
+```ts
+export interface WriteReceipt {
+  path: string;
+  bytes: number;
+  hash: string;      // sha256:<hex>
+  changed: boolean;  // 与写前内容是否不同
+}
+
+export async function atomicWriteText(path: string, content: string): Promise<WriteReceipt>;
+export async function atomicWriteJson(path: string, value: unknown): Promise<WriteReceipt>;
+```
+
+原语的保证：
+
+1. **原子替换** —— 先写同目录临时文件，再 `rename` 覆盖。
+2. **写完必验** —— 读回目标文件，逐字节比对预期内容；不一致直接抛错。
+3. **失败必抛** —— 不吞异常，不返回「看起来成功」的结果。
+4. **成功有凭据** —— 返回值带字节数、SHA-256 哈希、是否发生变化。
+
+#### ② 调用方必须复核「内容是否真的变了」
+
+对于「修改既有状态文件」的命令，**内容没变就是失败**，不能报成功。
+原语返回 `changed: false` 时，调用方必须：
+
+- 返回**非 0 退出码**；
+- 打印明确的原因（目标条目/键不存在、内容已是期望值等）；
+- 不写「成功」类事件。
+
+#### ③ 接入范围
+
+**用户可见、修改状态文件**的命令：
+
+| 命令 | 位置 |
+|---|---|
+| `zelto set` | `src/cli/commands/slice-detail.ts` |
+| `zelto config set` | `src/cli/commands/config.ts` |
+| `zelto spec draft` / `confirm` | `src/cli/commands/slice-spec.ts` |
+| `zelto design patch` | `src/cli/commands/design-patch.ts` |
+| `zelto plan patch` | `src/cli/commands/plan-patch.ts` |
+| `zelto patch-content` | `src/cli/commands/patch-content.ts` |
+| `zelto policy add/edit/remove` | `src/cli/policy/handlers/rules.handler.ts` |
+| `zelto policy arch add/edit/remove` | `src/cli/policy/handlers/arch.handler.ts` |
+| `zelto slice create` | `src/cli/commands/slice-detail.ts` |
+
+**`core/` 状态 store**（切片、设计、版本计划、需求）也改用同一原语保存：
+
+- `src/core/slice/store.ts`
+- `src/core/design/store.ts`
+- `src/core/version/store.ts`
+- `src/core/requirements/store.ts`
+
+### 顺带修掉的两个「同类」缺陷
+
+修复过程中暴露出两处**同形状**的病灶，一并修掉：
+
+#### ① `section-editor.ts` 的条目范围吞掉了文件末尾换行
+
+段在文件末尾时，`range.end = lines.length`，
+而 `split('\n')` 会在文件末尾的换行符之后多出一个空串。
+不裁掉的话，`replaceSectionEntry` 把条目块换回去时会把那个空串**一起吃掉**
+—— 文件末尾的换行没了，于是「内容其实没变」也会被判定成「变了」。
+
+→ `src/core/policy/section-editor.ts`：条目范围不吞尾部空行。
+
+#### ② 命令别名把真命令整个遮住了
+
+`COMMAND_ALIASES` 里有 `slice: 'slices'`，而 `slice` 本身**也是**一个真命令
+（`slice create` / `slice validate` / `slice <id>` 详情）。
+别名优先于真命令，于是：
+
+```
+zelto slice create s1
+→ 跑到 slices（列表）上去 → 输出「No slices found.」+ 退出码 0
+```
+
+这是「工具报告成功、实际什么都没做」那族缺陷的**新变体**。
+
+→ `src/cli/commands/index.ts`：**真命令优先**，别名只在真命令不存在时兜底。
+
+（`docs/zelto-场景功能地图.md` 早就写了 `zelto slice <id> [--json]` 是「查看切片详情」——
+ 文档说的和实际行为早就不一致了。）
+
+### 测试
+
+`tests/d78-verified-file-writes.test.ts`：
+
+**原语层**：
+- 写完文件内容就是写进去的内容。
+- 返回可核对的凭据（字节数 + 哈希 + 是否变化）。
+- 父目录不存在时自动创建。
+- 不留下临时文件。
+- `hashContent` 的形态与策略锚点一致（`sha256:<hex>`）。
+- `WriteVerificationError` 是 `Error` 的子类。
+
+**命令层**（每条接入路径至少一条）：
+- `config set` 同值 → 退出码 ≠ 0，文件没变。
+- `config set` 真改值 → 退出码 0，文件确实变了。
+- `policy edit` 同值 → 退出码 ≠ 0。
+- `policy arch edit` 同值 → 退出码 ≠ 0。
+- `policy remove` 不存在的规则 → 退出码 ≠ 0。
+- `slice create` 规格已存在 → 退出码 ≠ 0。
+- `zelto set` 同值 → 退出码 ≠ 0。
+- `zelto spec confirm` 草稿与正式规格完全一致 → 退出码 ≠ 0。
 
 ---
 
-## 遗留 5：合并清理报错措辞（低）
+## D-79：合并清理报错措辞（低）
 
-**现状**：`src/cli/commands/merge-runner.ts` 的 `cleanupMergedSlices()`
-（约 596–638 行）已经**修正过一次**（D-40），现在的判据是对的：
+### 问题
 
-```ts
-const merged = upstream
-  ? isMergedIntoRef(sliceBranch, `refs/heads/${upstream}`, dir)
-  : isMergedIntoHead(sliceBranch, dir);
-
-if (!merged) {
-  console.log(`  ℹ️  Could not delete branch "${sliceBranch}": it still has changes not merged into ${upstream ?? 'HEAD'}.`);
-```
-
-但**两处措辞仍然混着两种情况**：
+`cleanupMergedSlices()` 的判据是对的（D-40 已修正过），但**两处措辞混着两种情况**：
 
 1. **判据没过**（`!merged`）vs **git 拒绝删**（catch 分支）：
    - 前者是「分支上还有未合入的内容」—— **真需要人处理**
-   - 后者是「git 说不行，但原因不明」—— 可能是 worktree 还占着、可能被别的进程锁住
-   现在两者的提示长得几乎一样，人分不出「要我去合」还是「要我去查锁」。
+   - 后者是「git 说不行，但原因不明」—— 可能是 worktree 还占着
+   原来两者的提示长得几乎一样，人分不出「要我去合」还是「要我去查锁」。
+2. **措辞本身**：`it still has changes not merged into X` 在版本分支场景下
+   **不准确** —— 分支**已经**合进 `version/vN` 了，只是判据查的是别的地方。
+   这时应该说「已合入目标分支，但删不掉」，而不是「还有未合入的内容」
+   （后者是假话，正是 D-62/D-63 那个形态）。
 
-2. **措辞本身**：`it still has changes not merged into X` 这个描述在
-   **版本分支场景**下不准确 —— 分支**已经**合进 `version/vN` 了，
-   只是判据查的是别的地方。这时应该说「已合入目标分支，但删不掉」，
-   而不是「还有未合入的内容」（后者是假话，正是 D-62/D-63 那个形态）。
+### 实现
 
-**要做的**：
-- 把两种失败**分开措辞**：
-  - 判据没过 → 「分支 `<name>` 上还有未合入 `<target>` 的内容 —— 先合，或确认后手动 `git branch -D`」
-  - git 拒绝 → 「分支已合入 `<target>`，但 git 拒绝删除（原因：<git 原话>）—— 通常是 worktree 还没释放；确认后手动 `git branch -D`」
-- 中文输出与英文输出**都要改**（现在两条提示是英文的，而项目其它地方是中文）。
+`src/cli/commands/merge-runner.ts` —— 两类失败**分开措辞**，且都改成中文：
 
-**测试**：两条路径各一条用例，断言提示文本能区分。
+- **判据没过**：
+  > 分支 `<name>` 上还有未合入 `<target>` 的内容 —— 先合，或确认后手动 `git branch -D <name>`
+- **git 拒绝删**：
+  > 分支已合入 `<target>`，但 git 拒绝删除（原因：<git 原话>）—— 通常是 worktree 还没释放；确认后手动 `git branch -D <name>`
+
+### 测试
+
+`tests/d79-merge-cleanup-wording.test.ts`：
+
+- 判据没过 → 如实说「还有未合入的内容」，且不删分支。
+- git 拒绝 → 说「已合入目标分支，但 git 拒绝删除」。
+- 两条提示能区分（措辞不同）。
+- 两条提示都是中文。
 
 ---
 
-## 通用要求
+## 真实项目复验（nimrtc-zelto）
 
-### 硬约束（C1–C9，永远不破）
+**「每条路径都接上了」不等于「每条路径都接全了」** ——
+所以每条都在 `D:\MyOpen\nimrtc-zelto` 上跑过一遍真实 CLI。
 
-- `core/` 零第三方运行时依赖（只用 Node 内置）
-- `core/` 不得 import `adapters/`
-- `core/policy/`、`core/gate/`、`core/sched/` 不调模型、不触网
-- 状态只落在文件里
-- 判定必须确定性
-- 每个动作写 append-only 事件
-- 写集预约运行时强制
+### ① 架构扫描无回归
 
-### 开发 zelto 自身时（AGENTS.md 例外条款）
+`zelto arch check --root .` → 退出码 0，覆盖面统计：
 
-这 5 条**不强制走切片流程** —— 可以直接改代码，
-但必须：**跑通测试、lint 通过**。
+```json
+{
+  "counts": {
+    "typescript": 2, "python": 82, "cpp": 493,
+    "go": 0, "rust": 0, "java": 0, "csharp": 0,
+    "build": 120, "doc": 160, "config": 36, "other": 115
+  },
+  "verifiable": ["typescript", "python", "cpp"],
+  "verifiedFiles": 575,
+  "unverifiableCodeFiles": 0,
+  "vendorFiles": 68784,
+  "testFiles": 244
+}
+```
 
-改契约（schema / 事件类型 / 配置格式 / core 公共接口）**仍要写 ADR**。
+C++ 的 493 个文件照常参与依赖验证，`unverifiableCodeFiles: 0`，
+没有因为新增语言类别而漂移。
 
-### 测试纪律
+### ② D-75 / D-76 / D-77 逐条跑通
 
-- 单元测试：`npm test`（**注意**：`npm test` 现在会自己构建 `dist/`，
-  见 ADR-080；并发跑 `npm run build` 和 `npm test` 会打掉 `dist/`）
-- 格式与 lint：`npm run lint`（biome）
-- 编码：`npm run check:encoding`
-- **每修一条，必须去 nimrtc-zelto 上复验一遍**（真实项目）
+用真实构建产物（`dist/core/arch/scan.js`）在真实工程形态的 fixture 上扫：
 
-### 提交规范
+| 语言 | 场景 | 结果 |
+|---|---|---|
+| Java | `src/app` 的 `import com.example.core.Registry` | ✅ `src/app → src/core` |
+| Kotlin | `src/ktapp` 的 `import com.example.core.Engine` | ✅ `src/ktapp → src/ktcore` |
+| Go | `internal/core` 的 `import "example.com/demo/internal/platform"` | ✅ `internal/core → internal/platform` |
+| Rust | `src/engine/peer.rs` 的 `use super::helper::H` + `use crate::core::registry::Registry` | ✅ `src/engine → src/core` |
 
-Conventional Commits + `Refs-Slice: <id>` trailer。
+`unresolved: []` —— 没有留下解析不到的 import。
 
-缺陷编号：演练记录里 D-73 / D-74 已用，**D-75 起可用**。
-但 `git log --all --oneline | grep "D-7"` 里只有 D-70 / D-71 / D-73 / D-74，
-**开工前再确认一次**（并行会话可能也在占号）。
+### ③ D-78 在真实状态文件上生效
 
-ADR 编号：**ADR-081 已被并行会话占用**（`adr-081-dashboard-list-and-metrics-read-amplification.md`），
-**ADR-082 起可用**。开工前 `ls docs/adr/ | grep adr-08` 再确认一次。
+```
+$ zelto config set gate.timeoutSec 120     # 同值
+Config key "gate.timeoutSec" already has that value — nothing was changed. Nothing was written.
+EXIT= 1
+```
+
+真实项目的 `.zelto/config.yaml` 跑完后内容完好（注释、密钥占位符一个没丢）。
+
+### ④ D-79 两种措辞都出来了
+
+在真实 git 仓库里造了两种情形：
+
+```
+情形一（判据没过）：
+  ℹ️  分支 "slice/verify-unmerged" 上还有未合入 "main" 的内容 —— 先合，或确认后手动 `git branch -D slice/verify-unmerged`
+
+情形二（git 拒绝删）：
+  ℹ️  分支已合入 "main"，但 git 拒绝删除（原因：Command failed: git branch -d slice/verify-locked）—— 通常是 worktree 还没释放；确认后手动 `git branch -D slice/verify-locked`
+```
+
+复验后真实项目已复位（`git reset --hard` 回原提交，分支 / worktree / 临时文件全部清干净）。
+
+---
+
+## 不变量核查
+
+- **C1**：无影响。状态仍只在文件里；原语只是把写文件做得更可靠。
+- **C2**：满足。`src/core/io/atomic-write.ts` 只用 `node:fs` / `node:path` / `node:crypto`；
+  `core/` 仍零第三方运行时依赖、仍不 import `adapters/`。
+- **C3**：满足。语言解析与写入原语都只做文件读写与纯计算，不调模型、不触网。
+- **C4**：强化。写失败不再被当成成功动作，事件流不会记录一个没发生的变更。
+- **C5**：无影响。
+- **C6**：满足。`core/` 不 import `adapters/`。
+- **C7**：无影响。
+- **C9**：无影响。写入范围仍由既有写集预约机制控制。
+
+---
+
+## 顺带说明：语言类别表的两处整理
+
+D-75 把 `java` 加进 `isVerifiableLang()` 之后，
+`isCodeLangCategory()` 与 `isVerifiableLang()` 变成了**完全相同的两个列表** ——
+「代码类但验不了」这一档空了，ADR-061 的区分就没法演示了。
+
+处理：
+
+1. **新增 `csharp` 类别**（`.cs`）—— 它有 `using` 依赖语义，但扫描器还没实现解析，
+   正好是「代码类但验不了」的代表。报告对 C# 项目能说清
+   「这是代码」与「依赖已验证」是两回事。
+2. **合并两份 `LangCategory` 定义** —— `imports.ts` 与 `types.ts` 各写了一份，
+   加语言时只改一处就会漂。现在 `imports.ts` 重新导出 `types.ts` 的那份，
+   **单一真源**。
+3. **CLI 改用 core 的 `isCodeLangCategory`** —— `src/cli/commands/architecture.ts`
+   里原来自己抄了一份，抄一份就会漂。
+
+相应地，`tests/arch-cpp-project.test.ts` 与 `tests/arch-lang-coverage.test.ts`
+里「用 Java 代表『验不了的代码』」的断言换成了 C#，
+「Java 不是可验证语言」的断言改成了「Java 是可验证语言」。
 
 ---
 
@@ -225,9 +443,7 @@ ADR 编号：**ADR-081 已被并行会话占用**（`adr-081-dashboard-list-and-
 | `D:\MyOpen\Zelto` | zelto 仓库本体 |
 | `D:\MyOpen\nimrtc-zelto` | 真实项目（复验用） |
 | `D:\MyOpen\Zelto\docs\zelto-实战演练记录-20261116.md` | 演练全过程 + 缺陷目录 |
-| `D:\MyOpen\Zelto\docs\adr\` | 现有 ADR（ADR-069 依赖解析 / ADR-070 静默失败 / ADR-080 构建） |
-
-**注意**：`D:\MyOpen\Zelto` 里可能有**并行会话**在跑 ADR-080
-（`scripts/build.mjs` / `build-lock.mjs` / `test.mjs` / `docs/adr/adr-080-*.md`）。
-开工前先 `git status` 看清楚，**不要覆盖别人的在途改动**。
-`npm test` 期间不要并发跑 `npm run build`（会互相打掉 `dist/`）。
+| `D:\MyOpen\Zelto\docs\adr\adr-082-verified-file-writes.md` | 本次新增的 ADR |
+| `D:\MyOpen\Zelto\docs\adr\adr-069-dependency-resolution.md` | 依赖解析（Go / Rust） |
+| `D:\MyOpen\Zelto\docs\adr\adr-070-policy-edit-silent-failure.md` | 静默失败防线（policy 编辑路径） |
+| `D:\MyOpen\Zelto\docs\adr\adr-080-build-dist-lock.md` | 构建锁 |

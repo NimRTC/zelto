@@ -616,8 +616,11 @@ export async function cleanupMergedSlices(
       : isMergedIntoHead(sliceBranch, dir);
 
     if (!merged) {
+      // ── 失败之一：**判据没过** ──
+      // 分支上还有未合入目标分支的内容 —— 这是真需要人处理的情形
+      // （要么先合，要么人工确认后强制删）。
       console.log(
-        `  ℹ️  Could not delete branch "${sliceBranch}": it still has changes not merged into ${upstream ?? 'HEAD'}.`,
+        `  ℹ️  分支 "${sliceBranch}" 上还有未合入 "${upstream ?? 'HEAD'}" 的内容 —— 先合，或确认后手动 \`git branch -D ${sliceBranch}\``,
       );
       console.log(`     先合或先查；确认要删再手动执行：git branch -D ${sliceBranch}`);
       continue;
@@ -632,8 +635,17 @@ export async function cleanupMergedSlices(
       execFileSync('git', ['branch', '-d', sliceBranch], { cwd: dir, timeout: 5000 });
       console.log(`  ✅ Deleted branch "${sliceBranch}"`);
     } catch (err) {
+      // ── 失败之二：**git 拒绝删** ──
+      // 判据已经通过（分支确实合入了目标分支），但 git 自己拒绝删除。
+      // 原因通常是 worktree 还占着、或者被别的进程锁住。
+      //
+      // 这与上面「还有未合入的内容」是**两种不同情形**，排查方向也不同：
+      // 前者要「去合」，后者要「去查锁」。
       const msg = err instanceof Error ? err.message : String(err);
-      console.log(`  ℹ️  Could not delete branch "${sliceBranch}" (${msg.split('\n')[0]})`);
+      const reason = msg.split('\n')[0];
+      console.log(
+        `  ℹ️  分支已合入 "${upstream ?? 'HEAD'}"，但 git 拒绝删除（原因：${reason}）—— 通常是 worktree 还没释放；确认后手动 \`git branch -D ${sliceBranch}\``,
+      );
       console.log(`     Delete manually: git branch -D ${sliceBranch}`);
     }
   }
