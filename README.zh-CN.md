@@ -83,9 +83,8 @@ clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ fr
 ## 状态
 
 - **pre-1.0** — CLI 参数、配置格式与事件格式都可能变，不保证向后兼容。需要稳定请锁定版本。
-- **尚未发布到 npm** — npm 发布流水线已就绪（见 `.github/workflows/release.yml`），
-  但**首次发布还没发生**：今天 `npm view zelto` 返回 404。先从源码装：
-  `git clone` + `pnpm install && pnpm build && pnpm link --global`。
+- **已发布到 npm** — `npm install -g zelto` 即可安装（当前 `0.6.0`）。
+  源里开发用 `git clone` + `pnpm install && pnpm build && pnpm link --global`。
   包本身是可打包且可安装验证的（`npm pack` 产出自包含 tarball，
   在全新项目里能跑通 `zelto init`）——发布流水线每次都会校验这一条。
 - **两个执行器，默认带一个** — `claude-agent`（拉 CLI 进程）是默认；`claude-agent-sdk` 用 `--adapter claude-agent-sdk` 显式开启。策略与门禁层与 harness 无关，但在适配器写出来之前不吹更多。
@@ -93,7 +92,10 @@ clarify（澄清规格）→ draft + 验收骨架 → check（门禁①）→ fr
 ## 快速开始
 
 ```bash
-# 从源码装（npm 首发尚未完成，见「状态」）
+# 从 npm 装（推荐）
+npm install -g zelto
+
+# 或从源码装（开发用）
 git clone https://github.com/NimRTC/zelto && cd zelto
 pnpm install
 pnpm build

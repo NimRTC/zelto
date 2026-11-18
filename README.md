@@ -33,11 +33,12 @@ the acceptance checks frozen alongside that spec.
 ## Quick start
 
 ```bash
-# 从源码装（npm 首发尚未完成，见 Status）
+# 从 npm 装（推荐）
+npm install -g zelto
+
+# 或从源码装（开发用）
 git clone https://github.com/NimRTC/zelto && cd zelto
 pnpm install && pnpm build && pnpm link --global
-
-cd <your-project>
 zelto init
 zelto create rate-limit-gateway --title "add per-IP rate limiting to the gateway"
 zelto check rate-limit-gateway   # gate 1 — deterministic: traceable? contracts? acceptance frozen?
@@ -116,10 +117,8 @@ Protected paths are hard-coded outside policy reach, and `core/` has zero third-
 - **Two executors, default included.** `claude-agent` (CLI spawn) is the default; `claude-agent-sdk`
   is opt-in via `--adapter claude-agent-sdk`. The policy/gate layer is harness-agnostic,
   but claiming more harnesses before the adapters exist would be a lie.
-- **Not yet on npm.** The npm release channel is wired up (see
-  [`.github/workflows/release.yml`](.github/workflows/release.yml)) but the first
-  publish has not happened yet — `npm view zelto` returns 404 today.
-  Install from source for now:
+- **Published to npm.** `npm install -g zelto` installs the CLI (currently `0.6.0`).
+  To develop against the source instead:
 
   ```bash
   git clone https://github.com/NimRTC/zelto && cd zelto

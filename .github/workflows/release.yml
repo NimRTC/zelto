@@ -22,7 +22,10 @@ on:
         default: true
 
 permissions:
-  contents: read
+  # 发布后要把 `release-status.json` 翻成 published: true 并提交回去 ——
+  # 那是发布状态的真源（README 与 CHANGELOG 都跟它对齐）。只有 read 的话
+  # 那一步会 403，"发布完了但文档还说没发布" 就又发生了（ADR-085）。
+  contents: write
   id-token: write # npm provenance 用 OIDC，不要这个权限 provenance 签不了
 
 jobs:
@@ -111,9 +114,21 @@ jobs:
           " "$PKG"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # tag 触发时 checkout 出来是 detached HEAD —— 直接 commit 会挂在
+          # 一个游离的 HEAD 上，push 无处可去（"not currently on a branch"）。
+          # 所以先落到目标分支上，再 push。
+          #
+          # 用远端分支的尖端做基，而不是 detached HEAD 的 commit ——
+          # 否则 main 在 tag 之后又前进了的话，push 就是非快进，会被拒。
+          BRANCH="${GITHUB_REF_TYPE == 'tag' && echo main || echo ${GITHUB_REF_NAME}}"
+          git fetch --no-tags origin "$BRANCH"
+          git checkout -B "$BRANCH" "origin/$BRANCH"
           git add release-status.json
           git commit -m "chore(release): 标记 v${PKG} 已发布到 npm" || echo "（无改动，跳过）"
-          git push || echo "⚠️  推送失败 —— 请手动把 published 置为 true"
+          git push origin "HEAD:${BRANCH}" || {
+            echo "::error::推送 release-status.json 失败 —— published 状态需手动置为 true"
+            exit 1
+          }
 
       - name: 仅打包（dry run）
         if: ${{ inputs.dry-run }}
