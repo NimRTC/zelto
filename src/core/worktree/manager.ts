@@ -193,6 +193,10 @@ export class WorktreeManager {
    *
    * 与 `remove()` 一样先把 `node_modules` 连接摘掉 —— Windows 上路径过长
    * 会让 `git worktree remove` 报 "Filename too long"。
+   *
+   * D-72：含 submodule 的 worktree 必须用 `--force` 移除 ——
+   * git 会硬拒：`fatal: working trees containing submodules cannot be moved
+   * or removed`。详见 `needsForceForSubmodules()`。
    */
   async removeVersionWorktree(label: string, options: { force?: boolean } = {}): Promise<void> {
     const target = this.versionPathFor(label);
@@ -204,11 +208,33 @@ export class WorktreeManager {
     this.unlinkNodeModules(target);
 
     const args = ['worktree', 'remove'];
-    if (options.force) args.push('--force');
+    // D-72：含 submodule 的 worktree 只有 `--force` 能移除。
+    // 人没给 `--force` 时也不能就此失败 —— 清理一个工作目录
+    // 不该因为「里面有 submodule」而把人卡住（worktree 本来就要删）。
+    if (options.force || this.needsForceForSubmodules(target)) args.push('--force');
     args.push(target);
 
     this.removeWithRetry(args, target, `移除版本工作目录失败: ${this.versionRelativePathFor(label)}`);
     this.git(['worktree', 'prune'], '清理 worktree 登记失败');
+  }
+
+  /**
+   * 这个 worktree 里有没有 submodule（D-72）。
+   *
+   * 判据：**worktree 自己有没有 `.gitmodules`**。
+   *
+   * 为什么不用「主仓有没有」：主仓有 submodule 不代表这个 worktree 有 ——
+   * worktree 检出的是某个 commit，那个 commit 可能还没有 submodule。
+   * 反过来 worktree 有 `.gitmodules` 就说明它**一定**含 submodule
+   * （至少登记了一个 gitlink）。
+   *
+   * 为什么不用「目录里有没有 submodule 工作区」：submodule 可能没初始化
+   * （目录是空的），但 `.gitmodules` 仍在 —— 而 git 的硬拒看的是
+   * **登记**（`.git/modules/` 与 index 里的 gitlink），不是工作区内容。
+   * 所以判据要落在登记上：`.gitmodules` 存在 = 有登记 = 会被硬拒。
+   */
+  needsForceForSubmodules(worktreePath: string): boolean {
+    return existsSync(join(worktreePath, '.gitmodules'));
   }
 
   /**
@@ -752,7 +778,8 @@ export class WorktreeManager {
     this.unlinkNodeModules(target);
 
     const args = ['worktree', 'remove'];
-    if (options.force) args.push('--force');
+    // D-72：含 submodule 的 worktree 只有 `--force` 能移除（git 硬拒）。
+    if (options.force || this.needsForceForSubmodules(target)) args.push('--force');
     args.push(target);
 
     this.removeWithRetry(args, target, `移除 worktree 失败: ${relative(this.repoRoot, target)}`);
