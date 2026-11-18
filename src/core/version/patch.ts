@@ -58,6 +58,15 @@ export interface VersionPatch {
   dependsOn?: string[];
   /** 新的版本状态 */
   status?: Version['status'];
+  /**
+   * 新的版本 tag 名（D-78）。
+   *
+   * 为什么需要这个字段：D-73 之前没有它，于是「修历史遗留的错误 tag 记录」
+   * 只能手改状态文件 —— 手改是追溯链上的谎言（C4）。
+   *
+   * 传 `null` 表示「这一版没有 tag」（清掉记录）。
+   */
+  tag?: string | null;
 }
 
 /** 一次计划修正 */
@@ -152,6 +161,30 @@ export function applyPlanPatch(plan: VersionPlan, patch: PlanPatch): PlanPatchRe
         after: vPatch.status,
       });
       version.status = vPatch.status;
+    }
+
+    // ── 版本 tag（D-78）──
+    //
+    // 「这一版有没有 tag」是**追溯锚点**（ADR-056 D6-C）——
+    // 它与 tag 打在哪个提交上一起构成「这一版交付了什么」的证据。
+    //
+    // D-73 之后 ship 会以 git 里的事实为准写这个字段，
+    // 但**历史遗留**的错误记录（v1 / v2 的 undefined）不会自动改写 ——
+    // 改写状态文件而不留事件同样是追溯链上的谎言。
+    // 修历史走这里：确定性修正 + 写 `draft.revised` 事件。
+    if (vPatch.tag !== undefined) {
+      const before = version.tag ?? '(无)';
+      const after = vPatch.tag ?? '(无)';
+      if (before !== after) {
+        changed.push({
+          version: vPatch.version,
+          slice: null,
+          field: 'tag',
+          before,
+          after,
+        });
+        version.tag = vPatch.tag ?? undefined;
+      }
     }
 
     // ── 加切片 ──

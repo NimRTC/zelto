@@ -77,7 +77,7 @@ function splitPatterns(values: string[]): string[] {
  * 语法：
  * ```
  * zelto plan patch <plan-id> \
- *   --version <v> [--description <text>] [--depends-on <v1,v2>] [--status <s>] \
+ *   --version <v> [--description <text>] [--depends-on <v1,v2>] [--status <s>] [--tag <name|none>] \
  *   --add-slice <id> --slice-title <t> --slice-module <m> --slice-spec <path> --write <p>... \
  *   --remove-slice <id> \
  *   --slice <id> [--write <p>...] [--slice-title <t>] [--slice-module <m>] [--slice-spec <path>]
@@ -113,6 +113,19 @@ function parsePlanPatch(args: string[]): PlanPatch {
   const status = optionValue(args, '--status');
   if (status !== undefined && ['planned', 'in_progress', 'integrated', 'delivered'].includes(status)) {
     v.status = status as VersionPatch['status'];
+  }
+
+  // ── 版本 tag（D-78）──
+  //
+  // `--tag <name>` 设 tag；`--tag none` 清掉记录。
+  //
+  // 「这一版有没有 tag」是追溯锚点（ADR-056 D6-C）。
+  // D-73 修的是「以后 ship 会以 git 事实为准」；
+  // 历史遗留的错误记录靠这个选项修 —— 且修正会写 `draft.revised` 事件，
+  // 不留「谁在什么时候把 tag 改成什么」的痕迹就是追溯链上的谎言。
+  const tagOpt = optionValue(args, '--tag');
+  if (tagOpt !== undefined) {
+    v.tag = tagOpt === 'none' ? null : tagOpt;
   }
 
   // ── 加切片 / 改切片 / 删切片 ──
@@ -198,7 +211,7 @@ function parsePlanPatch(args: string[]): PlanPatch {
 export async function planPatch(args: string[]): Promise<number> {
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--slice <id> --write <p> ...]');
+    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--slice <id> --write <p> ...] [--tag <name|none>]');
     return 1;
   }
 

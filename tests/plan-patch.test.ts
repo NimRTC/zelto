@@ -217,6 +217,51 @@ describe('版本计划的确定性修正（zelto plan patch）', () => {
     });
   });
 
+  describe('版本 tag 的修正（D-78）', () => {
+    it('设 tag：留下 before/after（修 D-73 的历史遗留记录）', () => {
+      const plan = makePlan();
+      // 模拟 D-73 留下的历史遗留：v1 被 ship 两次 → tag 记录被抹成 undefined
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', tag: 'v1' }],
+      });
+      assert.equal(result.changed.length, 1);
+      assert.equal(result.changed[0].field, 'tag');
+      assert.equal(result.changed[0].before, '(无)');
+      assert.equal(result.changed[0].after, 'v1');
+      assert.equal(result.plan.versions[0].tag, 'v1');
+    });
+
+    it('tag 为 null 表示「这一版没有 tag」（清掉记录）', () => {
+      const plan = makePlan();
+      (plan.versions[0] as { tag?: string }).tag = 'v1';
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', tag: null }],
+      });
+      assert.equal(result.changed[0].field, 'tag');
+      assert.equal(result.changed[0].before, 'v1');
+      assert.equal(result.changed[0].after, '(无)');
+      assert.equal(result.plan.versions[0].tag, undefined);
+    });
+
+    it('tag 不变时不产生改动记录（幂等）', () => {
+      const plan = makePlan();
+      (plan.versions[0] as { tag?: string }).tag = 'v1';
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', tag: 'v1' }],
+      });
+      assert.equal(result.changed.length, 0, '没变化就不该记一笔');
+    });
+
+    it('不传 tag 时不动 tag 字段', () => {
+      const plan = makePlan();
+      (plan.versions[0] as { tag?: string }).tag = 'v1';
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', description: '只改描述' }],
+      });
+      assert.equal(result.plan.versions[0].tag, 'v1', '不该碰 tag');
+    });
+  });
+
   describe('重复切片 id 检查', () => {
     it('同一个切片 id 出现在两个版本里会被查出', () => {
       const plan = makePlan();

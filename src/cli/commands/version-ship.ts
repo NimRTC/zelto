@@ -409,6 +409,16 @@ function shipBranch(
   };
 }
 
+/**
+ * tag 在 git 里**已经存在**吗（D-73）。
+ *
+ * 「本次打了 tag」与「这一版有 tag」是两件事 ——
+ * 二次 ship 时前者是假、后者是真。
+ */
+function tagAlreadyExists(tag: string, repoRoot: string): boolean {
+  return git(['rev-parse', '--verify', `refs/tags/${tag}`], repoRoot).ok;
+}
+
 /** 打 tag（幂等 —— 已存在就跳过，不覆盖） */
 function tagVersion(tag: string, commit: string, repoRoot: string, log: (m: string) => void): boolean {
   const existing = git(['rev-parse', '--verify', `refs/tags/${tag}`], repoRoot);
@@ -572,6 +582,37 @@ export async function handleVersionShip(
     f.out(`  ⚠️  没有诚实的锚点可打 —— 不打 tag "${tag}"（版本内容不在目标分支上）。`);
   }
 
+  // D-73：这一版**有没有 tag**，以 git 里的事实为准 ——
+  // 不是以「本次有没有新打」为准。
+  //
+  // 病灶（实测 nimrtc-zelto v1 / v2，2026-11-17）：
+  //   `tagVersion()` 对已存在的 tag 返回 false（「不覆盖」），
+  //   于是 `version.tag = tagged ? tag : undefined` 把计划里**已有的**
+  //   tag 记录抹成 undefined，事件里也记 `tag: null`。
+  //
+  //   但 git 里 tag 好好地在那儿（`git tag -l` 看得到）。
+  //   结果：计划说「这一版没打 tag」，git 说「tag 在」——
+  //   **两个证据打架**（C4：事件是追溯的唯一证据载体，这里事件说了假话）。
+  //
+  //   实测后果：nimrtc-zelto 的版本计划里
+  //     v1: tag=undefined   v2: tag=undefined
+  //     v3: tag="v3"        v4: tag="v4"        v5: tag="v5"
+  //   差别就是「这一版有没有被 ship 第二次」—— v1 / v2 各被 ship 了两次。
+  //
+  // 三种情形对得很齐：
+  //   本次打了              → git 里有 → 记录 tag
+  //   tag 早就有了          → git 里有 → 记录 tag（沿用）
+  //   真没有 / `--no-tag`  → git 里没有 → 记 null（不虚报）
+  //
+  // 注意 `--no-tag` 的语义是「**本次不创建** tag」，
+  // 不是「抹掉这一版的 tag 记录」—— 后者又是同一个病灶。
+  // tag 是否存在，一律以 git 里的事实为准。
+  const tagExists = tagAlreadyExists(tag, process.cwd());
+  const versionHasTag = tagExists;
+  if (tagExists && !tagged) {
+    f.out(`  ℹ️  tag "${tag}" 已存在 —— 沿用它（这一版的追溯锚点不变）。`);
+  }
+
   // ── D3-C：ship 后在合入目标上重跑版本级验收（只提示不阻断）────────
   //
   // 版本分支上验过一遍了；合入时可能撞出集成缺口。
@@ -604,14 +645,21 @@ export async function handleVersionShip(
   // 但 `targetPlan` 是**旧对象**（status 还是 integrated）——
   // 后一次 save 把刚写进盘的 delivered 覆盖回了 integrated。
   // 结果：ship 完成了、tag 打了，状态却停在 integrated。
-  version.tag = tagged ? tag : undefined;
+  // D-73：写计划里的 tag 用「这一版**有没有** tag」，不是「本次**有没有新打**」。
+  //
+  // 二次 ship 时 tag 已存在（tagVersion 返回 false）——
+  // 旧写法 `version.tag = tagged ? tag : undefined` 会把已有的记录抹掉，
+  // 事件里也记 tag: null，而 git 里 tag 好好地在那儿。
+  // 两个证据打架 = 追溯链说假话。
+  version.tag = versionHasTag ? tag : undefined;
   version.status = 'delivered';
   await versionStore.save(targetPlan);
 
   await events.append(versionEventKey(versionLabel), 'version.delivered', 'zelto', {
     version: versionLabel,
     branch: versionBranch,
-    tag: tagged ? tag : null,
+    // D-73：tag 已存在也算「这一版有 tag」—— 事件不能因为「本次没新打」就否认它。
+    tag: versionHasTag ? tag : null,
     shippedTo: result.targetBranch ?? 'main',
     // D-71：mergeCommit 只在**本次合并真的产生了提交**时才有值。
     // 空操作合并记 null —— 那是真话；拿 HEAD 顶替是假话。
@@ -638,7 +686,10 @@ export async function handleVersionShip(
         {
           version: versionLabel,
           branch: versionBranch,
-          tag: tagged ? tag : null,
+          // D-73：与事件、计划一致 —— 「这一版有没有 tag」，不是「本次有没有新打」。
+          tag: versionHasTag ? tag : null,
+          // 本次是不是新打的（区分「打了」与「沿用已存在的」）
+          tagCreated: tagged,
           mergeCommit: result.mergeCommit,
           anchorCommit: result.anchorCommit,
           noop: result.noop,
@@ -653,7 +704,7 @@ export async function handleVersionShip(
 
   f.out('');
   // D-63：说真名 —— 「已合入主干」在主仓停在 feat/xxx 时是假的。
-  f.out(`✅ 版本 ${versionLabel} 已合入 ${result.targetBranch ?? '目标分支'}${tagged ? `，tag "${tag}"` : ''}`);
+  f.out(`✅ 版本 ${versionLabel} 已合入 ${result.targetBranch ?? '目标分支'}${versionHasTag ? `，tag "${tag}"` : ''}`);
   // D-71：空操作合并要说真话 —— 本次没产生新提交。
   if (result.noop) {
     f.out(`   本次合并是空操作 —— 产物早已在 ${result.targetBranch ?? '目标分支'} 上，没有产生新提交。`);
