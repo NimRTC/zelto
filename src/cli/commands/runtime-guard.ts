@@ -338,6 +338,17 @@ export async function reportAuditResult(
     return;
   }
 
+  // D-69：审计覆盖缺口 —— 结论是「没看见」而不是「没有」，必须留痕。
+  if (result.coverageGap) {
+    await events.append(sliceId, 'policy.violation', 'zelto', {
+      sliceId,
+      kind: 'audit-coverage-gap',
+      error: result.coverageGap,
+      changed: result.changed,
+    });
+    return;
+  }
+
   if (result.violations.length > 0 || result.tampered.length > 0) {
     await events.append(sliceId, 'policy.violation', 'zelto', {
       sliceId,
@@ -418,6 +429,29 @@ export async function enforceWriteSet(
       ...(await resolveExtraPayload(extraPayload, [])),
     });
     return { ok: false, violations: [], tampered: [], error: result.error };
+  }
+
+  // D-69：审计**没能覆盖到本片已提交改动** —— 也按 fail closed 处理。
+  //
+  // 此刻 result.violations 是空的，但那不是「没有越界」，
+  // 是「本片的提交没认出来 → 那些改动根本没被审计」。
+  // 放行 = fail open：越界提交进主干，而所有记录都说「正常」。
+  //
+  // 保守方向：**看不见 ≠ 没有**。
+  if (result.coverageGap) {
+    await reportAuditResult(sliceId, result);
+    await handleWriteSetViolation(sliceId, {
+      violations: [],
+      tampered: [],
+      reason: `write-set audit coverage gap: ${result.coverageGap}`,
+      ...(await resolveExtraPayload(extraPayload, [])),
+    });
+    return {
+      ok: false,
+      violations: [],
+      tampered: [],
+      error: result.coverageGap,
+    };
   }
 
   if (result.violations.length === 0 && result.tampered.length === 0) return pass;

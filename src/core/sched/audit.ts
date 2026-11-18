@@ -52,10 +52,11 @@ export interface AuditOptions {
    * 本片 id（ADR-067 D3）。
    *
    * 给了就**只把本片自己产出的提交**算进审计范围 ——
-   * 判据是 commit message 里的 `Refs-Slice: <id>` trailer。
+   * 判据是 commit message 里的 `Refs-Slice: <id>` trailer
+   * **或**标题 `feat(<id>): slice approved`（D-69：trailer 会丢，标题不会）。
    *
    * 不给就退回「基点..HEAD 的全部提交」（老行为）。这个行为在
-   * 切片分支被别的东西推进过时会误报：那些提交不是本片 agent 写的，
+   * 切片分支被别的东西推进过时时会误报：那些提交不是本片 agent 写的，
    * 却会被算成「本片的越界写入」（实测 D-28）。
    */
   sliceId?: string | null;
@@ -70,6 +71,19 @@ export interface WriteAuditResult {
   tampered: string[];
   /** git 调用失败时的说明（不抛异常，调用方自行决定怎么处理） */
   error: string | null;
+  /**
+   * 审计**没能覆盖到本片已提交改动**时的说明（D-69）。
+   *
+   * 为什么要有这个字段：审计按提交过滤后，如果本片的提交**一个都认不出**
+   * （trailer 与标题都没命中），那「已提交部分」的 diff 就是空的 ——
+   * violations 也是空的，但那是**因为看不见**才空，不是真的没有越界。
+   *
+   * 这与「没有越界」在结果上无法区分，所以必须**显式说出来**：
+   * 否则审计就变成了 fail open —— 越界提交被放行，而所有记录都说「正常」。
+   *
+   * 非 null 时调用方**必须**按 fail closed 处理（拒绝放行）。
+   */
+  coverageGap?: string | null;
 }
 
 /**
@@ -291,11 +305,22 @@ export function listFilesUnder(root: string, relativeDir: string): string[] {
 /**
  * 分支上属于某个切片的提交（ADR-067 D3）。
  *
- * 判据：commit message 里有 `Refs-Slice: <sliceId>` trailer。
- * 这是 zelto 既有的提交约定（`merge-runner.ts` 的自动提交就带它），
- * 确定性可判，不调模型、不触网（C3）。
+ * 判据：commit message 里有 `Refs-Slice: <sliceId>` trailer
+ * **或**标题是 `feat(<sliceId>): slice approved`。
  *
- * 为什么需要它：审计要回答「本片 agent 改了什么」。
+ * 两个判据不是冗余，是**互为兜底**（D-69）：
+ *
+ *  - trailer 是精确声明，但它**会丢** —— Windows 上 `execSync` 走 cmd.exe，
+ *    命令里的换行被当成命令分隔符，`git commit -m "a\n\nb"` 实际只拿到
+ *    第一行，trailer 被静默吞掉（实测 nimrtc-zelto：全部切片提交都没了 trailer）。
+ *  - 标题 `feat(<id>): slice approved` 是 zelto 自己的提交约定，
+ *    **它自己写、不会被 cmd 吃掉**（标题就是第一行）。
+ *
+ * 只认 trailer 时，trailer 一丢 → 本片的提交**全部看不见** →
+ * 审计的 changed 变空 → violations 变空 → **越界被放行**（fail open）。
+ * 这是 C9 的兜底判据失效，不是「记录不全」那么轻。
+ *
+ * 为什么需要按提交过滤：审计要回答「本片 agent 改了什么」。
  * 分支上的提交可能不全来自本片 —— 基点错了、或运行期间有人把别的
  * 分支合进来时，那些提交会被误算成「本片的越界写入」（实测 D-28）。
  *
@@ -331,7 +356,7 @@ export function commitsOfSlice(
     const hash = record.slice(0, sep).trim();
     const body = record.slice(sep + 1);
     if (!hash) continue;
-    if (hasRefsSlice(body, sliceId)) result.push(hash);
+    if (isSliceCommit(body, sliceId)) result.push(hash);
   }
   // git log 是从新到旧；反转成从旧到新（diff 累积时顺序不影响结果，
   // 但可读性与调试体验更好）
@@ -350,6 +375,31 @@ export function hasRefsSlice(message: string, sliceId: string): boolean {
   while ((match = pattern.exec(message)) !== null) {
     if (match[1].trim() === sliceId) return true;
   }
+  return false;
+}
+
+/**
+ * 判断一条 commit message 是否是「某个切片产出的提交」。
+ *
+ * 两个判据，**任一命中**即算（D-69）：
+ *
+ *  1. `Refs-Slice: <id>` trailer —— 精确声明，但**会丢**
+ *     （Windows 上 cmd.exe 吞掉提交信息里的换行）；
+ *  2. 标题 `feat(<id>): slice approved` —— zelto 自己的提交约定，
+ *     标题就是提交信息的第一行，**不会被 cmd 吃掉**。
+ *
+ * 为什么必须有第 2 个：只认 trailer 时，trailer 一丢，
+ * `commitsOfSlice` 就返回空 → 审计的 changed/violations 都变空 →
+ * **越界被放行**（fail open）。判据不能只有一条会断的绳。
+ *
+ * 判据 2 精确匹配切片 id：`feat(v1-a): ...` 不能被 `v1-ab` 命中。
+ */
+export function isSliceCommit(message: string, sliceId: string): boolean {
+  if (hasRefsSlice(message, sliceId)) return true;
+  const subject = (message || '').split('\n', 1)[0].trim();
+  if (subject.startsWith(`feat(${sliceId}):`)) return true;
+  // 合并提交也算本片的产物 —— `Merge slice <id>`（merge-executor 写的）
+  if (subject === `Merge slice ${sliceId}`) return true;
   return false;
 }
 
@@ -449,6 +499,7 @@ export function auditWorktreeWrites(
   const baseCommit = options.baseCommit ?? null;
   const managed = options.managed ?? [];
   const changed = new Set<string>();
+  let coverageGap: string | null = null;
 
   try {
     // D-63：不用 `--untracked-files=all`（它在冷 worktree 上要 224 秒）。
@@ -457,7 +508,13 @@ export function auditWorktreeWrites(
     for (const p of listChangedPaths(worktreeRoot)) changed.add(p);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { changed: [], violations: [], tampered: [], error: `git status 失败: ${message}` };
+    return {
+      changed: [],
+      violations: [],
+      tampered: [],
+      error: `git status 失败: ${message}`,
+      coverageGap: null,
+    };
   }
 
   if (baseCommit) {
@@ -471,7 +528,8 @@ export function auditWorktreeWrites(
     // 所以给了 sliceId 就按 `Refs-Slice:` trailer 过滤，只算本片的提交。
     const sliceId = options.sliceId ?? null;
     if (sliceId) {
-      for (const commit of commitsOfSlice(worktreeRoot, baseCommit, 'HEAD', sliceId)) {
+      const sliceCommits = commitsOfSlice(worktreeRoot, baseCommit, 'HEAD', sliceId);
+      for (const commit of sliceCommits) {
         try {
           const diff = git(['diff', '--name-only', `${commit}^..${commit}`], worktreeRoot);
           for (const line of diff.split('\n')) {
@@ -481,6 +539,20 @@ export function auditWorktreeWrites(
         } catch {
           // 单个提交读不出来（根提交没有父提交等）——跳过，不影响其余
         }
+      }
+      // D-69：认不出本片的提交 → 「已提交部分」根本没被审计到。
+      //
+      // 此刻 violations 是空的，但那**不是**「没有越界」，
+      // 是「看不见所以没报」—— fail open。
+      //
+      // 所以显式记下这个缺口，让调用方按 fail closed 处理。
+      // 判据：基点之后有提交，但一个都没认出来。
+      // （基点之后没有提交是正常态 —— agent 还没提交任何东西。）
+      if (sliceCommits.length === 0 && hasCommitsBetween(worktreeRoot, baseCommit, 'HEAD')) {
+        coverageGap =
+          `本片的提交一个都认不出来（既没有 \`Refs-Slice: ${sliceId}\` trailer，` +
+          `也没有 \`feat(${sliceId}): slice approved\` 标题）—— ` +
+          `已提交部分的改动**没有被审计**，不能据此说「没有越界」`;
       }
     } else {
       try {
@@ -514,5 +586,24 @@ export function auditWorktreeWrites(
   const violations = all.filter(
     (p) => !managedPaths.has(p) && !baseline.has(p) && !pathInWriteSet(p, writes),
   );
-  return { changed: all, violations, tampered, error: null };
+  return { changed: all, violations, tampered, error: null, coverageGap };
+}
+
+/**
+ * 基点之后有没有提交（D-69）。
+ *
+ * 用来区分两种「本片提交认不出来」的情况：
+ *  - 基点之后**没有**提交 → 正常态（agent 还没提交东西），不是缺口；
+ *  - 基点之后**有**提交 → 缺口：那些改动没被审计到。
+ *
+ * 读不出来（基点不可达等）时返回 false —— 不因为读不到就报缺口，
+ * 那是另一个错误（基点错位），不该在这里混成一句话。
+ */
+function hasCommitsBetween(repoRoot: string, baseCommit: string, headCommit: string): boolean {
+  try {
+    const out = git(['rev-list', '--count', `${baseCommit}..${headCommit}`], repoRoot).trim();
+    return Number(out) > 0;
+  } catch {
+    return false;
+  }
 }
