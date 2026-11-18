@@ -38,9 +38,10 @@ describe('ADR-075 · 骨架带「写集边界断言的正确写法」', () => {
 
   it('明确点破旧写法为什么错：git diff 只在未合并状态成立', () => {
     assert.match(skeleton, /git diff/);
-    assert.match(skeleton, /未合并/);
     // 必须说清「历史事件 vs 状态」这个区别
     assert.match(skeleton, /历史事件/);
+    // 必须点破旧写法被绑在历史上（合并策略一变就翻转）
+    assert.match(skeleton, /绑定|绑上/);
   });
 
   it('给出可抄的辅助函数形态', () => {
@@ -48,12 +49,24 @@ describe('ADR-075 · 骨架带「写集边界断言的正确写法」', () => {
     assert.match(skeleton, /spawnSync\('git'/);
   });
 
-  it('越界守卫明确交给运行时守卫（C9），不在验收测试里重做', () => {
-    // 必须说清「越界由 C9 负责」——否则 agent 会自己写一个必然误报的版本
-    assert.match(skeleton, /越界/);
-    assert.match(skeleton, /PreToolUse/);
-    // 明确劝退「基点之后的提交动了什么」这条脆判据
-    assert.match(skeleton, /不要/);
+  it('说清 ① 越界（历史）与 ② 产物（状态）的形态分工', () => {
+    // 这是 agent 最容易混的一处 —— 骨架必须说清
+    assert.match(skeleton, /历史事件/);
+    assert.match(skeleton, /状态/);
+    assert.match(skeleton, /改动清单/);
+  });
+
+  it('越界检查保留，但给出三个来源与两个 trailer 判据', () => {
+    assert.match(skeleton, /越界检查/);
+    assert.match(skeleton, /ls-files.*--others|--others/);
+    // 两个判据任一命中即算 —— 只有一条会断的绳 = 越界 fail open
+    assert.match(skeleton, /Refs-Slice/);
+    assert.match(skeleton, /slice approved/);
+    assert.match(skeleton, /任一命中/);
+  });
+
+  it('劝退「基点之后的提交动了什么」这条必然误报的判据', () => {
+    assert.match(skeleton, /不要用「基点之后的提交动了什么」/);
   });
 
   it('导出的指南与骨架里嵌的那份一致', () => {
@@ -65,7 +78,7 @@ describe('ADR-075 · 骨架不得把脆判据当成正确写法', () => {
   const skeleton = buildAcceptanceSkeleton('v1-demo', ['第一条验收标准']);
 
   it('「必须存在未提交改动」只能作为反例出现，不能作为判据', () => {
-    // 反例行会被标成「错（只在未合并状态成立）」——
+    // 反例行会被标成「错（绑在历史上）」——
     // 断言它出现时**必须**跟着那个标记，否则就是把它当判据教给了 agent。
     const lines = skeleton.split('\n');
     for (const line of lines) {
@@ -73,7 +86,7 @@ describe('ADR-075 · 骨架不得把脆判据当成正确写法', () => {
       // 反例块要么在「错（…）」那一段里，要么紧邻明确的错误标记
       const before = lines.slice(0, lines.indexOf(line)).join('\n');
       const isCounterExample =
-        /错（只在未合并状态成立）/.test(before.split('\n').slice(-12).join('\n')) ||
+        /错（绑在历史上）/.test(before.split('\n').slice(-12).join('\n')) ||
         /对（任何状态都成立）/.test(before.split('\n').slice(-12).join('\n'));
       assert.ok(
         isCounterExample,
