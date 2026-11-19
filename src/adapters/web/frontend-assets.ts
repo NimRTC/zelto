@@ -350,6 +350,24 @@ function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
+/**
+ * 一个「值」可以是文本，也可以是一个已经建好的 DOM 节点。
+ *
+ * 为什么需要它：el(tag, cls, text) 只收文本 —— 传节点进去会被
+ * String(text) 变成 "[object HTMLSpanElement]"。
+ * （2026-11-19 实测：预算页的「状态」、详情页的活性徽标真的这么显示过。）
+ *
+ * 判据是 nodeType 而不是 instanceof Node —— 后者在假 DOM / 跨窗口
+ * 场景下不可靠。数字 0、空串仍然照常当文本。
+ */
+function setValue(parent, value) {
+  if (value && typeof value === 'object' && typeof value.nodeType === 'number') {
+    parent.appendChild(value);
+  } else {
+    parent.appendChild(el('span', null, value));
+  }
+}
+
 function table(headers, rows) {
   const t = el('table');
   const thead = el('thead');
@@ -497,7 +515,9 @@ async function viewOverview(target) {
   const cost = el('dl', 'kv');
   const ckv = function (k, v) {
     cost.appendChild(el('dt', null, k));
-    cost.appendChild(el('dd', null, v));
+    const dd = el('dd');
+    setValue(dd, v);
+    cost.appendChild(dd);
   };
   ckv('已花费', formatUsd(s.spentUsd));
   // 没记账的切片列出来 —— 否则「已花费」看起来像完整总额，实际只算了一半的账。
@@ -817,7 +837,9 @@ async function viewBudget(target) {
   const dl = el('dl', 'kv');
   const kv = function (k, v) {
     dl.appendChild(el('dt', null, k));
-    dl.appendChild(el('dd', null, v));
+    const dd = el('dd');
+    setValue(dd, v);
+    dl.appendChild(dd);
   };
   kv('已花费', formatUsd(b.spentUsd));
   kv('上限', b.unlimited ? '不限' : formatUsd(b.limitUsd));
@@ -989,7 +1011,9 @@ async function showSliceDetail(id, forSign) {
   const dl = el('dl', 'kv');
   const kv = function (k, v) {
     dl.appendChild(el('dt', null, k));
-    dl.appendChild(el('dd', null, v));
+    const dd = el('dd');
+    setValue(dd, v);
+    dl.appendChild(dd);
   };
   kv('类型', slice.type || '—');
   kv('写集', String((slice.writes || []).length) + ' 项');
@@ -1323,7 +1347,10 @@ function renderLiveBox(box, summary) {
   const row = el('div', 'check');
   row.appendChild(el('span', 'label', '状态'));
   row.appendChild(el('span', null, summary.state));
-  row.appendChild(el('span', 'ev', liveBadge(summary)));
+  // liveBadge / costCell / progressCell 返回的是**节点**，不是文本 ——
+  // 必须 appendChild。传给 el() 的 text 会被 String() 成 "[object HTMLSpanElement]"
+  // （2026-11-19 实测：详情页那一块真的显示了这串东西）。
+  row.appendChild(liveBadge(summary));
   box.appendChild(row);
 
   if (summary.state === 'running') {
@@ -1338,7 +1365,7 @@ function renderLiveBox(box, summary) {
 
   const cost = el('div', 'check');
   cost.appendChild(el('span', 'label', '花费'));
-  cost.appendChild(el('span', null, costCell(summary)));
+  cost.appendChild(costCell(summary));
   box.appendChild(cost);
 }
 
@@ -1460,9 +1487,9 @@ async function doRun(sliceId, btn) {
 async function doResume(sliceId, btn) {
   btn.disabled = true;
   const choice = window.confirm(
-    '续跑这片停机的切片：\n\n' +
-    '确定 = 恢复以便重跑（保留停机记录）\n' +
-    '取消 = 放弃这片（不可逆）\n\n' +
+    '续跑这片停机的切片：\\n\\n' +
+    '确定 = 恢复以便重跑（保留停机记录）\\n' +
+    '取消 = 放弃这片（不可逆）\\n\\n' +
     '想「只标记已解决、不重跑」请用终端：zelto resume ' + sliceId + ' --skip'
   );
   if (choice === null) {
