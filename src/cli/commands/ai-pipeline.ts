@@ -17,6 +17,7 @@ import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
 import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, hashSpecFile, validateVersionLabelArg } from './shared.js';
+import { computeBoundaryHash } from '../../core/lifecycle/freeze.js';
 import { createSpecDraft } from './slice-spec.js';
 import { RevisionStore } from '../../core/review/index.js';
 import { designFacts, planFacts, requirementFacts, showDraft } from './draft-review.js';
@@ -1407,11 +1408,13 @@ register('version', async (args) => {
 
         sliceData.spec.frozenHash = hashSpecFile(specPath) ?? `sha256:${Date.now()}`;
         sliceData.spec.frozenAt = new Date().toISOString();
+        sliceData.spec.boundaryHash = computeBoundaryHash(sliceData);
         await sliceStore.write(sliceData);
         await sliceStore.transit(sliceDef.id, 'FREEZE');
         await events.append(sliceDef.id, 'spec.frozen', 'cli', {
           sliceId: sliceDef.id,
           frozenHash: sliceData.spec.frozenHash,
+          boundaryHash: sliceData.spec.boundaryHash,
           frozenAt: sliceData.spec.frozenAt,
         });
         f.out(`  ❄️  "${sliceDef.id}" 已冻结`);

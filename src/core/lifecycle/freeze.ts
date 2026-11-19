@@ -86,6 +86,8 @@ export async function freezeSlice(
     const refreshed = await store.read(sliceId);
     refreshed.spec.frozenHash = null;
     refreshed.spec.frozenAt = null;
+    // ADR-092：边界摘要一并清空 —— 重新冻结会重算
+    refreshed.spec.boundaryHash = null;
     // 追溯重新物化：规格改了，需求条目也可能变了
     refreshed.trace.requirements = [];
     await store.write(refreshed);
@@ -196,12 +198,16 @@ export async function freezeSlice(
   const specHash = hashSpecFile(specPath);
   slice.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
   slice.spec.frozenAt = new Date().toISOString();
+  // ADR-092：边界摘要（writes + gateCommands）随冻结一起钉住。
+  // frozenHash 只覆盖规格文件；边界是切片 JSON 字段 —— 不钉住就能被事后偷改。
+  slice.spec.boundaryHash = computeBoundaryHash(slice);
   await store.write(slice);
 
   await store.transit(sliceId, 'FREEZE', actor);
   await events.append(sliceId, 'spec.frozen', actor, {
     sliceId,
     frozenHash: slice.spec.frozenHash,
+    boundaryHash: slice.spec.boundaryHash,
     frozenAt: slice.spec.frozenAt,
     materializedRequirements: traceGate.requirements.length,
     traceSource: materialized ? 'spec' : 'declared',
@@ -212,6 +218,7 @@ export async function freezeSlice(
     sliceId,
     state: 'frozen',
     frozenHash: slice.spec.frozenHash,
+    boundaryHash: slice.spec.boundaryHash,
     frozenAt: slice.spec.frozenAt,
     materializedRequirements: traceGate.requirements.length,
     traceSource: materialized ? 'spec' : 'declared',
@@ -329,6 +336,33 @@ export function hashSpecFile(specPath: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 门禁边界的规范化摘要（ADR-092）。
+ *
+ * 覆盖两样东西 —— 它们都是切片 JSON 字段，不在规格文件里，所以
+ * `frozenHash` 管不到：
+ *   - `writes`：写集（C9 运行时强制用的就是它，冻结时做过策略预检 / D-4 覆盖）；
+ *   - `spec.gateCommands`：本片专属门禁命令（ADR-051）。
+ *
+ * 规范化口径（必须确定性、与实现无关）：
+ *   - `writes`：正斜杠归一 + 去重 + **排序**（顺序无意义）；
+ *   - `gateCommands`：按**原顺序**（顺序是语义，ADR-045），每项 `<name>\0<run>`；
+ *   - 空 gateCommands 与「未设置」视为同一（都 = 用项目级命令）。
+ *
+ * 与 `frozenHash` 同前缀（`sha256:`），避免真假哈希分叉（见 ADR-075 §2）。
+ */
+export function computeBoundaryHash(slice: {
+  writes: string[];
+  spec: { gateCommands?: Array<{ name: string; run: string }> };
+}): string {
+  const writes = Array.from(
+    new Set((slice.writes ?? []).map((w) => w.replace(/\\/g, '/'))),
+  ).sort();
+  const gate = (slice.spec.gateCommands ?? []).map((c) => `${c.name}\u0000${c.run}`);
+  const payload = `${writes.join('\n')}\n--\n${gate.join('\n')}`;
+  return hashContent(payload);
 }
 
 /**

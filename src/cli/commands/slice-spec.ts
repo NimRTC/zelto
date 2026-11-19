@@ -317,7 +317,7 @@ async function handleConfirm(args: string[]): Promise<number> {
   const f = getDefaultFormatter();
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto spec confirm <slice-id>');
+    f.error('USAGE', 'Usage: zelto spec confirm <slice-id> [--force] [--refreeze]');
     return 1;
   }
 
@@ -337,6 +337,28 @@ async function handleConfirm(args: string[]): Promise<number> {
 
   const slice = await store.read(id);
   const specPath = slice.spec.path;
+
+  // ── 状态门（ADR-092）──
+  //
+  // 冻结 = 这套规格与边界已被人批准。冻结后重写规格必须显式走 --refreeze，
+  // 让整套校验（追溯物化 / 策略预检 / D-4 覆盖 / 边界摘要）重新跑一遍。
+  //
+  // 没有这道门时，`spec confirm` 能在 frozen 切片上把规格与骨架一起换掉 ——
+  // 签字时比对的是旧规格的哈希，但盘上已经是新内容，追溯链从此对不上。
+  const isFrozen = slice.state === 'frozen';
+  const force = args.includes('--force');
+  const refreeze = args.includes('--refreeze');
+  if (isFrozen && !refreeze) {
+    f.error(
+      'FROZEN',
+      `切片 "${id}" 已冻结 —— 改规格请先重新冻结（让整套校验重跑）。`,
+    );
+    f.out('');
+    f.out(`  1) 重新冻结（会把切片退回 draft 并重走追溯 / 策略 / 写集校验）：`);
+    f.out(`     zelto freeze ${id} --refreeze`);
+    f.out(`  2) 然后再确认草稿：zelto spec confirm ${id}`);
+    return 1;
+  }
 
   // ── 确认前预演追溯物化 ──
   //
@@ -406,19 +428,75 @@ async function handleConfirm(args: string[]): Promise<number> {
     draftPath: specDraftPath(id),
   });
 
-  // 确认后按新规格重建骨架（ADR-050）：骨架的出处是**正式规格**。
+  // 确认后按新规格重建骨架（ADR-050：骨架的出处是**正式规格**）。
   // 人改了验收标准，骨架就该跟着变 —— 否则 agent 追的是上一版的契约。
-  const skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, draft, id, process.cwd(), {
-    force: true,
+  //
+  // 但「跟着变」**不能**覆盖已实现的断言（ADR-092）。判据：目标文件是否还是
+  // 纯 todo 骨架。
+  //   - 不存在            → 正常生成；
+  //   - 纯 todo           → 覆盖重建（此时覆盖无损失）；
+  //   - 含真断言 / 已编辑 → **默认保全**；只有显式 `--force` 才覆盖。
+  //
+  // 默认保全而不是默认覆盖，是因为断言是「绿灯的含义」，是人的劳动产物。
+  // 悄悄换回 todo = 悄悄改验证语义，正是追溯链最不能容忍的静默失败。
+  const first = writeAcceptanceSkeleton(slice.acceptance?.dir, draft, id, process.cwd(), {
+    // 先不 force：让 writeAcceptanceSkeleton 告诉我们「现有文件是什么形态」。
+    force: false,
   });
+
+  let skeleton = first;
+  let overwritten: 'none' | 'skeleton' | 'assertions' = 'none';
+
+  if (first.path) {
+    // 骨架不存在 → 已生成
+    overwritten = 'skeleton';
+  } else if (first.skippedExisting) {
+    if (first.existingIsPureTodo) {
+      // 现有文件还是纯 todo —— 覆盖没有损失，按新规格重建
+      skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, draft, id, process.cwd(), {
+        force: true,
+      });
+      overwritten = 'skeleton';
+    } else if (force) {
+      // 人显式要求覆盖含真断言的文件
+      skeleton = writeAcceptanceSkeleton(slice.acceptance?.dir, draft, id, process.cwd(), {
+        force: true,
+      });
+      overwritten = 'assertions';
+    } else {
+      // 保全：含真断言的骨架**不覆盖**
+      skeleton = first;
+    }
+  }
+
   if (skeleton.path) {
     await addAcceptanceSkeletonToWriteSet(id, skeleton.path);
+  }
+
+  if (overwritten === 'assertions') {
+    // 覆盖了真断言——这是「改验证语义」，留下显著痕迹（C4）。
+    // 复用既有 `spec.checked` 事件（不新增事件类型）：
+    // phase 标明这是 confirm 阶段的检查，overwritten 说明骨架被覆盖。
+    await events.append(id, 'spec.checked', 'zelto', {
+      sliceId: id,
+      passed: true,
+      phase: 'confirm',
+      overwritten: 'assertions',
+      path: skeleton.path,
+    });
   }
 
   f.success(`规格已确认，写入 ${specPath}`);
   f.out('  这份规格现在是「人批准的出处」—— 冻结时它会物化成本片的需求追溯。');
   if (skeleton.path) {
-    f.out(`  验收骨架已同步重建：${skeleton.path}（${skeleton.caseCount} 条用例）`);
+    f.out(`  验收骨架已按新规格重建：${skeleton.path}（${skeleton.caseCount} 条用例）`);
+  } else if (first.skippedExisting && !first.existingIsPureTodo && !force) {
+    // 保全路径：要明确告诉人「有断言没被覆盖」，以及怎么覆盖
+    const target = first.reason?.split('：').slice(1).join('：') ?? '验收骨架';
+    f.warn(`  验收骨架 ${target} 含已实现的断言 —— 已保全，未覆盖（ADR-092）。`);
+    f.out(`  若确实需要按新规格重建（会抹掉这些断言）：zelto spec confirm ${id} --force`);
+  } else if (skeleton.reason) {
+    f.warn(`  验收骨架未重建：${skeleton.reason}`);
   }
   return 0;
 }
@@ -433,8 +511,9 @@ register('spec', async (args: string[]): Promise<number> => {
     f.error('USAGE', 'Usage: zelto spec <draft|show|confirm|skeleton> <slice-id>');
     f.out('       zelto spec draft <slice-id>    生成规格草稿 + 验收测试骨架');
     f.out('       zelto spec show <slice-id>     看草稿 / 正式规格');
-    f.out('       zelto spec confirm <slice-id>  确认草稿 → 写进正式规格');
-    f.out('       zelto spec skeleton <slice-id> 从正式规格重新生成验收骨架');
+    f.out('       zelto spec confirm <slice-id> [--force] [--refreeze]  确认草稿 → 写进正式规格');
+    f.out('       zelto spec skeleton <slice-id> [--force]  从正式规格重新生成验收骨架');
+    f.out('         （含已实现断言的骨架默认保全；--force 才覆盖；frozen 切片需 --refreeze）');
     return 1;
   }
 

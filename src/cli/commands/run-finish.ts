@@ -80,6 +80,15 @@ export interface FinishRunOptions {
    */
   alreadyRecorded?: boolean;
   /**
+   * 本次运行的出处（ADR-092），写进 `runs[*].phase`。
+   *
+   * 只在 `alreadyRecorded !== true` 时生效 —— 即只有 `finishRun` 自己记账时
+   * 才用得上。前台单片已由循环内记账（传 `alreadyRecorded: true`），
+   * 所以这里通常是 `'supervisor'`（后台监督进程）。
+   * 缺省 = `'foreground'`（历史默认）。
+   */
+  runPhase?: 'foreground' | 'supervisor';
+  /**
    * 切片是否**已经停机**了。
    *
    * 前台运行：会先调 `handleAgentFailure` —— 它在重试预算耗尽时**已经**
@@ -188,13 +197,14 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
     alreadyRecorded = false,
     alreadyStalled = false,
     outcomeUnknown = false,
+    runPhase = 'foreground',
   } = options;
   const write = options.write ?? ((line: string) => console.log(line));
 
-  // ── 1. 记账（ADR-041 §3.1）────────────────────────────────────────────
+  // ── 1. 记账（ADR-041 §3.1 / ADR-092）─────────────────────────────────
   if (!alreadyRecorded) {
     try {
-      await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
+      await store.recordRun(sliceId, { ok: exitCode === 0, exitCode, phase: runPhase });
     } catch {
       /* 记账失败不阻断 —— 现场比账本重要 */
     }

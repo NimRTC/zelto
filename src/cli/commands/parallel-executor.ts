@@ -655,12 +655,14 @@ export async function executeSlicesParallel(
         st.exitCode = exitCode.exitCode;
         st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
 
-        // 记账（ADR-041 §3.1）：每次 agent 进程结束 = 一条运行记录。
+        // 记账（ADR-041 §3.1 / ADR-092）：每次 agent 进程结束 = 一条运行记录。
         // 重试会另起一个 agent，所以重试一次就多一条 —— 记录的是「跑过几次」，
-        // 不是「这一轮批次的最终结论」。
+        // 不是「这一轮批次的最终结论」。口径与前台单片一致（ADR-092）。
         await store.recordRun(st.id, {
           ok: exitCode.exitCode === 0,
           exitCode: exitCode.exitCode,
+          phase: 'parallel',
+          attempt: attempt + 1,
         });
 
         if (exitCode.halted) {

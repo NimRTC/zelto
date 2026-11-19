@@ -78,7 +78,7 @@ import { validateDeterministic } from '../../core/spec/deterministic/validator.j
 import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
 import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 // ADR-086：冻结编排下沉到 core —— CLI 与 Web 调同一份（C3：判定不许分叉）
-import { freezeSlice } from '../../core/lifecycle/freeze.js';
+import { freezeSlice, computeBoundaryHash } from '../../core/lifecycle/freeze.js';
 import { register } from './shared.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
@@ -365,9 +365,11 @@ async function waitForExitWithWatchdog(opts: {
         // 只报「超时收走」，人看到的还是「又跑废了」。
         ...(await collectWatchdogProgress(sliceId)),
       });
-      // 记账：这一轮同样是一次运行（ADR-041 §3.1）
+      // 记账：这一轮同样是一次运行（ADR-041 §3.1 / ADR-092）。
+      // 看门狗收走的这一轮**由这里记、且只记一次** —— 主循环看到
+      // watchdogRecorded 后不再补记。
       try {
-        await store.recordRun(sliceId, { ok: false, exitCode: null });
+        await store.recordRun(sliceId, { ok: false, exitCode: null, phase: 'watchdog' });
       } catch { /* 记账失败不阻断处置 */ }
 
       const stateNote = transitioned?.reverted ? '（已退回 frozen，修好环境后直接重跑）' : '';      console.error(`\n  🐕 活进程看门狗：${action.reason}${stateNote}`);
@@ -989,10 +991,11 @@ register('clarify', async (args) => {
       const specHash = hashSpecFile(afterConverge.spec.path);
       afterConverge.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
       afterConverge.spec.frozenAt = new Date().toISOString();
+      afterConverge.spec.boundaryHash = computeBoundaryHash(afterConverge);
       await store.write(afterConverge);
       await store.transit(id, 'FREEZE');
       await events.append(id, 'spec.frozen', 'zelto', {
-        sliceId: id, frozenHash: afterConverge.spec.frozenHash, frozenAt: afterConverge.spec.frozenAt,
+        sliceId: id, frozenHash: afterConverge.spec.frozenHash, boundaryHash: afterConverge.spec.boundaryHash, frozenAt: afterConverge.spec.frozenAt,
       });
 
       console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
@@ -1050,10 +1053,11 @@ register('clarify', async (args) => {
     const specHash = hashSpecFile(afterConverge.spec.path);
     afterConverge.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
     afterConverge.spec.frozenAt = new Date().toISOString();
+    afterConverge.spec.boundaryHash = computeBoundaryHash(afterConverge);
     await store.write(afterConverge);
     await store.transit(id, 'FREEZE');
     await events.append(id, 'spec.frozen', 'human', {
-      sliceId: id, frozenHash: afterConverge.spec.frozenHash, frozenAt: afterConverge.spec.frozenAt,
+      sliceId: id, frozenHash: afterConverge.spec.frozenHash, boundaryHash: afterConverge.spec.boundaryHash, frozenAt: afterConverge.spec.frozenAt,
     });
 
       console.log(`  ✅ Slice frozen at ${afterConverge.spec.frozenAt}`);
@@ -1639,16 +1643,28 @@ register('run', async (args) => {
       }
       process.stdout.write('\r' + ' '.repeat(50) + '\r');
 
-      if (exitCode === 0) {
-        finalExitCode = 0;
-        break;
-      }
-
       // 看门狗已经写好了停机（退 frozen + 分类 + run.aborted + 记账）——
       // 再走一遍 handleAgentFailure 只会写第二份分类、迁第二次状态。
       if (waited.watchdogReaped) {
         finalExitCode = null;
         watchdogRecorded = true;
+        break;
+      }
+
+      // 记账（ADR-092）：**每次 agent 进程结束 = 一条**，与并行路径同口径。
+      // 记在重试判断之前 —— 中间被重试掉的失败尝试也必须在账本里。
+      // 计数：attempt 从 0 起算，记录里的 attempt 从 1 起算。
+      try {
+        await store.recordRun(id, {
+          ok: exitCode === 0,
+          exitCode,
+          phase: 'foreground',
+          attempt: attempt + 1,
+        });
+      } catch { /* 记账失败不阻断 —— 现场比账本重要 */ }
+
+      if (exitCode === 0) {
+        finalExitCode = 0;
         break;
       }
 
@@ -1712,10 +1728,14 @@ register('run', async (args) => {
     // 前台与后台监督进程**走同一条流水线**（./run-finish.ts）。
     // 两份实现必然漂移（一处跑门禁、一处忘了）—— 见 run-finish.ts 的说明。
     //
-    // 看门狗收走的那一轮已经记过账（exitCode=null）—— 不再记第二次，
-    // 否则一次运行会变成两条记录。
-    if (!watchdogRecorded) {
-      await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
+    // 记账（ADR-092）已经在重试循环里**每次进程结束记一条**（与并行同口径）。
+    // 唯二没走循环内记账的情形：
+    //   1. 看门狗收走的那一轮 —— 由 watchdog 记过（exitCode=null）；
+    //   2. agent 起不来 / 循环一次都没跑（finalExitCode 仍是初始值）——
+    //      这种「没有进程真的跑完」的结局**不该**进 runs（不是一次运行）。
+    // 因此这里只在「看门狗收走」时补记，其余不再记 —— 否则会变成一条两记。
+    if (watchdogRecorded) {
+      // 看门狗已记过，这里不再记。
     }
 
     if (watchdogRecorded) {
@@ -1973,10 +1993,11 @@ register('start', async (args) => {
       const specHash = hashSpecFile(specPath);
       current.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
       current.spec.frozenAt = new Date().toISOString();
+      current.spec.boundaryHash = computeBoundaryHash(current);
       await store.write(current);
       await store.transit(id, 'FREEZE');
       await events.append(id, 'spec.frozen', 'cli', {
-        sliceId: id, frozenHash: current.spec.frozenHash, frozenAt: current.spec.frozenAt,
+        sliceId: id, frozenHash: current.spec.frozenHash, boundaryHash: current.spec.boundaryHash, frozenAt: current.spec.frozenAt,
       });
       console.log(`  ✅ Frozen: ${id}`);
     } else {
@@ -2087,15 +2108,26 @@ register('start', async (args) => {
       clearInterval(progressTimer);
       process.stdout.write('\r' + ' '.repeat(50) + '\r');
 
-      if (exitCode === 0) {
-        finalExitCode = 0;
-        break;
-      }
-
-      // 看门狗已写好停机与记账 —— 不再走 handleAgentFailure
+      // 看门狗已写好停机与记账 —— 不再走 handleAgentFailure / 不再记账
       if (waited.watchdogReaped) {
         finalExitCode = null;
         watchdogRecorded = true;
+        break;
+      }
+
+      // 记账（ADR-092）：**每次 agent 进程结束 = 一条**，与并行路径同口径。
+      // 成功与失败都要记 —— 中间被重试掉的失败尝试也必须在账本里。
+      try {
+        await store.recordRun(id, {
+          ok: exitCode === 0,
+          exitCode,
+          phase: 'foreground',
+          attempt: attempt + 1,
+        });
+      } catch { /* 记账失败不阻断 */ }
+
+      if (exitCode === 0) {
+        finalExitCode = 0;
         break;
       }
 
@@ -2143,10 +2175,8 @@ register('start', async (args) => {
       break;
     }
 
-    // 记账（ADR-041 §3.1）—— 看门狗收走的那一轮已经记过，不再记第二次。
-    if (!watchdogRecorded) {
-      await store.recordRun(id, { ok: finalExitCode === 0, exitCode: finalExitCode });
-    }
+    // 记账（ADR-092）已在重试循环里每次进程结束记过 —— 这里不再补记，
+    // 否则会变成一条两记。看门狗收走的那一轮由 watchdog 自己记。
 
     if (watchdogRecorded) {
       // 这一轮已交回给人（frozen + 停机分类），不再跑门禁 / 不进签字

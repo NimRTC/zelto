@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { checkSliceId } from '../../core/slice/store.js';
+import { computeBoundaryHash } from '../../core/lifecycle/freeze.js';
 
 // ─── slice (detail) ────────────────────────────────────────────────────────
 
@@ -64,6 +65,12 @@ register('slice', async (args) => {
     const specHashOk = slice.spec.frozenHash
       ? (hashSpecFile(slice.spec.path) === slice.spec.frozenHash ? '✅' : '⚠️ changed')
       : '⬜ not frozen';
+    // 边界摘要（ADR-092）：冻结时写的 writes/gateCommands 摘要是否还对得上。
+    // null = 未钉边界（老切片），不误报 mismatch。
+    let boundaryOk = '⬜ not pinned';
+    if (slice.state === 'frozen' && slice.spec.boundaryHash) {
+      boundaryOk = computeBoundaryHash(slice) === slice.spec.boundaryHash ? '✅' : '⚠️ changed';
+    }
 
     const stateIcons: Record<string, string> = {
       draft: '📝', clarifying: '❓', frozen: '❄️',
@@ -74,6 +81,7 @@ register('slice', async (args) => {
     f.out(`  Title:     ${slice.title}`);
     f.out(`  State:     ${slice.state}`);
     f.out(`  Spec:      ${slice.spec.path} ${specHashOk}`);
+    f.out(`  Boundary:  ${boundaryOk}${slice.spec.boundaryHash ? ' (writes + gateCommands)' : ''}`);
     f.out(`  Created:   ${slice.createdAt.slice(0, 10)}`);
     f.out(`  Updated:   ${slice.updatedAt.slice(0, 10)}`);
     f.out(`  Base:      ${slice.baseCommit ?? '(not set)'}`);
@@ -190,6 +198,31 @@ register('set', async (args) => {
   try {
     const slice = await store.read(id);
     const prevState = slice.state;
+
+    // ── 冻结边界保护（ADR-092）──
+    //
+    // 门禁边界（写集 + 门禁命令）冻结后被钉进 spec.boundaryHash。
+    //
+    // 危险的是「签字之后再偷改」——签字的凭据是当时的边界。而签字后
+    // 切片已是**终态**（completed / abandoned），所以真正要硬拒的是终态改边界。
+    //
+    // 为什么不用「frozen 下硬拒」：越界退 frozen 后**扩写集重跑**是既有的
+    // 官方恢复路径（tests/acceptance/write-set-recovery）。frozen 的切片还
+    // 没签字（签字即 completed），此时改边界不会造成「签字与边界脱钩」——
+    // 门禁与签字都会重新基于改后的边界。所以 frozen 下允许改，但必须：
+    //   1) 重算 boundaryHash（保持摘要一致，避免 check 误报）；
+    //   2) 留一条显式事件（不静默）。
+    const BOUNDARY_FIELDS = new Set(['writes', 'spec.gateCommands']);
+    const isBoundaryField = BOUNDARY_FIELDS.has(field);
+    if (isBoundaryField && (slice.state === 'completed' || slice.state === 'abandoned')) {
+      f.error(
+        'SIGNED_BOUNDARY',
+        `切片 "${id}" 已 ${slice.state === 'completed' ? '签字完成' : '放弃'} —— ${field} 是冻结边界的一部分，不能再改。`,
+      );
+      f.out('');
+      f.out('  签字之后边界已钉死（签字的凭据就是当时的边界）。要改边界请开新切片。');
+      return 1;
+    }
     // ADR-082：写前留一份**字段值**快照 —— 写完若目标字段没变，
     // 就不能报告成功。（不能比整个 JSON：`store.write` 会刷新 `updatedAt`，
     // 整个 JSON 永远会「变」。）
@@ -276,9 +309,30 @@ register('set', async (args) => {
       return 1;
     }
 
+    // ADR-092：改了冻结边界 → 重算 boundaryHash，并留一条显式事件（不静默）。
+    // 这里只管 frozen（签字后是 completed，上面已经硬拒）。frozen 下改边界
+    // 的合法场景是「越界后退回 frozen → 扩写集重跑」—— 重算摘要让 check
+    // 不再把它当成漂移，事件让「边界何时动过」可追溯。
+    let boundaryChanged = false;
+    if (isBoundaryField && slice.state === 'frozen') {
+      slice.spec.boundaryHash = computeBoundaryHash(slice);
+      await store.write(slice);
+      boundaryChanged = true;
+    }
+
     await events.append(id, 'spec.drafted', 'cli', {
       sliceId: id, field, fromValue: prevState, action: 'slice.set',
     });
+
+    if (boundaryChanged) {
+      await events.append(id, 'spec.checked', 'cli', {
+        sliceId: id,
+        passed: true,
+        phase: 'set-boundary',
+        field,
+        boundaryHash: slice.spec.boundaryHash,
+      });
+    }
 
     if (isJson) {
       f.data({ success: true, id, field, value: rawValue });

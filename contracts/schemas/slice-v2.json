@@ -22,7 +22,11 @@
       "properties": {
         "path": { "type": "string" },
         "frozenHash": { "type": ["string", "null"] },
-        "frozenAt": { "type": ["string", "null"] }
+        "frozenAt": { "type": ["string", "null"] },
+        "boundaryHash": {
+          "type": ["string", "null"],
+          "description": "冻结时 writes + spec.gateCommands 的规范化摘要（ADR-092）。null = 未钉边界（老切片）。"
+        }
       }
     },
     "acceptance": {
@@ -62,7 +66,17 @@
         "properties": {
           "at": { "type": "string", "format": "date-time", "description": "运行结束时刻（ISO 8601）" },
           "ok": { "type": "boolean", "description": "agent 进程是否正常退出（退出码 0）" },
-          "exitCode": { "type": ["integer", "null"], "description": "agent 退出码；被信号打断为 null" }
+          "exitCode": { "type": ["integer", "null"], "description": "agent 退出码；被信号打断为 null" },
+          "phase": {
+            "type": "string",
+            "enum": ["foreground", "parallel", "resume", "watchdog", "supervisor"],
+            "description": "这条运行记录出自哪条执行路径（ADR-092）。老记录缺省按 foreground。"
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "在本轮（同一会话 / 重试族）里是第几次尝试，从 1 开始（ADR-092）。缺省 = 1。"
+          }
         }
       }
     },

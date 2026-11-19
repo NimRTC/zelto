@@ -18,6 +18,7 @@ import { register } from './shared.js';
 import { ZELTO_DIR, SLICES_DIR, EVENTS_DIR, createLlmFromConfig } from './shared.js';
 import { events as sharedEvents } from './shared.js';
 import { appendBaselineRegisteredEvent } from '../../core/project/baseline.js';
+import { computeBoundaryHash } from '../../core/lifecycle/freeze.js';
 
 // ─── pipeline ────────────────────────────────────────────────────────────────
 
@@ -502,6 +503,7 @@ register('project', async (args) => {
       // 这件事永远判不出来（ADR-039 §2）。
       slice.spec.frozenHash = `sha256:${createHash('sha256').update(specContent, 'utf-8').digest('hex')}`;
       slice.spec.frozenAt = new Date().toISOString();
+      slice.spec.boundaryHash = computeBoundaryHash(slice);
       await sliceStore.write(slice);
 
       writeFileSync(specPath, specContent, 'utf-8');

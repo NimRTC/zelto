@@ -26,6 +26,7 @@ import { isProtectedPath } from '../policy/engine.js';
 import type { EventType } from '../events/stream.js';
 import type { SliceStore } from '../slice/store.js';
 import type { ProjectMap, ProjectModule } from './types.js';
+import { computeBoundaryHash } from '../lifecycle/freeze.js';
 
 /** 一个待生成的基线切片 */
 export interface BaselineSlicePlan {
@@ -278,6 +279,7 @@ export async function registerBaselineSlices(
     slice.spec.path = specPath;
     slice.spec.frozenHash = `sha256:${createHash('sha256').update(specContent, 'utf-8').digest('hex')}`;
     slice.spec.frozenAt = new Date().toISOString();
+    slice.spec.boundaryHash = computeBoundaryHash(slice);
     await deps.store.write(slice);
 
     await writeFile(specPath, specContent, 'utf-8');

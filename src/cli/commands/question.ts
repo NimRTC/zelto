@@ -235,8 +235,8 @@ register('answer', async (args) => {
 
   const exitCode = await adapter.waitForExit(newSessionId);
 
-  // 记账（ADR-041 §3.1）：续跑也是一次运行 —— agent 又跑了一遍。
-  await store.recordRun(sliceId, { ok: exitCode === 0, exitCode });
+  // 记账（ADR-041 §3.1 / ADR-092）：续跑也是一次运行 —— agent 又跑了一遍。
+  await store.recordRun(sliceId, { ok: exitCode === 0, exitCode, phase: 'resume' });
 
   if (exitCode !== 0) {
     const elapsedNote = `exit ${exitCode ?? 'signal'}`;

@@ -82,6 +82,17 @@ export interface SliceSpec {
    * 缺省 = 用项目级命令（`gate.commands` 或对应 profile）。
    */
   gateCommands?: Array<{ name: string; run: string; timeoutSec?: number }>;
+  /**
+   * 冻结时 `writes` + `gateCommands` 的规范化摘要（ADR-092）。
+   *
+   * 为什么要有：`frozenHash` 只覆盖规格文件内容，`writes` / `gateCommands`
+   * 都是切片 JSON 字段 —— 不纳入摘要的话，冻结后偷改写集或门禁命令，
+   * 签字与校验就脱钩了（历史缺陷）。
+   *
+   * 语义与 `frozenHash` 平行：`sha256:<hex>`。老切片缺省 `null`（类型上可选，
+   * 读时归一化成 `null`）。
+   */
+  boundaryHash?: string | null;
 }
 
 export interface SliceAcceptance {
@@ -103,10 +114,14 @@ export interface SliceTrace {
 }
 
 /**
- * 一次 agent 运行的记录（ADR-041 §3.1）。
+ * 一次 agent 运行的记录（ADR-041 §3.1，口径统一见 ADR-092）。
  *
- * 「一次运行」的边界：**agent 进程结束** —— 无论成功、失败、被提问挂起还是越界回退。
- * 门禁、签字、合并都不算运行 —— 它们不是 agent 的执行。
+ * 「一次运行」的边界：**agent 进程结束** —— 无论成功、失败、被提问挂起、
+ * 越界回退、看门狗收走，还是续跑。门禁、签字、合并都不算运行。
+ *
+ * **口径（ADR-092）**：一次 agent 进程结束 = **一条**记录，前后台一致。
+ * 真实仓库经历过「前台按整轮记一条、并行按每次记一条」的分叉 ——
+ * 同一片重试 3 次，前台落 1 条、并行落 3 条，北极星的解释变量从此不可比。
  *
  * `ok` 记的是 agent 进程自己的退出结果：退出码 0 为 true。
  * 越界（写集违规）不会翻转这个标志 —— 那是另一次判定的事实，
@@ -119,6 +134,20 @@ export interface SliceRun {
   ok: boolean;
   /** agent 退出码；被信号打断时为 null */
   exitCode: number | null;
+  /**
+   * 这一条出自哪条执行路径（ADR-092）。
+   *
+   * 老状态文件没有这个字段 —— 归一化时按 'foreground' 兜底，
+   * 不伪造语义（历史上前台是默认路径）。
+   */
+  phase?: 'foreground' | 'parallel' | 'resume' | 'watchdog' | 'supervisor';
+  /**
+   * 在本轮（同一会话 / 重试族）里是第几次尝试，从 1 开始（可选）。
+   *
+   * 缺省 = 1。用来把「每次尝试」与「整轮结论」分开 —— 整轮结论是派生量，
+   * 不要再拿 `runs.length` 当「跑了几轮」。
+   */
+  attempt?: number;
 }
 
 export interface SliceData {
@@ -161,13 +190,26 @@ export type SliceEventRecord = {
  */
 function normalizeRuns(raw: unknown): SliceRun[] {
   if (!Array.isArray(raw)) return [];
-  return raw.filter(
-    (r): r is SliceRun =>
-      !!r &&
-      typeof r === 'object' &&
-      typeof (r as SliceRun).at === 'string' &&
-      typeof (r as SliceRun).ok === 'boolean',
-  );
+  return raw
+    .filter(
+      (r): r is Partial<SliceRun> =>
+        !!r &&
+        typeof r === 'object' &&
+        typeof (r as SliceRun).at === 'string' &&
+        typeof (r as SliceRun).ok === 'boolean',
+    )
+    .map((r) => {
+      const run: SliceRun = {
+        at: r.at as string,
+        ok: r.ok as boolean,
+        exitCode: typeof r.exitCode === 'number' ? r.exitCode : null,
+      };
+      // ADR-092：老记录没有 phase / attempt —— 按缺省兜底，不伪造语义。
+      // 不写回磁盘（读时归一化即可）；下一次真写入会带上当前字段。
+      if (r.phase) run.phase = r.phase;
+      if (typeof r.attempt === 'number' && Number.isFinite(r.attempt)) run.attempt = r.attempt;
+      return run;
+    });
 }
 
 /**
@@ -234,6 +276,11 @@ export class SliceStore {
     slice.stall = normalizeStall(slice.stall);
     if (typeof slice.clarifyRounds !== 'number' || !Number.isFinite(slice.clarifyRounds)) {
       slice.clarifyRounds = 0;
+    }
+    // `spec.boundaryHash`（ADR-092）：老切片没有这个字段 —— 读时补 `null`，
+    // 不伪造。`check` 看到 `null` 会显示「未钉边界」而不是误报 mismatch。
+    if (slice.spec && (slice.spec.boundaryHash === undefined || slice.spec.boundaryHash === null)) {
+      slice.spec.boundaryHash = null;
     }
     // 终态自愈（ADR-041 §3.3）：已经 completed / abandoned 的切片不该还挂着停机分类。
     // 老状态文件是在清账规则落地之前写的 —— 读的时候顺手归正，
@@ -307,14 +354,24 @@ export class SliceStore {
    * 为什么要有它：事件流记的是「发生过什么」，切片状态记的是「这片现在什么样」。
    * `runs` 之前是死字段（永远空数组），人查切片状态得到的是假信息；
    * 澄清轮次也因为读它而永远停在第 1 轮。
+   *
+   * **口径（ADR-092）**：一次 agent 进程结束 = 一条记录。调用方必须保证
+   * 「一次进程只记一次」—— 看门狗收走的那一轮由 watchdog 记，主循环不再记。
+   * `phase` / `attempt` 让账本能分清「这是哪条路径的第几次尝试」。
    */
-  async recordRun(id: string, run: { ok: boolean; exitCode: number | null; at?: string }): Promise<void> {
+  async recordRun(
+    id: string,
+    run: { ok: boolean; exitCode: number | null; at?: string; phase?: SliceRun['phase']; attempt?: number },
+  ): Promise<void> {
     const slice = await this.read(id);
-    slice.runs.push({
+    const entry: SliceRun = {
       at: run.at ?? new Date().toISOString(),
       ok: run.ok,
       exitCode: run.exitCode ?? null,
-    });
+    };
+    if (run.phase) entry.phase = run.phase;
+    if (typeof run.attempt === 'number' && Number.isFinite(run.attempt)) entry.attempt = run.attempt;
+    slice.runs.push(entry);
     await this.write(slice);
   }
 
@@ -341,7 +398,7 @@ export class SliceStore {
       id,
       title,
       state: 'draft',
-      spec: { path: `specs/slices/${id}.md`, frozenHash: null, frozenAt: null },
+      spec: { path: `specs/slices/${id}.md`, frozenHash: null, frozenAt: null, boundaryHash: null },
       acceptance: { dir: `tests/acceptance/${id}/`, frozenHash: null, oracleSrc: null },
       baseCommit: opts?.baseCommit ?? null,
       drift: { detected: false, reason: null, at: null },

@@ -14,9 +14,10 @@
 //
 // C3: 纯文本生成 + 写文件，不调模型、不触网。
 
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { extractAcceptanceCriteria } from './trace-extract.js';
+import { isPureTodoSkeleton } from '../project/managed-acceptance.js';
 
 /** 骨架文件名 —— 必须能被门禁的测试文件识别规则（isTestFileName）认出来 */
 export const SKELETON_FILE_NAME = 'acceptance.test.cjs';
@@ -31,6 +32,14 @@ export interface SkeletonResult {
   reason: string | null;
   /** 目标已存在、没覆盖时为 true */
   skippedExisting?: boolean;
+  /**
+   * 目标已存在时，它是否还是「纯 todo 骨架」（ADR-092）。
+   *
+   * 只有 `skippedExisting === true` 时才有意义：
+   *   - `true`  → 原文件全是 `test.todo`，覆盖它没有损失；
+   *   - `false` → 原文件里已有真断言（人/agent 的工作），**不能**静默覆盖。
+   */
+  existingIsPureTodo?: boolean;
 }
 
 /**
@@ -224,11 +233,21 @@ export function writeAcceptanceSkeleton(
 
   const targetAbs = join(root, target);
   if (existsSync(targetAbs) && !opts?.force) {
+    // 告诉调用方「现有文件是不是纯 todo」（ADR-092）：confirm 据此决定
+    // 「覆盖没损失」还是「覆盖会抹掉人/agent 的真断言」。
+    let existingIsPureTodo = false;
+    try {
+      existingIsPureTodo = isPureTodoSkeleton(readFileSync(targetAbs, 'utf-8'));
+    } catch {
+      // 读不到 → 当作「不是纯 todo」（保守：宁可拒绝覆盖）
+      existingIsPureTodo = false;
+    }
     return {
       path: null,
       caseCount: 0,
       reason: `验收骨架已存在，未覆盖：${target}`,
       skippedExisting: true,
+      existingIsPureTodo,
     };
   }
 
