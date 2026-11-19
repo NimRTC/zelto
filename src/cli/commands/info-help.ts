@@ -3,6 +3,8 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Scheduler } from '../../core/sched/engine.js';
+// ADR-086：续跑编排下沉到 core —— CLI 与 Web 调同一份（C3：判定不许分叉）
+import { resumeSlice } from '../../core/lifecycle/resume.js';
 import { isSliceStalled, findDeadSlices, findOrphanShells, reapDeadSlices } from '../../core/stall/index.js';
 import {
   classifyLivenessAsync,
@@ -1028,29 +1030,32 @@ register('resume', async (args) => {
   const autoResolvedBefore = before.stall.autoResolved;
 
   try {
-    const result = await scheduler.resume(id, { skip, abandon, resetRetry });
+    // ADR-086：续跑编排下沉到 core/lifecycle/resume.ts ——
+    // CLI 与 Web 调**同一份**（判定不许分叉，C3）。
+    const outcome = await resumeSlice(
+      {
+        repoRoot: process.cwd(),
+        store,
+        events,
+        actor: 'cli',
+        via: 'cli',
+      },
+      id,
+      { skip, abandon, resetRetry },
+    );
+
+    if (!outcome.ok) {
+      console.error(`Error: ${outcome.reason}`);
+      return 1;
+    }
 
     // 顺序：先报预算，再报这次动作的结果。
     // 「预算已重置」是这次动作**唯一**的效果，混在一堆话里容易被忽略。
-    if (resetRetry) {
-      if (result.retryBudgetReset) {
-        console.log(
-          `  自动重试预算已重置（${autoResolvedBefore} → 0）—— 本次重跑会重新获得自动重试`,
-        );
+    for (const advisory of outcome.advisories) {
+      if (advisory.includes('预算本来就是 0')) {
+        console.log(`  ${advisory}`);
       } else {
-        console.log('  自动重试预算本来就是 0，无需重置');
-      }
-    } else if (autoResolvedBefore > 0) {
-      // 预算已用尽却不重置 —— 人重跑后会发现「第一次失败就停机」，
-      // 而原因在这里。不说，等于让下一个 agent 轮次白跑。
-      const maxRetries = loadConfig().agent.maxRetries ?? 2;
-      if (autoResolvedBefore >= maxRetries) {
-        console.log(
-          `  ⚠️ 自动重试预算已用尽（${autoResolvedBefore}/${maxRetries}）—— 重跑后第一次失败就会停机`,
-        );
-        console.log(
-          `     修好问题后若要恢复自动重试：zelto resume ${id} --reset-retry`,
-        );
+        console.log(`  ⚠️ ${advisory}`);
       }
     }
 
@@ -1068,7 +1073,6 @@ register('resume', async (args) => {
     console.error(`Error: ${msg}`);
     return 1;
   }
-
   return 0;
 });
 

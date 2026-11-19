@@ -1,10 +1,16 @@
 // `zelto web` —— 浏览器驾驶舱（ADR-072）
 //
-// 形态：只读驾驶舱 + **唯一**的写操作（签字）。
+// 形态：**可接管的驾驶舱** —— 刹车（ADR-084：拒签 / 回答 / 拉闸）
+//       + 油门（ADR-086：冻结 / 门禁 / 开跑 / 续跑）。
 // 绑定：硬编码 `127.0.0.1`，不可配置（ADR-072 §7）。
 //
-// 没有 run / gate / freeze / admit / abandon / resume ——
-// 那些动作在 CLI 侧有完整实现，Web 侧再实现一份会分叉判定。
+// **纪律不变**：Web 侧**不重写判定**，只调 CLI 与 Web 共用的那一份 ——
+//   - freeze / gate / resume → 直接调 `core/lifecycle/` 的编排
+//   - run                  → 拉起 CLI 进程本身（`zelto run --detach`）
+// 这样「浏览器里点的」与「终端里跑的」结论永远一致（C3）。
+//
+// 仍然没有 admit / abandon ——
+// 那两个动作在 CLI 侧有完整实现，Web 侧再实现一份会分叉判定。
 // 理由见 ADR-072 §4。
 
 import { WebServer } from '../../adapters/web/index.js';
@@ -47,7 +53,8 @@ register('web', async (args) => {
   }
 
   console.log(`🌐 zelto 驾驶舱已启动：${server.url}`);
-  console.log(`   （只读驾驶舱 + 签字。签字不等于合并 —— 合入主干请跑 zelto merge <id>）`);
+  console.log(`   （能接管：签字 / 拒签 / 回答 / 拉闸 + 冻结 / 门禁 / 开跑 / 续跑）`);
+  console.log(`   （签字不等于合并 —— 合入主干请跑 zelto merge <id>）`);
   console.log('   Ctrl+C 停止');
 
   if (openBrowser) {

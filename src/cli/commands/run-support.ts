@@ -20,7 +20,7 @@ import { classifyStall, isAutoResolvable, type StallClass } from '../../core/sta
 import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
-import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
+import { checkSliceGateGuard, describeGuardKinds } from '../../core/arch/guard-wiring.js';
 import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
 
 /**

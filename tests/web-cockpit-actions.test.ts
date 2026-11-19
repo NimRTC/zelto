@@ -253,10 +253,48 @@ describe('驾驶舱的可接管动作（ADR-084）', () => {
 
   // ── 边界 ──────────────────────────────────────────────────────────────
 
-  it('Web 端**没有** run / gate / freeze / resume 端点（ADR-084 §1）', async () => {
+  it('顶层没有裸的 run / gate / freeze / resume 端点（动作挂在切片下）', async () => {
+    // ADR-086 把这四个动作搬到了 `/api/slices/:id/<动作>` 下 ——
+    // 顶层裸端点**仍然不该有**（没有切片 id 就没有作用对象）。
     for (const path of ['/api/run', '/api/gate', '/api/freeze', '/api/resume']) {
       const res = await req('POST', path, { body: {} });
       assert.equal(res.status, 404, `${path} 不该存在，实际 ${res.status}`);
+    }
+  });
+
+  it('ADR-086 的四个油门端点挂在切片下（不再被 ADR-084 §1 排除）', async () => {
+    // 这条断言**取代**了 ADR-084 §8「Web 端没有 run/gate/freeze/resume 端点」。
+    //
+    // 断言的是「端点存在」而不是「动作成功」——
+    // 动作成功与否取决于切片状态，那是另一个文件（web-cockpit-throttle）的事。
+    //
+    // 存在的判据：**不是 404**。非 POST 的请求会拿到 405（Method not allowed），
+    // 那也证明路由认得这个端点。
+    for (const path of [
+      '/api/slices/slice-a/freeze',
+      '/api/slices/slice-a/gate',
+      '/api/slices/slice-a/run',
+      '/api/slices/slice-a/resume',
+    ]) {
+      const res = await req('GET', path);
+      assert.notEqual(res.status, 404, `${path} 应当存在，实际 404`);
+    }
+  });
+
+  it('四个油门端点同样过三道防线（缺 token 被拒）', async () => {
+    // 端点存在不等于端点安全 —— 新端点必须继承 ADR-072 §3 的三道校验。
+    for (const path of [
+      '/api/slices/slice-a/freeze',
+      '/api/slices/slice-a/gate',
+      '/api/slices/slice-a/run',
+      '/api/slices/slice-a/resume',
+    ]) {
+      const res = await fetch(`${baseUrl}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(res.status, 403, `${path} 缺 token 必须被拒，实际 ${res.status}`);
     }
   });
 

@@ -17,7 +17,7 @@
 import { reviewBatch, planExecutionPhases, evaluateBatchConflicts, groupIssues } from '../../core/sched/batch.js';
 import type { BatchIssue, BatchMember } from '../../core/sched/batch.js';
 import { readDependencies, readEffectiveWriteSet, readSliceFacts } from './batch-facts.js';
-import { loadWholeGraphGuard, sliceGuardForWrites, sliceGuardIssue } from './arch-guard.js';
+import { loadWholeGraphGuard, sliceGuardForWrites, sliceGuardIssue } from '../../core/arch/guard-wiring.js';
 import { register } from './shared.js';
 
 register('batch', async (args) => {

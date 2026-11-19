@@ -77,6 +77,8 @@ import { judgeTrace, traceCountsOf, blockingViolations, advisoryViolations } fro
 import { validateDeterministic } from '../../core/spec/deterministic/validator.js';
 import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
 import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
+// ADR-086：冻结编排下沉到 core —— CLI 与 Web 调同一份（C3：判定不许分叉）
+import { freezeSlice } from '../../core/lifecycle/freeze.js';
 import { register } from './shared.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
@@ -1129,211 +1131,76 @@ register('freeze', async (args) => {
   const isRefreeze = args.includes('--refreeze');
 
   try {
-    // `let` 而非 `const`：--refreeze 分支会把 slice 换成刷新后的对象
-    // （transit 会覆写盘上的状态，局部变量必须跟着换）。
-    let slice = await store.read(id);
-    if (slice.state !== 'draft' && slice.state !== 'clarifying') {
-      // 只有 frozen 能重新冻结。running / completed / abandoned 的规格
-      // 变了要另走流程 —— 那些状态里可能已经有 agent 的产物了。
-      const canRefreeze = isRefreeze && slice.state === 'frozen';
-      if (!canRefreeze) {
-        if (isJson) {
-          console.log(JSON.stringify({ sliceId: id, success: false, error: `Cannot freeze slice in state "${slice.state}"` }));
-        } else {
-          console.error(`Slice "${id}" is in state "${slice.state}", cannot freeze.`);
-          if (slice.state === 'frozen') {
-            console.error(`        规格已改？用 zelto freeze ${id} --refreeze 重新冻结。`);
-          }
-        }
-        return 1;
-      }
-
-      // 重新冻结 = 人确认了新规格。退回 draft 让 FREEZE 转换合法可用。
-      //
-      // 顺序要紧：`store.transit` 会重新读盘并整份覆写，所以字段修改
-      // 必须在 transit **之后**再做（否则刚改的字段会被冲掉）。
-      await store.transit(id, 'REFREEZE');
-
-      const refreshed = await store.read(id);
-      refreshed.spec.frozenHash = null;
-      refreshed.spec.frozenAt = null;
-      // 追溯重新物化：规格改了，需求条目也可能变了
-      refreshed.trace.requirements = [];
-      await store.write(refreshed);
-      // 后面的追溯物化与 FREEZE 转换都基于这个对象继续 —— 不换掉的话
-      // 局部变量还停在旧状态（frozen），FREEZE 转换会直接抛 Invalid transition。
-      slice = refreshed;
-
-      // 事件留痕：规格变更是人做的，必须能在事件流里看到（C4）。
-      await events.append(id, 'slice.state.changed', 'cli', {
-        sliceId: id, from: 'frozen', to: 'draft', event: 'REFREEZE',
-      });
-      console.log(`  ↻ 重新冻结：${id} 已退回 draft（规格哈希已重置，追溯待重新物化）`);
-    }
-
-    // 追溯物化 + 准入闸门（ADR-032 §3.1 / §3.3）：
-    //   人显式声明过的追溯优先；没声明时，从规格正文的「验收标准」物化——
-    //   那份验收标准就是人批准的出处（`zelto create --from-spec` 早就在这么用）。
-    //   物化只读规格、不改规格，也不替人写需求。
-    //   需求追溯为空 = 没有出处 → 拒绝冻结；契约 / 测试缺失只提示，不阻断。
-    let specContent = '';
-    try {
-      specContent = await readFile(slice.spec.path, 'utf-8');
-    } catch {
-      specContent = '';
-    }
-    const gate = evaluateFreezeTrace(slice, specContent);
-    const materialized = gate.requirements.length !== slice.trace.requirements.length;
-    if (materialized) {
-      slice.trace.requirements = gate.requirements;
-      await store.write(slice);
-    }
-
-    // ── D-4：规格提到的文件必须在写集里 ────────────────────────────
+    // ADR-086：冻结编排下沉到 core/lifecycle/freeze.ts ——
+    // Web 端与 CLI 端调**同一份**编排（判定不许分叉，C3）。
     //
-    // 「规格说要改 + 写集不允许改」这个矛盾，在冻结时就能看出来 ——
-    // 写集守卫（C9）会正确地拦住 agent，但代价是 agent 建了新文件
-    // 却无法登记，链接期才炸（LNK2019）。
+    // 注意这里**不再**先跑 `resolveWriteSet(id)`（旧 CLI 会把从规格
+    // 解析出的写集**写回切片文件**）。那个写回是有害的：
     //
-    // 实测案例（nimrtc D1）：规格需求 6 写着
-    // 「`src/engine/CMakeLists.txt` 如需登记新 `.cpp` 文件，只加一行」，
-    // 但写集里没有这个文件。
+    //   首次 freeze  → 写集被固化成 `['src/a.js']` 落进 slice 文件
+    //   改规格扩写集 → 再 freeze 时 `slice.writes.length > 0`，
+    //                   解析链直接短路，**新写的路径看不见了**
+    //   结果          → 409「规格与写集不一致」，切片永久卡住
     //
-    // 判据是纯文件解析（C3）：解析规格全文提到的路径，比对写集覆盖。
-    //
-    // 比对的是**有效写集**，不是 `slice.writes`：
-    // 写集有三级来源（`slice.writes` → 规格「范围」章节 → 目录探测），
-    // 切片没显式给 `--writes` 时写集要从规格里推。只看 `slice.writes`
-    // 会把「写集由规格推导出来」的正常切片误判成缺授权。
-    const effectiveWrites = await resolveWriteSet(id, false).then(
-      (r) => r.writes,
-      () => slice.writes,
+    // 编排层里的 `resolveEffectiveWrites` 按**同一口径**三级取值
+    // （slice.writes → 规格「范围」→ 目录探测），但**不落盘** ——
+    // 「有效写集」是判定输入，不该在判定途中把状态改了（C1）。
+    const outcome = await freezeSlice(
+      {
+        repoRoot: process.cwd(),
+        store,
+        events,
+        actor: 'cli',
+        via: 'cli',
+      },
+      id,
+      { refreeze: isRefreeze },
     );
 
-    // ── 写集 × 策略的预检（freeze 也是闸门，不只是 check）──────────────
-    //
-    // 放在 D-4 检查**之前**：D-4 问「规格提到的文件在写集里吗」，
-    // 这条问「写集里的路径 policy 放行吗」。**先问后者**——
-    // 写集整体被策略挡住时，D-4 报「某文件不在写集里」只是症状，
-    // 病根在策略。顺序反了会让人去改写集，而真正该改的是策略。
-    //
-    // 冻结 = 把规格钉成「基线」。钉一个**注定跑不起来**的基线没有意义：
-    // 后面每一条事件都会指向这个基线，而基线对应的活根本交不出来。
-    //
-    // 判据与 `run` / `check` 完全同源（core/spec/write-set-policy.ts）——
-    // 三处共用一个判据，不各写一份（各写一份必然漂移）。
-    {
-      const verdict = await precheckWriteSetAgainstPolicy(id, effectiveWrites);
-      for (const a of verdict.advisories) console.warn(`  ⚠️  ${a}`);
-      if (!verdict.ok) {
-        if (isJson) {
-          console.log(JSON.stringify({
-            sliceId: id, success: false,
-            error: `写集与策略互相矛盾，拒绝冻结：${verdict.details.join('；')}`,
-            issues: verdict.details,
-          }));
-        } else {
-          console.error(`zelto freeze ${id} — ❌ 写集与策略互相矛盾，拒绝冻结`);
-          for (const d of verdict.details) console.error(`  - ${d}`);
-          console.error('');
-          console.error('  冻结一个注定跑不起来的基线没有意义 —— 后面每条事件都会指向它。');
-          console.error('  修法二选一：');
-          console.error('    - 把该路径加进 policy.yaml 的 allow 规则（之后跑 zelto policy lock --update 更新锚点）');
-          console.error(`    - 或改写集： zelto set ${id} --field writes --value "<路径>"`);
+    if (!outcome.ok) {
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, success: false,
+          error: outcome.reason,
+          issues: outcome.details,
+        }));
+      } else {
+        console.error(`zelto freeze ${id} — ❌ ${outcome.reason}`);
+        for (const d of outcome.details) console.error(`  - ${d}`);
+        if (outcome.details.length > 0) console.error('');
+        // 提示项也要打出来 —— 「已冻结，需 --refreeze」这类修法
+        // 就住在 advisories 里（details 只装阻断项）。
+        // 不打出来 = 人只看到「不行」，不知道下一步该敲什么。
+        for (const a of outcome.advisories) console.error(`  ⚠ ${a}`);
+        // 逐类阻断给出**可操作的修法** —— 只说「不行」等于把人赶走。
+        if (outcome.reason.includes('\u7b56\u7565')) {
+          console.error('  \u51bb\u7ed3\u4e00\u4e2a\u6ce8\u5b9a\u8dd1\u4e0d\u8d77\u6765\u7684\u57fa\u7ebf\u6ca1\u6709\u610f\u4e49 \u2014\u2014 \u540e\u9762\u6bcf\u4e00\u6761\u4e8b\u4ef6\u90fd\u4f1a\u6307\u5411\u5b83\u3002');
+          console.error('  \u4fee\u6cd5\u4e8c\u9009\u4e00\uff1a');
+          console.error('    - \u628a\u8be5\u8def\u5f84\u52a0\u8fdb policy.yaml \u7684 allow \u89c4\u5219\uff08\u4e4b\u540e\u8dd1 zelto policy lock --update \u66f4\u65b0\u951a\u70b9\uff09');
+          console.error(`    - \u6216\u6539\u5199\u96c6\uff1a zelto set ${id} --field writes --value "<\u8def\u5f84>"`);
+        } else if (outcome.reason.includes('\u5199\u96c6')) {
+          console.error(`  \u628a\u8fd9\u4e9b\u6587\u4ef6\u52a0\u8fdb\u5199\u96c6\uff1a zelto set ${id} --field writes --value "<\u8def\u5f84>"`);
+          console.error('  \u6216\u6539\u89c4\u683c\uff1a\u4e0d\u8981\u63d0\u8fd9\u4e9b\u6587\u4ef6\uff08\u6216\u5728\u300c\u8303\u56f4\u300d\u7ae0\u8282\u58f0\u660e\u5b83\u4eec\uff09');
+        } else if (outcome.reason.includes('\u8ffd\u6eaf')) {
+          console.error('  \u5728\u89c4\u683c\u91cc\u5199\u300c## \u9a8c\u6536\u6807\u51c6\u300d\uff08\u7f16\u53f7\u6761\u76ee\uff09\u2192 zelto \u4f1a\u81ea\u52a8\u7269\u5316\u6210\u9700\u6c42\u8ffd\u6eaf');
+          console.error('  \u6216\u663e\u5f0f\u58f0\u660e\u9700\u6c42\u8ffd\u6eaf\uff1a zelto set <id> --field trace.requirements --value "<\u9700\u6c42\u5f15\u7528>"');
+          console.error('  \u6216\u5199\u660e\u8c41\u514d\u7406\u7531\uff1a zelto set <id> --field traceWaiver --value "<\u7406\u7531>"');
         }
-        return 1;
-      }
-    }
-
-    // ── D-4：规格提到的文件必须在写集里 ────────────────────────────
-    //
-    // 放在写集×策略检查**之后**：D-4 问「规格提到的文件在写集里吗」，
-    // 那条问「写集里的路径 policy 放行吗」。**先问后者**——
-    // 写集整体被策略挡住时，D-4 报「某文件不在写集里」只是症状，
-    // 病根在策略。顺序反了会让人去改写集，而真正该改的是策略。
-    //
-    // **只读引用要豁免**（`parseReferencedPaths`）：
-    // 规格里「对应 `docs/plan/xxx.md` §5.1」这种**指路**不是「要改它」——
-    // 那份规划文档恰恰是 agent 不该动的（它是人批准的出处）。
-    // 把指路当成要求修改 → 冻结被拦，而规格完全没问题（闸门误报）。
-    const mentionedPaths = parseMentionedPaths(specContent);
-    const referencedPaths = new Set(parseReferencedPaths(specContent));
-    const requiredPaths = mentionedPaths.filter((p) => !referencedPaths.has(p));
-    const coverage = evaluateWriteSetCoverage(requiredPaths, effectiveWrites);
-    if (coverage.uncovered.length > 0) {
-      const details = coverage.uncovered.map(
-        (p) => `规格提到「${p}」，但它不在写集里 —— agent 改不了它`,
-      );
-      await events.append(id, 'spec.checked', 'cli', {
-        sliceId: id,
-        issues: details.length,
-        passed: false,
-        details,
-        phase: 'freeze',
-      });
-      const advice = [
-        `  把这些文件加进写集： zelto set ${id} --field writes --value "<路径>"`,
-        `  或改规格：不要提这些文件（或在「范围」章节声明它们）`,
-      ].join('\n');
-      if (isJson) {
-        console.log(JSON.stringify({
-          sliceId: id, success: false,
-          error: `规格与写集不一致，拒绝冻结：${details.join('；')}`,
-          issues: coverage.uncovered,
-        }));
-      } else {
-        console.error(`zelto freeze ${id} — ❌ 规格与写集不一致，拒绝冻结`);
-        for (const d of details) console.error(`  - ${d}`);
-        console.error(advice);
       }
       return 1;
     }
 
-    if (gate.blocking.length > 0) {
-      const details = gate.blocking.map((v) => v.message);
-      await events.append(id, 'spec.checked', 'cli', {
-        sliceId: id, issues: gate.blocking.length, passed: false, details, phase: 'freeze',
-      });
-      const advice = [
-        `  在规格里写「## 验收标准」（编号条目）→ zelto 会自动物化成需求追溯`,
-        `  或显式声明需求追溯： zelto set ${id} --field trace.requirements --value "<需求引用>"`,
-        `  或写明豁免理由： zelto set ${id} --field traceWaiver --value "<理由>"`,
-      ].join('\n');
-      if (isJson) {
-        console.log(JSON.stringify({
-          sliceId: id, success: false,
-          error: `追溯不合格，拒绝冻结：${details.join('；')}`,
-          issues: gate.blocking.map((v) => v.short),
-        }));
-      } else {
-        console.error(`zelto freeze ${id} — ❌ 追溯不合格，拒绝冻结`);
-        for (const d of details) console.error(`  - ${d}`);
-        console.error(advice);
-      }
-      return 1;
-    }
-
-    // 物化追溯也是一次状态变更（C4）：留痕挂在同一次冻结动作的事件上——
-    // 单独再写一条 spec.checked 会让「本片 check 过几次」这种统计失真。
-    const specHash = hashSpecFile(slice.spec.path);
-    slice.spec.frozenHash = specHash ?? `sha256:${Date.now()}`;
-    slice.spec.frozenAt = new Date().toISOString();
-    await store.write(slice);
-
-    await store.transit(id, 'FREEZE');
-    await events.append(id, 'spec.frozen', 'cli', {
-      sliceId: id, frozenHash: slice.spec.frozenHash, frozenAt: slice.spec.frozenAt,
-      materializedRequirements: gate.requirements.length,
-      traceSource: materialized ? 'spec' : 'declared',
-    });
-
+    const facts = (outcome.facts ?? {}) as {
+      frozenHash?: string;
+      frozenAt?: string;
+    };
     if (isJson) {
       console.log(JSON.stringify({
         sliceId: id, success: true, state: 'frozen',
-        frozenHash: slice.spec.frozenHash, frozenAt: slice.spec.frozenAt,
+        frozenHash: facts.frozenHash, frozenAt: facts.frozenAt,
       }));
     } else {
-      console.log(`zelto freeze ${id} — ✅ Slice frozen at ${slice.spec.frozenAt}`);
+      console.log(`zelto freeze ${id} — \u2705 Slice frozen at ${facts.frozenAt}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -1568,14 +1435,15 @@ register('run', async (args) => {
     }
 
     const cfg = loadConfig();
+    const adapterType = optionValueStrict(args, '--adapter');
     const agentCmd = cfg.agent.command;
+
     // D-2：`--agent` 没给值时回退到配置里的默认 agent，
     // 而不是把 undefined 当成「用户指定的值」传下去。
     //
     // **adapter 决定默认命令**：Cursor 侧的默认命令是 `cursor-agent`，
-    // 不是配置里那个 `npx claude-code` — 复用它会起一个 claude 进程，
+    // 不是配置里那个 `npx claude-code` —— 复用它会起一个 claude 进程，
     // 表面上「跑的是 Cursor」，实际跑的是 Claude。
-    const adapterType = optionValueStrict(args, '--adapter');
     const agentName = optionValue(
       args,
       '--agent',
@@ -1587,14 +1455,13 @@ register('run', async (args) => {
     console.log('');
 
     // Check agent availability before starting
+    //
+    // 用**与 adapter 无关**的检查（ADR-086 抽出来的 agent-command.ts）：
+    // Claude、Cursor、Codex 查的都是同一件事 —— 这条命令找不找得到。
+    // 之前这里用的是 Claude 适配器的静态方法，
+    // 对 Cursor 拿 `cursor-agent` 去问「claude 在吗」，答案永远是「不在」。
     try {
-      // **与 adapter 无关**的检查（ADR-087 抽出来的 agent-command.ts）：
-      // Claude、Cursor、Codex 查的都是同一件事 —— 这条命令找不找得到。
-      // 之前这里用的是 Claude 适配器的静态方法，
-      // 拿 Cursor 的 `cursor-agent` 去问「claude 在吗」，答案永远是「不在」。
       const { checkAgentAvailable } = await import('../../adapters/agent-command.js');
-      // D-27：把配置里的命令一起传进去 —— 命令行拼错时，
-      // 错误信息要指向那条**真的能用**的命令，而不是让人去改本来没问题的配置。
       const agentError = await checkAgentAvailable(agentName, agentCmd);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
@@ -1700,7 +1567,7 @@ register('run', async (args) => {
         projectRoot: process.cwd(),
         baseCommit: worktree?.baseCommit ?? null,
         managedPaths: zeltoOwnedPaths(worktree?.path ?? null, slice),
-        // 装哪个 harness 的钩子 —— adapter 决定跑的是谁，
+        // 装哪种 harness 的钩子 —— adapter 决定跑的是谁，
         // harness 决定钩子的信封格式（ADR-083）。
         // 配错 = hook 读不懂载荷 = 判定静默失效。
         harness: harnessForAdapter(adapterType ?? cfg.agent.adapter),
@@ -2149,8 +2016,7 @@ register('start', async (args) => {
     const cfg = loadConfig();
     const adapterType = optionValueStrict(args, '--adapter');
     // D-2：同上 —— `--agent` 没给值时回退到默认 agent。
-    //
-    // **adapter 决定默认命令**（Cursor 是 `cursor-agent`）。
+    // **adapter 决定默认命令**（Cursor → `cursor-agent`）。
     const agentName = optionValue(
       args,
       '--agent',

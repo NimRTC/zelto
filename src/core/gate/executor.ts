@@ -111,8 +111,27 @@ export class GateExecutor {
     this.projectRoot = projectRoot;
   }
 
-  async execute(sliceId: string, actor: string = 'zelto'): Promise<GateReport> {
+  /**
+   * 跑门禁命令。
+   *
+   * @param sliceId 切片 id
+   * @param actor 谁触发的（判定产物一律用 'zelto'）
+   * @param options.via 在哪儿触发的（'cli' / 'web'）——
+   *   记进 `gate.executed` / `gate.result` 的 payload，
+   *   让追溯链能回答「这次门禁是从哪儿点的」。
+   *
+   *   **为什么是同一条事件的一个维度，而不是另写一条**：
+   *   `rework_rate` 的算法是「`gate.retry` 条数 ÷ `gate.executed` 条数」
+   *   —— 多写一条 `gate.executed` 会把这个比值直接砍半，
+   *   度量从此失真（ADR-086 §6）。
+   */
+  async execute(
+    sliceId: string,
+    actor: string = 'zelto',
+    options: { via?: string } = {},
+  ): Promise<GateReport> {
     const slice = await this.store.read(sliceId);
+    const via = options.via;
     const totalStart = performance.now();
     const results: GateResult[] = [];
     let passed = true;
@@ -135,6 +154,7 @@ export class GateExecutor {
       profile: sliceCommands && sliceCommands.length > 0
         ? 'slice-specific'
         : commands === this.config.commands ? 'default' : sliceType,
+      ...(via ? { via } : {}),
     });
 
     // Check for uninitialized git submodules before running commands
@@ -162,6 +182,7 @@ export class GateExecutor {
         results: [{ command: 'submodule-check', passed: false, exitCode: 1, stderr: submoduleIssue }],
         retryCount: 0,
         totalDurationMs: 0,
+        ...(via ? { via } : {}),
       });
 
       return {
@@ -208,6 +229,7 @@ export class GateExecutor {
       retryCount: totalRetries,
       totalDurationMs,
       acceptance,
+      ...(via ? { via } : {}),
     });
 
     return {

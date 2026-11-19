@@ -1,6 +1,5 @@
 // Shared utilities, types, and store instances for CLI commands
 
-import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -15,8 +14,11 @@ import { EventStream } from '../../core/events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
 import type { GateAcceptanceConfig } from '../../core/gate/types.js';
-import { parseBlockScalarHeader, readBlockScalar } from './config-blocks.js';
+import { parseBlockScalarHeader, readBlockScalar } from '../../core/config/blocks.js';
 import { SliceStore, checkSliceId } from '../../core/slice/store.js';
+// ADR-086：规格哈希的**唯一实源**在 core —— CLI 与 Web 调同一份。
+// 两份实现哪怕只差一个 `sha256:` 前缀，就会表现为「刚冻结完就报 hash mismatch」。
+import { hashSpecFile as hashSpecFileCore } from '../../core/lifecycle/freeze.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,
@@ -143,13 +145,23 @@ export function loadPolicyConfig(root?: string): LoadedPolicy {
 
 // ─── Spec Hash ───────────────────────────────────────────────────────────────
 
+/**
+ * 规格文件的哈希。
+ *
+ * **唯一实源在 `core/lifecycle/freeze.ts`** —— 那里的一份是**真源**，
+ * 这里只是转发。
+ *
+ * 为什么必须只有一份：冻结时写进切片文件的哈希，与 `zelto check`
+ * 算出来比对的哈希，**必须逐字节相同**。
+ * 两份实现哪怕只差一个 `sha256:` 前缀，就会表现为
+ * 「规格刚冻结完就报 hash mismatch」——
+ * 而症状离病因很远，人会先去查规格、查 git、查 worktree，
+ * 唯独想不到是两份实现的格式悄悄不一样。
+ *
+ * 这正是 ADR-086 §实施记录 2 记的那个坑（当时真的踩了）。
+ */
 export function hashSpecFile(specPath: string): string | null {
-  try {
-    const content = readFileSync(specPath, 'utf-8');
-    return `sha256:${createHash('sha256').update(content).digest('hex')}`;
-  } catch {
-    return null;
-  }
+  return hashSpecFileCore(specPath);
 }
 
 // ─── Option Parsing ──────────────────────────────────────────────────────────
@@ -211,686 +223,22 @@ export function optionValueStrict(
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
+// ADR-086：配置解析下沉到 core/config/loader.ts ——
+// CLI 与 Web 读同一份配置（配置语义不许漂移）。
+// 这里保留 re-export，CLI 侧所有 `from './shared.js'` 的调用点不用改。
+export {
+  expandConfigEnvRefs,
+  loadConfig,
+  loadConfigAt,
+  parseConfigYaml,
+  parseEnvRef,
+  resolveApiKey,
+  type ZeltoConfig,
+} from '../../core/config/loader.js';
 
-export interface ZeltoConfig {
-  gate: {
-    commands: Array<{ name: string; run: string; timeoutSec?: number }>;
-    profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
-    /** 切片级验收配置（ADR-033）。没配就退回到「跑该片的验收目录」。 */
-    acceptance?: GateAcceptanceConfig;
-    timeoutSec: number;
-    /** 子模块预检开关（默认 true）；`false` = 不跑 `submodule-check` 这道预检 */
-    submoduleCheck?: boolean;
-    retry: { max: number };
-  };
-  agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
-  llm?: { provider: string; apiKey?: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
-  /** External project configuration for cross-repo workflows.
-   *  When set, `zelto gate` and `zelto slice create` operate in the
-   *  target project directory instead of the current working directory. */
-  targetProject?: {
-    /** Absolute or relative path to the target project root. */
-    path: string;
-    /** Optional gate overrides for the target project. Falls back to
-     *  the root gate.commands when not specified. */
-    gate?: {
-      commands: Array<{ name: string; run: string; timeoutSec?: number }>;
-      profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
-    };
-    /** Spec directory relative to target project root. Default = "specs/slices". */
-    specDir?: string;
-  };
-}
-
-/**
- * Resolve the LLM API key (ADR-022).
- *
- * Priority, highest first:
- *   1. `ZELTO_LLM_API_KEY`  — zelto-specific, never collides with other tools
- *   2. `DEEPSEEK_API_KEY`   — the ecosystem convention
- *   3. `llm.apiKey` in `.zelto/config.yaml` — the existing fallback
- *
- * The key never has to live in a file: set it in the environment and the
- * config file only carries the non-secret parts (baseUrl, model, pricing).
- *
- * `llm.baseUrl` / `llm.model` are NOT read from the environment — they are
- * not secrets, and keeping them in the config file is what makes a project
- * reproducible.
- */
-export function resolveApiKey(
-  configApiKey: string | undefined,
-  env: NodeJS.ProcessEnv = process.env,
-): string | undefined {
-  const fromEnv = env.ZELTO_LLM_API_KEY?.trim() || env.DEEPSEEK_API_KEY?.trim();
-  if (fromEnv) return fromEnv;
-  const fromConfig = configApiKey?.trim();
-  return fromConfig ? fromConfig : undefined;
-}
-
-/**
- * Parse an environment-variable reference of the form `${NAME}` (ADR-026).
- *
- * Only whole-value references count: `"${FOO}"` parses, `"prefix-${FOO}"`
- * does not. Partial expansion would silently produce half a credential when
- * the variable is unset — harder to diagnose than not expanding at all.
- *
- * Returns the variable name, or null when the value is not a reference.
- */
-export function parseEnvRef(value: string): string | null {
-  const m = value.trim().match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
-  return m ? m[1] : null;
-}
-
-/**
- * Expand `${VAR}` references in `llm.apiKey` (ADR-026).
- *
- * Only the API key is expanded. `llm.baseUrl` / `llm.model` / `llm.pricing`
- * are configuration, not secrets — they stay in the file so the project
- * remains reproducible (ADR-022). `gate.commands[].run` is handed to the
- * shell, which does its own variable substitution; expanding here would
- * change the command's meaning.
- *
- * A reference to an unset variable resolves to "no key" rather than to the
- * literal text — sending `${NIMRTC_LLM_API_KEY}` as a bearer token would
- * fail with an opaque 401 that points at the wrong thing.
- */
-export function expandConfigEnvRefs(
-  config: ZeltoConfig,
-  env: NodeJS.ProcessEnv = process.env,
-): ZeltoConfig {
-  const llm = config.llm;
-  if (!llm?.apiKey) return config;
-
-  const name = parseEnvRef(llm.apiKey);
-  if (!name) return config;
-
-  const resolved = env[name]?.trim();
-  if (!resolved) {
-    console.warn(
-      `  ⚠️  Config: llm.apiKey references environment variable ${name}, but it is not set.`,
-    );
-    console.warn('      The LLM path (clarify / spec / stall) will be unavailable.');
-    return { ...config, llm: { ...llm, apiKey: '' } };
-  }
-
-  return { ...config, llm: { ...llm, apiKey: resolved } };
-}
-
-export function loadConfig(): ZeltoConfig {
-  const configPath = join(ZELTO_DIR, 'config.yaml');
-  const defaultConfig: ZeltoConfig = {
-    gate: {
-      commands: [
-        { name: 'test', run: 'pnpm test' },
-        { name: 'lint', run: 'pnpm lint' },
-      ],
-      timeoutSec: 120,
-      retry: { max: 2 },
-    },
-    agent: {
-      command: 'npx claude-code',
-      maxRetries: 2,
-    },
-  };
-
-  if (!existsSync(configPath)) return withEnvApiKey(defaultConfig);
-
-  try {
-    const content = readFileSync(configPath, 'utf-8');
-    const parsed = parseConfigYaml(content);
-    if (parsed) {
-      const assembled: ZeltoConfig = {
-        gate: parsed.gate,
-        agent: parsed.agent ?? defaultConfig.agent,
-        llm: parsed.llm,
-        targetProject: parsed.targetProject,
-      };
-      // Expand `${VAR}` references before validating — the placeholder check
-      // has to see the real value (ADR-026).
-      const expanded = expandConfigEnvRefs(assembled);
-      // Validate config and warn about common issues
-      validateConfig(expanded);
-      return withEnvApiKey(expanded);
-    }
-    return withEnvApiKey(defaultConfig);
-  } catch {
-    return withEnvApiKey(defaultConfig);
-  }
-}
-
-/**
- * Apply the environment-variable API key to a config (ADR-022).
- *
- * The environment wins over the config file. If the file has no `llm` section
- * at all but the environment provides a key, an `llm` section is synthesised
- * so the LLM path (clarify / spec / stall) stays usable with a key that never
- * touched the disk.
- */
-function withEnvApiKey(config: ZeltoConfig): ZeltoConfig {
-  const envKey = resolveApiKey(undefined);
-  if (!envKey) {
-    // No environment key — keep whatever the config file had.
-    if (!config.llm?.apiKey) return config;
-    return config;
-  }
-
-  const llm = config.llm
-    ? { ...config.llm, provider: config.llm.provider || 'deepseek', apiKey: envKey }
-    : { provider: 'deepseek', apiKey: envKey };
-
-  return { ...config, llm };
-}
-
-/**
- * Validate config for common issues and log warnings.
- * Does not throw — warnings are non-fatal.
- */
-function validateConfig(config: ZeltoConfig): void {
-  if (!config.gate?.commands?.length) {
-    console.warn('  ⚠️  Config: no gate commands defined. Gate② will be a no-op.');
-  }
-  if (config.gate?.timeoutSec !== undefined && (config.gate.timeoutSec < 10 || config.gate.timeoutSec > 3600)) {
-    console.warn(`  ⚠️  Config: gate.timeoutSec (${config.gate.timeoutSec}) seems unusual. Expected 10-3600.`);
-  }
-  if (config.gate?.retry?.max !== undefined && config.gate.retry.max < 0) {
-    console.warn(`  ⚠️  Config: gate.retry.max (${config.gate.retry.max}) is negative. Using 0.`);
-    config.gate.retry.max = 0;
-  }
-  if (!config.agent?.command) {
-    console.warn('  ⚠️  Config: no agent command defined. "zelto run" will fail.');
-  }
-  if (config.llm?.apiKey && config.llm.apiKey === 'sk-your-key-here' && !resolveApiKey(undefined)) {
-    console.warn('  ⚠️  Config: LLM API key appears to be a placeholder. Set ZELTO_LLM_API_KEY or update .zelto/config.yaml with a real key.');
-  }
-}
-
-/**
- * Parse .zelto/config.yaml into a ZeltoConfig.
- *
- * Quote stripping is delegated to core/policy/yaml.ts so that config and
- * policy parsing share one definition of "surrounding quotes".
- */
-export function parseConfigYaml(content: string): ZeltoConfig | null {
-  const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
-  const profiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
-  let timeoutSec = 120;
-  let retryMax = 2;
-  let agentCommand = 'npx claude-code';
-  let agentAdapter = '';
-  let agentTimeout: number | undefined;
-  let agentMaxRetries: number | undefined;
-  let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
-  /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
-  let currentCommandIndent = 0;
-  let inGateSection = false;
-  let inAgentSection = false;
-  let inLlmSection = false;
-  let inTargetProjectSection = false;
-  let inTargetProjectGateSection = false;
-  let inProfileSection = false;
-  let currentProfile: string | null = null;
-  // 切片级验收段（ADR-033）
-  let inAcceptanceSection = false;
-  let acceptanceIndent = 0;
-  let acceptanceCommand = '';
-  let acceptanceRequired = true;
-  let acceptanceTimeoutSec: number | undefined;
-  let acceptanceBuildDir: string | undefined;
-  /** 子模块预检开关（缺省 = 不写字段 = 预检开启） */
-  let submoduleCheck: boolean | undefined;
-  let llmProvider = '';
-  let llmApiKey = '';
-  let llmModel = '';
-  let llmBaseUrl = '';
-  let inLlmPricingSection = false;
-  let currentPricingModel = '';
-  const llmPricing: Record<string, { inputPer1k: number; outputPer1k: number }> = {};
-  let targetProjectPath = '';
-  let targetProjectSpecDir = '';
-  let targetProjectDepth = 0;
-  const targetProjectCommands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
-  const targetProjectProfiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
-  let currentTpCommand: { name: string; run: string; timeoutSec?: number } | null = null;
-  /** 缩进层级：区分命令自身的 timeoutSec 与上层配置 */
-  let currentTpCommandIndent = 0;
-  let inTpProfileSection = false;
-  let currentTpProfile: string | null = null;
-
-  const lines = content.split('\n');
-  // 索引式循环：块标量（run: > / command: |）要一次吃掉若干行，
-  // 需要能把游标推进到块之后的下一行（见 config-blocks.ts）。
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    const indent = line.length - trimmed.length;
-    if (trimmed.startsWith('#') || trimmed === '') continue;
-
-    if (trimmed === 'gate:' && !inTargetProjectSection) {
-      inGateSection = true;
-      inAgentSection = false;
-      inLlmSection = false;
-      inProfileSection = false;
-      currentProfile = null;
-      continue;
-    }
-    if (trimmed === 'agent:' && !inTargetProjectSection) {
-      inAgentSection = true;
-      inGateSection = false;
-      inLlmSection = false;
-      inProfileSection = false;
-      currentProfile = null;
-      continue;
-    }
-    if (trimmed === 'llm:' && !inTargetProjectSection) {
-      inLlmSection = true;
-      inGateSection = false;
-      inAgentSection = false;
-      inTargetProjectSection = false;
-      inProfileSection = false;
-      inLlmPricingSection = false;
-      currentProfile = null;
-      continue;
-    }
-    if (trimmed === 'targetProject:') {
-      inTargetProjectSection = true;
-      inGateSection = false;
-      inAgentSection = false;
-      inLlmSection = false;
-      inProfileSection = false;
-      currentProfile = null;
-      targetProjectDepth = 0;
-      continue;
-    }
-
-    if (inGateSection) {
-      // Handle profiles: section header — flush pending command to commands first
-      if (trimmed === 'profiles:') {
-        if (currentCommand) {
-          commands.push(currentCommand);
-          currentCommand = null;
-        }
-        inProfileSection = true;
-        currentProfile = null;
-        continue;
-      }
-
-      // acceptance: 切片级验收段（ADR-033）。
-      // 它是 gate 的兄弟节点，不是 command —— 所以要在这里另开一个状态机，
-      // 不能借用 currentCommand 那套（那是给 `- name:` 列表用的）。
-      //
-      // 位置要紧：必须在「profile 名匹配」之前判。否则 `profiles:` 之后的
-      // `acceptance:` 会被当成一个叫 acceptance 的 profile 名吃掉，
-      // 验收配置就静默丢了 —— 门禁于是「配了却没跑」。
-      if (trimmed === 'acceptance:') {
-        inAcceptanceSection = true;
-        acceptanceIndent = indent;
-        acceptanceCommand = '';
-        acceptanceRequired = true;
-        acceptanceTimeoutSec = undefined;
-        acceptanceBuildDir = undefined;
-        continue;
-      }
-
-      // Detect profile name (indented under profiles:, e.g. "  docs:")
-      const profileMatch = trimmed.match(/^(\w+):$/);
-      if (profileMatch && inProfileSection) {
-        // Push pending command to the previous profile before switching
-        if (currentCommand && currentProfile) {
-          (profiles[currentProfile] ??= []).push(currentCommand);
-          currentCommand = null;
-        }
-        currentProfile = profileMatch[1];
-        continue;
-      }
-
-      if (trimmed.startsWith('commands:') || trimmed === 'commands:') {
-        inProfileSection = false;
-        currentProfile = null;
-        continue;
-      }
-
-      if (inAcceptanceSection) {
-        // 只认比 acceptance: 更深缩进的键 —— 否则 gate 顶层的 timeoutSec: 会被误吞。
-        if (indent <= acceptanceIndent) {
-          inAcceptanceSection = false;
-        } else if (trimmed.startsWith('command:')) {
-          const raw = trimmed.slice(8).trim();
-          const header = parseBlockScalarHeader(raw);
-          if (header) {
-            const block = readBlockScalar(lines, i, indent, header);
-            if (block) {
-              acceptanceCommand = block.value;
-              i = block.nextIndex - 1;
-              continue;
-            }
-          }
-          acceptanceCommand = stripSurroundingQuotes(raw);
-          continue;
-        } else if (trimmed.startsWith('required:')) {
-          const raw = trimmed.slice(9).trim().toLowerCase();
-          acceptanceRequired = raw !== 'false';
-          continue;
-        } else if (trimmed.startsWith('timeoutSec:')) {
-          acceptanceTimeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
-          continue;
-        } else if (trimmed.startsWith('buildDir:')) {
-          acceptanceBuildDir = stripSurroundingQuotes(trimmed.slice(9).trim()) || undefined;
-          continue;
-        } else {
-          // 未知子键：结束这段，别把它当 gate 的键处理
-          inAcceptanceSection = false;
-        }
-      }
-
-      const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
-      if (inlineMatch) {
-        if (currentCommand) {
-          if (currentProfile) {
-            (profiles[currentProfile] ??= []).push(currentCommand);
-          } else {
-            commands.push(currentCommand);
-          }
-        }
-        currentCommand = { name: inlineMatch[1], run: inlineMatch[2] };
-        currentCommandIndent = indent;
-        continue;
-      }
-
-      if (trimmed === '- name: test' || trimmed.startsWith('- name:')) {
-        if (currentCommand) {
-          if (currentProfile) {
-            (profiles[currentProfile] ??= []).push(currentCommand);
-          } else {
-            commands.push(currentCommand);
-          }
-        }
-        currentCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
-        currentCommandIndent = indent;
-        continue;
-      }
-
-      if (trimmed.startsWith('run:')) {
-        const raw = trimmed.slice(4).trim();
-        const header = parseBlockScalarHeader(raw);
-        if (header) {
-          const block = readBlockScalar(lines, i, indent, header);
-          if (block) {
-            if (currentCommand) currentCommand.run = block.value;
-            i = block.nextIndex - 1;
-            continue;
-          }
-        }
-        if (currentCommand) {
-          currentCommand.run = stripSurroundingQuotes(raw);
-        }
-        continue;
-      }
-
-      // timeoutSec：缩进比命令项更深 → 该命令专属；否则 → gate 全局
-      if (trimmed.startsWith('timeoutSec:')) {
-        const isPerCommand = currentCommand !== null && currentCommand.run !== '' && indent > currentCommandIndent;
-        if (isPerCommand && currentCommand) {
-          currentCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
-        } else {
-          timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || 120;
-        }
-        continue;
-      }
-
-      // submoduleCheck：子模块预检开关（默认 true）。`false` 显式关掉。
-      if (trimmed.startsWith('submoduleCheck:')) {
-        submoduleCheck = trimmed.slice(15).trim().toLowerCase() !== 'false';
-        continue;
-      }
-
-      if (trimmed.startsWith('max:')) {
-        retryMax = Number.parseInt(trimmed.slice(4).trim(), 10) || 2;
-        continue;
-      }
-    }
-
-    if (inAgentSection && trimmed.startsWith('command:')) {
-      const raw = trimmed.slice(8).trim();
-      const header = parseBlockScalarHeader(raw);
-      if (header) {
-        const block = readBlockScalar(lines, i, indent, header);
-        if (block) {
-          agentCommand = block.value;
-          i = block.nextIndex - 1;
-        }
-      } else {
-        agentCommand = stripSurroundingQuotes(raw);
-      }
-    }
-
-    if (inAgentSection && trimmed.startsWith('adapter:')) {
-      agentAdapter = stripSurroundingQuotes(trimmed.slice(8).trim());
-    }
-
-    if (inAgentSection && trimmed.startsWith('timeout:')) {
-      agentTimeout = Number.parseInt(trimmed.slice(8).trim(), 10) || undefined;
-    }
-
-    if (inAgentSection && trimmed.startsWith('maxRetries:')) {
-      agentMaxRetries = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
-    }
-
-    if (inLlmSection) {
-      if (trimmed.startsWith('provider:')) {
-        llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
-        inLlmPricingSection = false;
-      } else if (trimmed.startsWith('apiKey:')) {
-        llmApiKey = stripSurroundingQuotes(trimmed.slice(7).trim());
-        inLlmPricingSection = false;
-      } else if (trimmed.startsWith('model:')) {
-        llmModel = stripSurroundingQuotes(trimmed.slice(6).trim());
-        inLlmPricingSection = false;
-      } else if (trimmed.startsWith('baseUrl:')) {
-        llmBaseUrl = stripSurroundingQuotes(trimmed.slice(8).trim());
-        inLlmPricingSection = false;
-      } else if (trimmed === 'pricing:') {
-        inLlmPricingSection = true;
-      } else if (inLlmPricingSection) {
-        // Parse model-level pricing entries
-        const modelMatch = trimmed.match(/^([\w.-]+):\s*$/);
-        if (modelMatch) {
-          currentPricingModel = modelMatch[1];
-          llmPricing[currentPricingModel] = { inputPer1k: 0, outputPer1k: 0 };
-        } else if (currentPricingModel && trimmed.startsWith('inputPer1k:')) {
-          const val = Number.parseFloat(trimmed.slice(11).trim());
-          if (!Number.isNaN(val)) llmPricing[currentPricingModel].inputPer1k = val;
-        } else if (currentPricingModel && trimmed.startsWith('outputPer1k:')) {
-          const val = Number.parseFloat(trimmed.slice(12).trim());
-          if (!Number.isNaN(val)) llmPricing[currentPricingModel].outputPer1k = val;
-        }
-      }
-    }
-
-    if (inTargetProjectSection) {
-      // Track indentation depth to detect when targetProject ends
-      if (indent <= targetProjectDepth && indent > 0 && trimmed.includes(':')) {
-        // Sub-section header within targetProject
-      }
-
-      if (trimmed.startsWith('path:')) {
-        targetProjectPath = stripSurroundingQuotes(trimmed.slice(5).trim());
-        continue;
-      }
-      if (trimmed.startsWith('specDir:')) {
-        targetProjectSpecDir = stripSurroundingQuotes(trimmed.slice(8).trim());
-        continue;
-      }
-
-      // Nested gate: section under targetProject
-      if (trimmed === 'gate:') {
-        inTargetProjectGateSection = true;
-        inTpProfileSection = false;
-        currentTpProfile = null;
-        continue;
-      }
-
-      if (inTargetProjectGateSection) {
-        if (trimmed === 'profiles:') {
-          if (currentTpCommand) {
-            targetProjectCommands.push(currentTpCommand);
-            currentTpCommand = null;
-          }
-          inTpProfileSection = true;
-          currentTpProfile = null;
-          continue;
-        }
-
-        // Detect profile name (indented under profiles:)
-        const profileMatch = trimmed.match(/^(\w+):$/);
-        if (profileMatch && inTpProfileSection) {
-          if (currentTpCommand && currentTpProfile) {
-            (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
-            currentTpCommand = null;
-          }
-          currentTpProfile = profileMatch[1];
-          continue;
-        }
-
-        if (trimmed.startsWith('commands:') || trimmed === 'commands:') {
-          inTpProfileSection = false;
-          currentTpProfile = null;
-          continue;
-        }
-
-        const inlineMatch = trimmed.match(/^- \{\s*name:\s*(\S+?)\s*,\s*run:\s*"([^"]*)"\s*\}$/);
-        if (inlineMatch) {
-          if (currentTpCommand) {
-            if (currentTpProfile) {
-              (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
-            } else {
-              targetProjectCommands.push(currentTpCommand);
-            }
-          }
-          currentTpCommand = { name: inlineMatch[1], run: inlineMatch[2] };
-          currentTpCommandIndent = indent;
-          continue;
-        }
-
-        if (trimmed.startsWith('- name:')) {
-          if (currentTpCommand) {
-            if (currentTpProfile) {
-              (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
-            } else {
-              targetProjectCommands.push(currentTpCommand);
-            }
-          }
-          currentTpCommand = { name: trimmed.slice(7).trim(), run: '', timeoutSec: undefined };
-          currentTpCommandIndent = indent;
-          continue;
-        }
-
-        if (trimmed.startsWith('run:')) {
-          const raw = trimmed.slice(4).trim();
-          const header = parseBlockScalarHeader(raw);
-          if (header) {
-            const block = readBlockScalar(lines, i, indent, header);
-            if (block) {
-              if (currentTpCommand) currentTpCommand.run = block.value;
-              i = block.nextIndex - 1;
-              continue;
-            }
-          }
-          if (currentTpCommand) {
-            currentTpCommand.run = stripSurroundingQuotes(raw);
-          }
-          continue;
-        }
-
-        if (trimmed.startsWith('timeoutSec:')) {
-          // 缩进比命令项更深 → 该命令专属；否则忽略（targetProject.gate 没有全局超时）
-          if (currentTpCommand && currentTpCommand.run && indent > currentTpCommandIndent) {
-            currentTpCommand.timeoutSec = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
-          }
-          continue;
-        }
-      }
-    }
-  }
-
-  if (currentCommand) {
-    if (currentProfile) {
-      (profiles[currentProfile] ??= []).push(currentCommand);
-    } else {
-      commands.push(currentCommand);
-    }
-  }
-
-  // Flush pending targetProject command
-  if (currentTpCommand) {
-    if (currentTpProfile) {
-      (targetProjectProfiles[currentTpProfile] ??= []).push(currentTpCommand);
-    } else {
-      targetProjectCommands.push(currentTpCommand);
-    }
-  }
-
-  const pricingKeys = Object.keys(llmPricing);
-  // The llm section is kept as long as it carries any of its own fields.
-  // The apiKey may come from the environment (ADR-022), so requiring
-  // `provider && apiKey` here would drop baseUrl/model/pricing along with it.
-  const hasLlm = Boolean(llmProvider || llmApiKey || llmModel || llmBaseUrl || pricingKeys.length > 0);
-  const llm = hasLlm
-    ? {
-        provider: llmProvider,
-        apiKey: llmApiKey,
-        ...(llmModel ? { model: llmModel } : {}),
-        ...(llmBaseUrl ? { baseUrl: llmBaseUrl } : {}),
-        ...(pricingKeys.length > 0 ? { pricing: llmPricing } : {}),
-      }
-    : undefined;
-
-  // 切片级验收配置（ADR-033）：只有在 command 非空时才生效。
-  // 「配了 acceptance 段但没写 command」等于没配 —— 宁可退回默认行为，
-  // 也不要拿一个空命令去跑门禁（那必然失败，失败原因还会误导人）。
-  const acceptance: GateAcceptanceConfig | undefined = acceptanceCommand
-    ? {
-        command: acceptanceCommand,
-        required: acceptanceRequired,
-        ...(acceptanceTimeoutSec !== undefined ? { timeoutSec: acceptanceTimeoutSec } : {}),
-        ...(acceptanceBuildDir !== undefined ? { buildDir: acceptanceBuildDir } : {}),
-      }
-    : undefined;
-
-  const gate = commands.length > 0
-    ? {
-        commands,
-        ...(Object.keys(profiles).length > 0 ? { profiles } : {}),
-        ...(acceptance ? { acceptance } : {}),
-        timeoutSec,
-        ...(submoduleCheck !== undefined ? { submoduleCheck } : {}),
-        retry: { max: retryMax },
-      }
-    : { commands: [], ...(acceptance ? { acceptance } : {}), timeoutSec: 120, retry: { max: 2 } };
-
-  const targetProject = targetProjectPath
-    ? {
-        path: targetProjectPath,
-        ...(targetProjectSpecDir ? { specDir: targetProjectSpecDir } : {}),
-        ...(targetProjectCommands.length > 0 || Object.keys(targetProjectProfiles).length > 0
-          ? {
-              gate: {
-                commands: targetProjectCommands,
-                ...(Object.keys(targetProjectProfiles).length > 0 ? { profiles: targetProjectProfiles } : {}),
-              },
-            }
-          : {}),
-      }
-    : undefined;
-
-  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject
-    ? {
-        gate,
-        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}), ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}) },
-        llm,
-        ...(targetProject ? { targetProject } : {}),
-      }
-    : null;
-}
+// shared.ts 自己也要用 loadConfig —— re-export 不产生本地绑定，
+// 所以这里单独 import 一次（同一份实现，不会分叉）。
+import { loadConfig } from '../../core/config/loader.js';
 
 /**
  * Resolve the target project directory if configured.
@@ -924,10 +272,12 @@ export function resolveSpecDir(): string {
 /**
  * 校验版本 label，不合法就报错并返回 false。
  *
- * 为什么要有这道：版本 label 会进 `.zelto/version-worktrees/<label>/`。
- * `join` 会把 `..` **归一化掉** —— 于是 `..` 能让工作目录落出 base。
+ * 为什么要有这道：版本 label 会进 `.zelto/version-worktrees/<label>/`，
+ * 而 `join` 会把 `..` **归一化掉** —— 于是 `..` 能让工作目录落出 base。
  * core 层有兜底断言（`resolveWithin`），但那时人看到的已经是
- * 「路径逃逸：标识符 ".." 拼出的路径落在 base 之外」—— 说清了机制，没说清「你该写什么」。
+ * 「路径逃逸：标识符 ".." 拼出的路径落在 ... 之外」——
+ * 说清了机制，没说清「你该写什么」。
+ *
  * 这里在**入口**就说清楚：label 只能是什么形状。
  */
 export function validateVersionLabelArg(
@@ -1287,11 +637,12 @@ export type AdapterType = 'claude-agent' | 'claude-agent-sdk' | 'cursor-agent';
  * 某个 adapter 对应的 **hook harness**。
  *
  * adapter 决定「谁在跑 agent」，harness 决定「agent 的钩子协议长什么样」。
- * 两者一一对应：Cursor CLI 是 `preToolUse` + `permission` 信封，
- * Claude Code 是 `PreToolUse` + `hookSpecificOutput`。
+ * 两者一一对应：Cursor CLI 用 `preToolUse` + `permission` 信封，
+ * Claude Code 用 `PreToolUse` + `hookSpecificOutput`。
  *
- * 配错的后果是**静默失效**：hook 收到自己看不懂的信封，解析失败 → 判不出
- * 要么全部拒绝（agent 完全不能动），要么在 Cursor 的 fail-open 默认下全部放行（闸门形同虚设）。
+ * 配错的后果是**静默失效**：hook 收到自己看不懂的信封，
+ * 解析失败 → 判不了 → 要么全部拒绝（agent 完全不能动），
+ * 要么在 Cursor 的 fail-open 默认下全部放行（闸门形同虚设）。
  * 所以这里用一张显式的表，而不是到处写 if。
  */
 export function harnessForAdapter(
@@ -1308,13 +659,13 @@ export function harnessForAdapter(
 }
 
 /**
- * 解析某个 adapter 要用的 **agent 命令**。
+ * 解析某个 adapter 要用的 agent 命令。
  *
- * 优先级：**显式覆盖 > adapter 默认 > 配置里的 command**。
+ * 优先级：**显式覆盖 > adapter 默认值 > 配置里的 command**。
  *
  * 注意 Cursor 的默认命令是 `cursor-agent` —— 配置里的 `agent.command`
- * 默认是 `npx claude-code`，那是给 Claude 用的。
- * 直接复用的话，切到 Cursor 后会起一个 claude 进程 ——
+ * 默认是 `npx claude-code`，那是给 Claude 用的；
+ * 直接复用的话，切到 Cursor 后会起一个 claude 进程，
  * 表面上「适配器是 Cursor」，实际跑的还是 Claude。
  */
 export function resolveAgentCommand(

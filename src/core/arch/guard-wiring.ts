@@ -1,18 +1,23 @@
-// 架构护栏的 CLI 接线层（ADR-027）
+// 架构护栏的接线层（ADR-027 / ADR-086）
 //
 // `core/arch/guard.ts` 是纯判定（C3，不碰文件）；这里是唯一碰文件的地方：
 // 找确认设计 → 扫 import 图 → 出报告 → 按 policy.yaml 的 `arch:` 段定级。
 // 三处执行点（deliver / batch / gate）都走这里，读法只有一份。
+//
+// **为什么它在 core 而不是 cli**（ADR-086）：
+// 门禁的第一道闸是架构护栏。它住在 CLI 层，就意味着 Web 端跑门禁时
+// 要么跳过它（判定分叉），要么再抄一份（判定分叉）。
+// 它只读文件、只调 core/arch 的纯函数 —— 所以它能进 core。
 //
 // C1: 只读文件，不写任何状态（设计、源码、policy 全是读）
 // C3: 判定本身在 core/arch，确定性；这里只做 IO 与翻译
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { DesignStore } from '../../core/design/store.js';
-import { deriveModules } from '../../core/design/derive.js';
-import { pickDefaultDesign } from '../../core/design/selection.js';
-import type { DesignDoc } from '../../core/design/types.js';
+import { DesignStore } from '../design/store.js';
+import { deriveModules } from '../design/derive.js';
+import { pickDefaultDesign } from '../design/selection.js';
+import type { DesignDoc } from '../design/types.js';
 import {
   buildArchitectureReport,
   filterDesignScopedDeviations,
@@ -24,9 +29,9 @@ import {
   type GuardRule,
   type GuardVerdict,
   type ModuleSpec,
-} from '../../core/arch/index.js';
-import type { BatchIssue } from '../../core/sched/batch.js';
-import { loadPolicyConfig } from './shared.js';
+} from './index.js';
+import type { BatchIssue } from '../sched/batch.js';
+import { loadArchRules } from '../policy/data-access.js';
 
 /** 整图护栏上下文：一次扫描，多处复用（batch 逐片判定时只扫一次图） */
 export interface WholeGraphGuard {
@@ -85,7 +90,7 @@ export async function loadWholeGraphGuard(options?: {
   const report = buildArchitectureReport(specs, scan);
   // 策略读 designRoot（主仓），不读 cwd —— gate 扫 worktree 时 cwd 在 worktree 里，
   // 那里没有 policy.yaml，读 cwd 会静默掉回默认 deny，把 ask/allow 配置丢掉。
-  const guardRules = options?.guardRules ?? loadPolicyConfig(designRoot).arch;
+  const guardRules = options?.guardRules ?? loadArchRules(designRoot);
   const guard = judgeArchGuard(report, guardRules);
 
   return { designId: design.id, designTitle: design.title, specs, report, guard, guardRules };

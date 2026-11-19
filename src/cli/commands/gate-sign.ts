@@ -6,7 +6,9 @@ import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, loadConfig, resolveTargetDir, existingWorktreePath } from './shared.js';
-import { checkSliceGateGuard, describeGuardKinds } from './arch-guard.js';
+import { checkSliceGateGuard, describeGuardKinds } from '../../core/arch/guard-wiring.js';
+// ADR-086：门禁编排下沉到 core —— CLI 与 Web 调同一份（C3：判定不许分叉）
+import { runGate } from '../../core/lifecycle/gate.js';
 import { SpecMdExecutor } from '../../core/spec/SpecMdExecutor.js';
 import { resolve } from 'node:path';
 import { readdir } from 'node:fs/promises';
@@ -90,55 +92,14 @@ register('gate', async (args) => {
       console.log(`  Commands: 本片专属（${gateCommands.length} 条）`);
     }
 
-    // Dry run: show what would be executed
-    if (isDryRun) {
-      if (isJson) {
-        console.log(JSON.stringify({
-          sliceId: id, dryRun: true,
-          commands: gateCommands
-            .filter((c) => !onlyCommand || c.name === onlyCommand)
-            .map((c) => ({ name: c.name, run: c.run })),
-          timeoutSec: config.gate.timeoutSec,
-          retry: config.gate.retry,
-          only: onlyCommand,
-          targetDir,
-        }));
-      } else {
-        const filteredCmds = gateCommands.filter((c) => !onlyCommand || c.name === onlyCommand);
-        console.log(`  Dry-run for gate ${id}:`);
-        console.log(`  Commands: ${filteredCmds.length}${onlyCommand ? ` (filtered: ${onlyCommand})` : ''}`);
-        for (const c of filteredCmds) {
-          console.log(`    - ${c.name}: ${c.run}`);
-        }
-        console.log(`  Timeout: ${config.gate.timeoutSec}s`);
-        console.log(`  Retries: ${config.gate.retry.max}`);
-        if (targetDir) console.log(`  CWD:     ${targetDir}`);
-        console.log(`\n  Run without --dry-run to execute.`);
-      }
-      return 0;
-    }
+    const worktreePath = existingWorktreePath(id);
+    const gateRoot = worktreePath ?? targetDir ?? undefined;
 
-    const gateConfig = {
-      commands: gateCommands
-        .filter((c) => !onlyCommand || c.name === onlyCommand)
-        .map((c) => ({ name: c.name, run: c.run })),
-      profiles: gateProfiles,
-      ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
-      timeoutSec: config.gate.timeoutSec,
-      ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
-      retry: { max: forceRetry >= 0 ? forceRetry : config.gate.retry.max, budgetStepUsd: 0.05 },
-    } satisfies GateConfig;
-
-    if (onlyCommand && gateConfig.commands.length === 0) {
-      console.error(`No gate command found with name "${onlyCommand}". Available: ${gateCommands.map((c) => c.name).join(', ')}`);
-      return 1;
-    }
-
-    if (onlyCommand && !isJson) {
-      console.log(`  Only:     ${onlyCommand}`);
-    }
-
-    // Run spec-md validation if --spec-md flag is set
+    // ── spec-md 校验（CLI 特有：它是「规格格式」检查，不是门禁命令）────
+    //
+    // 为什么留在 CLI：spec-md 验的是规格文件的**格式**，
+    // 不属于门禁②的「产物验过了吗」。Web 端不做这一步 ——
+    // 驾驶舱不做「另一个 CLI 的全部功能」。
     if (hasSpecMd) {
       const specMd = new SpecMdExecutor(resolve(process.cwd(), 'specs', 'slices'));
       const result = await specMd.validate(id);
@@ -158,58 +119,136 @@ register('gate', async (args) => {
       }
     }
 
-    const worktreePath = existingWorktreePath(id);
-    const gateRoot = worktreePath ?? targetDir ?? undefined;
+    // ── ADR-086：门禁编排下沉到 core/lifecycle/gate.ts ────────────────
+    // CLI 与 Web 调**同一份**编排（判定不许分叉，C3）。
+    // 这里只负责**呈现** —— 渲染成人看的终端输出。
+    const outcome = await runGate(
+      {
+        repoRoot: process.cwd(),
+        store,
+        events,
+        actor: 'cli',
+        via: 'cli',
+      },
+      id,
+      {
+        commands: gateCommands.map((c) => ({ name: c.name, run: c.run })),
+        profiles: gateProfiles,
+        timeoutSec: config.gate.timeoutSec,
+        retryMax: forceRetry >= 0 ? forceRetry : config.gate.retry.max,
+        ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
+        ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
+        ...(gateRoot ? { gateRoot } : {}),
+        requestSign: true,
+      },
+      {
+        ...(onlyCommand ? { only: onlyCommand } : {}),
+        ...(forceRetry >= 0 ? { retry: forceRetry } : {}),
+        ...(isDryRun ? { dryRun: true } : {}),
+      },
+    );
 
-    // ── 架构护栏（切片级：只看与本片写集相关的偏离，ADR-027 Q2）────
-    // 设计与策略读主仓（设计不在 worktree 里），源码扫门禁实际跑的目录
-    // （worktree 有就验 worktree，没有就验主仓）。
-    // 无确认设计时跳过（老项目无感）；ask 只提示不拦，deny 才拦。
-    // --dry-run 不拦（只展示命令）；--only 只跑单个命令时不拦（不是完整门禁）。
-    if (!isDryRun && !onlyCommand) {
-      const sliceGuard = await checkSliceGateGuard(slice.writes, {
-        scanRoot: gateRoot ?? process.cwd(),
-      });
-      if (sliceGuard) {
-        if (sliceGuard.verdict.blocked) {
-          const msg = `架构护栏拦截：${describeGuardKinds(sliceGuard.verdict, 'blocked')} —— 修好或改 policy.yaml 的 arch 段后再跑门禁`;
-          if (isJson) {
-            console.log(JSON.stringify({
-              sliceId: id, passed: false, error: msg, code: 'arch_guard_blocked',
-            }));
-          } else {
-            console.log(`  Arch:     ❌ ${msg}`);
-            console.log(`  Design:   ${sliceGuard.designId}`);
-          }
-          return 1;
+    // ── 干跑：只看要跑什么 ────────────────────────────────────────────
+    if (isDryRun) {
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id, dryRun: true,
+          commands: outcome.facts?.commands ?? [],
+          timeoutSec: config.gate.timeoutSec,
+          retry: config.gate.retry,
+          only: onlyCommand,
+          targetDir,
+        }));
+      } else {
+        const facts = (outcome.facts ?? {}) as { commands?: Array<{ name: string; run: string }> };
+        const filteredCmds = facts.commands ?? [];
+        console.log(`  Dry-run for gate ${id}:`);
+        console.log(`  Commands: ${filteredCmds.length}${onlyCommand ? ` (filtered: ${onlyCommand})` : ''}`);
+        for (const c of filteredCmds) {
+          console.log(`    - ${c.name}: ${c.run}`);
         }
-        if (sliceGuard.verdict.needsConfirm && !isJson) {
-          console.log(`  Arch:     ⚠️  待确认（不拦）：${describeGuardKinds(sliceGuard.verdict, 'pending')}`);
-        }
+        console.log(`  Timeout: ${config.gate.timeoutSec}s`);
+        console.log(`  Retries: ${config.gate.retry.max}`);
+        if (targetDir) console.log(`  CWD:     ${targetDir}`);
+        console.log(`\n  Run without --dry-run to execute.`);
       }
+      return 0;
     }
 
-    const executor = new GateExecutor(store, events, gateConfig, gateRoot);
-    const report = await executor.execute(id);
+    if (onlyCommand && !isJson) {
+      console.log(`  Only:     ${onlyCommand}`);
+    }
+
+    const facts = (outcome.facts ?? {}) as {
+      passed?: boolean;
+      results?: Array<{ command: string; passed: boolean; exitCode: number | null; durationMs: number; stderr?: string | null }>;
+      acceptance?: { status: string; path: string | null; command: string | null; reason: string | null } | null;
+      retryCount?: number;
+      totalDurationMs?: number;
+      signRequestId?: string;
+      code?: string;
+      designId?: string;
+    };
+
+    // 架构护栏拦截 —— 它在跑门禁命令**之前**就拦下了。
+    if (facts.code === 'arch_guard_blocked') {
+      const msg = outcome.reason;
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, passed: false, error: msg, code: 'arch_guard_blocked' }));
+      } else {
+        console.log(`  Arch:     ❌ ${msg}`);
+        if (facts.designId) console.log(`  Design:   ${facts.designId}`);
+      }
+      return 1;
+    }
+
+    // 「门禁跑了但没过」与「门禁根本没跑起来」是**两回事** ——
+    // 退出码不一样，输出也不一样。
+    //
+    //   门禁跑了但没过 → 文本模式**退出码仍是 0**（重构前的既有契约）。
+    //     为什么：门禁的结论写在输出里（❌ + Gate failed），
+    //     而退出码被 `zelto batch` / CI 脚本当「命令本身出错」用。
+    //     门禁没通过 ≠ 命令崩了 —— 混成一个信号，
+    //     批处理就会把「这片没过门禁」当成「zelto 坏了」而中断整批。
+    //     （`tests/acceptance/gate-retry` 明确守着这条契约。）
+    //
+    //   门禁根本没跑起来（状态不对 / `--only` 名字不存在）→ 退出码 1。
+    //     那是**命令用错了**，不是「结论为否」。
+    const gateRan = outcome.ok === false && facts.passed === false && Array.isArray(facts.results);
+
+    if (!outcome.ok && !gateRan) {
+      // 命令用错了 —— 退出码 1。
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, passed: false, error: outcome.reason }));
+        return 1;
+      }
+      console.error(`zelto gate ${id} — ❌ ${outcome.reason}`);
+      for (const d of outcome.details) console.error(`  - ${d}`);
+      for (const a of outcome.advisories) console.error(`  ⚠ ${a}`);
+      return 1;
+    }
+
     if (worktreePath && !isJson) {
       console.log(`  Worktree: ${worktreePath}`);
     }
 
     if (isJson) {
       console.log(JSON.stringify({
-        sliceId: id, passed: report.passed,
-        commands: report.results.map((r) => ({
+        sliceId: id, passed: facts.passed,
+        commands: facts.results?.map((r) => ({
           command: r.command, passed: r.passed, exitCode: r.exitCode, durationMs: r.durationMs,
         })),
-        ...(report.acceptance ? { acceptance: report.acceptance } : {}),
-        retryCount: report.retryCount,
-        totalDurationMs: report.totalDurationMs,
+        ...(facts.acceptance ? { acceptance: facts.acceptance } : {}),
+        retryCount: facts.retryCount,
+        totalDurationMs: facts.totalDurationMs,
       }));
-      return report.passed ? 0 : 1;
+      // JSON 模式的退出码跟着**结论**走（重构前既有契约）：
+      // 门禁没通过 = 结论为否 = 退出码 1。
+      return facts.passed ? 0 : 1;
     }
 
-    console.log(`  Commands: ${report.results.length}`);
-    for (const r of report.results) {
+    console.log(`  Commands: ${facts.results?.length ?? 0}`);
+    for (const r of facts.results ?? []) {
       const icon = r.passed ? '✅' : '❌';
       console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
       if (!r.passed && r.stderr) {
@@ -223,7 +262,7 @@ register('gate', async (args) => {
 
     // 切片级验收（ADR-033）：跑没跑、跑没跑过、结论是什么，都要说清楚。
     // skipped 也要显式说 —— 静默跳过等于骗人。
-    const acceptance = report.acceptance;
+    const acceptance = facts.acceptance;
     if (acceptance) {
       const icon = acceptance.status === 'passed' ? '✅'
         : acceptance.status === 'failed' ? '❌'
@@ -238,25 +277,21 @@ register('gate', async (args) => {
       }
     }
 
-    if (report.retryCount > 0) {
-      console.log(`  Retries:  ${report.retryCount}`);
+    if ((facts.retryCount ?? 0) > 0) {
+      console.log(`  Retries:  ${facts.retryCount}`);
     }
 
-    if (report.passed) {
-      console.log(`  Result:   ✅ Gate passed (${report.totalDurationMs.toFixed(0)}ms)`);
-      const prevState = slice.state;
-      await store.transit(id, 'GATE_PASS');
-      await events.append(id, 'slice.state.changed', 'cli', {
-        sliceId: id, from: prevState, to: 'completed', event: 'GATE_PASS',
-      });
+    if (facts.passed) {
+      console.log(`  Result:   ✅ Gate passed (${(facts.totalDurationMs ?? 0).toFixed(0)}ms)`);
       console.log(`  State:    ✅ Slice transitioned to "completed"`);
-
-      const signManager = new SignManager(ZELTO_DIR, events, store);
-      const signReq = await signManager.request(id, 'zelto');
-      console.log(`  Sign:     📋 Sign request created (${signReq.id})`);
-      console.log(`  Next:     Run "zelto sign ${id} --approve" to approve`);
+      if (facts.signRequestId) {
+        console.log(`  Sign:     📋 Sign request created (${facts.signRequestId})`);
+        console.log(`  Next:     Run "zelto sign ${id} --approve" to approve`);
+      }
     } else {
-      console.log(`  Result:   ❌ Gate failed (${report.totalDurationMs.toFixed(0)}ms)`);
+      // 门禁跑了但没过 —— 逐条说清哪条命令、什么错。
+      console.log(`  Result:   ❌ Gate failed (${(facts.totalDurationMs ?? 0).toFixed(0)}ms)`);
+      for (const d of outcome.details) console.log(`  - ${d}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

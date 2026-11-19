@@ -7,9 +7,14 @@
 //      如果照它实现，**任何网页都能替人签字**。
 //      本测试直接模拟那个攻击：第三方 Origin + 无 token → 必须被拒。
 //
-//   2. **范围收窄**（§4）：除了签字，**没有任何写操作**。
+//   2. **范围收窄**（§4）：除签字外，**没有写操作**。
 //      run / gate / freeze / admit / abandon / resume 一律 404/405 ——
 //      它们在 CLI 侧有完整实现，Web 侧再实现一份会分叉判定。
+//
+//      **ADR-086 部分取代了这条**：run / gate / freeze / resume 搬进了驾驶舱，
+//      但方式是**复用 core 编排**而不是重写判定。
+//      仍然不开放的：admit / abandon / clarify / create。
+//      （被取代的四个在 `web-cockpit-throttle.test.ts` 里验。）
 //
 //   3. **服务端强制四项确认项**（§5.2）：签字不是「一键批准」——
 //      有确认项不过时，服务端必须拒绝（409），哪怕前端说「都过了」。
@@ -298,18 +303,19 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
     );
   });
 
-  // ── ② 范围收窄：除签字外没有写操作 ────────────────────────────────────
+  // ── ② 范围收窄 ───────────────────────────────────────────────────────
 
-  it('范围：run / gate / freeze / admit / abandon / resume 一律不存在（ADR-072 §4）', async () => {
+  it('范围：admit / abandon / clarify / create 一律不存在', async () => {
+    // ADR-086 把 run / gate / freeze / resume 搬进了驾驶舱（复用 core 判定），
+    // 所以这条断言**缩小**为「仍未开放的写操作」。
+    //
+    // ADR-072 §4 的排除清单**部分**被 ADR-086 取代 —— 被取代的四个
+    // 在 `web-cockpit-throttle.test.ts` 里验；这里守住**没被取代的**那些。
     await writeSlice('scope-slice');
     const token = await readSessionToken();
     const paths = [
-      '/api/slices/scope-slice/run',
-      '/api/slices/scope-slice/gate',
-      '/api/slices/scope-slice/freeze',
       '/api/slices/scope-slice/admit',
       '/api/slices/scope-slice/abandon',
-      '/api/slices/scope-slice/resume',
       '/api/slices/scope-slice/clarify',
     ];
     for (const p of paths) {
@@ -319,6 +325,35 @@ describe('zelto web —— 安全与范围（ADR-072）', () => {
         body: '{}',
       });
       assert.equal(res.status, 404, `${p} 不该存在，实际返回 ${res.status}`);
+    }
+  });
+
+  it('范围：ADR-086 开放的四个端点**确实存在**（不是 404）', async () => {
+    // 反向断言：光断言「别的端点不存在」不能证明新端点装上了 ——
+    // 路由没匹配到也是 404，那跟「不存在」长得一模一样。
+    //
+    // **用 GET 探，不真 POST**：
+    // 这四个端点只接受 POST，而 POST /run 会**真的拉起 CLI 子进程**
+    // （fire-and-forget），POST /gate 会真的跑命令。
+    // 探路用的请求不该有副作用 —— 尤其不该在临时目录里留下子进程，
+    // 那会让清理阶段 EBUSY。
+    //
+    // GET 拿到 **405**（Method Not Allowed）恰恰证明「路由匹配到了、
+    // 只是方法不对」—— 404 说明路由不存在，405 说明存在且只收 POST。
+    await writeSlice('scope-slice');
+    const token = await readSessionToken();
+    const paths = [
+      '/api/slices/scope-slice/run',
+      '/api/slices/scope-slice/gate',
+      '/api/slices/scope-slice/freeze',
+      '/api/slices/scope-slice/resume',
+    ];
+    for (const p of paths) {
+      const res = await req(p, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json', 'X-Zelto-Token': token },
+      });
+      assert.equal(res.status, 405, `${p} 应当存在（GET 得 405），实际返回 ${res.status}`);
     }
   });
 

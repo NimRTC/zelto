@@ -26,9 +26,21 @@
 //   POST /api/slices/:id/answer          回答 agent 的提问（只记录，不续跑）
 //   POST /api/halt                      拉闸
 //
-// **仍然没有** run / gate / freeze / admit / abandon / resume ——
-// 理由见 ADR-072 §4：那些动作在 CLI 侧有完整实现，
+// ADR-086 再补上**四个油门**动作：
+//   POST /api/slices/:id/freeze          冻结规格
+//   POST /api/slices/:id/gate            跑门禁②
+//   POST /api/slices/:id/run             开跑（后台 agent）
+//   POST /api/slices/:id/resume          续跑停机切片
+//
+// **仍然没有** admit / abandon ——
+// 理由见 ADR-072 §4：那两个动作在 CLI 侧有完整实现，
 // Web 侧再实现一份会分叉判定（C3 的隐患）。
+//
+// 四个新动作的共同纪律（ADR-086 §1）：
+// **Web 侧不重写判定，只调 core** —— freeze / gate / resume 直接调
+// `core/lifecycle/` 里那份编排（CLI 与 Web 调同一个函数）；
+// `run` 拉起 CLI 进程本身（`zelto run <id> --detach`），
+// 因为 run 必须用 executor adapter，而 `core/` 不许 import `adapters/`（C2）。
 //
 // 三个新动作的共同纪律（ADR-084 §2）：
 // **Web 侧不重写判定，只调 core** —— 每一件都复用 CLI 侧同一个实现。
@@ -256,6 +268,136 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
     return;
   }
 
+  // ── POST /api/slices/:id/freeze ─────────────────────────────────────
+  // ADR-086：冻结 —— 与 CLI `zelto freeze` 同一份编排（core/lifecycle/freeze.ts）。
+  //
+  // 驾驶舱与 CLI 调**同一份**编排 —— 判定不分叉（C3）。
+  const freezeMatch = path.match(/^\/api\/slices\/([^/]+)\/freeze$/);
+  if (freezeMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const id = validId(freezeMatch[1]);
+    if (!id) {
+      sendJson(res, 400, { error: '切片 id 非法' });
+      return;
+    }
+    const body = ctx.body as { refreeze?: unknown } | undefined;
+    const result = await api.freezeSlice(id, {
+      ...(body?.refreeze === true ? { refreeze: true } : {}),
+    });
+    if (!result.ok) {
+      sendLifecycleFailure(res, result);
+      return;
+    }
+    sendJson(res, 200, { ...result, ok: true });
+    return;
+  }
+
+  // ── POST /api/slices/:id/gate ───────────────────────────────────────
+  // ADR-086：门禁② —— 与 CLI `zelto gate` 同一份编排（core/lifecycle/gate.ts）。
+  const gateMatch = path.match(/^\/api\/slices\/([^/]+)\/gate$/);
+  if (gateMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const id = validId(gateMatch[1]);
+    if (!id) {
+      sendJson(res, 400, { error: '切片 id 非法' });
+      return;
+    }
+    const body = ctx.body as { only?: unknown; retry?: unknown; dryRun?: unknown } | undefined;
+    const only = typeof body?.only === 'string' ? body.only : undefined;
+    const retry = typeof body?.retry === 'number' && Number.isFinite(body.retry)
+      ? Math.max(0, Math.floor(body.retry))
+      : undefined;
+    const result = await api.runGate(id, {
+      ...(only ? { only } : {}),
+      ...(retry !== undefined ? { retry } : {}),
+      ...(body?.dryRun === true ? { dryRun: true } : {}),
+    });
+    if (!result.ok) {
+      sendLifecycleFailure(res, result);
+      return;
+    }
+    sendJson(res, 200, { ...result, ok: true });
+    return;
+  }
+
+  // ── POST /api/slices/:id/run ────────────────────────────────────────
+  // ADR-086 §3：开跑 —— **拉起 CLI 进程**（`zelto run <id> --detach`），
+  // 不是 Web 侧重实现 run。
+  //
+  // fire-and-forget：HTTP 请求**不挂着** agent 会话 ——
+  // agent 跑在独立的监督进程里（ADR-084 §1.1 要的就是这个）。
+  const runMatch = path.match(/^\/api\/slices\/([^/]+)\/run$/);
+  if (runMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const id = validId(runMatch[1]);
+    if (!id) {
+      sendJson(res, 400, { error: '切片 id 非法' });
+      return;
+    }
+    const body = ctx.body as { hotfix?: unknown; confirmHotfix?: unknown } | undefined;
+    const hotfix = body?.hotfix === true;
+    // ADR-015 §3.1：hotfix 跳过门禁② —— 必须显式确认。
+    // Web 端要**两个独立字段**（hotfix + confirmHotfix），比 CLI 的两个词更严。
+    if (hotfix && body?.confirmHotfix !== true) {
+      sendJson(res, 400, {
+        error:
+          'hotfix 会跳过门禁②（验收测试），等于放弃「签字前必须过门禁」这条约束，' +
+          '所以必须显式确认。请同时提交 hotfix 与 confirmHotfix。',
+      });
+      return;
+    }
+    const result = await api.runSlice(id, {
+      hotfix,
+      confirmHotfix: body?.confirmHotfix === true,
+    });
+    if (!result.ok) {
+      sendJson(res, 409, { ok: false, error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, { ...result, ok: true });
+    return;
+  }
+
+  // ── POST /api/slices/:id/resume ─────────────────────────────────────
+  // ADR-086：续跑停机切片 —— 与 CLI `zelto resume` 同一份编排。
+  const resumeMatch = path.match(/^\/api\/slices\/([^/]+)\/resume$/);
+  if (resumeMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const id = validId(resumeMatch[1]);
+    if (!id) {
+      sendJson(res, 400, { error: '切片 id 非法' });
+      return;
+    }
+    const body = ctx.body as {
+      skip?: unknown;
+      abandon?: unknown;
+      resetRetry?: unknown;
+    } | undefined;
+    const result = await api.resumeSlice(id, {
+      ...(body?.skip === true ? { skip: true } : {}),
+      ...(body?.abandon === true ? { abandon: true } : {}),
+      ...(body?.resetRetry === true ? { resetRetry: true } : {}),
+    });
+    if (!result.ok) {
+      sendLifecycleFailure(res, result);
+      return;
+    }
+    sendJson(res, 200, { ...result, ok: true });
+    return;
+  }
+
   // ── GET /api/slices/:id ─────────────────────────────────────────────
   const detailMatch = path.match(/^\/api\/slices\/([^/]+)$/);
   if (detailMatch) {
@@ -311,6 +453,50 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
   }
 
   sendJson(res, 404, { error: 'Not found' });
+}
+
+/**
+ * 编排类动作的失败响应（ADR-086 的 freeze / gate / resume 共用）。
+ *
+ * **404 与 409 是两回事**：
+ *   - 404 —— 切片根本不存在。人的动作是错的（点了不存在的东西）。
+ *   - 409 —— 切片在，但**状态不允许**这个动作（还没冻结、门禁没过……）。
+ *
+ * 为什么要分开：都返回 409 的话，人看到「冲突」会去猜「跟谁冲突」，
+ * 而真相只是「你点的那个 id 不存在」。反过来都返回 404 的话，
+ * 状态冲突会被误报成「页面丢了」—— 那更糟，因为**人会刷新重试**，
+ * 而重试不会改变状态，只会让人更困惑。
+ *
+ * 409 是**可恢复**的（改状态再来），404 是**不可恢复**的（换个 id）。
+ * 这条区别决定了前端该提示「改状态」还是「刷新列表」。
+ */
+function sendLifecycleFailure(
+  res: ServerResponse,
+  result: {
+    ok: boolean;
+    reason: string;
+    details?: string[];
+    advisories?: string[];
+    facts?: Record<string, unknown>;
+    notFound?: boolean;
+  },
+): void {
+  if (result.notFound) {
+    sendJson(res, 404, {
+      ok: false,
+      error: result.reason,
+      reason: result.reason,
+      ...(result.details && result.details.length > 0 ? { details: result.details } : {}),
+    });
+    return;
+  }
+  sendJson(res, 409, {
+    ok: false,
+    error: result.reason,
+    reason: result.reason,
+    ...(result.details && result.details.length > 0 ? { details: result.details } : {}),
+    ...(result.advisories && result.advisories.length > 0 ? { advisories: result.advisories } : {}),
+  });
 }
 
 /**

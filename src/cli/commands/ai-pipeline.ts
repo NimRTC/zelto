@@ -31,7 +31,7 @@ import {
 } from './version-runtime.js';
 import { worktreeManager } from './shared.js';
 import { resolveWriteSet } from './run-support.js';
-import { describeGuardKinds, designGuard, loadWholeGraphGuard } from './arch-guard.js';
+import { describeGuardKinds, designGuard, loadWholeGraphGuard } from '../../core/arch/guard-wiring.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 import { ContractBaselineStore, ContractRegistry, diffSchemas } from '../../core/contracts/index.js';
@@ -634,12 +634,13 @@ register('plan', async (args) => {
 
     // ── 确认前校验计划里的标识符 ──
     //
-    // 为什么在这里卡：版本 label 与切片 id 都会**拼进路径**
+    // 为什么在这里卡：版本 label 与切片 id 都会被**拼进路径**
     // （`.zelto/version-worktrees/<label>/`、`.zelto/slices/<id>.json`、
-    // `specs/slices/<id>.md`、`tests/acceptance/<id>/`、`.zelto/worktrees/<id>/`），
-    // 而计划的 label 与切片 id **可能来自 LLM 产出**——那条路不经过命令行的 id 白名单。
+    // `specs/slices/<id>.md`、`tests/acceptance/<id>/`、`.zelto/worktrees/<id>/`）。
+    // 而计划的 label 与切片 id **可能来自 LLM 产出**——
+    // 那条路不经过命令行的 id 白名单。
     //
-    // 确认是**人签字的时刻**：此刻拒掉，比跑起 `version start` 才炸清楚得多。
+    // 确认是**人签字的时刻**：此刻拒掉，比跑到 `version start` 才炸清楚得多。
     // 报错要说清「哪个标识符不合法」，让人能直接改计划。
     const invalidVersions: Array<{ label: string; reason: string }> = [];
     for (const v of plan.versions) {
@@ -665,7 +666,7 @@ register('plan', async (args) => {
       for (const s of invalidSlices) {
         f.out(`   切片 id ${s.reason}`);
       }
-      f.out('   改法：zelto plan patch <id> --version <label> ... ，或直接编辑计划文件');
+      f.out('   改法：zelto plan patch <id> --version <label> ... ，或直接编辑计划文件。');
       return 1;
     }
 

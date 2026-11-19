@@ -168,6 +168,10 @@ tr.clickable:hover td { background: #161b22; }
 /* 顶栏的拉闸按钮 —— 跟导航按钮同排，但要一眼看出是「刹车」 */
 nav button.danger { color: var(--bad); border-color: var(--bad); margin-left: auto; }
 nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
+/* ADR-086：油门按钮组 —— 冻结 / 门禁 / 开跑 / 续跑 */
+.throttle-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+/* ADR-086：详情页自己轮询的这一块（状态 / 活性 / 进度） */
+.live-box { margin-bottom: 10px; }
 /* ADR-084：回答提问的输入行 */
 .answer-row { display: flex; gap: 8px; margin-top: 8px; }
 .answer-input {
@@ -676,6 +680,8 @@ function formatUsd(v) {
 // ADR-072 砍掉的只是**写操作**（run/gate/freeze/...）——
 // 只读的度量与状态展示原本就在 ADR-010 的范围里，ADR-072 §1 的摘要
 // 也写着「只读驾驶舱（切片总览 / 切片详情 / 事件流 / 审计 / 签字复查）」。
+//
+// （写操作后来由 ADR-084 / ADR-086 补上了，见上面的油门按钮组。）
 
 async function viewMetrics(target) {
   const m = await apiGet('/api/metrics');
@@ -940,7 +946,7 @@ async function showSliceDetail(id, forSign) {
   clear(main);
   inDetail = true;
   const back = el('button', 'back', '← 返回');
-  back.addEventListener('click', function () { render(currentView); });
+  back.addEventListener('click', function () { stopDetailPolling(); render(currentView); });
   main.appendChild(back);
 
   let d;
@@ -955,21 +961,37 @@ async function showSliceDetail(id, forSign) {
   const slice = d.slice;
   main.appendChild(el('h2', null, id + ' — ' + slice.title));
 
+  // ── ADR-086：油门 ────────────────────────────────────────────────────
+  //
+  // 驾驶舱从「只有刹车的看板」变成「能踩油门的驾驶舱」。
+  //
+  // 纪律不变（ADR-084 §2 / ADR-086 §1）：
+  // **前端不重写任何判定** —— 按钮只发请求、只把服务端回来的话显示出来。
+  // 能不能做、为什么不能做，全由服务端的 core 编排说了算。
+  const throttleRow = el('div', 'throttle-row');
+  main.appendChild(throttleRow);
+  renderThrottleButtons(throttleRow, id, slice, d.summary);
+
+  // ── ADR-086：详情页自己轮询「状态 / 活性 / 进度」────────────────────
+  //
+  // 为什么详情页要单独轮询：
+  // 全局轮询在详情页上是**停用**的（免得把人正在看的内容刷掉）。
+  // 但「点了开跑，然后盯着这一页看进度」正是驾驶舱最有用的场景 ——
+  // 人盯着一个不动的页面，会怀疑 agent 卡死了（本可避免的焦虑）。
+  //
+  // 所以这里只轮询**一小块**（状态 / 活性 / 进度 / 花费），
+  // 不动页面其余部分 —— 既给出「它还活着」的证据，又不抢人的视线。
+  const liveBox = el('div', 'live-box');
+  main.appendChild(liveBox);
+  renderLiveBox(liveBox, d.summary);
+  startDetailPolling(id, liveBox);
+
   const dl = el('dl', 'kv');
   const kv = function (k, v) {
     dl.appendChild(el('dt', null, k));
     dl.appendChild(el('dd', null, v));
   };
-  kv('状态', slice.state);
   kv('类型', slice.type || '—');
-  // 活性 / 最后活动 —— 与列表页同源（服务端算一次），详情页不另猜
-  const sm = d.summary;
-  if (sm && sm.state === 'running') {
-    kv('活性', livenessCell(sm));
-    const prog = progressCell(sm);
-    if (prog) kv('进度', prog);
-  }
-  kv('花费', sm ? costCell(sm) : '—');
   kv('写集', String((slice.writes || []).length) + ' 项');
   kv('运行', String((slice.runs || []).length) + ' 次');
   kv('创建', new Date(slice.createdAt).toLocaleString());
@@ -1221,12 +1243,255 @@ async function doAnswer(sliceId, input, btn) {
   btn.textContent = '提交答案';
 }
 
+// ── ADR-086：油门（冻结 / 门禁 / 开跑 / 续跑）───────────────────────────
+//
+// 共同纪律（ADR-084 §2 / ADR-086 §1）：
+// **前端不重写任何判定** —— 按钮只负责发请求、只负责把服务端回来的话显示出来。
+// 「能不能做」「为什么不能做」全部由服务端的 core 编排决定。
+//
+// 前端**能**做的唯一一件事是「按状态把不该点的按钮置灰」——
+// 那不是判定，那是把服务端一定会拒绝的动作提前说清楚，省人一次等待。
+
+/**
+ * 按切片状态渲染四个油门按钮。
+ *
+ * 置灰规则与服务端 core 的准入规则一一对应（ADR-086 §2）：
+ *   - 冻结：draft / clarifying 可冻结；frozen 可「重新冻结」（改规格后）
+ *   - 门禁：frozen 才能验（门禁要验的是「冻结基线上的产物」）
+ *   - 开跑：frozen / completed 可跑
+ *   - 续跑：只有停机片才需要续跑
+ *
+ * **置灰只是提示，不是门** —— 服务端照样会拒。前端猜错了也只是
+ * 「按钮亮着但点了被拒」，反过来（该亮的没亮）才是真问题，
+ * 所以规则宁可保守。
+ */
+function renderThrottleButtons(row, sliceId, slice, summary) {
+  clear(row);
+  const state = slice.state;
+  const stalled = !!(summary && summary.stalled);
+
+  // ── 冻结 ────────────────────────────────────────────────────────────
+  if (state === 'draft' || state === 'clarifying') {
+    const b = el('button', 'btn', '❄ 冻结规格');
+    b.addEventListener('click', function () { doFreeze(sliceId, b, false); });
+    row.appendChild(b);
+  } else if (state === 'frozen') {
+    // 已冻结 —— 「重新冻结」是改规格后的正常路径（最常见是扩写集）。
+    // 不给这个路径，那个切片就永久卡住（规格改了、哈希对不上、又冻不了）。
+    const b = el('button', 'btn', '❄ 重新冻结');
+    b.addEventListener('click', function () { doFreeze(sliceId, b, true); });
+    row.appendChild(b);
+  }
+
+  // ── 门禁 ────────────────────────────────────────────────────────────
+  if (state === 'frozen') {
+    const b = el('button', 'btn', '🛡 跑门禁');
+    b.addEventListener('click', function () { doGate(sliceId, b); });
+    row.appendChild(b);
+  }
+
+  // ── 开跑 ────────────────────────────────────────────────────────────
+  if (state === 'frozen' || state === 'completed') {
+    const b = el('button', 'btn ok', '▶ 开跑');
+    b.addEventListener('click', function () { doRun(sliceId, b); });
+    row.appendChild(b);
+  }
+
+  // ── 续跑 ────────────────────────────────────────────────────────────
+  if (stalled) {
+    const b = el('button', 'btn', '↻ 续跑');
+    b.addEventListener('click', function () { doResume(sliceId, b); });
+    row.appendChild(b);
+  }
+
+  // 一个按钮都不该出现时，说清为什么 —— 否则人以为驾驶舱坏了。
+  if (row.childNodes.length === 0) {
+    row.appendChild(el('span', 'muted',
+      '当前状态（' + state + '）下没有可执行的动作 —— 动作按状态开放，不摆不能用的按钮。'));
+  }
+}
+
+/**
+ * 详情页的「状态 / 活性 / 进度 / 花费」小块。
+ *
+ * 与列表页同源（服务端算一次，前端不另猜）——
+ * liveness / progressLine / elapsedMs 全是服务端读的现场。
+ */
+function renderLiveBox(box, summary) {
+  clear(box);
+  if (!summary) return;
+  const row = el('div', 'check');
+  row.appendChild(el('span', 'label', '状态'));
+  row.appendChild(el('span', null, summary.state));
+  row.appendChild(el('span', 'ev', liveBadge(summary)));
+  box.appendChild(row);
+
+  if (summary.state === 'running') {
+    const prog = progressCell(summary);
+    if (prog) {
+      const r2 = el('div', 'check');
+      r2.appendChild(el('span', 'label', '进度'));
+      r2.appendChild(prog);
+      box.appendChild(r2);
+    }
+  }
+
+  const cost = el('div', 'check');
+  cost.appendChild(el('span', 'label', '花费'));
+  cost.appendChild(el('span', null, costCell(summary)));
+  box.appendChild(cost);
+}
+
+/**
+ * 详情页的小轮询 —— 只刷新那一小块，不动页面其余部分。
+ *
+ * 为什么不复用全局轮询：全局轮询在详情页是停用的（免得刷掉人正在看的内容）。
+ * 但「点了开跑然后盯着看」正是驾驶舱最有用的场景 ——
+ * 人盯着一个不动的页面会怀疑 agent 卡死（本可避免的焦虑）。
+ *
+ * 轮询失败**保留旧内容** —— 一次抖动不该把现场清空。
+ */
+let detailPollTimer = null;
+function startDetailPolling(sliceId, box) {
+  stopDetailPolling();
+  detailPollTimer = setInterval(function () {
+    apiGet('/api/slices/' + encodeURIComponent(sliceId)).then(function (d) {
+      renderLiveBox(box, d.summary);
+      noteConnected();
+    }).catch(function (err) {
+      if (isConnectionError(err)) noteDisconnected(err);
+    });
+  }, 3000);
+}
+function stopDetailPolling() {
+  if (detailPollTimer) {
+    clearInterval(detailPollTimer);
+    detailPollTimer = null;
+  }
+}
+
+/**
+ * **冻结** —— 把规格钉成基线。
+ *
+ * 与 CLI zelto freeze 同一份编排（服务端 core/lifecycle/freeze.ts）。
+ */
+async function doFreeze(sliceId, btn, refreeze) {
+  btn.disabled = true;
+  btn.textContent = refreeze ? '重新冻结中…' : '冻结中…';
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/freeze',
+    refreeze ? { refreeze: true } : {});
+  if (res.ok && res.body && res.body.ok) {
+    showBanner('notice ok', '✅ ' + (res.body.reason || '已冻结'));
+    await showSliceDetail(sliceId);
+    return;
+  }
+  showFreezeFailure(res, btn, refreeze);
+}
+
+/** 冻结失败时把「哪条写集被挡了」说出来 —— 那是人能直接动手的地方。 */
+function showFreezeFailure(res, btn, refreeze) {
+  const body = res.body || {};
+  const details = body.details || [];
+  const advisories = body.advisories || [];
+  const msg = (body.error || body.reason) || ('HTTP ' + res.status);
+  showBanner('notice bad', '❌ ' + msg);
+  for (const d of details) showBanner('notice bad', '· ' + d);
+  for (const a of advisories) showBanner('notice', '· ' + a);
+  btn.disabled = false;
+  btn.textContent = refreeze ? '❄ 重新冻结' : '❄ 冻结规格';
+}
+
+/**
+ * **门禁** —— 验冻结基线上的产物。
+ *
+ * 与 CLI zelto gate 同一份编排（服务端 core/lifecycle/gate.ts）。
+ */
+async function doGate(sliceId, btn) {
+  btn.disabled = true;
+  btn.textContent = '门禁运行中…';
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/gate', {});
+  if (res.ok && res.body && res.body.ok) {
+    showBanner('notice ok', '✅ ' + (res.body.reason || '门禁通过'));
+    const facts = res.body.facts || {};
+    if (facts.signRequestId) {
+      showBanner('notice', '已发出签字请求 —— 去「待签字」页签逐片确认。');
+    }
+    await showSliceDetail(sliceId);
+    return;
+  }
+  const body = res.body || {};
+  const msg = (body.error || body.reason) || ('HTTP ' + res.status);
+  showBanner('notice bad', '❌ ' + msg);
+  for (const d of (body.details || [])) showBanner('notice bad', '· ' + d);
+  btn.disabled = false;
+  btn.textContent = '🛡 跑门禁';
+}
+
+/**
+ * **开跑** —— 起一个后台 agent（fire-and-forget）。
+ *
+ * 关键：**HTTP 请求不挂着 agent 会话**（ADR-086 §3）。
+ * 服务端拉起独立的监督进程（zelto run --detach），
+ * 请求立刻返回，进度在详情页那块小面板上自己更新。
+ */
+async function doRun(sliceId, btn) {
+  btn.disabled = true;
+  btn.textContent = '起跑中…';
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/run', {});
+  if (res.ok && res.body && res.body.ok) {
+    showBanner('notice ok', '🚀 ' + (res.body.reason || '已在后台起跑'));
+    if (res.body.nextStep) showBanner('notice', res.body.nextStep);
+    await showSliceDetail(sliceId);
+    return;
+  }
+  const body = res.body || {};
+  const msg = (body.error || body.reason) || ('HTTP ' + res.status);
+  showBanner('notice bad', '❌ 起跑失败：' + msg);
+  btn.disabled = false;
+  btn.textContent = '▶ 开跑';
+}
+
+/**
+ * **续跑** —— 恢复一片停机的切片。
+ *
+ * 三个选项对应 CLI 的三个旗标。这里用 confirm 一次问清楚 ——
+ * 「放弃」是不可逆的（abandoned 是终态），不该由一个误点的按钮决定。
+ */
+async function doResume(sliceId, btn) {
+  btn.disabled = true;
+  const choice = window.confirm(
+    '续跑这片停机的切片：\n\n' +
+    '确定 = 恢复以便重跑（保留停机记录）\n' +
+    '取消 = 放弃这片（不可逆）\n\n' +
+    '想「只标记已解决、不重跑」请用终端：zelto resume ' + sliceId + ' --skip'
+  );
+  if (choice === null) {
+    btn.disabled = false;
+    btn.textContent = '↻ 续跑';
+    return;
+  }
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/resume',
+    choice ? {} : { abandon: true });
+  if (res.ok && res.body && res.body.ok) {
+    showBanner('notice ok', '✅ ' + (res.body.reason || '已恢复'));
+    for (const a of (res.body.advisories || [])) showBanner('notice', '· ' + a);
+    await showSliceDetail(sliceId);
+    return;
+  }
+  const body = res.body || {};
+  const msg = (body.error || body.reason) || ('HTTP ' + res.status);
+  showBanner('notice bad', '❌ 续跑失败：' + msg);
+  btn.disabled = false;
+  btn.textContent = '↻ 续跑';
+}
+
 /**
  * **拉闸** —— 顶栏按钮（ADR-084）。
  *
- * 驾驶舱只提供「刹车」，不提供「油门」——
- * resume 会改切片状态机、走重试预算、可能触发 gate，
- * 那是「推进」动作，不是「接管」动作（ADR-084 §1）。
+ * 拉闸是**刹车**：把控制权从 agent 手里收回来。
+ *
+ * 驾驶舱现在刹车油门都有（ADR-086 补上了 freeze / gate / run / resume），
+ * 但**拉闸的语义没变** —— 它只交回控制权，不推进任何东西。
  */
 async function doHalt(btn) {
   const reason = window.prompt('拉闸原因（可留空）：', '人工拉闸');
@@ -1285,6 +1550,9 @@ async function render(view) {
   currentView = view;
   // 回到列表视图 —— 详情页的状态不再成立
   inDetail = false;
+  // 详情页自己的小轮询也要停 —— 离开详情页后它还在往一个已被清空的
+  // DOM 节点里写，那只会白费一次请求（而且可能把连接状态误判为断了）。
+  stopDetailPolling();
   // 用户主动切换视图 → 旧提示过期，清掉。
   // （轮询刷新走 refreshSilently，不经过这里 —— 提示要活过轮询。）
   clearBanner();

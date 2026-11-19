@@ -40,6 +40,16 @@ import { resolveSliceOwnership } from '../../core/version/branch.js';
 import type { Version } from '../../core/version/types.js';
 import { HaltStore } from '../../core/halt/index.js';
 import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
+// ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
+// run 拉起 CLI 进程。判定不分叉（C3）。
+import {
+  freezeSlice,
+  resumeSlice,
+  runGate,
+  type LifecycleContext,
+} from '../../core/lifecycle/index.js';
+import { loadConfigAt } from '../../core/config/index.js';
+import { launchRun } from './throttle.js';
 
 /** 一片切片的总览行 —— 前端列表用。 */
 export interface SliceSummary {
@@ -918,6 +928,280 @@ export class WebApi {
         reason: req.reason,
       },
     };
+  }
+
+  // ── ADR-086：驾驶舱装上油门 ─────────────────────────────────────────
+  //
+  // 下面四个动作的共同纪律（ADR-084 §2 延续）：
+  // **Web 侧不重写判定，只调 core** ——
+  //   - freeze / gate / resume → 直接调 `core/lifecycle/` 的编排
+  //   - run                  → 拉起 CLI 进程（判定在 CLI 二进制里）
+  // 两条路都保证「浏览器里点的」与「终端里跑的」结论一致（C3）。
+
+  /** 编排层需要的上下文 —— actor 与 via 是两个维度（ADR-084 §4）。 */
+  private lifecycleContext(): LifecycleContext {
+    return {
+      repoRoot: this.repoRoot,
+      store: this.store,
+      events: this.events,
+      actor: 'human',
+      via: 'web',
+    };
+  }
+
+  /**
+   * **冻结** —— 与 `zelto freeze` 同一份编排（ADR-086）。
+   *
+   * 编排住在 `core/lifecycle/freeze.ts` —— CLI 与 Web 调同一份。
+   */
+  async freezeSlice(
+    sliceId: string,
+    options: { refreeze?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    reason: string;
+    details: string[];
+    advisories: string[];
+    facts?: Record<string, unknown>;
+    notFound?: boolean;
+  }> {
+    // 切片不存在 → 404，不是 500。
+    //
+    // 为什么要在调 core **之前**查：`store.read()` 抛 ENOENT，
+    // 那个异常一路冒到 router 就成了「服务器内部错误」——
+    // 但人的动作是错的（点了不存在的切片），不是服务器坏了。
+    // 500 会把人引去查日志，404 才能让人意识到「点错了」。
+    if (!(await this.store.exists(sliceId))) {
+      return {
+        ok: false,
+        reason: `切片 "${sliceId}" 不存在`,
+        details: [],
+        advisories: [],
+        notFound: true,
+      };
+    }
+
+    const outcome = await freezeSlice(this.lifecycleContext(), sliceId, {
+      ...(options.refreeze ? { refreeze: true } : {}),
+    });
+    return {
+      ok: outcome.ok,
+      reason: outcome.reason,
+      details: outcome.details,
+      advisories: outcome.advisories,
+      ...(outcome.facts ? { facts: outcome.facts } : {}),
+    };
+  }
+
+  /**
+   * **门禁②** —— 与 `zelto gate` 同一份编排（ADR-086）。
+   *
+   * 编排住在 `core/lifecycle/gate.ts` —— CLI 与 Web 调同一份。
+   */
+  async runGate(
+    sliceId: string,
+    options: { only?: string; retry?: number; dryRun?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    reason: string;
+    details: string[];
+    advisories: string[];
+    facts?: Record<string, unknown>;
+    notFound?: boolean;
+  }> {
+    if (!(await this.store.exists(sliceId))) {
+      return {
+        ok: false,
+        reason: `切片 "${sliceId}" 不存在`,
+        details: [],
+        advisories: [],
+        notFound: true,
+      };
+    }
+
+    const config = loadConfigAt(this.repoRoot);
+    const gateRoot = this.worktrees.exists(sliceId)
+      ? this.worktrees.pathFor(sliceId)
+      : undefined;
+
+    const outcome = await runGate(
+      this.lifecycleContext(),
+      sliceId,
+      {
+        commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+        ...(config.gate.profiles ? { profiles: config.gate.profiles } : {}),
+        timeoutSec: config.gate.timeoutSec,
+        retryMax: config.gate.retry.max,
+        ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
+        ...(config.gate.submoduleCheck !== undefined
+          ? { submoduleCheck: config.gate.submoduleCheck }
+          : {}),
+        ...(gateRoot ? { gateRoot } : {}),
+        requestSign: true,
+      },
+      {
+        ...(options.only ? { only: options.only } : {}),
+        ...(options.retry !== undefined ? { retry: options.retry } : {}),
+        ...(options.dryRun ? { dryRun: true } : {}),
+      },
+    );
+
+    return {
+      ok: outcome.ok,
+      reason: outcome.reason,
+      details: outcome.details,
+      advisories: outcome.advisories,
+      ...(outcome.facts ? { facts: outcome.facts } : {}),
+    };
+  }
+
+  /**
+   * **续跑停机切片** —— 与 `zelto resume` 同一份编排（ADR-086）。
+   */
+  async resumeSlice(
+    sliceId: string,
+    options: { skip?: boolean; abandon?: boolean; resetRetry?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    reason: string;
+    details: string[];
+    advisories: string[];
+    facts?: Record<string, unknown>;
+    notFound?: boolean;
+  }> {
+    if (!(await this.store.exists(sliceId))) {
+      return {
+        ok: false,
+        reason: `切片 "${sliceId}" 不存在`,
+        details: [],
+        advisories: [],
+        notFound: true,
+      };
+    }
+
+    const outcome = await resumeSlice(this.lifecycleContext(), sliceId, options);
+    return {
+      ok: outcome.ok,
+      reason: outcome.reason,
+      details: outcome.details,
+      advisories: outcome.advisories,
+      ...(outcome.facts ? { facts: outcome.facts } : {}),
+    };
+  }
+
+  /**
+   * **开跑** —— 拉起 CLI 进程（ADR-086 §3）。
+   *
+   * **不是**在 Web 侧重实现 run：run 必须用 executor adapter，
+   * 而 `core/` 不许 import `adapters/`（C2）。
+   * 所以 Web 端拉起 **CLI 二进制本身**（`zelto run <id> --detach`）：
+   * 同一份准入判定、同一份写集预检、同一份事件（C3）。
+   *
+   * **fire-and-forget**：HTTP 请求**不挂着** agent 会话 ——
+   * agent 跑在独立的监督进程里（ADR-084 §1.1 要的就是这个）。
+   */
+  async runSlice(
+    sliceId: string,
+    options: { hotfix?: boolean; confirmHotfix?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    reason: string;
+    taskId?: string;
+    supervisorPid?: number;
+    nextStep?: string;
+  }> {
+    // 同时在跑的 detached 任务数有上限 —— 点错一下就可能同时拉起多个 agent，
+    // 而每个 agent 都在烧 token。这不是安全漏洞，是**成本失控**的闸门。
+    const running = await this.countRunningDetachedTasks();
+    const limit = this.maxConcurrentRuns();
+    if (running >= limit) {
+      return {
+        ok: false,
+        reason:
+          `已有 ${running} 个后台运行在进行中（上限 ${limit}）—— ` +
+          `请等它们跑完，或先在终端里 zelto status 看进度。`,
+      };
+    }
+
+    const launch = await launchRun(this.repoRoot, sliceId, options);
+    if (!launch.ok) {
+      return { ok: false, reason: launch.reason ?? '发起运行失败' };
+    }
+
+    return {
+      ok: true,
+      reason: '已在后台起跑',
+      ...(launch.taskId ? { taskId: launch.taskId } : {}),
+      ...(launch.supervisorPid ? { supervisorPid: launch.supervisorPid } : {}),
+      // 下一步说清楚：进度在驾驶舱上看，合并要显式跑 merge。
+      nextStep:
+        '进度会实时显示在本页。跑完后会生成签字请求 —— ' +
+        '签字不等于合并，合入主干需另跑 zelto merge <slice-id>',
+    };
+  }
+
+  /**
+   * 当前有多少个 detached 运行在进行中。
+   *
+   * 判据是**任务文件 + 进程存活**（不是切片状态）——
+   * 切片状态在 agent 跑完后才变，任务文件才是「这一轮还在跑」的凭据。
+   */
+  private async countRunningDetachedTasks(): Promise<number> {
+    const tasksDir = join(this.zeltoDir, 'tasks');
+    let entries: string[];
+    try {
+      entries = readdirSync(tasksDir);
+    } catch {
+      // 没有任务目录 = 没有任何后台运行
+      return 0;
+    }
+
+    let count = 0;
+    for (const file of entries) {
+      if (!file.endsWith('.json')) continue;
+      let task: { status?: string; supervisorPid?: number };
+      try {
+        task = JSON.parse(readFileSync(join(tasksDir, file), 'utf-8')) as {
+          status?: string;
+          supervisorPid?: number;
+        };
+      } catch {
+        // 任务文件读不出来 —— 跳过（它自己都坏了，算不算在跑说不上）
+        continue;
+      }
+      if (task.status !== 'running') continue;
+      if (typeof task.supervisorPid === 'number' && task.supervisorPid > 0) {
+        if (isProcessAlive(task.supervisorPid)) {
+          count++;
+          continue;
+        }
+        // pid 在但进程没了 —— 那一轮已经死了，不算在跑
+        continue;
+      }
+      // 拿不到 pid 时只能信任务文件 —— 但那可能是残留记录。
+      // 宁可多算一个（拒绝启动），也不要少算（超限烧 token）。
+      count++;
+    }
+    return count;
+  }
+
+  /**
+   * 同时在跑的 detached 任务上限。
+   *
+   * 默认 1 —— 驾驶舱里点错一下就多烧一轮 token，
+   * 所以默认保守。人可以在 `.zelto/config.yaml` 里调大。
+   */
+  private maxConcurrentRuns(): number {
+    try {
+      const config = loadConfigAt(this.repoRoot);
+      const raw = config.web?.maxConcurrentRuns;
+      if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1) {
+        return Math.floor(raw);
+      }
+    } catch {
+      // 读不到配置 —— 用默认值
+    }
+    return 1;
   }
 }
 

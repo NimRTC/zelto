@@ -33,6 +33,21 @@ export interface PolicyData {
 }
 
 /**
+ * 读策略里的 `arch:` 段 —— 架构护栏规则（ADR-086）。
+ *
+ * 与 CLI 的 `loadPolicyConfig(root).arch` 同口径。
+ *
+ * **读不到就返回 undefined（不是空数组）**：
+ * 「没有护栏规则」与「配了但为空」在判定上不同 ——
+ * `judgeArchGuard` 对 undefined 与 [] 的处理不一样，
+ * 把 undefined 变成 [] 会悄悄改掉判定结果（C3）。
+ */
+export function loadArchRules(projectRoot?: string): ArchGuardRule[] | undefined {
+  const loaded = loadPolicy(projectRoot);
+  return loaded?.arch;
+}
+
+/**
  * Load policy rules from policy.yaml.
  * Returns null if the file doesn't exist or can't be parsed.
  * Uses the single parser (core/policy/yaml.ts) so `arch:` survives.

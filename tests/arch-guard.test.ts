@@ -28,7 +28,7 @@ import {
   loadWholeGraphGuard,
   sliceGuardForWrites,
   sliceGuardIssue,
-} from '../src/cli/commands/arch-guard.js';
+} from '../src/core/arch/guard-wiring.js';
 import { validatePolicyConfig } from '../src/core/policy/validator.js';
 
 /** 最小的空报告骨架，只填要测的偏离 */
@@ -287,7 +287,7 @@ describe('loadWholeGraphGuard — 整图上下文', () => {
     const ctx = await loadWholeGraphGuard({ designRoot: root, scanRoot: root, guardRules: [] });
     assert.ok(ctx);
     assert.equal(ctx.designId, 'dsg-guard');
-    assert.ok(ctx.report.deviations.some((d) => d.kind === 'undeclared_dependency'));
+    assert.ok(ctx.report.deviations.some((d: { kind: string }) => d.kind === 'undeclared_dependency'));
     assert.equal(ctx.guard.blocked, true);
   });
 

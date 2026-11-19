@@ -328,12 +328,20 @@ export class Scheduler {
    * @param options.abandon - If true, abandon the slice instead of resuming
    * @param options.resetRetry - If true, reset the auto-retry budget
    *   (`stall.autoResolved`) back to 0 — see ADR-052
+   * @param options.via - 在哪儿触发的（'cli' / 'web'）——
+   *   记进 `run.resumed` 的 payload，让追溯链能回答「这次续跑是从哪儿点的」。
+   *
+   *   **为什么在这里而不是调用方补一条事件**：
+   *   补写会让同一次续跑留下**两条** `run.resumed` ——
+   *   而「这片被续跑了几次」这种统计会因此翻倍（`rework_rate` 同理）。
+   *   所以 `via` 是**同一条事件的一个维度**，不是第二条事件。
    */
   async resume(
     sliceId: string,
-    options: { skip?: boolean; abandon?: boolean; resetRetry?: boolean },
+    options: { skip?: boolean; abandon?: boolean; resetRetry?: boolean; via?: string },
   ): Promise<{ retryBudgetReset: boolean }> {
     const slice = await this.store.read(sliceId);
+    const via = options.via;
 
     // `--reset-retry` 独立于停机状态（ADR-052）。
     //
@@ -355,6 +363,7 @@ export class Scheduler {
       await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
         resolution: 'manual_abandon',
         previousStallClass: slice.stall.class,
+        ...(via ? { via } : {}),
       });
       await this.store.transit(sliceId, 'ABANDON');
       return { retryBudgetReset: false };
@@ -387,6 +396,7 @@ export class Scheduler {
       await this.appendEvent(sliceId, 'run.resumed', 'zelto', {
         resolution,
         previousStallClass: slice.stall.class,
+        ...(via ? { via } : {}),
       });
     }
 
