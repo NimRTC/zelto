@@ -108,4 +108,43 @@ describe('Cursor hook 必须显式 fail closed', () => {
     assert.ok(command, '必须有命令');
     assert.match(command, /--harness\s+cursor/, '命令里必须带 --harness cursor');
   });
+
+  it('matcher 用的是 **Cursor CLI 的真实工具名**', () => {
+    // 这是 ADR-087 §6 修的一处**看不见的失效**。
+    //
+    // matcher 的求值是 `new RegExp(matcher).test(tool_name)` ——
+    // 名字写错一个都匹配不上 → hook 永远不被调用 →
+    // **写集预约在 Cursor 下等于没有**，而配置文件看上去一切正常。
+    //
+    // 之前写的 `create_file|edit_file|terminal` 这些名字
+    // 在 cursor-agent 里**根本不存在**。
+    installCursorHook({ root: ROOT });
+    const raw = JSON.parse(
+      readFileSync(join(ROOT, CURSOR_HOOKS_RELATIVE), 'utf-8'),
+    ) as { hooks?: { preToolUse?: Array<{ command?: string; matcher?: string }> } };
+
+    const matcher = (raw.hooks?.preToolUse ?? []).find((e) =>
+      e.command?.includes('--zelto-pretool'),
+    )?.matcher;
+
+    assert.ok(matcher, '必须有 matcher');
+
+    // Cursor CLI 的真实写工具名（2026.09.18 实测）
+    const realWriteTools = ['Write', 'Delete', 'Shell'];
+    const re = new RegExp(matcher);
+    for (const tool of realWriteTools) {
+      assert.ok(
+        re.test(tool),
+        `matcher 必须匹配 Cursor 的真实工具名 "${tool}" —— 匹配不上 hook 就不会被调用`,
+      );
+    }
+
+    // 反向：不该匹配一堆不存在的老名字
+    for (const bogus of ['create_file', 'edit_file', 'terminal']) {
+      assert.ok(
+        !re.test(bogus),
+        `matcher 不该匹配 Cursor 里不存在的工具名 "${bogus}"（那是假想的名字）`,
+      );
+    }
+  });
 });

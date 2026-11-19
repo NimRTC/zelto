@@ -48,7 +48,11 @@ import { buildDist } from './build-dist.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-withBuildLock(root, () => {
+// 与 `build.mjs` 同理：**不要在这里 `process.exit()`** ——
+// 那会跳过 `withBuildLock` 的 `finally`，把锁留在磁盘上。
+// 抛出去让锁被正常释放，退出码自然非零。
+try {
+  withBuildLock(root, () => {
   // 1. 编码检查（先于一切）
   execFileSync(process.execPath, [join(root, 'scripts', 'check-encoding.mjs')], {
     cwd: root,
@@ -73,4 +77,8 @@ withBuildLock(root, () => {
     ['--test', 'dist-test/tests/**/*.test.js'],
     { cwd: root, stdio: 'inherit' },
   );
-});
+  });
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exitCode = 1;
+}

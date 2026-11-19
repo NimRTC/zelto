@@ -41,6 +41,46 @@ describe('harness 归一化 —— 各 harness 的输入必须抽出同一个写
     assert.equal(p.tool_input.file_path, '/repo/src/a.ts');
   });
 
+  it('Cursor 的真实工具名 Write → Write', () => {
+    // Cursor CLI 2026.09.18 的真实工具名（实测）：
+    // Write（写）/ Delete（删）/ Shell（跑命令）/ Read / Grep / List …
+    const p = normalizePayload('cursor', {
+      hook_event_name: 'preToolUse',
+      tool_name: 'Write',
+      tool_input: { file_path: '/repo/src/a.ts', content: 'x' },
+    });
+    assert.equal(p.tool_name, 'Write');
+    assert.equal(p.tool_input.file_path, '/repo/src/a.ts');
+  });
+
+  it('Cursor 的 Delete → Write（删除也是写：文件会消失）', () => {
+    const p = normalizePayload('cursor', {
+      tool_name: 'Delete',
+      tool_input: { file_path: '/repo/src/a.ts' },
+    });
+    assert.equal(p.tool_name, 'Write');
+    assert.equal(p.tool_input.file_path, '/repo/src/a.ts');
+  });
+
+  it('Cursor 的 Shell → Bash', () => {
+    const p = normalizePayload('cursor', {
+      tool_name: 'Shell',
+      tool_input: { command: 'rm -rf build', cwd: '/repo' },
+    });
+    assert.equal(p.tool_name, 'Bash');
+    assert.equal(p.tool_input.command, 'rm -rf build');
+  });
+
+  it('Cursor 的只读工具被标成 read_only（读文件不是越界写入）', () => {
+    for (const tool of ['Read', 'ReadLints', 'Grep', 'List', 'Fetch']) {
+      const p = normalizePayload('cursor', {
+        tool_name: tool,
+        tool_input: { file_path: '/repo/src/a.ts' },
+      });
+      assert.equal(p.read_only, true, `${tool} 应当被标成只读`);
+    }
+  });
+
   it('Codex 的 apply_patch → 同一个 file_path', () => {
     const p = normalizePayload('codex', {
       event: 'PreToolUse',
@@ -150,13 +190,18 @@ describe('harness 输出渲染 —— 判决内容必须一致，信封形状可
   it('Cursor 的信封（permission 字段，不是 hookSpecificOutput）', () => {
     const out = renderDecision('cursor', decision) as {
       permission: string;
-      userMessage: string;
-      agentMessage: string;
+      user_message: string;
+      agent_message: string;
     };
     assert.equal(out.permission, 'deny');
-    // 原因要同时给人看和给模型看 —— 人要知道为什么，模型要知道怎么改
-    assert.equal(out.userMessage, decision.reason);
-    assert.equal(out.agentMessage, decision.reason);
+    // 原因要同时给人看和给模型看 —— 人要知道为什么，模型要知道怎么改。
+    //
+    // **字段名是 snake_case**（实测 cursor-agent 2026.09.18 的响应 schema）。
+    // 写成 camelCase 的话 Cursor 的校验器会**直接丢掉这两个字段** ——
+    // 判决照样生效，但「为什么被拒」人看不到、模型也拿不到：
+    // 人看到一句无来由的拒绝，agent 只会反复重试同一个越界动作。
+    assert.equal(out.user_message, decision.reason);
+    assert.equal(out.agent_message, decision.reason);
   });
 
   it('Codex 的信封与 Claude Code 同构', () => {

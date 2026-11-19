@@ -30,6 +30,8 @@ import {
   loadPolicyConfig,
   store,
   worktreeManager,
+  harnessForAdapter,
+  resolveAgentCommand,
 } from './shared.js';
 import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, markSliceStalled, revertRunAbortedBeforeStart } from './run-support.js';
 import {
@@ -431,8 +433,9 @@ export async function executeSlicesParallel(
 
   // ── Phase 2: 隔离 worktree + 写集预约守卫 ─────────────────────────
   const { execSync } = await import('node:child_process');
-  const agentName = options.agentName ?? loadConfig().agent.command;
   const adapterType = options.adapterType;
+  const agentName =
+    options.agentName ?? resolveAgentCommand(adapterType ?? loadConfig().agent.adapter, undefined, loadConfig());
 
   // 每个切片一份运行时守卫（C9）：写集预约 + PreToolUse 钩子
   const guards = new Map<string, RuntimeGuard>();
@@ -510,6 +513,8 @@ export async function executeSlicesParallel(
         projectRoot: process.cwd(),
         baseCommit,
         managedPaths: zeltoOwnedPaths(st.worktreePath, slice),
+        // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
+        harness: harnessForAdapter(options.adapterType),
       });
       guards.set(st.id, g);
     } catch (err) {

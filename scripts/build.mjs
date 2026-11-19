@@ -15,4 +15,12 @@ import { buildDist } from './build-dist.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-withBuildLock(root, () => buildDist(root));
+// 失败要以**非零码**退出，但**不能**在这里 `process.exit()` ——
+// 那会跳过 `withBuildLock` 的 `finally`，把锁留在磁盘上
+// （细节见 `build-dist.mjs` 里 `buildDist` 的 catch 块）。
+try {
+  withBuildLock(root, () => buildDist(root));
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err));
+  process.exitCode = 1;
+}

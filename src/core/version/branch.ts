@@ -49,6 +49,72 @@ export function versionWorktreeRelativePath(label: string): string {
 }
 
 /**
+ * 版本 label 的合法字符白名单。
+ *
+ * 允许：字母、数字、点、下划线、连字符。
+ * 拒绝：路径分隔符、空格、以及其它一切可能被解释成路径结构的字符。
+ *
+ * 为什么比切片 id 的白名单宽一点（切片 id 不允许点）：
+ * 版本 label 会进 **git 分支名**（`version/<label>`）与 **tag 名**，
+ * `v1.2.3` 这种带点的 label 在 git 里完全合法，且是常见写法。
+ * 但点带来的 `.` / `..` 必须单独拒掉 —— 见 `isValidVersionLabel`。
+ */
+const VERSION_LABEL_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;
+
+/**
+ * 版本 label 是否合法。
+ *
+ * 白名单之外还专门拒掉 `.` 与 `..`：
+ * 它们在字符上「合法」（只由点组成，匹配上面的 pattern），但语义上是
+ * **父目录**——`join('.zelto/version-worktrees', '..')` 会归一化成
+ * `.zelto`，路径直接逃出 base。
+ *
+ * 为什么这条必须在这里挡：
+ * `versionPathFor()` 用的是**原始 label**（不是清洗过的），
+ * 而清洗函数（`versionWorktreeRelativePath` 里的 replace）**允许点**，
+ * 所以 `..` 不会被替换成 `-` —— 只能靠显式拒掉。
+ */
+export function isValidVersionLabel(label: string): boolean {
+  const trimmed = label.trim();
+  if (!trimmed) return false;
+  if (trimmed === '.' || trimmed === '..') return false;
+  return VERSION_LABEL_PATTERN.test(trimmed);
+}
+
+/**
+ * 版本 label 的清洗结果 —— 与 label 本身不一致时带原因。
+ *
+ * 给 CLI 边界用：报错信息要说清「哪里不对」，而不是只说「不合法」。
+ */
+export interface VersionLabelCheck {
+  valid: boolean;
+  /** 不合法的原因（valid 为 true 时为 null） */
+  reason: string | null;
+}
+
+/**
+ * 校验版本 label，给出可读的原因。
+ *
+ * 与 `isValidVersionLabel` 同一套判据，只是多说了「为什么」。
+ */
+export function checkVersionLabel(label: string): VersionLabelCheck {
+  const trimmed = label.trim();
+  if (!trimmed) {
+    return { valid: false, reason: '版本 label 不能为空' };
+  }
+  if (trimmed === '.' || trimmed === '..') {
+    return { valid: false, reason: `版本 label "${label}" 是路径结构符号，不能作为 label` };
+  }
+  if (!VERSION_LABEL_PATTERN.test(trimmed)) {
+    return {
+      valid: false,
+      reason: `版本 label "${label}" 含非法字符 —— 只允许字母、数字、点、下划线、连字符，且必须以字母/数字/下划线开头`,
+    };
+  }
+  return { valid: true, reason: null };
+}
+
+/**
  * 版本自己的分支名（计划里显式写了 `branch` 就用它，否则派生）。
  */
 export function branchOfVersion(version: Version): string {

@@ -11,10 +11,13 @@
 //   exit 0 = 已判定；exit 2 = 阻断错误（stderr 回灌给模型）
 //
 // 协议（Cursor）：
-//   stdin  ← {"hook_event_name":"preToolUse","tool_name":"edit_file",
-//              "tool_input":{"path":"..."},...}
-//   stdout → {"permission":"allow|deny","userMessage":"...","agentMessage":"..."}
+//   stdin  ← {"hook_event_name":"preToolUse","tool_name":"Write",
+//              "tool_input":{"file_path":"..."},...}
+//   stdout → {"permission":"allow|deny","user_message":"...","agent_message":"..."}
 //   exit 0 = 已判定；exit 2 = 阻断
+//
+// 注意 Cursor 的响应字段是 **snake_case**（`user_message`/`agent_message`）——
+// 写成 camelCase 的话 Cursor 会静默丢掉这两个字段。
 //
 // **判定内核与 harness 无关**（ADR-083 §1）：
 // 各 harness 的输入先经 `harness.ts` 归一化成统一载荷，
@@ -77,6 +80,8 @@ export interface PreToolPayload {
   cwd?: string;
   session_id?: string;
   hook_event_name?: string;
+  /** 归一化阶段判定出来的「只读工具」标记 */
+  read_only?: boolean;
 }
 
 // ── 路径处理 ────────────────────────────────────────────────────────────────
@@ -86,6 +91,7 @@ import { isZeltoManagedSpecPath } from './managed-spec.js';
 import {
   normalizePayload,
   renderDecision,
+  READ_ONLY_TOOLS,
   type HarnessName,
   type NormalizedPayload,
 } from './harness.js';
@@ -328,6 +334,17 @@ export function extractBashWriteTargets(command: string): string[] {
 export function extractWriteTargets(payload: PreToolPayload): string[] {
   const tool = payload.tool_name ?? '';
   const input = payload.tool_input ?? {};
+
+  // 只读工具 → 没有写入目标。
+  //
+  // 这一步必须显式做：归一化的兜底是「工具名不认识 → 找路径字段」，
+  // 而 Read/Grep/List 这类工具**也带路径字段**。
+  // 不显式豁免的话，agent 读一个写集外的文件会被判成
+  // 「越界写入」—— 把「不许写」误判成「不许看」，
+  // agent 连查资料都做不了。
+  if (payload.read_only === true || READ_ONLY_TOOLS.has(tool)) {
+    return [];
+  }
 
   if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
     return input.file_path ? [input.file_path] : [];

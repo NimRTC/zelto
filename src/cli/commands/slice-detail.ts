@@ -6,6 +6,7 @@ import { getDefaultFormatter } from '../output-formatter.js';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteText } from '../../core/io/atomic-write.js';
+import { checkSliceId } from '../../core/slice/store.js';
 
 // ─── slice (detail) ────────────────────────────────────────────────────────
 
@@ -327,8 +328,10 @@ async function handleSliceCreate(args: string[], f: ReturnType<typeof getDefault
     return 1;
   }
 
-  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-    f.error('INVALID_ID', `Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+  // id 白名单只有一份定义（core/slice/store.ts 的 `checkSliceId`）。
+  const idCheck = checkSliceId(id);
+  if (!idCheck.valid) {
+    f.error('INVALID_ID', idCheck.reason ?? `Invalid slice ID: "${id}"`);
     return 1;
   }
 

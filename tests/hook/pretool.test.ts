@@ -101,6 +101,44 @@ describe('extractWriteTargets', () => {
     assert.deepEqual(extractBashWriteTargets('ls -la'), []);
     assert.deepEqual(extractBashWriteTargets('cat README.md'), []);
   });
+
+  it('只读工具**不产生**写入目标（ADR-087 §8）', () => {
+    // 归一化的兜底是「工具名不认识 → 找路径字段」，
+    // 而 Read / Grep / List **也带路径字段**。
+    //
+    // 不显式豁免的话，agent 读一个写集外的文件会被判成「越界写入」——
+    // 把「不许写」误判成「不许看」，agent 连查资料都做不了。
+    for (const tool of ['Read', 'ReadLints', 'Grep', 'List', 'Fetch']) {
+      assert.deepEqual(
+        extractWriteTargets({ tool_name: tool, tool_input: { file_path: '/repo/src/a.ts' } }),
+        [],
+        `${tool} 是只读工具，不该产生写入目标`,
+      );
+    }
+  });
+
+  it('归一化标了 read_only 的载荷同样豁免', () => {
+    assert.deepEqual(
+      extractWriteTargets({
+        tool_name: 'SomeBrandNewReader',
+        tool_input: { file_path: '/repo/src/a.ts' },
+        read_only: true,
+      }),
+      [],
+    );
+  });
+
+  it('未知工具**不豁免**（ADR-083 §2 的保守原则不变）', () => {
+    // 只豁免「已知只读」，未知工具仍然退回「找路径字段」并判定 ——
+    // 那等于给新 harness 开一个绕过闸门的后门。
+    assert.deepEqual(
+      extractWriteTargets({
+        tool_name: 'brand_new_editor_tool',
+        tool_input: { file_path: '/repo/src/secret.ts' },
+      }),
+      ['/repo/src/secret.ts'],
+    );
+  });
 });
 
 describe('extractRedirectTargets —— 重定向必须认引号（ADR-043）', () => {

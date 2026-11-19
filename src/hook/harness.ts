@@ -26,9 +26,13 @@
 //               exit 0 = 已判定；exit 2 = 阻断
 //
 //   Cursor      stdin: {hook_event_name, tool_name, tool_input:{path|command}, cwd}
-//               stdout: {permission:"allow|deny", userMessage, agentMessage}
+//               stdout: {permission:"allow|deny", user_message, agent_message}
 //               exit 0 = 已判定；exit 2 = 阻断
 //               **默认 fail open** —— 必须显式设 failClosed:true
+//               **字段名是 snake_case**（实测 cursor-agent 2026.09.18 的
+//               PreToolUse 响应 schema：permission / user_message /
+//               agent_message / updated_input / additional_context ——
+//               camelCase 的 userMessage 会被 Cursor 直接丢掉）
 //
 //   Codex       stdin: {event, tool_name, tool_input:{...}}
 //               stdout: {hookSpecificOutput:{hookEventName, permissionDecision}}
@@ -50,6 +54,17 @@ export interface NormalizedPayload {
   };
   /** 原始工具名 —— 写进事件流，供事后查「agent 当时调了什么」 */
   raw_tool_name?: string;
+  /**
+   * 这个工具**只读**吗？
+   *
+   * 归一化的兜底逻辑是「工具名不认识 → 找路径字段」——
+   * 那条兜底对写工具是保守的（多拦不漏拦），
+   * 但对**读**工具就是误报：读一个不在写集里的文件，
+   * 不该被判成「越界写入」。
+   *
+   * 所以已知的只读工具要显式标出来，让写目标提取跳过它们。
+   */
+  read_only?: boolean;
 }
 
 /** 统一判决 —— 与 harness 无关。 */
@@ -99,6 +114,17 @@ export function flagOfHarness(name: HarnessName): string {
  * 它们之间没有差别。统一成一个名字后，
  * 「这个工具会不会写文件」就只有一个判据 —— 不会因为 harness 换了工具名
  * 而让抽目标这条逻辑分叉。
+ *
+ * ── Cursor 的工具名（实测 cursor-agent 2026.09.18）──────────────────
+ *
+ * Cursor CLI 的工具名是**首字母大写的类型名**，不是老版本文档里的
+ * `edit_file` / `terminal`：
+ *
+ *   Write（写文件） Delete（删文件） Shell（跑命令）
+ *   Read / ReadLints / Grep / List / Fetch（读，不写）
+ *
+ * 老名字（`edit_file` / `create_file` / `terminal` …）一并留着 ——
+ * 判据是「多认一个名字不会漏拦，少认一个会漏拦」。
  */
 const WRITE_TOOL_ALIASES: Record<string, string> = {
   // Claude Code
@@ -109,7 +135,10 @@ const WRITE_TOOL_ALIASES: Record<string, string> = {
   bash: 'Bash',
   bashoutput: 'Bash',
 
-  // Cursor
+  // Cursor —— 真实工具名（2026.09.18）
+  delete: 'Write',
+  shell: 'Bash',
+  // Cursor —— 旧名字（保留：多认不漏拦）
   create_file: 'Write',
   edit_file: 'Write',
   write_file: 'Write',
@@ -120,9 +149,44 @@ const WRITE_TOOL_ALIASES: Record<string, string> = {
 
   // Codex
   apply_patch: 'Write',
-  shell: 'Bash',
   exec: 'Bash',
 };
+
+/**
+ * **只读**工具名 —— 归一化后标出来，写目标提取要跳过它们。
+ *
+ * 为什么需要：归一化的兜底逻辑是「工具名不认识 → 找路径字段」。
+ * 这条兜底对**写**工具是对的（保守：多拦不漏拦），
+ * 但如果把**读**工具也套进去，就会把「读一个不在写集里的文件」
+ * 判成「越界写入」—— 一个纯粹的误报。
+ *
+ * 所以读工具要**显式列出并豁免**：判据是「这个工具会不会写」，
+ * 而不是「它有没有路径字段」。
+ *
+ * 名单来自 Cursor CLI 的工具注册表（2026.09.18 实测）。
+ */
+const READ_ONLY_TOOL_ALIASES: Record<string, string> = {
+  // Cursor
+  read: 'Read',
+  readlints: 'ReadLints',
+  grep: 'Grep',
+  list: 'List',
+  fetch: 'Fetch',
+  listmcpresources: 'ListMcpResources',
+  fetchmcpresource: 'FetchMcpResource',
+  record_screen: 'RecordScreen',
+  recordscreen: 'RecordScreen',
+
+  // Claude Code
+  glob: 'Glob',
+  webfetch: 'WebFetch',
+  websearch: 'WebSearch',
+};
+
+/** 只读工具的归一化名集合（写目标提取时跳过）。 */
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(
+  Object.values(READ_ONLY_TOOL_ALIASES),
+);
 
 /** Cursor / Codex 的命令字段名（Claude Code 用 `command`）。 */
 function pickCommand(input: Record<string, unknown>): string | undefined {
@@ -141,7 +205,14 @@ function pickCommand(input: Record<string, unknown>): string | undefined {
 
 /** 各 harness 的路径字段名。 */
 function pickPath(input: Record<string, unknown>): string | undefined {
-  for (const key of ['file_path', 'filePath', 'path', 'target_file', 'absolute_path']) {
+  for (const key of [
+    'file_path',
+    'filePath',
+    'path',
+    'relative_workspace_path',
+    'target_file',
+    'absolute_path',
+  ]) {
     const v = input[key];
     if (typeof v === 'string' && v) return v;
   }
@@ -179,7 +250,8 @@ export function normalizePayload(harness: HarnessName, raw: unknown): Normalized
   // 归一化工具名
   const key = rawToolName.toLowerCase();
   const aliased = WRITE_TOOL_ALIASES[key];
-  const toolName = aliased ?? rawToolName;
+  const readOnlyAlias = READ_ONLY_TOOL_ALIASES[key];
+  const toolName = aliased ?? readOnlyAlias ?? rawToolName;
 
   const filePath = pickPath(input);
   const command = pickCommand(input);
@@ -191,11 +263,14 @@ export function normalizePayload(harness: HarnessName, raw: unknown): Normalized
   const nb = input['notebook_path'] ?? input['notebookPath'];
   if (typeof nb === 'string' && nb) toolInput.notebook_path = nb;
 
-  return {
+  const out: NormalizedPayload = {
     tool_name: toolName,
     tool_input: toolInput,
     raw_tool_name: rawToolName || undefined,
   };
+  // 只读工具显式标记 —— 写目标提取要跳过它们（否则读文件被当成越界写入）。
+  if (readOnlyAlias) out.read_only = true;
+  return out;
 }
 
 // ── 输出渲染 ────────────────────────────────────────────────────────────────
@@ -208,11 +283,21 @@ export function normalizePayload(harness: HarnessName, raw: unknown): Normalized
 export function renderDecision(harness: HarnessName, decision: NormalizedDecision): unknown {
   switch (harness) {
     case 'cursor':
-      // Cursor 的 permission hook：permission 字段 + 给用户/给模型的消息
+      // Cursor 的 permission hook：**snake_case** 字段名。
+      //
+      // 实测 cursor-agent 2026.09.18 的 PreToolUse 响应 schema：
+      //   { permission: "allow"|"deny"|"ask",
+      //     user_message?: string, agent_message?: string,
+      //     updated_input?: object, additional_context?: string }
+      //
+      // 写成 camelCase（userMessage / agentMessage）的话，
+      // Cursor 的校验器会**直接丢掉这两个字段** ——
+      // 判决还是生效（permission 认了），但「为什么被拒」没人看得见：
+      // 人看到的是一句无来由的拒绝，模型也拿不到纠偏线索。
       return {
         permission: decision.decision,
-        userMessage: decision.reason,
-        agentMessage: decision.reason,
+        user_message: decision.reason,
+        agent_message: decision.reason,
       };
     case 'codex':
     case 'claude-code':

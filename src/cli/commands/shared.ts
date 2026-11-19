@@ -10,16 +10,18 @@ import { DeepSeekAdapter } from '../../adapters/llm/index.js';
 import { EventEmittingLlmAdapter, type PricingTable } from '../../adapters/llm/event-emitting-adapter.js';
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js';
+import { CursorAgentAdapter, DEFAULT_CURSOR_COMMAND } from '../../adapters/cursor-agent/index.js';
 import { EventStream } from '../../core/events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
 import type { GateAcceptanceConfig } from '../../core/gate/types.js';
 import { parseBlockScalarHeader, readBlockScalar } from './config-blocks.js';
-import { SliceStore } from '../../core/slice/store.js';
+import { SliceStore, checkSliceId } from '../../core/slice/store.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,
   versionBranchTip,
+  checkVersionLabel,
 } from '../../core/version/branch.js';
 import { buildDeterministicSliceSpec } from '../../llm/generators/slice-spec.js';
 
@@ -917,6 +919,44 @@ export function resolveSpecDir(): string {
   return resolve(process.cwd(), 'specs', 'slices');
 }
 
+// ─── 标识符校验（CLI 边界）─────────────────────────────────────────────────
+
+/**
+ * 校验版本 label，不合法就报错并返回 false。
+ *
+ * 为什么要有这道：版本 label 会进 `.zelto/version-worktrees/<label>/`。
+ * `join` 会把 `..` **归一化掉** —— 于是 `..` 能让工作目录落出 base。
+ * core 层有兜底断言（`resolveWithin`），但那时人看到的已经是
+ * 「路径逃逸：标识符 ".." 拼出的路径落在 base 之外」—— 说清了机制，没说清「你该写什么」。
+ * 这里在**入口**就说清楚：label 只能是什么形状。
+ */
+export function validateVersionLabelArg(
+  label: string,
+  f: { error(code: string, message: string): void },
+): boolean {
+  const check = checkVersionLabel(label);
+  if (check.valid) return true;
+  f.error('INVALID_VERSION_LABEL', check.reason ?? `Invalid version label: "${label}"`);
+  return false;
+}
+
+/**
+ * 校验切片 id，不合法就报错并返回 false。
+ *
+ * 与 `validateVersionLabelArg` 同理：切片 id 会进
+ * `.zelto/slices/<id>.json`、`specs/slices/<id>.md`、
+ * `tests/acceptance/<id>/`、`.zelto/worktrees/<id>/`。
+ */
+export function validateSliceIdArg(
+  id: string,
+  f: { error(code: string, message: string): void },
+): boolean {
+  const check = checkSliceId(id);
+  if (check.valid) return true;
+  f.error('INVALID_SLICE_ID', check.reason ?? `Invalid slice ID: "${id}"`);
+  return false;
+}
+
 // ─── Worktree Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -1241,7 +1281,51 @@ export function createLlmFromConfig(
 
 // ─── Executor Adapter Factory ──────────────────────────────────────────────
 
-export type AdapterType = 'claude-agent' | 'claude-agent-sdk';
+export type AdapterType = 'claude-agent' | 'claude-agent-sdk' | 'cursor-agent';
+
+/**
+ * 某个 adapter 对应的 **hook harness**。
+ *
+ * adapter 决定「谁在跑 agent」，harness 决定「agent 的钩子协议长什么样」。
+ * 两者一一对应：Cursor CLI 是 `preToolUse` + `permission` 信封，
+ * Claude Code 是 `PreToolUse` + `hookSpecificOutput`。
+ *
+ * 配错的后果是**静默失效**：hook 收到自己看不懂的信封，解析失败 → 判不出
+ * 要么全部拒绝（agent 完全不能动），要么在 Cursor 的 fail-open 默认下全部放行（闸门形同虚设）。
+ * 所以这里用一张显式的表，而不是到处写 if。
+ */
+export function harnessForAdapter(
+  adapterType: string | undefined,
+): 'claude-code' | 'cursor' | 'codex' {
+  switch (adapterType) {
+    case 'cursor-agent':
+      return 'cursor';
+    case 'codex':
+      return 'codex';
+    default:
+      return 'claude-code';
+  }
+}
+
+/**
+ * 解析某个 adapter 要用的 **agent 命令**。
+ *
+ * 优先级：**显式覆盖 > adapter 默认 > 配置里的 command**。
+ *
+ * 注意 Cursor 的默认命令是 `cursor-agent` —— 配置里的 `agent.command`
+ * 默认是 `npx claude-code`，那是给 Claude 用的。
+ * 直接复用的话，切到 Cursor 后会起一个 claude 进程 ——
+ * 表面上「适配器是 Cursor」，实际跑的还是 Claude。
+ */
+export function resolveAgentCommand(
+  adapterType: string | undefined,
+  override: string | undefined,
+  cfg: { agent: { command: string } },
+): string {
+  if (override && override.trim()) return override.trim();
+  if (adapterType === 'cursor-agent') return DEFAULT_CURSOR_COMMAND;
+  return cfg.agent.command;
+}
 
 /**
  * Create an executor adapter based on config and optional override.
@@ -1261,6 +1345,15 @@ export function createExecutorAdapter(
   const timeoutMs = (timeoutSec ?? cfg.agent.timeout ?? 900) * 1000;
   const workDir = cwd ?? process.cwd();
 
+  if (type === 'cursor-agent') {
+    return new CursorAgentAdapter({
+      cwd: workDir,
+      agentCommand: resolveAgentCommand(type, agentCommand, cfg),
+      timeoutMs,
+      maxRetries: cfg.agent.maxRetries ?? 2,
+    });
+  }
+
   if (type === 'claude-agent-sdk') {
     return new ClaudeAgentSdkAdapter({
       cwd: workDir,
@@ -1272,7 +1365,7 @@ export function createExecutorAdapter(
   // Default: claude-agent (shell spawn)
   return new ClaudeAgentAdapter({
     cwd: workDir,
-    agentCommand: agentCommand ?? cfg.agent.command,
+    agentCommand: resolveAgentCommand(type, agentCommand, cfg),
     timeoutMs,
   });
 }

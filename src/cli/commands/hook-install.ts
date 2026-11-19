@@ -212,7 +212,7 @@ export function claudeCodeHookInstalled(root: string): boolean {
 //
 //   Cursor  .cursor/hooks.json
 //     { "version": 1, "hooks": { "preToolUse": [ { command, matcher, failClosed } ] } }
-//     输出 { "permission": "allow|deny", "userMessage", "agentMessage" }
+//     输出 { "permission": "allow|deny", "user_message", "agent_message" }
 //
 //   Codex   .codex/hooks.json
 //     { "hooks": { "PreToolUse": [ { command, matcher } ] } }
@@ -229,8 +229,25 @@ export const CURSOR_HOOKS_RELATIVE = join('.cursor', 'hooks.json');
 /** Codex 的项目级 hook 配置。 */
 export const CODEX_HOOKS_RELATIVE = join('.codex', 'hooks.json');
 
-/** Cursor / Codex 的工具匹配串 —— 与 Claude Code 的等价。 */
-export const CURSOR_PRETOOL_MATCHER = 'create_file|edit_file|write_file|replace|search_replace|terminal|run_terminal_cmd|apply_patch|shell';
+/**
+ * Cursor / Codex 的工具匹配串。
+ *
+ * **Cursor 用的是 CLI 真实工具名**（2026.09.18 实测）：
+ *   `Write`（写文件）、`Delete`（删文件）、`Shell`（跑命令）。
+ *
+ * 之前这里写的是 `create_file|edit_file|write_file|replace|search_replace|
+ * terminal|run_terminal_cmd|apply_patch|shell` —— 那是一组**假想的名字**，
+ * Cursor CLI 里根本不存在。matcher 是拿 `new RegExp(matcher)` 去测
+ * `tool_name` 的，一个都匹配不上 → hook 永远不被调用 →
+ * **写集预约在 Cursor 下等于没有**，而配置文件看上去一切正常。
+ *
+ * 这正是「看不见的失效」：不是报错，是安静地不生效。
+ * 所以这里必须跟 CLI 真实工具名对齐。
+ */
+export const CURSOR_PRETOOL_MATCHER = 'Write|Delete|Shell';
+
+/** Codex 的工具匹配串 —— Codex 的工具名与 Cursor 不同，单独一份。 */
+export const CODEX_PRETOOL_MATCHER = 'apply_patch|shell|write|edit';
 
 interface CursorHookEntry {
   command: string;
@@ -391,7 +408,7 @@ export function installCodexHook(options: ClaudeHookOptions): {
   const preToolUse = (hooks.PreToolUse ?? []).filter((entry) => !isZeltoCursorEntry(entry));
   preToolUse.push({
     command: buildHarnessHookCommand('codex', options),
-    matcher: CURSOR_PRETOOL_MATCHER,
+    matcher: CODEX_PRETOOL_MATCHER,
   });
   hooks.PreToolUse = preToolUse;
   file.hooks = hooks;
@@ -645,7 +662,6 @@ export function gitHooksDir(root: string): string | null {
 export async function hookCommand(args: string[]): Promise<number> {
   const action = args[0];
   const wantClaude = args.includes('--claude');
-  const onlyClaude = args.includes('--claude-only');
 
   // 多 harness（ADR-083）。
   //
@@ -655,18 +671,35 @@ export async function hookCommand(args: string[]): Promise<number> {
   const wantCodex = args.includes('--codex');
   const wantAllHarnesses = args.includes('--all');
   const anyHarnessFlag = wantClaude || wantCursor || wantCodex || wantAllHarnesses;
-  const onlyHarness =
-    args.includes('--claude-only') ||
-    args.includes('--cursor-only') ||
-    args.includes('--codex-only');
+
+  // `--xxx-only` 是**排他**的：只动这一个 harness。
+  //
+  // 之前 `onlyHarness` 只是个布尔量，装卸时只用来决定「要不要顺带装
+  // git hooks」—— harness 列表本身照样按上面的规则全装了一遍。
+  // 于是 `zelto hook --install --cursor-only` 装了三个 harness：
+  // 名字说「只装 Cursor」，实际把 Claude Code 与 Codex 也动了。
+  //
+  // **说了只做一件事却做了三件** —— 人以为没动 Claude Code，
+  // 实际上 `.claude/settings.local.json` 已经被改了。
+  const onlyCursor = args.includes('--cursor-only');
+  const onlyCodex = args.includes('--codex-only');
+  const onlyClaude = args.includes('--claude-only');
 
   /** 要装/卸的 harness 列表。 */
   const harnesses: Array<'claude-code' | 'cursor' | 'codex'> = [];
-  if (wantCursor || (anyHarnessFlag && !wantClaude)) harnesses.push('cursor');
-  if (wantCodex || (anyHarnessFlag && !wantClaude)) harnesses.push('codex');
-  if (wantClaude || (anyHarnessFlag && !wantCursor && !wantCodex)) harnesses.push('claude-code');
-  // 没有任何旗标 → 默认全装（ADR-083 §5）
-  if (harnesses.length === 0) harnesses.push('cursor', 'codex', 'claude-code');
+  if (onlyCursor) {
+    harnesses.push('cursor');
+  } else if (onlyCodex) {
+    harnesses.push('codex');
+  } else if (onlyClaude) {
+    harnesses.push('claude-code');
+  } else {
+    if (wantCursor || (anyHarnessFlag && !wantClaude)) harnesses.push('cursor');
+    if (wantCodex || (anyHarnessFlag && !wantClaude)) harnesses.push('codex');
+    if (wantClaude || (anyHarnessFlag && !wantCursor && !wantCodex)) harnesses.push('claude-code');
+    // 没有任何旗标 → 默认全装（ADR-083 §5）
+    if (harnesses.length === 0) harnesses.push('cursor', 'codex', 'claude-code');
+  }
 
   /** 装某个 harness 的 hook。 */
   function installHarnessHook(harness: 'claude-code' | 'cursor' | 'codex'): void {
@@ -811,7 +844,7 @@ export async function hookCommand(args: string[]): Promise<number> {
     for (const harness of harnesses) {
       installHarnessHook(harness);
     }
-    if (onlyHarness) return 0;
+    if (onlyCursor || onlyCodex || onlyClaude) return 0;
 
     if (!scope.root || !GIT_HOOKS_DIR) {
       console.log(`  ℹ️  ${scope.reason}`);
@@ -836,7 +869,7 @@ export async function hookCommand(args: string[]): Promise<number> {
     for (const harness of harnesses) {
       uninstallHarnessHook(harness);
     }
-    if (onlyHarness) return 0;
+    if (onlyCursor || onlyCodex || onlyClaude) return 0;
 
     if (!scope.root || !GIT_HOOKS_DIR) {
       console.log(`  ℹ️  ${scope.reason}`);
@@ -902,5 +935,6 @@ export async function hookCommand(args: string[]): Promise<number> {
   console.error('       zelto hook <file-path>');
   console.error('');
   console.error('  不带 harness 旗标时默认装全部已知 agent（claude-code / cursor / codex）。');
+  console.error('  Cursor 的钩子必须显式带 failClosed —— Cursor 默认 fail open（hook 出错就放行）。');
   return 1;
 }

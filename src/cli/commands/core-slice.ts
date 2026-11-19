@@ -44,6 +44,7 @@ function extractFlagValues(args: string[], flag: string): string[] {
 import { ClarifyEngine, type LlmQuestionGenerator } from '../../core/clarify/engine.js';
 import { Scheduler } from '../../core/sched/engine.js';
 import type { SliceData } from '../../core/slice/store.js';
+import { checkSliceId } from '../../core/slice/store.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
@@ -78,7 +79,7 @@ import { analyzeSemantic } from '../../core/spec/semantic/analyzer.js';
 import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/trace-extract.js';
 import { register } from './shared.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -526,11 +527,14 @@ register('create', async (args) => {
   // 没有规格可解析时，这是人唯一能声明「这段代码为什么存在」的入口（ADR-032 §3.3）。
   const declaredRequirements = extractFlagValues(args, '--requirement');
 
-  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+  // id 白名单只有一份定义（core/slice/store.ts 的 `checkSliceId`）——
+  // 「什么算合法 id」不该有多个口径。
+  const idCheck = checkSliceId(id);
+  if (!idCheck.valid) {
     if (isJson) {
-      console.log(JSON.stringify({ success: false, error: `Invalid slice ID: "${id}"` }));
+      console.log(JSON.stringify({ success: false, error: idCheck.reason }));
     } else {
-      console.error(`Invalid slice ID: "${id}". Use only letters, numbers, hyphens, and underscores.`);
+      console.error(idCheck.reason);
     }
     return 1;
   }
@@ -1349,6 +1353,7 @@ register('run', async (args) => {
   // `--help` 只读说明，不能进执行 —— 不拦住的话 `--help` 会被当成切片 id 去跑
   if (args.includes('--help') || args.includes('-h')) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
+    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent');
     console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
     console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
     console.error('       zelto run <slice-id> --detach [--json]');
@@ -1362,6 +1367,7 @@ register('run', async (args) => {
   const [id] = args;
   if (!id) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
+    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent');
     console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
     console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
     return 1;
@@ -1565,26 +1571,37 @@ register('run', async (args) => {
     const agentCmd = cfg.agent.command;
     // D-2：`--agent` 没给值时回退到配置里的默认 agent，
     // 而不是把 undefined 当成「用户指定的值」传下去。
-    const agentName = optionValue(args, '--agent', agentCmd);
+    //
+    // **adapter 决定默认命令**：Cursor 侧的默认命令是 `cursor-agent`，
+    // 不是配置里那个 `npx claude-code` — 复用它会起一个 claude 进程，
+    // 表面上「跑的是 Cursor」，实际跑的是 Claude。
+    const adapterType = optionValueStrict(args, '--adapter');
+    const agentName = optionValue(
+      args,
+      '--agent',
+      resolveAgentCommand(adapterType ?? cfg.agent.adapter, undefined, cfg),
+    );
 
     console.log(`  Agent:         ${agentName}`);
     console.log(`  Bundle:        ${bundlePath}`);
     console.log('');
 
-    const adapterType = optionValueStrict(args, '--adapter');
-
     // Check agent availability before starting
     try {
-      const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
+      // **与 adapter 无关**的检查（ADR-087 抽出来的 agent-command.ts）：
+      // Claude、Cursor、Codex 查的都是同一件事 —— 这条命令找不找得到。
+      // 之前这里用的是 Claude 适配器的静态方法，
+      // 拿 Cursor 的 `cursor-agent` 去问「claude 在吗」，答案永远是「不在」。
+      const { checkAgentAvailable } = await import('../../adapters/agent-command.js');
       // D-27：把配置里的命令一起传进去 —— 命令行拼错时，
       // 错误信息要指向那条**真的能用**的命令，而不是让人去改本来没问题的配置。
-      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName, agentCmd);
+      const agentError = await checkAgentAvailable(agentName, agentCmd);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
         return 1;
       }
     } catch {
-      // checkAgentAvailable might not exist in SDK adapter; skip check
+      // 检查本身失败不该拦住运行 —— 起了就知道了。
     }
 
     // Show progress spinner during execution
@@ -1683,6 +1700,10 @@ register('run', async (args) => {
         projectRoot: process.cwd(),
         baseCommit: worktree?.baseCommit ?? null,
         managedPaths: zeltoOwnedPaths(worktree?.path ?? null, slice),
+        // 装哪个 harness 的钩子 —— adapter 决定跑的是谁，
+        // harness 决定钩子的信封格式（ADR-083）。
+        // 配错 = hook 读不懂载荷 = 判定静默失效。
+        harness: harnessForAdapter(adapterType ?? cfg.agent.adapter),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2126,16 +2147,23 @@ register('start', async (args) => {
     write(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 
     const cfg = loadConfig();
+    const adapterType = optionValueStrict(args, '--adapter');
     // D-2：同上 —— `--agent` 没给值时回退到默认 agent。
-    const agentName = optionValue(args, '--agent', cfg.agent.command);
+    //
+    // **adapter 决定默认命令**（Cursor 是 `cursor-agent`）。
+    const agentName = optionValue(
+      args,
+      '--agent',
+      resolveAgentCommand(adapterType ?? cfg.agent.adapter, undefined, cfg),
+    );
 
     console.log(`  Agent:         ${agentName}`);
 
     // Check agent availability before starting
     try {
-      const { ClaudeAgentAdapter } = await import('../../adapters/claude-agent/index.js');
+      const { checkAgentAvailable } = await import('../../adapters/agent-command.js');
       // D-27：同上 —— 带上配置里的命令，错误信息要指向能用的那条。
-      const agentError = await ClaudeAgentAdapter.checkAgentAvailable(agentName, cfg.agent.command);
+      const agentError = await checkAgentAvailable(agentName, cfg.agent.command);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
         return 1;
@@ -2144,7 +2172,6 @@ register('start', async (args) => {
       // skip check
     }
 
-    const adapterType = optionValueStrict(args, '--adapter');
     const sliceForTimeout = await store.read(id);
     let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
     // 活进程看门狗（ADR-074）的「本轮起跑时刻」—— **必须在 start 之前**取。

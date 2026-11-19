@@ -11,7 +11,7 @@ import { QuestionStore, parseQuestion, type QuestionRecord } from '../../core/qu
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { register } from './shared.js';
 import {
-  store, events, ZELTO_DIR, loadConfig, createExecutorAdapter, existingWorktreePath,
+  store, events, ZELTO_DIR, loadConfig, createExecutorAdapter, resolveAgentCommand, existingWorktreePath,
 } from './shared.js';
 // 直接从 run-support 拿 autoGateAfterRun —— core-slice.ts 只是再导出它。
 // 经 core-slice 绕一圈会形成 question.ts → core-slice.ts → question.ts 的环，
@@ -194,7 +194,9 @@ register('answer', async (args) => {
   const workDir = existingWorktreePath(sliceId) ?? process.cwd();
   const adapter = createExecutorAdapter(
     record.adapterName ?? cfg.agent.adapter,
-    cfg.agent.command,
+    // 命令也要按 adapter 重算 —— Cursor 的默认命令是 `cursor-agent`，
+    // 拿配置里的 `npx claude-code` 去续一个 Cursor 会话，续的是另一个人。
+    resolveAgentCommand(record.adapterName ?? cfg.agent.adapter, undefined, cfg),
     slice.agentTimeout,
     workDir,
   );

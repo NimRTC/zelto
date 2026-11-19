@@ -90,7 +90,7 @@ export interface SupervisorArgs {
    */
   logFile?: string;
   /**
-   * 适配器类型（`claude-agent` / `claude-agent-sdk`）。
+   * 适配器类型（`claude-agent` / `claude-agent-sdk` / `cursor-agent`）。
    * 监督进程要**用同一个适配器**起 agent —— 换适配器就换了行为。
    */
   adapterType?: string;
@@ -290,7 +290,7 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
   //
   // 适配器必须住在这个进程里：它负责写会话文件的 `exitCode` 与 `status`。
   // 主进程一退就没人记录了（见文件头的说明）。
-  const { createExecutorAdapter, store, events } = await import('./shared.js');
+  const { createExecutorAdapter, store, events, harnessForAdapter } = await import('./shared.js');
   const adapter = createExecutorAdapter(
     args.adapterType,
     args.agentCommand,
@@ -333,6 +333,8 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       // 自己的规格副本拦下」。
       managedPaths:
         slice && worktreePath ? zeltoOwnedPaths(worktreePath, slice) : undefined,
+      // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
+      harness: harnessForAdapter(args.adapterType),
     });
     log(`写集预约已取得：${(slice?.writes ?? []).join(', ') || '(空)'}`);
 

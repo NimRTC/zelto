@@ -71,9 +71,24 @@ export function buildDist(root) {
       cwd: root,
       stdio: 'inherit',
     });
-  } catch {
+  } catch (err) {
+    // **抛出去，不要 `process.exit(1)`**。
+    //
+    // `process.exit()` **不会跑 `finally`** —— 而调用方 `withBuildLock`
+    // 正是靠 `finally` 放锁的。所以在这里 exit 的话，
+    // `.build-lock/` 目录会**留在磁盘上**，下一次构建就得等它：
+    //
+    //   - 锁没超过 10 分钟 → 干等（每 200ms 轮询一次）
+    //   - 超过 10 分钟 → 走「陈旧锁自愈」，白等 10 分钟
+    //
+    // 实测（2026-11-19）：一次编译失败之后，紧接着的 `npm run build`
+    // 挂了 2 分半没动 —— 人看到的现象是「构建卡住了」，
+    // 而病根是上一次失败留下的锁。
+    //
+    // 抛异常让 `finally` 正常跑，锁被正常释放；
+    // 调用方（`build.mjs` / `test.mjs`）自然以非零码退出。
     console.error('compile failed — dist/ is now incomplete (build it again)');
-    process.exit(1);
+    throw err;
   }
 
   console.log('built dist/');

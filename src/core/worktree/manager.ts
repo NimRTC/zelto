@@ -7,6 +7,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, cpSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
+import { resolveWithin } from '../io/path-safe.js';
 
 /** worktree 根目录（相对仓库根） */
 export const WORKTREE_BASE_DIR = join('.zelto', 'worktrees');
@@ -92,9 +93,18 @@ export class WorktreeManager {
     this.repoRoot = repoRoot;
   }
 
-  /** worktree 的绝对路径（不要求已存在） */
+  /**
+   * worktree 的绝对路径（不要求已存在）。
+   *
+   * 与 `versionPathFor` 同理：切片 id 会被拼进路径，
+   * `join` 会归一化掉 `..`，于是 id 能把 worktree 指到 base 之外。
+   * CLI 入口有 id 白名单，但 worktree 的 id 也可能来自版本计划里的
+   * 切片定义（LLM 产出的 id），那条路不经过 CLI 白名单。
+   *
+   * 这里用 `resolveWithin` 兜底 —— 路径逃出去就当场抛错。
+   */
   pathFor(sliceId: string): string {
-    return join(this.repoRoot, WORKTREE_BASE_DIR, sliceId);
+    return resolveWithin(join(this.repoRoot, WORKTREE_BASE_DIR), sliceId);
   }
 
   /** worktree 的相对仓库根路径 */
@@ -107,9 +117,17 @@ export class WorktreeManager {
     return `slice/${sliceId}`;
   }
 
-  /** 该切片是否已有 worktree 目录 */
+  /**
+   * 该切片是否已有 worktree 目录。
+   *
+   * id 不合法时返回 false（而不是抛错）：这是一个**判据**。
+   */
   exists(sliceId: string): boolean {
-    return existsSync(this.pathFor(sliceId));
+    try {
+      return existsSync(this.pathFor(sliceId));
+    } catch {
+      return false;
+    }
   }
 
   // ─── 版本工作目录（ADR-056）───────────────────────────────────────────────
@@ -119,9 +137,26 @@ export class WorktreeManager {
    *
    * 与切片 worktree 分开落在 `.zelto/version-worktrees/<label>/`——
    * 见 `VERSION_WORKTREE_BASE_DIR` 的说明。
+   *
+   * 为什么要在这里再挡一次（防御纵深）：
+   * label 会被拼进路径，而 `join` 会把 `..` **归一化掉**——
+   * `join('.zelto/version-worktrees', '..')` 得到 `.zelto`，
+   * 路径就逃出了 base。于是版本工作目录可能落在 `.zelto/` 本身
+   * 甚至仓库根上，而 `createVersionWorktree` / `removeVersionWorktree`
+   * 会对它做建目录、删目录的操作。
+   *
+   * 上游（CLI 边界）已经有 label 白名单，但那条路可以被绕过：
+   * - `merge --target version/<label>` 的 label 是**从分支名反查**的
+   * - `versionExists()` 只做存在性判断，label 从哪来都能走到这里
+   *
+   * 所以这里用 `resolveWithin` 兜底：路径逃出去就**当场抛错**，
+   * 绝不建、也绝不删。
    */
   versionPathFor(label: string): string {
-    return join(this.repoRoot, VERSION_WORKTREE_BASE_DIR, label);
+    return resolveWithin(
+      join(this.repoRoot, VERSION_WORKTREE_BASE_DIR),
+      label,
+    );
   }
 
   /** 版本工作目录的相对仓库根路径 */
@@ -129,9 +164,17 @@ export class WorktreeManager {
     return join(VERSION_WORKTREE_BASE_DIR, label);
   }
 
-  /** 该版本是否已有工作目录 */
+  /**
+   * 该版本是否已有工作目录。
+   *
+   * label 不合法时返回 false（而不是抛错）：这是一个**判据**。
+   */
   versionExists(label: string): boolean {
-    return existsSync(this.versionPathFor(label));
+    try {
+      return existsSync(this.versionPathFor(label));
+    } catch {
+      return false;
+    }
   }
 
   /**

@@ -31,14 +31,32 @@ import { events } from './shared.js';
 import { handleWriteSetViolation } from './run-support.js';
 import {
   CLAUDE_SETTINGS_RELATIVE,
+  CURSOR_HOOKS_RELATIVE,
   type ClaudeHookOptions,
   buildPreToolHookExec,
   installClaudeCodeHook,
+  installCodexHook,
+  installCursorHook,
   removeClaudeCodeHook,
+  removeCodexHook,
+  removeCursorHook,
 } from './hook-install.js';
 
 /** zelto 装进 worktree 的 Claude Code 设置文件（相对 worktree 的路径） */
 export const MANAGED_SETTINGS_PATH = CLAUDE_SETTINGS_RELATIVE.replace(/\\/g, '/');
+/** zelto 装进 worktree 的 Cursor 钩子文件（相对 worktree 的路径） */
+export const MANAGED_CURSOR_HOOKS_PATH = CURSOR_HOOKS_RELATIVE.replace(/\\/g, '/');
+/** zelto 装进 worktree 的 Codex 钩子文件（相对 worktree 的路径） */
+export const MANAGED_CODEX_HOOKS_PATH = 'codex/hooks.json';
+
+/**
+ * 守卫要装哪种 harness 的钩子。
+ *
+ * Claude Code 是默认（保持旧行为）；Cursor / Codex 走各自的信封。
+ * 装错 harness = hook 收不到自己认识的格式 → 判不了 →
+ * 在 Cursor 的 fail-open 默认下**放行一切**（闸门形同虚设）。
+ */
+export type GuardHarness = 'claude-code' | 'cursor' | 'codex';
 
 /**
  * 开工时的基线快照（D-29）：worktree 建出来那一刻就已经脏的路径。
@@ -125,6 +143,15 @@ export interface RuntimeGuardOptions {
    * —— 改了规格副本等于自动改规格，改了钩子设置等于关掉门禁。
    */
   managedPaths?: string[];
+  /**
+   * 装哪种 harness 的钩子。
+   *
+   * 默认 `'claude-code'` —— 保持旧行为不变。
+   * Cursor 侧必须是 `'cursor'`：它的钩子配置在 `.cursor/hooks.json`，
+   * 信封是 `{permission, user_message, agent_message}`，
+   * 跟 Claude Code 的 `.claude/settings.local.json` 完全不同。
+   */
+  harness?: GuardHarness;
 }
 
 export interface RuntimeGuard {
@@ -170,6 +197,34 @@ function readOriginalSettings(root: string): string | null {
   }
 }
 
+/** 读取安装钩子之前 `.cursor/hooks.json` 的原始内容。 */
+function readOriginalCursorHooks(root: string): string | null {
+  const path = join(root, CURSOR_HOOKS_RELATIVE);
+  try {
+    if (!existsSync(path)) return null;
+    return readFileSync(path, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 某个 harness 的钩子配置落在哪个相对路径下。
+ *
+ * 托管文件清单要覆盖它 —— agent 改了钩子文件就等于**关掉了门禁**，
+ * 那是一种越界写入，审计时必须认出来。
+ */
+function managedHookPath(harness: GuardHarness): string {
+  switch (harness) {
+    case 'cursor':
+      return MANAGED_CURSOR_HOOKS_PATH;
+    case 'codex':
+      return MANAGED_CODEX_HOOKS_PATH;
+    default:
+      return MANAGED_SETTINGS_PATH;
+  }
+}
+
 /**
  * 取写集预约 + 装 PreToolUse 钩子。
  *
@@ -201,7 +256,9 @@ export async function installRuntimeGuard(
   });
 
   // 装钩子之前先留一份原始设置 —— 运行结束时要还原回去
-  const originalSettings = readOriginalSettings(hookRoot);
+  const harness: GuardHarness = options.harness ?? 'claude-code';
+  const originalSettings =
+    harness === 'claude-code' ? readOriginalSettings(hookRoot) : readOriginalCursorHooks(hookRoot);
 
   const hookOptions: ClaudeHookOptions = {
     root: hookRoot,
@@ -209,8 +266,20 @@ export async function installRuntimeGuard(
     sliceId: options.sliceId,
     worktree: options.worktree,
   };
-  const installed = installClaudeCodeHook(hookOptions);
+  const installed =
+    harness === 'cursor'
+      ? installCursorHook(hookOptions)
+      : harness === 'codex'
+        ? installCodexHook(hookOptions)
+        : installClaudeCodeHook(hookOptions);
   const exec = buildPreToolHookExec(hookOptions);
+  if (harness !== 'claude-code') {
+    // 判定内核靠 `--harness` 知道该按哪套信封解输入。
+    // Claude Code 是默认（不带 `--harness` 就是 claude-code），
+    // Cursor / Codex 必须显式带上 —— 否则 hook 会按 Claude 的格式去读
+    // Cursor 的载荷，读不到路径 → 判不出写入目标 → 判定失效。
+    exec.args.push('--harness', harness);
+  }
 
   if (!installed.installed) {
     // 钩子没装上 = 运行时拦不住越界写。运行后的审计还在，但过程里没人拦 ——
@@ -227,8 +296,8 @@ export async function installRuntimeGuard(
     if (hash) managed.push({ path, hash });
   }
   if (installed.installed) {
-    const hash = hashFile(join(hookRoot, MANAGED_SETTINGS_PATH));
-    if (hash) managed.push({ path: MANAGED_SETTINGS_PATH, hash });
+    const hash = hashFile(join(hookRoot, managedHookPath(harness)));
+    if (hash) managed.push({ path: managedHookPath(harness), hash });
   }
 
   await events.append(options.sliceId, 'reservation.acquired', 'zelto', {
@@ -272,8 +341,11 @@ export async function installRuntimeGuard(
       released = true;
 
       // 撤钩子并还原原始设置
-      removeClaudeCodeHook(hookRoot);
-      const settingsPath = join(hookRoot, CLAUDE_SETTINGS_RELATIVE);
+      if (harness === 'cursor') removeCursorHook(hookRoot);
+      else if (harness === 'codex') removeCodexHook(hookRoot);
+      else removeClaudeCodeHook(hookRoot);
+
+      const settingsPath = join(hookRoot, managedHookPath(harness));
       if (originalSettings !== null) {
         try {
           writeFileSync(settingsPath, originalSettings, 'utf-8');

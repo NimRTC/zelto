@@ -4,9 +4,65 @@ import { readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { atomicWriteText } from '../io/atomic-write.js';
+import { resolveWithin } from '../io/path-safe.js';
 import { type SliceState, transitionSlice, isTerminalState, type SliceEvent } from './state.js';
 import type { StallInfo } from '../stall/types.js';
 import type { SliceType } from './kind.js';
+
+/**
+ * 切片 id 的合法字符白名单。
+ *
+ * 允许：字母、数字、下划线、连字符。
+ * 拒绝：路径分隔符、点、空格 —— 凡是能被解释成路径结构的字符。
+ *
+ * 为什么切片 id 不允许点：id 会进 `.zelto/slices/<id>.json`、
+ * `specs/slices/<id>.md`、`tests/acceptance/<id>/`、`.zelto/worktrees/<id>/`。
+ * 允许 `.` 就等于允许 `..`，而 `join` 会把 `..` 归一化掉 ——
+ * 路径会逃出本该在的目录。所以这里连点一起拒。
+ *
+ * 这条规则以前散在 CLI 的三处（`create` / `slice create` / `slice-detail`），
+ * 各写一份。现在只有这一份定义 —— 「什么算合法 id」不该有多个口径。
+ */
+const SLICE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * 切片 id 是否合法。
+ *
+ * 与 CLI 入口的白名单同一套判据 —— 放在 `core/` 是为了让
+ * 「从 LLM 产出或版本计划读进来的 id」也走这道闸，而不只是命令行手输的 id。
+ */
+export function isValidSliceId(id: string): boolean {
+  return SLICE_ID_PATTERN.test(id);
+}
+
+/** 切片 id 不合法时的原因说明 */
+export interface SliceIdCheck {
+  valid: boolean;
+  /** 不合法的原因（valid 为 true 时为 null） */
+  reason: string | null;
+}
+
+/**
+ * 校验切片 id，给出可读的原因。
+ *
+ * 与 `isValidSliceId` 同一套判据，只是多说了「为什么」。
+ *
+ * 原因里保留 "Invalid slice ID" 这个说法：它是 CLI 的既有输出契约
+ * （`zelto create` 的错误信息一直长这样），脚本可能在匹配它。
+ * 后面补的中文是给人看的新增信息。
+ */
+export function checkSliceId(id: string): SliceIdCheck {
+  if (!id) {
+    return { valid: false, reason: 'Invalid slice ID: id 不能为空' };
+  }
+  if (!SLICE_ID_PATTERN.test(id)) {
+    return {
+      valid: false,
+      reason: `Invalid slice ID: "${id}" 含非法字符 —— 只允许字母、数字、下划线、连字符`,
+    };
+  }
+  return { valid: true, reason: null };
+}
 
 export interface SliceSpec {
   path: string;
@@ -152,8 +208,17 @@ export class SliceStore {
     this.baseDir = baseDir;
   }
 
+  /**
+   * 切片文件路径。
+   *
+   * 用 `resolveWithin` 而不是裸 `join`：id 里有 `..` 时 `join` 会归一化掉，
+   * 路径就逃出了 `.zelto/slices/`。切片 id 可能来自版本计划里的切片定义
+   * （LLM 产出的 id），那条路不经过 CLI 的白名单。
+   *
+   * 逃出去时**当场抛错** —— 读不到就报错，而不是去仓库根上找一个同名的文件。
+   */
   private path(id: string): string {
-    return join(this.baseDir, `${id}.json`);
+    return resolveWithin(this.baseDir, `${id}.json`);
   }
 
   async read(id: string): Promise<SliceData> {
@@ -197,8 +262,19 @@ export class SliceStore {
     await atomicWriteText(p, JSON.stringify(slice, null, 2));
   }
 
+  /**
+   * 该切片是否存在。
+   *
+   * id 不合法时返回 false（而不是抛错）：这是一个**判据**，
+   * 「这个 id 对应的切片在不在」——不存在就是 false。
+   * 抛错会让 `store.exists()` 的调用方（遍布 CLI）都要包 try/catch。
+   */
   async exists(id: string): Promise<boolean> {
-    return existsSync(this.path(id));
+    try {
+      return existsSync(this.path(id));
+    } catch {
+      return false;
+    }
   }
 
   async list(): Promise<string[]> {

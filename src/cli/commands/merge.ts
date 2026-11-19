@@ -11,7 +11,7 @@
 import { join } from 'node:path';
 import { formatMergePlan } from '../../core/sched/merge.js';
 import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
-import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager } from './shared.js';
+import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager, validateVersionLabelArg } from './shared.js';
 import { SignManager } from '../../core/gate/sign.js';
 import { buildMergePlan } from './merge-plan.js';
 import { executeMergePlan, branchExists, verifyArtifactsInRef, type MergeSliceInfo } from './merge-executor.js';
@@ -132,6 +132,13 @@ register('merge', async (args) => {
     const label = ownershipVersionOf(branch);
     if (!label) {
       console.error(`❌ 目标分支 "${branch}" 找不到对应的版本，无法定位版本工作目录。`);
+      process.exit(1);
+    }
+    // label 是从**分支名反查**来的（`--target version/<label>`），
+    // 不是从版本计划里读的真源 —— 所以它可能压根不是合法 label。
+    // 不校验的话，`version/..` 这种目标分支会让工作目录指到 base 之外。
+    if (!validateVersionLabelArg(label, { error: (code, msg) => console.error(`❌ ${msg}`) })) {
+      console.error(`   （来自目标分支 "${branch}"）`);
       process.exit(1);
     }
     if (!manager.versionExists(label)) {

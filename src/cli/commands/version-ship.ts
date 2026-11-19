@@ -17,7 +17,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { register, events, ZELTO_DIR, worktreeManager, loadConfig } from './shared.js';
+import { register, events, ZELTO_DIR, worktreeManager, loadConfig, validateVersionLabelArg } from './shared.js';
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
 import { branchOfVersion, versionBranchName, versionTagName } from '../../core/version/branch.js';
@@ -451,6 +451,7 @@ export async function handleVersionShip(
     f.error('USAGE', 'Usage: zelto version ship <version-label> [--plan <plan-id>] [--dry-run] [--no-tag]');
     return 1;
   }
+  if (!validateVersionLabelArg(versionLabel, f)) return 1;
 
   const planIdx = args.indexOf('--plan');
   const planId = planIdx >= 0 ? args[planIdx + 1] : null;
@@ -729,6 +730,7 @@ export async function handleVersionCleanup(
     f.error('USAGE', 'Usage: zelto version cleanup <version-label> [--force]');
     return 1;
   }
+  if (!validateVersionLabelArg(versionLabel, f)) return 1;
 
   const manager = worktreeManager();
   if (!manager.versionExists(versionLabel)) {

@@ -32,7 +32,7 @@
 // 3. **可复现** —— 基点一旦钉死就不再重算（ADR-056 D1-A 的性质）。
 
 import { execFileSync } from 'node:child_process';
-import { register, events, ZELTO_DIR, worktreeManager } from './shared.js';
+import { register, events, ZELTO_DIR, worktreeManager, validateVersionLabelArg } from './shared.js';
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
 import { branchOfVersion } from '../../core/version/branch.js';
@@ -82,9 +82,10 @@ export async function handleVersionAdopt(
 ): Promise<number> {
   const versionLabel = args[1];
   if (!versionLabel || versionLabel.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto version adopt <version-label> [--plan <plan-id>] [--dry-run]');
+    f.error('USAGE', 'Usage: zelto version adopt <version-label> [--plan <plan-id>] [--dry-run] [--json]');
     return 1;
   }
+  if (!validateVersionLabelArg(versionLabel, f)) return 1;
 
   const planIdx = args.indexOf('--plan');
   const planId = planIdx + 1 < args.length ? args[planIdx + 1] : null;

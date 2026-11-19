@@ -7,15 +7,16 @@ import { RequirementStore } from '../../core/requirements/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { deriveModules } from '../../core/design/derive.js';
 import { VersionStore } from '../../core/version/store.js';
-import { SliceStore } from '../../core/slice/store.js';
+import { SliceStore, checkSliceId } from '../../core/slice/store.js';
 import type { SliceData } from '../../core/slice/store.js';
+import { checkVersionLabel } from '../../core/version/branch.js';
 import type { RequirementDoc } from '../../core/requirements/types.js';
 import type { DesignDoc } from '../../core/design/types.js';
 import { generateRequirements, refineRequirements } from '../../llm/generators/requirements.js';
 import { generateDesign, refineDesign } from '../../llm/generators/design.js';
 import { generateSlicePlan, generateVersion } from '../../llm/generators/slice-plan.js';
 import { register } from './shared.js';
-import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, hashSpecFile } from './shared.js';
+import { events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadConfig, createLlmFromConfig, hashSpecFile, validateVersionLabelArg } from './shared.js';
 import { createSpecDraft } from './slice-spec.js';
 import { RevisionStore } from '../../core/review/index.js';
 import { designFacts, planFacts, requirementFacts, showDraft } from './draft-review.js';
@@ -630,6 +631,44 @@ register('plan', async (args) => {
       return 1;
     }
     const plan = await versionStore.read(id);
+
+    // ── 确认前校验计划里的标识符 ──
+    //
+    // 为什么在这里卡：版本 label 与切片 id 都会**拼进路径**
+    // （`.zelto/version-worktrees/<label>/`、`.zelto/slices/<id>.json`、
+    // `specs/slices/<id>.md`、`tests/acceptance/<id>/`、`.zelto/worktrees/<id>/`），
+    // 而计划的 label 与切片 id **可能来自 LLM 产出**——那条路不经过命令行的 id 白名单。
+    //
+    // 确认是**人签字的时刻**：此刻拒掉，比跑起 `version start` 才炸清楚得多。
+    // 报错要说清「哪个标识符不合法」，让人能直接改计划。
+    const invalidVersions: Array<{ label: string; reason: string }> = [];
+    for (const v of plan.versions) {
+      const check = checkVersionLabel(v.version);
+      if (!check.valid) {
+        invalidVersions.push({ label: v.version, reason: check.reason ?? '非法 label' });
+      }
+    }
+    const invalidSlices: Array<{ id: string; reason: string }> = [];
+    for (const v of plan.versions) {
+      for (const s of v.slices) {
+        const check = checkSliceId(s.id);
+        if (!check.valid) {
+          invalidSlices.push({ id: s.id, reason: check.reason ?? '非法 id' });
+        }
+      }
+    }
+    if (invalidVersions.length > 0 || invalidSlices.length > 0) {
+      f.error('INVALID_PLAN_IDENTIFIERS', `计划 "${id}" 里有不能作为路径的标识符 —— 先改掉再确认。`);
+      for (const v of invalidVersions) {
+        f.out(`   版本 label ${v.reason}`);
+      }
+      for (const s of invalidSlices) {
+        f.out(`   切片 id ${s.reason}`);
+      }
+      f.out('   改法：zelto plan patch <id> --version <label> ... ，或直接编辑计划文件');
+      return 1;
+    }
+
     plan.status = 'confirmed';
     plan.confirmedAt = new Date().toISOString();
     await versionStore.save(plan);
@@ -912,6 +951,7 @@ register('version', async (args) => {
       f.error('USAGE', 'Usage: zelto version deliver <version-label> [--plan <plan-id>]');
       return 1;
     }
+    if (!validateVersionLabelArg(versionLabel, f)) return 1;
 
     const planIdx = args.indexOf('--plan');
     const planId = planIdx >= 0 ? args[planIdx + 1] : null;
@@ -1193,6 +1233,7 @@ register('version', async (args) => {
       f.error('USAGE', 'Usage: zelto version start <version-label> [--plan <plan-id>] [--retry-failed]');
       return 1;
     }
+    if (!validateVersionLabelArg(versionLabel, f)) return 1;
 
     if (args.includes('--auto')) {
       f.error('INVALID_ARGS', 'zelto version start --auto 已移除：签字必须由人行使（AGENTS.md 禁区：一键批准 / 自动合并）。');
