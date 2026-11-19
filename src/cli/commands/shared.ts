@@ -679,6 +679,57 @@ export function resolveAgentCommand(
 }
 
 /**
+ * 把 `agent.env` 合并进当前进程环境（ADR-090）。
+ *
+ * 优先级：`process.env` < `agent.env`。
+ * 空对象直接返回 `process.env`，避免无谓的拷贝。
+ */
+export function mergeAgentEnv(
+  agentEnv: Record<string, string> | undefined,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (!agentEnv || Object.keys(agentEnv).length === 0) return base;
+  return { ...base, ...agentEnv };
+}
+
+/**
+ * 算出 Cursor CLI 要用的网关参数（ADR-090）。
+ *
+ * 三种凭证方式在这里归一：
+ *   1. `agent.cursor.endpoint` → `--endpoint`
+ *   2. `agent.cursor.apiKeyEnv` 指向的**环境变量**取到的值 → `--api-key`
+ *   3. 都没配 → 返回 `{}`，完全交给 CLI 自己的登录态
+ *
+ * 为什么 apiKey 只从环境变量读、不从配置读：
+ * 配置文件是要进版本库的，密钥不能进（同 ADR-022）。
+ *
+ * 为什么不回退到 `CURSOR_API_ENDPOINT` / `CURSOR_API_KEY`：
+ * 那两个是 **cursor-agent 自己**认的环境变量，CLI 会自己读 ——
+ * zelto 再读一遍转成旗标反而会**覆盖**用户 shell 里的设置，
+ * 制造「配了个空值把有值的都盖掉了」这种 bug。
+ * zelto 只在用户**显式**配置时才介入（见 ADR-090 §3 优先级表）。
+ */
+export function resolveCursorGateway(
+  cursor: { endpoint?: string; apiKeyEnv?: string } | undefined,
+  agentEnv: Record<string, string> | undefined,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): { endpoint?: string; apiKey?: string } {
+  const out: { endpoint?: string; apiKey?: string } = {};
+
+  const endpoint = cursor?.endpoint?.trim();
+  if (endpoint) out.endpoint = endpoint;
+
+  const keyVar = cursor?.apiKeyEnv?.trim();
+  if (keyVar) {
+    // agent.env 优先于 process.env —— 与 mergeAgentEnv 的覆盖方向一致。
+    const value = agentEnv?.[keyVar] ?? baseEnv[keyVar];
+    if (typeof value === 'string' && value.trim()) out.apiKey = value.trim();
+  }
+
+  return out;
+}
+
+/**
  * Create an executor adapter based on config and optional override.
  * @param overrideType — Optional override from CLI --adapter flag
  * @param agentCommand — Agent command string (for claude-agent adapter)
@@ -702,6 +753,10 @@ export function createExecutorAdapter(
       agentCommand: resolveAgentCommand(type, agentCommand, cfg),
       timeoutMs,
       maxRetries: cfg.agent.maxRetries ?? 2,
+      // ADR-090：凭证/网关透传。用户用哪种方式（本地登录 / API key /
+      // 自建端点）由配置决定，适配器不关心。
+      env: mergeAgentEnv(cfg.agent.env),
+      gateway: resolveCursorGateway(cfg.agent.cursor, cfg.agent.env, process.env),
     });
   }
 
@@ -709,7 +764,9 @@ export function createExecutorAdapter(
     return new ClaudeAgentSdkAdapter({
       cwd: workDir,
       model: cfg.llm?.model,
-      env: process.env as Record<string, string>,
+      // ADR-090：`agent.env` 对所有适配器生效 —— 这样「把凭证放配置里」
+      // 这条规则不会变成「只有 Cursor 能这么干」的特例。
+      env: mergeAgentEnv(cfg.agent.env) as Record<string, string>,
     });
   }
 
@@ -718,6 +775,7 @@ export function createExecutorAdapter(
     cwd: workDir,
     agentCommand: resolveAgentCommand(type, agentCommand, cfg),
     timeoutMs,
+    env: mergeAgentEnv(cfg.agent.env),
   });
 }
 

@@ -36,7 +36,37 @@ export interface ZeltoConfig {
     submoduleCheck?: boolean;
     retry: { max: number };
   };
-  agent: { command: string; adapter?: string; timeout?: number; maxRetries?: number };
+  agent: {
+    command: string;
+    adapter?: string;
+    timeout?: number;
+    maxRetries?: number;
+    /**
+     * 透传给 agent 子进程的额外环境变量（ADR-090）。
+     *
+     * 为什么是环境变量而不是命令行旗标：官方 `cursor-agent` 的两个凭证入口
+     * 都有环境变量形态（`CURSOR_API_KEY` / `CURSOR_API_ENDPOINT`），
+     * 且环境变量不会出现在进程表里 —— 旗标形态会把密钥暴露给 `ps`。
+     */
+    env?: Record<string, string>;
+    /**
+     * Cursor 专属可选参数（ADR-090）。只在 `adapter: cursor-agent` 时有意义。
+     *
+     * 存在的理由：让「我想用哪个端点」比「我需要记住 Cursor 的环境变量叫什么」
+     * 更可读。与 `env` 等价，只是更直接。
+     */
+    cursor?: {
+      /** 自定义 API 端点 → `--endpoint <url>` */
+      endpoint?: string;
+      /**
+       * 从**哪个环境变量**读 API key → `--api-key <value>`。
+       *
+       * 存的是**变量名**不是密钥本身 —— 配置文件要进版本库，
+       * 密钥不进（与 ADR-022 的 `ZELTO_LLM_API_KEY` 同口径）。
+       */
+      apiKeyEnv?: string;
+    };
+  };
   /**
    * Web 驾驶舱的配置（ADR-086 §7）。
    *
@@ -254,6 +284,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentAdapter = '';
   let agentTimeout: number | undefined;
   let agentMaxRetries: number | undefined;
+  // agent 段的嵌套节（ADR-090）—— 需要跟缩进，否则会把 agent 顶层的
+  // timeout: / maxRetries: 误吞成 env 的键
+  let inAgentEnvSection = false;
+  let agentEnvIndent = 0;
+  const agentEnv: Record<string, string> = {};
+  let inAgentCursorSection = false;
+  let agentCursorIndent = 0;
+  let agentCursorEndpoint: string | undefined;
+  let agentCursorApiKeyEnv: string | undefined;
   let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
   /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
   let currentCommandIndent = 0;
@@ -501,30 +540,89 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
     }
 
-    if (inAgentSection && trimmed.startsWith('command:')) {
-      const raw = trimmed.slice(8).trim();
-      const header = parseBlockScalarHeader(raw);
-      if (header) {
-        const block = readBlockScalar(lines, i, indent, header);
-        if (block) {
-          agentCommand = block.value;
-          i = block.nextIndex - 1;
-        }
-      } else {
-        agentCommand = stripSurroundingQuotes(raw);
+    if (inAgentSection) {
+      // ── 嵌套节（ADR-090）：env: / cursor: ──
+      // 位置要紧：必须在 command:/adapter:/timeout: 之前判，
+      // 否则 env 下面的键会被当成 agent 顶层键。
+      if (trimmed === 'env:') {
+        inAgentEnvSection = true;
+        agentEnvIndent = indent;
+        inAgentCursorSection = false;
+        continue;
       }
-    }
+      if (trimmed === 'cursor:') {
+        inAgentCursorSection = true;
+        agentCursorIndent = indent;
+        inAgentEnvSection = false;
+        continue;
+      }
 
-    if (inAgentSection && trimmed.startsWith('adapter:')) {
-      agentAdapter = stripSurroundingQuotes(trimmed.slice(8).trim());
-    }
+      if (inAgentEnvSection) {
+        // 只认比 env: 更深缩进的键
+        if (indent <= agentEnvIndent) {
+          inAgentEnvSection = false;
+        } else {
+          const kv = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/);
+          if (kv) {
+            const value = stripSurroundingQuotes(kv[2].trim());
+            // 空值 = 这个变量不注入（而不是注入空串 —— 那会让 CLI
+            // 以为「配了但设成了空」，行为与「没配」不同）。
+            if (value) agentEnv[kv[1]] = value;
+            continue;
+          }
+        }
+      }
 
-    if (inAgentSection && trimmed.startsWith('timeout:')) {
-      agentTimeout = Number.parseInt(trimmed.slice(8).trim(), 10) || undefined;
-    }
+      if (inAgentCursorSection) {
+        if (indent <= agentCursorIndent) {
+          inAgentCursorSection = false;
+        } else {
+          if (trimmed.startsWith('endpoint:')) {
+            agentCursorEndpoint =
+              stripSurroundingQuotes(trimmed.slice(9).trim()) || undefined;
+            continue;
+          }
+          if (trimmed.startsWith('apiKeyEnv:')) {
+            agentCursorApiKeyEnv =
+              stripSurroundingQuotes(trimmed.slice(10).trim()) || undefined;
+            continue;
+          }
+        }
+      }
 
-    if (inAgentSection && trimmed.startsWith('maxRetries:')) {
-      agentMaxRetries = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+      if (trimmed.startsWith('command:')) {
+        const raw = trimmed.slice(8).trim();
+        const header = parseBlockScalarHeader(raw);
+        if (header) {
+          const block = readBlockScalar(lines, i, indent, header);
+          if (block) {
+            agentCommand = block.value;
+            i = block.nextIndex - 1;
+          }
+        } else {
+          agentCommand = stripSurroundingQuotes(raw);
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith('adapter:')) {
+        agentAdapter = stripSurroundingQuotes(trimmed.slice(8).trim());
+        continue;
+      }
+
+      if (trimmed.startsWith('timeout:')) {
+        agentTimeout = Number.parseInt(trimmed.slice(8).trim(), 10) || undefined;
+        continue;
+      }
+
+      if (trimmed.startsWith('maxRetries:')) {
+        agentMaxRetries = Number.parseInt(trimmed.slice(11).trim(), 10) || undefined;
+        continue;
+      }
+
+      // 认不出的 agent 子键：结束嵌套节，交回其它段处理。
+      inAgentEnvSection = false;
+      inAgentCursorSection = false;
     }
 
     if (inWebSection && trimmed.startsWith('maxConcurrentRuns:')) {
@@ -747,7 +845,21 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web
     ? {
         gate,
-        agent: { command: agentCommand, ...(agentAdapter ? { adapter: agentAdapter } : {}), ...(agentTimeout ? { timeout: agentTimeout } : {}), ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}) },
+        agent: {
+          command: agentCommand,
+          ...(agentAdapter ? { adapter: agentAdapter } : {}),
+          ...(agentTimeout ? { timeout: agentTimeout } : {}),
+          ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}),
+          ...(Object.keys(agentEnv).length > 0 ? { env: { ...agentEnv } } : {}),
+          ...(agentCursorEndpoint || agentCursorApiKeyEnv
+            ? {
+                cursor: {
+                  ...(agentCursorEndpoint ? { endpoint: agentCursorEndpoint } : {}),
+                  ...(agentCursorApiKeyEnv ? { apiKeyEnv: agentCursorApiKeyEnv } : {}),
+                },
+              }
+            : {}),
+        },
         ...(web ? { web } : {}),
         llm,
         ...(targetProject ? { targetProject } : {}),

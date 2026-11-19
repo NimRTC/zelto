@@ -143,6 +143,24 @@ export function extractCursorTokens(
 
 // ─── 选项 ──────────────────────────────────────────────────────────────────
 
+/**
+ * 透传给 Cursor CLI 的网关参数（ADR-090）。
+ *
+ * 三种凭证方式都在这一个形状里表达，**适配器不关心用户用的是哪一种**：
+ *
+ * | 用户方式 | 传入 |
+ * |---|---|
+ * | 本地 `cursor-agent login` | 什么都不传（默认） |
+ * | API key | `apiKey`（通常来自环境变量） |
+ * | 自建/企业网关 | `endpoint`（必要时再加 `apiKey`） |
+ */
+export interface CursorGatewayOptions {
+  /** 自定义 API 端点 → `--endpoint <url>` */
+  endpoint?: string;
+  /** API key → `--api-key <key>`。**不要在日志里打印它。** */
+  apiKey?: string;
+}
+
 export interface CursorAgentAdapterOptions {
   /** agent 命令（默认 `cursor-agent`） */
   agentCommand?: string;
@@ -156,6 +174,8 @@ export interface CursorAgentAdapterOptions {
   maxRetries?: number;
   /** 模型覆盖（`--model`） */
   model?: string;
+  /** 网关 / 凭证透传（ADR-090） */
+  gateway?: CursorGatewayOptions;
   /** 实时输出回调 */
   onOutput?: (sessionId: string, text: string) => void;
   /** 进展回调 */
@@ -217,17 +237,51 @@ interface SessionState {
  * 实查 `te()` —— `preToolUse` 在工具执行路径上**无条件**先跑，
  * `permission === "deny"` 直接 reject，与 approval mode 无关。
  * 关掉的只是 Cursor 自己的确认询问。
+ *
+ * ── 凭据透传（ADR-090）──────────────────────────────────────────
+ *
+ * `endpoint` → `--endpoint <url>`；`apiKey` → `--api-key <key>`。
+ * 两者都**可选**：都没给时完全退回 CLI 默认（本地登录态 + 官方端点），
+ * 行为与 ADR-087 落地时完全一致 —— 向后兼容。
  */
-export function cursorFlags(extra: string[] = []): string {
-  return [
+export function cursorFlags(extra: string[] = [], gateway: CursorGatewayOptions = {}): string {
+  const flags: string[] = [
     '-p',
     '--output-format',
     'stream-json',
     '--stream-partial-output',
     '--force',
     '--trust',
-    ...extra,
-  ].join(' ');
+  ];
+
+  // 端点/密钥放在固定旗标之后 —— 与 cursor-agent --help 的「可选参数在末尾」一致。
+  if (gateway.endpoint) {
+    flags.push('--endpoint', shellQuote(gateway.endpoint));
+  }
+  if (gateway.apiKey) {
+    flags.push('--api-key', shellQuote(gateway.apiKey));
+  }
+
+  flags.push(...extra);
+  return flags.join(' ');
+}
+
+/**
+ * 给要拼进 shell 命令行的值加引号。
+ *
+ * 为什么必须加：`cursorFlags()` 的产出是拼进 `spawn(cmd, { shell: true })`
+ * 的**一整个字符串**，路径 / URL 里出现空格或 `&`、`|` 会被 shell 拆开
+ * 甚至执行 —— 端点 URL 来自配置文件，属于不可信输入（C5 的同一思路：
+ * 配置不能越权）。
+ *
+ * POSIX 用单引号（内部单引号走 `'\''` 拼接）；
+ * Windows cmd 不认单引号，用双引号（内部双引号转义为 `""`）。
+ */
+function shellQuote(value: string): string {
+  if (platform() === 'win32') {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export class CursorAgentAdapter implements ExecutorAdapter {
@@ -240,6 +294,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
   private readonly timeoutMs: number;
   private readonly maxRetries: number;
   private readonly model?: string;
+  /** 网关 / 凭证（ADR-090）；空对象 = 全用 CLI 默认 */
+  private readonly gateway: CursorGatewayOptions;
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
   private readonly sessions = new Map<string, SessionState>();
@@ -256,6 +312,7 @@ export class CursorAgentAdapter implements ExecutorAdapter {
     this.timeoutMs = options.timeoutMs ?? 900_000;
     this.maxRetries = options.maxRetries ?? 2;
     this.model = options.model;
+    this.gateway = options.gateway ?? {};
     this.onOutput = options.onOutput;
     this.onProgress = options.onProgress;
   }
@@ -362,7 +419,7 @@ export class CursorAgentAdapter implements ExecutorAdapter {
     }
     if (opts.model) extra.push('--model', opts.model);
 
-    const flags = cursorFlags(extra);
+    const flags = cursorFlags(extra, this.gateway);
 
     // Windows 上 `.cmd` 只能经 shell 起 —— `shell: true` 是必须的。
     // POSIX 上用 `detached` 建独立进程组，好让 kill(-pgid) 一次杀整棵树（ADR-055）。

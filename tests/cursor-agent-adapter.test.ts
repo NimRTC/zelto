@@ -27,6 +27,7 @@ import {
   extractCursorText,
   extractCursorTokens,
 } from '../src/adapters/cursor-agent/index.js';
+import { resolveCursorGateway, mergeAgentEnv } from '../src/cli/commands/shared.js';
 
 const TEST_DIR = join(tmpdir(), 'zelto-cursor-adapter-test');
 
@@ -98,6 +99,107 @@ describe('Cursor 命令行旗标', () => {
   it('续跑时加 --resume', () => {
     const flags = cursorFlags(['--resume', 'chat-42']);
     assert.ok(flags.includes('--resume chat-42'));
+  });
+});
+
+// ─── ADR-090：凭据透传 ──────────────────────────────────────────────────────
+
+describe('Cursor 网关 / 凭证透传（ADR-090）', () => {
+  it('什么都不传时，旗标与 ADR-087 完全一致（向后兼容）', () => {
+    const legacy = [
+      '-p',
+      '--output-format',
+      'stream-json',
+      '--stream-partial-output',
+      '--force',
+      '--trust',
+    ].join(' ');
+    assert.equal(cursorFlags(), legacy);
+    assert.equal(cursorFlags([], {}), legacy);
+    assert.equal(cursorFlags([], { endpoint: '', apiKey: '' }), legacy);
+  });
+
+  it('endpoint 落成 --endpoint', () => {
+    const flags = cursorFlags([], { endpoint: 'https://gw.example.com' });
+    assert.ok(flags.includes('--endpoint "https://gw.example.com"'));
+  });
+
+  it('apiKey 落成 --api-key', () => {
+    const flags = cursorFlags([], { apiKey: 'sk-test-123' });
+    assert.ok(flags.includes('--api-key "sk-test-123"'));
+  });
+
+  it('端点里的 shell 元字符被引号挡住（配置是不可信输入）', () => {
+    const flags = cursorFlags([], { endpoint: 'https://gw.example.com/a&b|c' });
+    // 整个值被包在引号里 —— shell 不会把它拆成两条命令。
+    assert.ok(flags.includes('"https://gw.example.com/a&b|c"'));
+  });
+
+  it('endpoint / apiKey 排在固定旗标之后、额外参数之前', () => {
+    const flags = cursorFlags(['--resume', 'chat-1'], {
+      endpoint: 'https://gw.example.com',
+      apiKey: 'k',
+    });
+    const iTrust = flags.indexOf('--trust');
+    const iEndpoint = flags.indexOf('--endpoint');
+    const iResume = flags.indexOf('--resume');
+    assert.ok(iTrust < iEndpoint, '--trust 在 --endpoint 之前');
+    assert.ok(iEndpoint < iResume, '--endpoint 在 --resume 之前');
+  });
+});
+
+describe('resolveCursorGateway / mergeAgentEnv（ADR-090）', () => {
+  it('没配置就返回空对象 —— 完全交给 CLI 登录态', () => {
+    assert.deepEqual(resolveCursorGateway(undefined, undefined, {}), {});
+    assert.deepEqual(resolveCursorGateway({}, {}, {}), {});
+  });
+
+  it('endpoint 原样透传', () => {
+    const gw = resolveCursorGateway({ endpoint: 'https://gw.example.com' }, undefined, {});
+    assert.equal(gw.endpoint, 'https://gw.example.com');
+    assert.equal(gw.apiKey, undefined);
+  });
+
+  it('apiKeyEnv 从环境变量取值 —— 配置里不存密钥', () => {
+    const gw = resolveCursorGateway(
+      { apiKeyEnv: 'MY_CURSOR_KEY' },
+      undefined,
+      { MY_CURSOR_KEY: 'sk-from-env' },
+    );
+    assert.equal(gw.apiKey, 'sk-from-env');
+  });
+
+  it('agent.env 里的值优先于 process.env', () => {
+    const gw = resolveCursorGateway(
+      { apiKeyEnv: 'MY_CURSOR_KEY' },
+      { MY_CURSOR_KEY: 'sk-from-config-env' },
+      { MY_CURSOR_KEY: 'sk-from-shell' },
+    );
+    assert.equal(gw.apiKey, 'sk-from-config-env');
+  });
+
+  it('apiKeyEnv 指向的变量不存在 → 不产出 apiKey（不是空串）', () => {
+    const gw = resolveCursorGateway({ apiKeyEnv: 'MISSING_VAR' }, undefined, {});
+    assert.equal(gw.apiKey, undefined);
+  });
+
+  it('apiKeyEnv 指向空值 → 不产出 apiKey', () => {
+    const gw = resolveCursorGateway({ apiKeyEnv: 'EMPTY_VAR' }, undefined, { EMPTY_VAR: '   ' });
+    assert.equal(gw.apiKey, undefined);
+  });
+
+  it('mergeAgentEnv 不改动传入的 base', () => {
+    const base = { A: '1', B: '2' };
+    const merged = mergeAgentEnv({ B: 'overridden' }, base);
+    assert.equal(merged.A, '1');
+    assert.equal(merged.B, 'overridden');
+    assert.equal(base.B, '2', 'base 必须没被改');
+  });
+
+  it('mergeAgentEnv 没有 agent.env 时原样返回 base', () => {
+    const base = { A: '1' };
+    assert.equal(mergeAgentEnv(undefined, base), base);
+    assert.equal(mergeAgentEnv({}, base), base);
   });
 });
 
