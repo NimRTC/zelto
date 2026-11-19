@@ -278,22 +278,23 @@ Claude / Cursor / Codex 查的都是同一件事：**这条命令找不找得到
   `api2.cursor.sh` 时报
   `ActionRequiredError: You've hit your usage limit` —— **免费额度已耗尽**，
   不是「没装好 / 没登录」。
-- **另一条路（CursorFree 代理）也不通**，且**不通的原因是结构性的**，
-  不是配置问题。完整实测见 **ADR-089**：
+- **另一条路（CursorFree 代理）也不通**，但两轮复核后原因已查清，
+  且**不是协议问题**。完整实测见 **ADR-089**：
   - 凭证层可复用（用 IDE 的 JWT 能拿到 `system/init` + session id）；
-  - 但 CursorFree 返回**重复的 `content-type` 头**
+  - CursorFree 返回**重复的 `content-type` 头**
     （`application/octet-stream` + `application/proto`），
     connect 客户端直接拒收 ——
-    **这一层已实测可以绕过**（h1 字节层 shim 删掉多余的头即可，
-    绕过后 `cursor-agent` 能握手成功拿到 session id）；
-  - 但绕过后，对话端点 `agent.v1.AgentService/Run` 在 CursorFree 侧
-    **恒定 400「注入失败」**（它解析不了 `cursor-agent` 的
-    `connect+proto` 双向流帧）——
-    **这一层绕不过**，卡点在 CursorFree 内部；
-  - 即使走 `RunSSE` 穿透到上游，上游也会因
-    **CursorFree 声明的客户端版本过旧**而拒绝
-    （`Your version of Cursor is no longer supported`）。
-  - 后两条都在 CursorFree 内部，**zelto 无权修改**。
+    **这一层已实测可以绕过**（h1 字节层 shim 删掉多余的头即可）；
+  - ~~`Run` 恒定 400「注入失败」~~ —— **这是误判**：
+    用空请求体重测才报「注入失败」；用 `cursor-agent` 的**真实请求体**，
+    CursorFree 走 h2 **正常转发**并回显 session id；
+  - ~~上游因客户端版本过旧拒绝~~ —— **可绕过**：
+    带上 `x-cursor-client-version: cli-<version>` 后 `RunSSE` 返回 200；
+  - **真正的卡点**：`agent.v1.AgentService/Run` 需要请求体内携带
+    `clientLlmGatewayCredential`（一枚由 **IDE 侧签发**的网关令牌）。
+    `cursor-agent` 以 `--endpoint` 指向代理时拿不到它，上游恒返
+    `ERROR_UNAUTHORIZED`（`actionRequired: "login"`、`isRetryable: false`）。
+    **这是凭证签发模型的身份问题，zelto 与 CursorFree 都无权修改。**
 - 替代方案：用**假 agent**（吐真实形状 NDJSON 的本地脚本）覆盖了
   解析层；用**真实 bundle 源码**覆盖了协议层；
   用**真实载荷**覆盖了判定层。

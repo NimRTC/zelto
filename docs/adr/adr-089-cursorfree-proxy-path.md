@@ -1,8 +1,13 @@
 # ADR-089：CursorFree 代理链路 —— `cursor-agent` 能否复用 IDE 的代理与凭证
 
-**状态**：调研完成 + 逐条复核（结论：不推荐作为 zelto 的 Cursor 执行路径）
+**状态**：调研完成 + 两轮复核（结论：**不可行**，卡在凭证签发模型，非协议问题）
 **日期**：2026-11-19
 **相关**：ADR-087（Cursor 第二执行器）、ADR-035（用量口径）
+
+> **一句话结论**：CursorFree 代理能把 `cursor-agent` 的请求**完整送到上游**，
+> 但 `agent.v1.AgentService/Run` 需要一枚只有 IDE 侧才能签发的
+> `clientLlmGatewayCredential`，缺它恒被判 `ERROR_UNAUTHORIZED`（`isRetryable: false`）。
+> 这条路由**不是配置或协议能解决的**。
 
 ## 背景
 
@@ -70,7 +75,7 @@ ADR-087 落地了 `CursorAgentAdapter`，但当时**没有真实服务端端到�
 **结论：凭证层没问题。** `apiKeySource: "login"` 表示认证成功、
 session 已建立。
 
-### 第 2 层：CursorFree 返回**重复的 content-type 头** —— 这是第一个真实障碍
+### 第 2 层：CursorFree 返回**重复的 content-type 头** —— 只发生在 h1 上
 
 镜像下来的原始响应字节（`ServerConfigService/GetServerConfig`）：
 
@@ -95,9 +100,14 @@ Error: [unknown] unsupported content type application/octet-stream
 **这不是 `cursor-agent` 的 bug，是 CursorFree 网关的行为。**
 注意：`GetMe` 这种路由正常，`GetServerConfig` 这种异常 —— 逐路由不同。
 
-### 第 3 层：`agent.v1.AgentService/Run` 恒定 400「注入失败」
+### 第 3 层：`agent.v1.AgentService/Run` 用**空请求体**测是 400「注入失败」
 
-绕开 content-type 问题后，对话端点暴露出来：
+> ⚠️ **2026-11-19 12:00 修正**：这一层的原始结论「`Run` 恒定 400」**不成立**。
+> 当时是用空帧（`\x00\x00\x00\x00\x00`）打的，CursorFree 解析不出
+> `AgentRunRequest`，自然报「注入失败」。用 `cursor-agent` 发出的**真实请求体**
+> 重测后，`Run` 走 h2 并被正常转发 —— 详见下文「第二轮复核」。
+
+用空帧直连 8788 时各路由表现：
 
 | 端点 | content-type | 结果 |
 |---|---|---|
@@ -159,22 +169,26 @@ g = { typeName: "agent.v1.AgentService",
 ## 结论
 
 > **走 CursorFree 代理，不能让 `cursor-agent` 跑起来。**
+>
+> ⚠️ **下表是调研阶段的判断，第 2、3 条已被第二轮复核推翻**（见文末）。
+> 保留它是为了记录推理过程 —— 最终依据以「第二轮复核」一节为准。
 
 理由不是「配置没调对」，而是三处**结构性**不匹配：
 
 | # | 不匹配 | 能否绕过 |
 |---|---|---|
 | 1 | CursorFree 返回重复 `content-type` 头，connect 客户端拒收 | **能** —— 写 shim 删掉多余的头 |
-| 2 | CursorFree 的 `Agent/Run` 注入逻辑解析不了 `cursor-agent` 的 `connect+proto` 双向流帧 | **不能**（除非改 CursorFree） |
-| 3 | CursorFree 声明的 `x-cursor-client-version` 过旧，上游直接拒绝 | **不能**（除非改 CursorFree） |
+| 2 | ~~CursorFree 的 `Agent/Run` 注入逻辑解析不了双向流帧~~ | **误判** —— 真实请求能被正常转发 |
+| 3 | ~~CursorFree 声明的 `x-cursor-client-version` 过旧~~ | **误判** —— 带上 `cli-<version>` 头即可过 |
 
 第 1 条可以在 zelto 侧用一层薄 shim 解决（本 ADR 的探测过程中已验证可行：
 握手 `system/init` 成功拿到 session id）。
-但第 2、3 条**在 CursorFree 内部**，zelto 无权修改。
+第 2、3 条经第二轮复核确认**不是障碍** —— 真正的墙是网关令牌（见文末）。
 
 **这不是 zelto 的问题，也不是配置问题。** 结论：
 CursorFree 是给 **Cursor IDE** 用的第三方代理，
-它实现的是「IDE 客户端协议」的一个子集，不是「cursor-agent 协议」。
+它转发的是「IDE 客户端协议」的一个子集；而 `cursor-agent` 的 `Run`
+需要一枚**由 IDE 侧签发**的网关令牌，代理无法代签。
 
 ### 对 zelto 的影响
 
@@ -186,17 +200,21 @@ CursorFree 是给 **Cursor IDE** 用的第三方代理，
    （直连官方 `api2.cursor.sh` 时报 `ActionRequiredError:
    You've hit your usage limit`），且 CursorFree 代理这条路走不通。
 3. **不引入 CursorFree 作为 zelto 的 Cursor 后端。**
-   若将来 CursorFree 支持了 `agent.v1.AgentService/Run` 的双向流语义，
-   可以重新评估 —— 但那需要 zelto 侧加一层 shim，属于契约变更，需再写 ADR。
-   （复核后更确定：shim 本身已验证可行，卡点全在 CursorFree 内部。）
+   若 CursorFree 将来改成能代签网关令牌，可以重新评估 ——
+   但那属于契约变更，需再写 ADR。
+   （两轮复核确认：shim 本身可行、转发可行、版本闸门可过；
+   卡点是**令牌签发方**，不是协议。）
 
-### 备选路径（未验证，按优先级）
+### 备选路径（按优先级）
 
 1. **官方 API + 可用额度**：`cursor-agent login` + 可用额度，
    直接连 `api2.cursor.sh`。这是 ADR-087 设计的原生路径。
+   —— 当前本机卡在免费额度耗尽（`You've hit your usage limit`）。
 2. **Cursor 官方 `cursor-agent` 订阅**：与 IDE 同一账号但独立计费。
-3. `cursor-agent` 支持 `--api-key` —— 若 CursorFree 侧有可用的 API key 形态凭证，
-   可绕过网关协议直接用（**未验证**）。
+3. ~~`cursor-agent --api-key` 绕过网关~~ —— **经查证无效**：
+   `--api-key` 只改 `authorization` 头（账单层），
+   而 `Run` 缺的是**请求体内**的 `clientLlmGatewayCredential`（算力层），
+   两者不是同一层。走这条路仍会撞 `ERROR_UNAUTHORIZED`。
 
 ## 复核（2026-11-19 11:43 之后逐条重测）
 
@@ -231,6 +249,13 @@ content-length: 0
 ```
 
 ### 补上的一条：协议层是 **h1**，不是 h2
+
+> ⚠️ **2026-11-19 12:00 修正：这条判断错了。**
+> `Run`（BiDiStreaming）走的是 **h2**，实测抓到 `PRI * HTTP/2.0` 前导。
+> 只有 unary RPC（`GetMe`、`GetServerConfig` 等）走 h1。
+> 下面「h2 无法在字节层删头」的推理本身没错，但**不构成障碍** ——
+> 因为重复 `content-type` 只出现在 h1 响应上，h2 的 HPACK 头天然是单值。
+> 保留原文是为了记住这个教训。
 
 调研过程里没记这条，但它决定了第 1 条**能不能绕过**：
 
@@ -268,22 +293,162 @@ cursor-agent → CursorFree 的连接是 HTTP/1.1
 > 「绕过了 content-type」不等于「能跑起来」—— 这两件事之间还隔着
 > 一个 CursorFree 内部的注入逻辑。
 
-### 对结论的影响
+---
+
+## 第二轮复核（2026-11-19 12:00）—— 上一轮有三处判断错了
+
+上面那轮复核用的是 h2 shim，测出的错误其实是**我自己的 shim 引入的**。
+换成**纯字节直通**（h2 一个字节都不改、h1 只在字节层删重复头）重测，
+结论发生实质变化。
+
+### 修正 1：`Run` 走 h2，且被 CursorFree **正常转发**
+
+抓到的连接前导（`c16.req` 首 16 字节）：
+
+```
+PRI * HTTP/2.0
+```
+
+CursorFree 对该 h2 连接的响应拆帧后（`c16.res`，960 字节）：
+
+```
+SETTINGS len=24
+SETTINGS len=0
+PING sid=0 len=8
+HEADERS sid=1 len=353 flags=0x4
+DATA sid=1 len=9    ← Connect 帧头
+DATA sid=1 len=47   ← 回显 session_id: abe6986c-...
+DATA sid=1 len=9
+DATA sid=1 len=416  ← 真正的错误体
+RST_STREAM sid=1
+```
+
+**它回显了 `cursor-agent` 的 session_id** —— 证明 CursorFree **成功解析了**
+h2 的 `AgentRunRequest`、成功注入、成功送到上游。
+「注入失败」是我上一轮用空请求体测出来的假象。
+
+### 修正 2：真正的拦路虎是**网关鉴权**，不是协议
+
+那段 416 字节的 DATA 解出来是标准 Cursor proto 错误：
+
+```json
+{"error":{"code":"unauthenticated","message":"User is unauthorized",
+  "details":[{"type":"aiserver.v1.ErrorDetails","debug":{
+    "error":"ERROR_UNAUTHORIZED",
+    "details":{"title":"Unauthorized request.","detail":"User is unauthorized",
+      "isRetryable":false,
+      "analyticsMetadata":{"actionRequired":"login"}},
+    "isExpected":true},"value":"CCYSOAoVVW5hdXRob3JpemVkIHJlcXVlc3Qu
+      EhRVc2VyIGlzIHVuYXV0aG9yaXplZCAAUgcKBWxvZ2luGAE"}]}}
+```
+
+`actionRequired: "login"`、`isExpected: true`、`isRetryable: false`
+—— 云端明确要求**登录**，且**不可重试**。
+
+### 修正 3：账单类 RPC 全部通过，只有 `Run` 被拒
+
+同一进程、同一凭证、同一代理，unary RPC 全绿：
+
+| 路由 | 结果 |
+|---|---|
+| `DashboardService/GetMe` | ✅ 200（`local_pro`、`pro-plugin@cursorfree.fun`）|
+| `AiService/AvailableModels` | ✅ 200（360KB 完整模型列表）|
+| `AiService/GetUsableModels` | ✅ 200 |
+| `AiService/GetDefaultModelForCli` | ✅ 200 |
+| `ServerConfigService/GetServerConfig` | ✅ 200（h1，重复头已被 shim 修掉）|
+| `DashboardService/GetManagedSkills` | ✅ 200 |
+| `agent.v1.AgentService/Run` (h2) | ❌ `ERROR_UNAUTHORIZED` |
+
+**这说明「代理的路由/凭证转发」是好的**，被拒的是**真正消耗模型算力的那一步**。
+
+### 机制：`Run` 需要一枚额外的网关令牌，而客户端自己拿不到
+
+反查 bundle 里 `AgentRunRequest` 的构造（`index.js:3596706`）：
+
+```js
+clientLlmGatewayCredential: Se,   // ← 由 mintLlmGatewayCredential 回调产出
+// ...
+const Se = void 0 === g.mintLlmGatewayCredential
+  ? void 0
+  : await (g.mintLlmGatewayCredential)({signal, isCanceled, requestId});
+// 产出后校验：bearerToken 不能为空
+```
+
+即：`Run` 除了 `authorization: Bearer <IDE JWT>`，还要在**请求体内**带一枚
+`ClientLlmGatewayCredential.bearerToken`。这枚 token 由宿主（IDE）注入。
+
+`cursor-agent` 以 `--endpoint http://127.0.0.1:9911` 指向代理时，
+`mintLlmGatewayCredential` **拿不到**这枚 token（它本来要靠 IDE 侧的会话），
+于是 `Run` 请求里这枚凭证缺失 → 上游判 `unauthenticated`。
+
+**而 IDE 能跑通**，正是因为 IDE 是 token 的原生签发方。
+这是整条链路里最硬的一环：**它不是协议问题，也不是配置问题，
+是「谁是凭证签发方」的身份问题。**
+
+### 修正 4：`x-cursor-client-version` 确实能过版本闸门
+
+上一轮说「上游认为 CursorFree 声明的版本过旧」。实测：带上
+`x-cursor-client-version: cli-2026.09.18-9a7762b`（`cursor-agent` 自己就会发这个头，
+bundle 里 `index.js:283371` 构造 `cli-${version}`）后，
+`RunSSE` 返回 **200 且保持连接**，不再报 `resource_exhausted`。
+
+**版本闸门是可以过的** —— 但它过后，仍会撞上 `ERROR_UNAUTHORIZED`。
+
+### 第二轮复核后的净结论
+
+**结论不变（不通），但理由完全换了。**
+
+| 原以为的障碍 | 实际 |
+|---|---|
+| h1 重复 `content-type` | 真实存在，**但可绕过**（字节层删重复行，已跑通）|
+| `Run` 注入失败 | **伪障碍** —— 空请求体测出来的，真实请求能被转发 |
+| 上游版本过旧 | **可绕过** —— 带上 `cli-<version>` 头即可 |
+| —— | **真正的墙：`Run` 缺 `clientLlmGatewayCredential` → `ERROR_UNAUTHORIZED`** |
+
+最后一道墙属于 **Cursor 的凭证签发模型**，不是 zelto 或 CursorFree 能改的。
+`isRetryable: false` 说明重试无意义。
+
+### 方法论（比上一轮那条更硬的版本）
+
+上一轮记的是「绕过一道障碍 ≠ 能跑起来」。
+这一轮补上更关键的一条：
+
+> **代理式诊断里，先排除「我的 shim 自己引入了错误」。**
+
+上一轮把 h2 解析式转发的实现 bug（`http2` 流默认 paused、
+`ServerHttp2Stream` 没有 `.resume()`）当成了代理的缺陷，
+于是得出「`Run` 注入失败」的错误结论。
+换成纯字节直通（h2 零干预）后，错误立刻从
+`unsupported content type` / `注入失败` 变成云端白纸黑字的 `ERROR_UNAUTHORIZED`。
+
+**诊断代理的第一原则：能不改字节就不改字节。**
+只有在确认字节层缺陷（如重复 `content-type`）时才动，且一次只动一处。
+
+---
+
+## 对结论的影响
 
 **结论不变**（走 CursorFree 代理不能让 `cursor-agent` 跑起来），
-但依据更硬了：
+但依据完全换了 —— 不是「协议不通」，而是「**凭证签发模型不通**」：
 
-- 第 1 条**确实可以**在 zelto 侧绕过 —— 已跑通到握手成功
-- 第 2、3 条在 CursorFree 内部 —— zelto 无权修改
-- 因此**净结论仍然是「不通」**
+- 重复 `content-type`：**可在 zelto 侧绕过** —— 已实测跑通握手
+- `Run` 的 h2 请求：**CursorFree 能正常转发** —— 已抓到 session 回显
+- 版本闸门：**带上 `cli-<version>` 头即可过**
+- `ERROR_UNAUTHORIZED`：**过不去** —— 缺 IDE 侧签发的
+  `clientLlmGatewayCredential`，且 `isRetryable: false`
 
-### 一条方法论
+前三道都能绕过，最后一道不能。**净结果仍然是零**，
+但这次是「知道撞在哪面墙上」的零。
 
-这次复核最值得记的不是结论，是**「绕过一道障碍 ≠ 能跑起来」**：
+### 可复用的产物
 
-调研时第 1 条被判为「能绕过」，容易读成「所以这条路能走」。
-实际上第 2 条会立刻接上。**三道障碍要一起看** ——
-一道能绕过、两道不能，净结果仍然是零。
+这轮排查留下的两个事实对 zelto 有独立价值：
+
+1. **诊断代理的原则**：纯字节直通优先，改动一次只改一处。
+   上一轮的错误结论就是 shim 自身 bug 造成的假象。
+2. **`cursor-agent` 的鉴权分层**：`GetMe`/模型列表走 JWT 即可（账单层），
+   `Run` 额外要网关令牌（算力层）。这解释了为什么会看到
+   「能登录、能看模型、就是不能跑」这种割裂现象。
 
 ## 参考
 
