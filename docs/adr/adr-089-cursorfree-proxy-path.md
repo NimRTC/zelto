@@ -1,13 +1,14 @@
 # ADR-089：CursorFree 代理链路 —— `cursor-agent` 能否复用 IDE 的代理与凭证
 
-**状态**：调研完成 + 两轮复核（结论：**不可行**，卡在凭证签发模型，非协议问题）
+**状态**：调研完成 + **三轮**复核（结论：**不可行**，卡点在 `cursor-agent` 的本地鉴权校验，早于协议层）
 **日期**：2026-11-19
-**相关**：ADR-087（Cursor 第二执行器）、ADR-035（用量口径）
+**相关**：ADR-087（Cursor 第二执行器）、ADR-035（用量口径）、ADR-090（凭证外置）
 
-> **一句话结论**：CursorFree 代理能把 `cursor-agent` 的请求**完整送到上游**，
-> 但 `agent.v1.AgentService/Run` 需要一枚只有 IDE 侧才能签发的
-> `clientLlmGatewayCredential`，缺它恒被判 `ERROR_UNAUTHORIZED`（`isRetryable: false`）。
-> 这条路由**不是配置或协议能解决的**。
+> **一句话结论**：CursorFree 是给 **Cursor IDE** 用的代理，它靠「客户端声明自己是 IDE
+> + 代理侧注入鉴权」工作。而 `cursor-agent` 在**发出任何请求之前**就要求
+> api-key/登录态，并且把 api-key 送到**官方地址**校验（无视 `--endpoint`）——
+> 用 IDE 的 JWT 冒充不过，`agent login` 又撞 CursorFree 的 404。
+> **它根本到不了代理**，不是「到了代理但凭证不对」。
 
 ## 背景
 
@@ -426,7 +427,150 @@ bundle 里 `index.js:283371` 构造 `cli-${version}`）后，
 
 ---
 
+## 第三轮复核（2026-11-19 13:53）—— 用 IDE 真实抓包对照
+
+前两轮都是「猜请求体」，这轮改成**抓 IDE 的真身**：开 CursorFree 的
+`captureProtocol` / `captureRequest`，让 IDE 正常提问，把它的
+`AgentService/Run` 请求原样落盘对照。
+
+> ⚠️ **前提修正**：前两轮说「`cursor-agent` 握手能过、session 能建立」，
+> 这个说法**只在 shim 场景下成立，且并不等于能发出 `Run`**。
+> 本轮实测发现 `cursor-agent` **在本地就拦掉了**，连 `Run` 都不会发。
+
+### 新事实 1：`cursor-agent` 的 api-key 校验**直连官方**，不认 `--endpoint`
+
+实测 `cursor-agent --endpoint http://127.0.0.1:8788 --api-key <任意值>`：
+
+抓它 node 子进程的 TCP 连接，同时有**两条**：
+
+```
+127.0.0.1:8788   Established   ← 我们指定的 endpoint
+3.92.129.183:443 Established   ← Cursor 官方（api2.cursor.sh），硬编码
+```
+
+api-key 校验打的是**官方地址**，不是 `--endpoint`。假 key 被官方拒 →
+进程退出。8788 那条连接根本没机会发 `Run`。
+
+同步验证：`cursor-agent` 的尝试在 CursorFree 抓包目录里**一条记录都没有**
+（对照：我们自己探针的每一发都被记录了）。证明它确实没走到代理。
+
+### 新事实 2：IDE 的 JWT 无法冒充 API key
+
+| 尝试 | 结果 |
+|---|---|
+| `--api-key <IDE accessToken>` | `Warning: The provided API key is invalid.`（本地拒，未发请求） |
+| `CURSOR_API_KEY=<IDE accessToken>` | 同上 |
+| `-H 'authorization: Bearer <IDE accessToken>'` | `Error: Authentication required. Please run 'agent login' first` |
+| `--api-key key_0000...`（伪造格式） | `Warning: The provided API key is invalid.` |
+
+**结论**：`cursor-agent` 有两道闸 —— 先要求存在 api-key/登录态，
+再向**官方**校验它。JWT 走哪条都过不去。
+
+### 新事实 3：`agent login` 也走不通，因为 CursorFree 没有登录路由
+
+`CURSOR_API_ENDPOINT=http://127.0.0.1:8788 cursor-agent login` 确实
+**改写了登录链接**：
+
+```
+Open a browser and navigate to this link:
+http://127.0.0.1:8788/loginDeepControl?challenge=...&redirectTarget=cli
+```
+
+说明 endpoint 变量对 CLI 生效。但直接请求该路径：
+
+| GET 路径 | 结果 |
+|---|---|
+| `/` | 200（CursorFree 自己的页面）|
+| `/loginDeepControl` | **404** |
+| `/login` | 404 |
+| `/api/auth/cli` | 404 |
+| `/health` | 200 `{"status":"ok","version":"1.2.3"}` |
+
+**CursorFree 只做代理，不实现登录/发券** —— 它假设客户端*已经*带着有效凭证。
+
+### 新事实 4：CursorFree 实现了哪些路由（完整清单）
+
+| 路由 | 结果 |
+|---|---|
+| `DashboardService/GetMe` | ✅ 200（mock 成 `local_pro` / `pro-plugin@cursorfree.fun`）|
+| `DashboardService/GetCurrentPeriodUsage` | ✅ 200（mock 配额）|
+| `AiService/AvailableModels` | ✅ 200（360KB 模型列表）|
+| `ServerConfigService/GetServerConfig` | ✅ 200 |
+| `AiService/GetUsableModels` | ❌ 401 `ERROR_NOT_LOGGED_IN` |
+| `AiService/GetDefaultModelNudgeData` | ❌ 401 |
+| `agent.v1.AgentService/Run` | ⚠️ 400「注入失败」（空帧/非法体）|
+| `agent.v1.AgentService/RunSSE` | ⚠️ 415 |
+| `AuthService/GetMe`、`ChatService/GetChat`、`CursorAuthService/GetEmail`、`AuthService/CheckLoginToken` | ❌ 404 |
+| `/loginDeepControl` 等登录页 | ❌ 404 |
+
+### 新事实 5：IDE 与 `cursor-agent` 的**身份头**不同
+
+抓到的 IDE `Run` 请求头（CursorFree 白名单原样记录）：
+
+```
+x-cursor-client-type: ide            ← agent 发的是 cli
+x-cursor-client-version: 3.23.23     ← agent 发的是 cli-<version>
+x-cursor-client-layout: unifiedAgent
+x-cursor-client-device-memory: 68523839488
+```
+
+**关键**：IDE 的 `Run` 请求里**既没有 `authorization`，也没有 `x-jg-auth`**
+（白名单里都没这两项）。说明 CursorFree 在 IDE 链路上是自己加鉴权的 ——
+客户端只负责声明「我是 IDE」，注入由代理侧完成。
+
+而 `cursor-agent` 恰恰**卡在成为「客户端」之前**（新事实 1/2/3）。
+
+### 新事实 6：`AgentRunRequest` 的体量说明它不可能手工构造
+
+IDE 真实请求 `#1` 帧 253755 字节（gzip 前），`conversationState` 结构：
+
+```
+1: {
+  1: {  1: bytes[32] × 42       ← 本地状态 id 列表
+        3: bytes[32] × 6
+        5: { 1: 31677, 2: 200000,        ← token 预算
+             3: {1:"system_prompt",2:"System prompt",3:1368,4:5329}
+             3: {1:"tools",...} {1:"rules"} {1:"skills"}
+             3: {1:"mcp"} {1:"subagents"}
+             3: {1:"summarized_conversation"} {1:"conversation"} }
+        8: bytes ...  9: str  10: 1  13: bytes
+        15: {1: str, 2: {1: bytes}} × N   ← 工具定义
+        18/21/22/26/27/37/38/39/46: ... } }
+  2: { ... action ... }
+```
+
+这些 `bytes[32]` 是 IDE 本地状态指纹，`5` 是分段计费口径，
+`15` 是 IDE 侧的工具定义 —— 全是**客户端本地生成的**，
+没有一份来自服务端下发的模板。手工拼一个「最小合法体」不可能：
+实测构造 5 种骨架全部被 CursorFree 判「注入失败」。
+
+### 这一轮净结论
+
+前两轮的「卡点是凭证签发模型」仍然成立，但**位置更靠前**：
+
+```
+cursor-agent 进程
+   │
+   ├─[闸 1] 必须存在 api-key / login 态   ← JWT 冒充不过
+   │         └─ login 需要 /loginDeepControl ← CursorFree 404
+   ├─[闸 2] api-key 被送到 api2.cursor.sh 校验 ← 绕过 --endpoint
+   │
+   └─ ✗ 进程退出，永远到不了 8788
+```
+
+**不是「到了代理但凭证不对」，而是「到不了代理」。**
+前两轮看到的 `ERROR_UNAUTHORIZED` 是 **shim 强推流量**才看到的，
+真实 `cursor-agent` 在这个位置之前已经放弃了。
+
+也就是说：**只有改写 `cursor-agent` 的二进制（改校验逻辑）才能走通** ——
+这不是 zelto 能做的事，也会破坏上游客户端完整性。
+
 ## 对结论的影响
+
+> **后续**：本 ADR 讨论的是「`cursor-agent` 能否走 CursorFree」。
+> 用户随后问「能不能直接用 IDE 里的 agent」——那条路是**官方支持的**，
+> 且绕开了额度与凭证签发两个难点，但被 `desktop_bridge` 特性闸门挡住。
+> 详见 **ADR-091**。本节及以下结论仅适用于 `cursor-agent` + CursorFree 组合。
 
 **结论不变**（走 CursorFree 代理不能让 `cursor-agent` 跑起来），
 但依据完全换了 —— 不是「协议不通」，而是「**凭证签发模型不通**」：
