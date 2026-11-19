@@ -20,7 +20,7 @@
     "dev": "tsc --watch",
     "test": "node scripts/test.mjs",
     "test:quick": "node --test \"dist-test/tests/**/*.test.js\"",
-    "test:unit": "tsc -p tsconfig.test.json && node scripts/filter-tests.mjs",
+    "test:unit": "tsc -p tsconfig.test.json && node scripts/copy-test-assets.mjs && node scripts/filter-tests.mjs",
     "test:acceptance": "node --test \"dist-test/tests/acceptance/**/*.test.js\"",
     "test:watch": "node --test --watch",
     "verify:adr056": "node scripts/verify-adr056.mjs",

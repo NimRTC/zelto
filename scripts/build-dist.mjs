@@ -46,7 +46,7 @@
 // 与 CLI 二进制无关，清它只会让 `npm test` 多编译一次。
 
 import { execFileSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
+import { cpSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -91,5 +91,52 @@ export function buildDist(root) {
     throw err;
   }
 
+  // 3. 复制非 TS 静态资源（ADR-093）
+  //
+  // `tsc` 只处理 `.ts` —— 前端脚本与样式表是纯资源，不会被编译，
+  // 也不会被自动复制。漏了这步的后果不是构建失败，而是**运行时**
+  // 才炸（`readAsset()` 抛「前端资源缺失」），且只在打开 `zelto web` 时炸。
+  // 所以复制必须放在构建里，和编译同一次、同一把锁。
+  copyAssets(root, 'dist');
+
   console.log('built dist/');
+}
+
+/**
+ * 前端静态资源目录（相对 `src/` / `tests/`）→ 编译后的同位置。
+ *
+ * 目前只有 `adapters/web/frontend/`。写成表而不是单条，是因为
+ * 第二个资源目录出现时不该再改构建结构。
+ *
+ * **导出**：`tsconfig.test.json` 把 `src/` 和 `tests/` 平铺到 `dist-test/` 下
+ * （`rootDir: "."`），所以单元测试跑的是 `dist-test/src/adapters/web/...` ——
+ * 那里同样需要这些资源，否则测试里调 `renderAppJs()` 会抛「前端资源缺失」。
+ * 资源只属于 `src/`，`tests/` 没有资源目录，所以 `dist-test` 的复制
+ * 源永远是 `src/`，只是目标跟着 `outDir` 走。
+ */
+const ASSET_DIRS = ['adapters/web/frontend'];
+
+/**
+ * 把静态资源从 `src/` 复制到某个产物目录下。
+ *
+ * @param root 仓库根
+ * @param outDir 产物目录名（`dist` 或 `dist-test`）
+ * @param outPrefix 产物目录内部的前缀 —— `tsc -p tsconfig.json` 的 rootDir 是
+ *   `src`，所以资源落在 `dist/<rel>`；而 `tsconfig.test.json` 的 rootDir 是 `.`，
+ *   资源要落在 `dist-test/src/<rel>`。这个差异由调用方说清楚，不猜。
+ */
+export function copyAssets(root, outDir, outPrefix = '') {
+  for (const rel of ASSET_DIRS) {
+    const from = join(root, 'src', rel);
+    const to = join(root, outDir, outPrefix, rel);
+    try {
+      cpSync(from, to, { recursive: true });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `复制静态资源失败：${from} → ${to}\n` +
+          `缺了它，zelto web 启动后会读不到前端脚本。原始错误：${reason}`,
+      );
+    }
+  }
 }

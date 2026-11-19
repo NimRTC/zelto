@@ -1,0 +1,212 @@
+
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #21262d;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+header {
+  border-bottom: 1px solid var(--border);
+  padding: 14px 20px;
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+h1 { font-size: 16px; margin: 0 0 6px; font-weight: 600; }
+h1 small { color: var(--muted); font-weight: 400; font-size: 12px; }
+.project-name { color: var(--accent); }
+.h1-sep { color: var(--muted); }
+.h1-sub { color: var(--muted); font-weight: 400; }
+/* 顶端元信息行：刷新心跳 + 工程根目录 —— 「页面还活着」的最直接证据 */
+.head-meta {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 10px;
+  min-height: 16px;
+}
+#refresh-line .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 5px;
+  vertical-align: middle;
+  background: var(--ok);
+}
+#refresh-line.warn .dot { background: var(--warn); }
+#refresh-line.bad .dot { background: var(--bad); }
+/* 实时进度（D-30 补）：running 片最后一条输出 + 已跑时长 */
+.progress-line {
+  color: var(--fg);
+  font-size: 11px;
+  max-width: 560px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.progress-line::before { content: '▶ '; color: var(--accent); }
+nav { display: flex; gap: 6px; }
+nav button {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+nav button:hover { color: var(--fg); border-color: var(--accent); }
+nav button.active { color: var(--fg); border-color: var(--accent); background: #1f2937; }
+main { padding: 20px; max-width: 1200px; }
+#banner { padding: 0 20px; max-width: 1200px; }
+#banner .notice { margin: 10px 0; }
+/* 连接状态条 —— 独占一行，在动作横幅上方 */
+#conn {
+  margin: 0 20px 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--bad);
+  background: #1c2128;
+  border-radius: 0 6px 6px 0;
+  max-width: 1160px;
+}
+h2 { font-size: 14px; margin: 22px 0 10px; font-weight: 600; }
+h2:first-child { margin-top: 0; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
+th, td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+tr.clickable { cursor: pointer; }
+tr.clickable:hover td { background: #161b22; }
+.muted { color: var(--muted); }
+.small { font-size: 11px; }
+.cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-width: 120px;
+  background: var(--panel);
+}
+.card .n { font-size: 22px; font-weight: 600; }
+.card .l { color: var(--muted); font-size: 11px; }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+}
+.state-draft { background: #6e7681; }
+.state-clarifying { background: #a371f7; }
+.state-frozen { background: #58a6ff; }
+.state-running { background: #d29922; }
+.state-completed { background: #3fb950; }
+.state-abandoned { background: #f85149; }
+/* 被动活性徽标（D-30）：running 到底活没活，一眼看出来 */
+.live-active { background: #3fb950; }
+.live-stale { background: #d29922; }
+.live-dead { background: #f85149; }
+.live-finished { background: #6e7681; }
+.check { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.check:last-child { border-bottom: none; }
+.check .mark { font-weight: 700; width: 16px; }
+.check.ok .mark { color: var(--ok); }
+.check.no .mark { color: var(--bad); }
+.check .label { font-weight: 600; min-width: 120px; }
+.check .ev { color: var(--muted); }
+.check .adr { color: #484f58; font-size: 11px; margin-left: auto; white-space: nowrap; }
+.btn {
+  border: 1px solid var(--border);
+  background: #21262d;
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.ok { background: #1a7f37; border-color: #2ea043; }
+.btn.ok:hover:not(:disabled) { background: #2ea043; }
+/* ADR-084：拒签 / 拉闸 —— 「危险」类动作，视觉上要与「批准」分开。
+   批准是绿色（推进），拒签与拉闸是红色（收回控制权）。 */
+.btn.bad { background: #8b2c2c; border-color: #da3633; }
+.btn.bad:hover:not(:disabled) { background: #da3633; }
+/* 顶栏的拉闸按钮 —— 跟导航按钮同排，但要一眼看出是「刹车」 */
+nav button.danger { color: var(--bad); border-color: var(--bad); margin-left: auto; }
+nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
+/* ADR-086：油门按钮组 —— 冻结 / 门禁 / 开跑 / 续跑 */
+.throttle-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 14px; }
+/* ADR-086：详情页自己轮询的这一块（状态 / 活性 / 进度） */
+.live-box { margin-bottom: 10px; }
+/* ADR-084：回答提问的输入行 */
+.answer-row { display: flex; gap: 8px; margin-top: 8px; }
+.answer-input {
+  flex: 1;
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  padding: 6px 10px;
+  font: inherit;
+}
+.answer-input:focus { outline: none; border-color: var(--accent); }
+.notice {
+  border-left: 3px solid var(--warn);
+  background: #1c2128;
+  padding: 8px 12px;
+  margin: 10px 0;
+  border-radius: 0 6px 6px 0;
+}
+.notice.bad { border-left-color: var(--bad); }
+.notice.ok { border-left-color: var(--ok); }
+pre {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+.back {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0 0 10px;
+  display: block;
+}
+.kv { display: grid; grid-template-columns: 130px 1fr; gap: 2px 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+.tag {
+  display: inline-block;
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 6px;
+  margin: 1px 3px 1px 0;
+  font-size: 11px;
+}

@@ -44,7 +44,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { withBuildLock } from './build-lock.mjs';
-import { buildDist } from './build-dist.mjs';
+import { buildDist, copyAssets } from './build-dist.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -70,6 +70,12 @@ try {
     cwd: root,
     stdio: 'inherit',
   });
+
+  // 3.5 复制静态资源到 dist-test（ADR-093）
+  //
+  // 单元测试跑的是 `dist-test/src/...`，而 `tsc` 不复制非 TS 文件。
+  // `tsconfig.test.json` 的 rootDir 是 `.`，所以资源要落在 `dist-test/src/` 下。
+  copyAssets(root, 'dist-test', 'src');
 
   // 4. 跑测试
   execFileSync(
