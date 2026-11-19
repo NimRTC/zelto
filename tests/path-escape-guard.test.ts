@@ -37,7 +37,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, relative } from 'node:path';
+import { join, resolve, relative, isAbsolute } from 'node:path';
 
 import { resolveWithin, isWithin, PathEscapeError } from '../src/core/io/path-safe.js';
 import { isValidVersionLabel, checkVersionLabel, versionBranchName } from '../src/core/version/branch.js';
@@ -67,10 +67,28 @@ test('resolveWithin：`..` 逃逸被拒', () => {
   assert.equal(isWithin(base, '../../evil'), false);
 });
 
-test('resolveWithin：绝对路径标识符被拒', () => {
+test('resolveWithin：绝对路径标识符不能把结果带出 base', () => {
   const base = resolve('D:/tmp/repo', '.zelto/worktrees');
-  // 绝对路径会直接盖掉 base
-  assert.throws(() => resolveWithin(base, 'D:/tmp/elsewhere'), PathEscapeError);
+  // 契约（跨平台）：绝对路径标识符**要么被拒（抛 PathEscapeError），
+  // 要么被安全地夹在 base 内** —— 无论哪种，结果都不得落在 base 之外。
+  //
+  // 注意平台差异（ADR-090 修复）：
+  //   - Windows：带盘符的绝对串（如 `E:/x`）会让 join 重置根 → 逃逸 → 被拒。
+  //   - POSIX：`join` 会剥掉前导 `/` 再拼进 base，绝对串**不会**逃逸 →
+  //     不抛，而是安全落在 base 下。
+  // 所以旧断言「绝对路径必抛」只在 Windows 成立，在 Linux CI 上漏判。
+  const absIdentifier = resolve('/', 'tmp', 'elsewhere');
+  assert.ok(isAbsolute(absIdentifier), `应构造出绝对路径，实际 "${absIdentifier}"`);
+  let escapes = false;
+  try {
+    const result = resolveWithin(base, absIdentifier);
+    // 没抛 —— 那就必须确实落在 base 之内
+    escapes = relative(resolve(base), resolve(result)).startsWith('..');
+  } catch (err) {
+    assert.ok(err instanceof PathEscapeError, `只该抛 PathEscapeError，实际 ${err}`);
+    return; // 被拒 = 契约成立
+  }
+  assert.equal(escapes, false, `绝对路径标识符不得把结果带出 base：${absIdentifier}`);
 });
 
 test('resolveWithin：前缀相同的邻居目录不算子目录', () => {

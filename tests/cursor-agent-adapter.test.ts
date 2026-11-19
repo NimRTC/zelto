@@ -121,18 +121,21 @@ describe('Cursor 网关 / 凭证透传（ADR-090）', () => {
 
   it('endpoint 落成 --endpoint', () => {
     const flags = cursorFlags([], { endpoint: 'https://gw.example.com' });
-    assert.ok(flags.includes('--endpoint "https://gw.example.com"'));
+    // 引号类型随平台（Windows cmd 双引号 / POSIX 单引号）——
+    // 断言「被某种引号包裹且内容原样」，而不是写死某种引号（ADR-090 修复）。
+    assert.match(flags, /--endpoint ["']https:\/\/gw\.example\.com["']/);
   });
 
   it('apiKey 落成 --api-key', () => {
     const flags = cursorFlags([], { apiKey: 'sk-test-123' });
-    assert.ok(flags.includes('--api-key "sk-test-123"'));
+    assert.match(flags, /--api-key ["']sk-test-123["']/);
   });
 
   it('端点里的 shell 元字符被引号挡住（配置是不可信输入）', () => {
     const flags = cursorFlags([], { endpoint: 'https://gw.example.com/a&b|c' });
     // 整个值被包在引号里 —— shell 不会把它拆成两条命令。
-    assert.ok(flags.includes('"https://gw.example.com/a&b|c"'));
+    // 引号类型随平台，断言「被引号包裹」即可。
+    assert.match(flags, /["']https:\/\/gw\.example\.com\/a&b\|c["']/);
   });
 
   it('endpoint / apiKey 排在固定旗标之后、额外参数之前', () => {
