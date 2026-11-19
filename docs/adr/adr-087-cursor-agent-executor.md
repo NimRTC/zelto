@@ -274,11 +274,26 @@ Claude / Cursor / Codex 查的都是同一件事：**这条命令找不找得到
 
 ### 未能验证的部分（如实说明）
 
-- **未做真实 API 端到端**：本机 `cursor-agent` **无凭证**
-  （`CURSOR_API_KEY` 未设，`agent login` 未执行），报错停在
-  `Authentication required`。
-  因此「真 agent 起进程 → 收 NDJSON → 解析会话 id → 续跑」这条链路
-  **未在真实服务端验证过**。
+- **未做真实 API 端到端**：本机 `cursor-agent` 走**官方**
+  `api2.cursor.sh` 时报
+  `ActionRequiredError: You've hit your usage limit` —— **免费额度已耗尽**，
+  不是「没装好 / 没登录」。
+- **另一条路（CursorFree 代理）也不通**，且**不通的原因是结构性的**，
+  不是配置问题。完整实测见 **ADR-089**：
+  - 凭证层可复用（用 IDE 的 JWT 能拿到 `system/init` + session id）；
+  - 但 CursorFree 返回**重复的 `content-type` 头**
+    （`application/octet-stream` + `application/proto`），
+    connect 客户端直接拒收 ——
+    **这一层已实测可以绕过**（h1 字节层 shim 删掉多余的头即可，
+    绕过后 `cursor-agent` 能握手成功拿到 session id）；
+  - 但绕过后，对话端点 `agent.v1.AgentService/Run` 在 CursorFree 侧
+    **恒定 400「注入失败」**（它解析不了 `cursor-agent` 的
+    `connect+proto` 双向流帧）——
+    **这一层绕不过**，卡点在 CursorFree 内部；
+  - 即使走 `RunSSE` 穿透到上游，上游也会因
+    **CursorFree 声明的客户端版本过旧**而拒绝
+    （`Your version of Cursor is no longer supported`）。
+  - 后两条都在 CursorFree 内部，**zelto 无权修改**。
 - 替代方案：用**假 agent**（吐真实形状 NDJSON 的本地脚本）覆盖了
   解析层；用**真实 bundle 源码**覆盖了协议层；
   用**真实载荷**覆盖了判定层。
@@ -349,3 +364,5 @@ Claude / Cursor / Codex 查的都是同一件事：**这条命令找不找得到
 - cursor-agent 2026.09.18（`2026.09.18-9a7762b`）实测：
   CLI 旗标、stdin 提示词消费、NDJSON 事件形状、hook schema、工具名
 - `docs/adr/adr-083-multi-harness-runtime-write-enforcement.md`
+- `docs/adr/adr-089-cursorfree-proxy-path.md`（CursorFree 代理路的实测结论：
+  凭证可复用，但协议与版本两处结构性不匹配，**不可作为 zelto 的 Cursor 后端**）
