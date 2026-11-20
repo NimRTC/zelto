@@ -581,7 +581,19 @@ export async function cleanupMergedSlices(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.log(`  ⚠️  Worktree removal failed: ${msg}`);
-      console.log(`     Remove it manually: git worktree remove --force ${manager.pathFor(id)}`);
+      // ZD-016：补救命令必须**真的能删掉目录**。
+      //
+      // 原来这里给的是 `git worktree remove --force <path>` —— 但
+      // `git worktree remove` 是「先摘 git 侧登记，再删目录」的：
+      // 目录删不掉时**登记已经被摘掉了**，于是这条命令重跑必然报
+      // 「fatal: '<path>' is not a working tree」。
+      //
+      // 人照着做 → 报一个看不懂的错 → 目录还在（几个 GB）。
+      //
+      // 给两条：一条是 git 侧（登记可能还在），一条是直接删目录
+      // （目录才是真正占地方的东西）。
+      console.log(`     If git still tracks it:  git worktree remove --force ${manager.pathFor(id)}`);
+      console.log(`     Or delete the directory:  rmdir /s /q "${manager.pathFor(id)}"`);
     }
 
     // ADR-071：空操作合并的切片**从来没有分支**（产物由人直接提交到

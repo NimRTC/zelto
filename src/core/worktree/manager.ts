@@ -825,8 +825,250 @@ export class WorktreeManager {
     if (options.force || this.needsForceForSubmodules(target)) args.push('--force');
     args.push(target);
 
-    this.removeWithRetry(args, target, `移除 worktree 失败: ${relative(this.repoRoot, target)}`);
+    // ── ZD-016：记下「移除之前」git 侧的登记状态 ────────────────────
+    //
+    // 兜底的前提是「git 侧已经注销了，但目录还在」。这个前提要拿**事实**判定：
+    //
+    //   事实一：git **自己说**「这已经不是工作树了」→ 它不认这个目录了。
+    //   事实二：事前 `git worktree list` 里查得到、事后查不到
+    //           → git 摘了登记（git 先摘登记再删目录，所以这个现象很常见）。
+    //
+    // 反过来，「事前就查不到」**不能**当成「git 刚摘掉」——
+    // 那只是「git 压根没管过这个目录」（比如残留目录、测试里手搓的目录）。
+    // 这两种情况在 list 输出上长得一模一样，只有**事前快照**能区分。
+    // 事前没登记 → remove 失败就是 git 的真错误 → 按 D-67 的契约立刻抛出。
+    const registeredBefore = this.isRegistered(target);
+    // 这个目录**当过 worktree 吗**？（看 `.git` 指针文件，见 looksLikeWorktree）
+    const wasWorktree = this.looksLikeWorktree(target);
+    // git 显式说「这已经不是工作树了」→ 它自己不认这个目录了。
+    const deregisteredSignal = /is not a working tree|not a working tree/i;
+
+    try {
+      this.removeWithRetry(args, target, `移除 worktree 失败: ${relative(this.repoRoot, target)}`);
+    } catch (err) {
+      // ── ZD-016：git 侧已注销、目录还在的兜底 ─────────────────────
+      //
+      // 病灶（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+      //   `git worktree remove` 报「Permission denied」（MSBuild 还持有
+      //   worktree 里 pdb 的句柄）→ 目录没删掉，但 **git 侧的登记已经
+      //   被摘掉了**（git 先摘登记再删目录）。
+      //
+      //   于是：
+      //     - 目录还在（几个 GB 的构建树）
+      //     - 但 `git worktree remove --force <path>` 现在必然失败 ——
+      //       「fatal: '<path>' is not a working tree」
+      //
+      //   zelto 之前给出的补救命令**正是这条必然失败的命令**。
+      //
+      // ── 关键：兜底的触发条件必须是「git 侧确实已注销」这个**事实**，
+      //         不能是「remove 失败了」这种**症状** ────────────────────
+      //
+      // 症状与事实必须分开，否则会把三类完全不同的失败混为一谈：
+      //
+      //   (a) git 说不认它了（显式报错 or 登记前后翻转）
+      //       → git 侧不用管了，**直接删目录**是安全的。
+      //
+      //   (b) **git 侧的登记还在**，只是目录删不掉
+      //       （文件句柄被占 / cwd 锁）→ 登记还在时直接删目录等于
+      //       绕过 git 撕毁登记，git 那边会留下一个指向不存在目录的
+      //       悬空条目 → 后续 `git worktree list` / prune 行为诡异。
+      //
+      //   (c) git **压根不认**这个目录（事前就没登记）→ remove 失败是
+      //       git 的真错误，按 D-67 的契约**立刻抛出**，不许被兜底吞掉。
+      const detail = err instanceof WorktreeError ? (err.stderr ?? '') : String(err);
+      const gitSaysDeregistered = deregisteredSignal.test(detail);
+      const registeredAfter = this.isRegistered(target);
+      const deregistered =
+        gitSaysDeregistered ||
+        (registeredBefore && !registeredAfter) ||
+        // 「当过 worktree，但 git 现在不认它了」——
+        // 这是 ZD-016 的真实现场：git 先摘登记再删目录，删到一半撞上占用。
+        (wasWorktree && !registeredAfter);
+
+      // ── 兜底的前提之二：失败必须是**占用类** ──────────────────────
+      //
+      // D-67 的契约是「**非占用类**错误立刻抛出，不许被兜底改写」。
+      // 而 git 报「not a working tree」也可能是非占用类的真错误 ——
+      // 比如这个路径压根不是工作树（测试里手搓的目录、早已 prune 过的残留），
+      // 那时 remove 失败就是 git 的**真错误**，必须原样抛出去让人看。
+      //
+      // 只有占用类失败才可能是「git 想删但删不掉、可能已经摘了登记」
+      // 那一回事 —— 那才是 ZD-016 的病灶。
+      //
+      // 两个条件是「且」的关系：
+      //   git 不认它（事实） **且** 失败是占用类（症状）
+      // 少任何一个都不兜底 —— 宁可报错让人看，不许替 git 改判。
+      const busyFailure = this.isBusyRemovalError(detail);
+
+      if (deregistered && busyFailure) {
+        // (a) git 侧已经不需要管了（登记没了），直接删目录。
+        this.git(['worktree', 'prune'], undefined, true);
+        if (this.deleteDirectoryDirectly(target)) return;
+      } else if (registeredBefore) {
+        // (b) 登记还在 → 先让 git 摘登记，再删目录（顺序不能反：
+        // 先删目录的话，git 会认为 worktree 还存在却目录不见了）。
+        this.git(['worktree', 'remove', '--force', target], undefined, true);
+        this.git(['worktree', 'prune'], undefined, true);
+        if (this.deleteDirectoryDirectly(target)) return;
+      }
+      // (c) 兜底不适用 → 把原始错误抛出去。
+      //
+      // ── ZD-017：目录删不掉 —— 区分「文件句柄被占」与「cwd 锁」──
+      //
+      // 两者的补救方式完全不同，给错建议等于把人送进死胡同
+      // （ZD-016 的教训）。这里把诊断结论附在**原始错误的消息**上。
+      //
+      // 注意是「附加」而不是「另起一个错误」：
+      //   - 保留原始 message / stderr → 人看到的是 git 真正说的话
+      //   - 保留原始错误类型（WorktreeError / 别的）→ 调用方的
+      //     `instanceof` 判断与 CLI 的错误分支不受影响
+      const diagnosis = this.diagnoseRemovalBlock(target);
+      const originalMessage = err instanceof Error ? err.message : String(err);
+      if (err instanceof Error) {
+        err.message = `${originalMessage}\n     ${diagnosis}`;
+        throw err;
+      }
+      throw new WorktreeError(`${originalMessage}\n     ${diagnosis}`);
+    }
     this.git(['worktree', 'prune'], '清理 worktree 登记失败');
+  }
+
+  /**
+   * 这个 worktree 在 git 侧**登记着吗**？（ZD-016）
+   *
+   * 判据问的是**事实**，不是症状：
+   *   - `git worktree list --porcelain` 里查得到这个路径 → 登记着
+   *   - 查不到 → 没登记
+   *
+   * 为什么不用「错误消息里有没有『not a working tree』」：
+   *   那句话只覆盖了事实成立**且 git 恰好这么说了**的情形。
+   *   占用类错误（Invalid argument / Permission denied）耗尽重试后，
+   *   git 侧可能**已经摘了登记**（git 先摘登记再删目录）也可能没有 ——
+   *   只有问 git 本人才知道。
+   *
+   * 问不到（git 调用本身失败）时**保守返回 false**（当作没登记）：
+   *   判「没登记」只会让兜底不生效 —— 错误照常抛出，不会误删目录。
+   */
+  private isRegistered(target: string): boolean {
+    let output = '';
+    try {
+      output = this.git(['worktree', 'list', '--porcelain'], undefined, true);
+    } catch {
+      return false;
+    }
+    const normalizedTarget = target.replace(/\\/g, '/').replace(/\/+$/, '');
+    for (const line of output.split('\n')) {
+      if (!line.startsWith('worktree ')) continue;
+      const path = line.slice('worktree '.length).trim().replace(/\\/g, '/').replace(/\/+$/, '');
+      if (path === normalizedTarget) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 这个目录**当过 git worktree 吗**？（ZD-016）
+   *
+   * 判据：目录里有 `.git` **文件**。
+   *
+   * 为什么是「文件」而不是「目录」：
+   *   - 主仓的 `.git` 是**目录**；
+   *   - worktree 的 `.git` 是**文件**（内容形如
+   *     `gitdir: D:/repo/.git/worktrees/<name>`）——
+   *     worktree 的 git 目录在**主仓**里，worktree 自己只留一个指针。
+   *
+   * 为什么需要它：
+   *   「`git worktree list` 里查不到这个路径」有两种来源 ——
+   *     (i)  git **刚摘掉**登记（ZD-016 的病灶）
+   *     (ii) 这个路径**从来**不是 worktree
+   *   两者在 list 输出上**长得一模一样**，只有这个判据能分开：
+   *   真正当过 worktree 的目录会留下 `.git` 文件。
+   *
+   * 只读文件、不调 git、不触网 —— 符合 core/ 的边界（C3）。
+   */
+  private looksLikeWorktree(target: string): boolean {
+    try {
+      const gitPath = join(target, '.git');
+      // 必须是**文件**：worktree 的 `.git` 是指针文件；
+      // 目录形态说明这是一份普通 clone（或者主仓根），不是 worktree。
+      return statSync(gitPath).isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 直接删目录（绕开 git）。
+   *
+   * 只在**git 侧的登记已经没了**之后用 —— 见 `remove` 里的 ZD-016 说明。
+   *
+   * @returns 是否删掉了
+   */
+  private deleteDirectoryDirectly(target: string): boolean {
+    if (!existsSync(target)) return true;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        rmSync(target, { recursive: true, force: true });
+        return !existsSync(target);
+      } catch {
+        // 文件被占用 —— 退避后重试（句柄通常几秒内释放）
+        if (attempt < 3) this.sleep(this.removeRetryDelayMs * attempt);
+      }
+    }
+    return !existsSync(target);
+  }
+
+  /**
+   * 诊断「目录删不掉」的真因，给出人能直接照做的建议。
+   *
+   * ── ZD-017（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）─────
+   *
+   * Windows 上有两类完全不同的「占用」，补救方式也不同：
+   *
+   * (a) **文件句柄被占** —— 某个进程打开了 worktree 里的文件
+   *     （MSBuild 拿着 pdb、刚跑完的 exe 没退干净）。等几秒句柄会释放，
+   *     `rmdir /s /q` 就能删掉。
+   *
+   * (b) **进程把目录设成了当前工作目录** —— 目录**一个文件都没有**
+   *     （只有 `.` 和 `..`），但 Windows 会给 cwd 一个目录句柄，
+   *     于是 `rd /s /q` 报「另一个程序正在使用此文件夹」。
+   *
+   * (b) 的关键识别特征是**目录是空的**：如果是 (a)，worktree 里躺着
+   * 几 GB 构建树，删不掉是因为文件还在；而 (b) 里 git 已经把内容清空了，
+   * 只剩一个空壳。
+   *
+   * 这一类**用 Restart Manager 查不到**（它只管文件句柄），
+   * `Get-CimInstance Win32_Process` 也看不到 cwd。唯一可靠的定位办法是
+   * 读进程 PEB —— 那是特权操作，超出 `core/` 「纯判定」的边界（C3），
+   * 所以 zelto 不自动查，只**认得出这个特征并给出正确的人工排查步骤**。
+   *
+   * @returns 给人的建议文本；目录为空且删不掉时返回 cwd 锁的排查指引
+   */
+  private diagnoseRemovalBlock(target: string): string {
+    let isEmpty = false;
+    try {
+      isEmpty = readdirSync(target).length === 0;
+    } catch {
+      // 读不出来（权限/已消失）→ 按普通占用处理
+    }
+
+    if (!isEmpty) {
+      return [
+        'Worktree directory still contains files — a process is holding file handles (typical: MSBuild / a freshly built exe).',
+        'Wait a few seconds and retry, or close that process, then:',
+        `  rmdir /s /q "${target}"`,
+      ].join('\n     ');
+    }
+
+    return [
+      'Worktree directory is EMPTY but cannot be deleted — this is the Windows "current working directory" lock (ZD-017),',
+      'not a file-handle problem. Some process still has this directory as its cwd, so Windows keeps a directory handle on it.',
+      'Restart Manager cannot see this kind of lock, so it will report "no lockers" even though the directory cannot be removed.',
+      'To find the holder (Windows):',
+      '  1. Open Sysinternals "handle.exe" and run:  handle.exe -accepteula "v1-n5-turn-server"',
+      '  2. Or list every process cwd by reading PEB (see docs/实战缺陷记录-nimrtc-v14.md §ZD-017 for a ready-to-run script)',
+      '  3. Kill that process, then:  rmdir /s /q "' + target + '"',
+      'Note: MSBuild workers started with /nodeReuse:true are a common culprit — `MSBuild.exe -nodeReuse:false` avoids it.',
+    ].join('\n     ');
   }
 
   // ─── 上下文同步 ──────────────────────────────────────────────────────────
@@ -1014,10 +1256,7 @@ export class WorktreeManager {
       } catch (err) {
         lastError = err;
         const detail = err instanceof WorktreeError ? (err.stderr ?? '') : String(err);
-        const busy =
-          /Invalid argument|being used by another process|cannot access|directory not empty|资源正被|另一个程序/i.test(
-            detail,
-          );
+        const busy = this.isBusyRemovalError(detail);
         // 不是占用类错误 → 重试也没用，立刻抛出（保留原始报错）
         if (!busy) throw err;
         // 目录已经真的不在了 → 视为成功
@@ -1033,6 +1272,34 @@ export class WorktreeManager {
     throw lastError instanceof Error
       ? lastError
       : new WorktreeError(errorMessage, args.join(' '), String(lastError));
+  }
+
+  /**
+   * 这个失败是不是「占用类」（文件句柄被占 / cwd 锁）？
+   *
+   * ── 为什么需要这个判据（ZD-016 / ZD-017 的边界）────────────────────
+   *
+   * `remove()` 的兜底逻辑（git 侧已注销 → 直接删目录）**只能**用在
+   * 占用类失败上：
+   *
+   *   - 占用类失败：git 是「想删但删不掉」，它可能**已经摘了登记**
+   *     （git 先摘登记再删目录）。这时目录残留、登记已无 → 直接删目录安全。
+   *
+   *   - 非占用类失败：git 是「压根不认 / 拒绝删」—— 这是 git 的**真错误**
+   *     （分支被占用、路径非法、权限不足…）。此时兜底等于**改写 git 的错误**，
+   *     把一个需要人看的真问题掩盖成「删掉了」。D-67 的契约明确要求：
+   *     非占用类错误**立刻抛出，不许被兜底吞掉**。
+   *
+   * 判据与 `removeWithRetry` 里那份**必须一致** —— 两处判据分叉的后果是
+   * 「重试时当成占用类，兜底时当成非占用类」（于是占用类错误直接抛出去，
+   * 白白丢掉 ZD-016 的修复）或反过来（于是 git 的真错误被吞掉）。
+   *
+   * 抽成一份函数，两边共用。
+   */
+  private isBusyRemovalError(detail: string): boolean {
+    return /Invalid argument|being used by another process|cannot access|directory not empty|资源正被|另一个程序/i.test(
+      detail,
+    );
   }
 
   /** 同步阻塞等待（Node 内置，无第三方依赖） */

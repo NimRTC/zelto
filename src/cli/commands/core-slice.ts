@@ -1101,7 +1101,9 @@ register('abandon', async (args) => {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`  ??  Worktree removal failed: ${msg}`);
-        console.error(`     Remove it manually: git worktree remove --force ${worktreeManager().pathFor(id)}`);
+        // ZD-016：补救命令必须**真的能删掉目录**（详见 merge-runner.ts 里的说明）。
+        console.error(`     If git still tracks it:  git worktree remove --force ${worktreeManager().pathFor(id)}`);
+        console.error(`     Or delete the directory:  rmdir /s /q "${worktreeManager().pathFor(id)}"`);
       }
     }
 
