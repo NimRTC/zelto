@@ -20,7 +20,7 @@ export interface Version {
   status: VersionStatus;
   /** 版本分支名；缺省派生为 `version/<label>` */
   branch?: string;
-  /** 版本分支的基点 commit（建分支时的主干 HEAD） */
+  /** 版本分支的基点 commit（建分支时的位置；可以是主干 HEAD、前置版本 tip，或计划里显式钉死的提交） */
   baseCommit?: string | null;
   /** 版本 tag 名；缺省派生为 `v<label>`（ADR-056 D6） */
   tag?: string;

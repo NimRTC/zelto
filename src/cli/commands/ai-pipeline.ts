@@ -1354,13 +1354,16 @@ register('version', async (args) => {
     //
     // 基点（D1-A + D2-A）：
     // - 有前置版本 → 从前置版本的分支 tip（否则 dependsOn 是假的依赖）
-    // - 无前置版本 → 从主干 HEAD
+    // - 版本计划钉了基点 → 从钉死的那个提交（凭空接一条非主干的分支时用）
+    // - 都没有 → 从主干 HEAD
     // - 第一次确定后**钉死**进版本计划，之后不重算（基点可复现）
     const versionBranch = branchOfVersion(version);
     let versionBaseCommit: string | null = version.baseCommit ?? null;
     let versionBaseSource = '版本计划里已钉死的基点';
 
-    if (!versionBaseCommit) {
+    // 计划已钉基点 → 不重算；但工作目录可能还没建（钉了基点之后才第一次 start），
+    // 所以仍然走 prepareVersionWorkspace —— 它以钉死的基点建分支，不会退回主干。
+    if (!version.baseCommit || !worktreeManager().versionExists(versionLabel)) {
       const manager = worktreeManager();
       if (manager.isGitRepo()) {
         const workspace = await prepareVersionWorkspace(version, targetPlan, {
@@ -1391,7 +1394,7 @@ register('version', async (args) => {
         f.out('  ℹ️  不在 git 仓库中 —— 版本分支不可用，切片将在当前目录执行');
       }
     } else {
-      f.out(`  📂 版本分支 ${versionBranch}（基点已钉死：${versionBaseCommit}）`);
+      f.out(`  📂 版本分支 ${versionBranch}（基点已钉死：${versionBaseCommit}；工作目录已存在）`);
     }
 
     await versionStore.updateVersionStatus(targetPlan.id, versionLabel, 'in_progress');

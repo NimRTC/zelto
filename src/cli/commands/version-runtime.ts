@@ -136,7 +136,7 @@ export function resolveVersionBaseCommit(
   plan: VersionPlan,
   repoRoot: string,
 ): { commit: string | null; source: string } {
-  // 有前置版本 → 从前置版本的分支 tip 建（D2-A）
+  // 前置版本 → 从前置版本的分支 tip 建（D2-A）
   for (const dep of version.dependsOn) {
     const depVersion = plan.versions.find((v) => v.version === dep);
     if (!depVersion) continue;
@@ -146,7 +146,26 @@ export function resolveVersionBaseCommit(
       return { commit: tip, source: `前置版本 ${dep} 的分支 ${depBranch}` };
     }
   }
-  // 无前置版本或前置分支还不存在 → 从主干 HEAD 建（D1-A）
+  // 版本自己显式钉了基点 → 用它（D1-A：人指定的起点优先于「主干 HEAD」的默认）
+  //
+  // 为什么需要这一条（实测：nimrtc 1.4 演练）：版本要接在一条**不是主干的
+  // 分支**上（`feat/v14-turn-tls`，且远端就是终态目标）。而 `version/<label>`
+  // 建起来之后，pin 进来的这个提交本身不再是分支 tip —— 只能靠计划里的
+  // `baseCommit` 记住「从哪来」。没有这一条，基点永远退回主干 HEAD，
+  // 正好是「从 main 拉」这个被明确排除的起点。
+  const pinned = version.baseCommit && version.baseCommit.trim();
+  if (pinned) {
+    const resolved = git(['rev-parse', '--verify', `${pinned}^{commit}`], repoRoot);
+    if (resolved.ok && resolved.stdout.trim()) {
+      return { commit: resolved.stdout.trim(), source: `版本计划里钉死的基点 ${pinned.slice(0, 10)}` };
+    }
+    // 钉了但解析不出来 —— 不静默退回主干：那会悄悄换掉起点
+    return {
+      commit: null,
+      source: `版本计划里钉死的基点 ${pinned.slice(0, 10)} 在仓库里解析不出来`,
+    };
+  }
+  // 无前置版本、无钉死基点 → 从主干 HEAD 建（D1-A）
   const head = headCommit(repoRoot);
   return { commit: head, source: '主干 HEAD' };
 }

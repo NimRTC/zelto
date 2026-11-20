@@ -79,6 +79,7 @@ function splitPatterns(values: string[]): string[] {
  * ```
  * zelto plan patch <plan-id> \
  *   --version <v> [--description <text>] [--depends-on <v1,v2>] [--status <s>] [--tag <name|none>] \
+ *   [--base-commit <sha|none>] \
  *   --add-slice <id> --slice-title <t> --slice-module <m> --slice-spec <path> --write <p>... \
  *   --remove-slice <id> \
  *   --slice <id> [--write <p>...] [--slice-title <t>] [--slice-module <m>] [--slice-spec <path>]
@@ -127,6 +128,18 @@ function parsePlanPatch(args: string[]): PlanPatch {
   const tagOpt = optionValue(args, '--tag');
   if (tagOpt !== undefined) {
     v.tag = tagOpt === 'none' ? null : tagOpt;
+  }
+
+  // ── 版本基点（钉死的 commit）──
+  //
+  // `--base-commit <sha>` 钉死基点；`--base-commit none` 清掉（回到默认解析）。
+  //
+  // 为什么需要：有一类版本的基点不在主干上 —— 比如在功能分支上开发的版本
+  // （nimrtc v1.4 开发在 `feat/v14-turn-tls` 上）。默认规则会退回 main HEAD，
+  // 于是版本分支从错误的基点长出来。之前钉基点只能手改状态文件（C4 的谎言）。
+  const baseOpt = optionValue(args, '--base-commit');
+  if (baseOpt !== undefined) {
+    v.baseCommit = baseOpt === 'none' ? null : baseOpt;
   }
 
   // ── 加切片 / 改切片 / 删切片 ──
@@ -212,7 +225,7 @@ function parsePlanPatch(args: string[]): PlanPatch {
 export async function planPatch(args: string[]): Promise<number> {
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--slice <id> --write <p> ...] [--tag <name|none>]');
+    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--slice <id> --write <p> ...] [--tag <name|none>] [--base-commit <sha|none>]');
     return 1;
   }
 
@@ -322,7 +335,8 @@ export async function planPatch(args: string[]): Promise<number> {
 }
 
 /** 把字段值渲染成人能看的样子。 */
-function formatValue(value: string | string[]): string {
+function formatValue(value: string | string[] | null): string {
+  if (value === null) return '（无）';
   if (Array.isArray(value)) return value.length > 0 ? value.join(', ') : '（无）';
   return value.length > 0 ? value : '（无）';
 }

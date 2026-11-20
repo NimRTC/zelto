@@ -67,6 +67,18 @@ export interface VersionPatch {
    * 传 `null` 表示「这一版没有 tag」（清掉记录）。
    */
   tag?: string | null;
+  /**
+   * 新的版本基点（钉死的 commit）。
+   *
+   * 为什么需要这个字段：版本分支从哪拉，决定了这一版包含什么。
+   * 默认规则是「前置版本的分支 tip → main HEAD」，但有一类版本**必须**从
+   * 非主干的地方拉 —— 比如在功能分支（`feat/v14-turn-tls`）上开发的版本，
+   * 它的基点钉在那个分支的 tip 上，主干 HEAD 是错的。
+   *
+   * 之前要钉死基点只能手改 `.zelto/versions/<id>.json` —— 追溯链上的谎言（C4）。
+   * 所以这里给它一条确定性通道（ADR-063 的精神）。
+   */
+  baseCommit?: string | null;
 }
 
 /** 一次计划修正 */
@@ -84,8 +96,8 @@ export interface PlanPatchResult {
     version: string;
     slice: string | null;
     field: string;
-    before: string | string[];
-    after: string | string[];
+    before: string | string[] | null;
+    after: string | string[] | null;
   }>;
   /** 找不到的版本 */
   missingVersions: string[];
@@ -161,6 +173,25 @@ export function applyPlanPatch(plan: VersionPlan, patch: PlanPatch): PlanPatchRe
         after: vPatch.status,
       });
       version.status = vPatch.status;
+    }
+
+    // ── 基点（钉死的 commit）──
+    //
+    // 传 undefined = 不改；传 null = 清掉（回到默认解析规则）；
+    // 传字符串 = 钉死。值不做校验 —— 校验归 `resolveVersionBaseCommit`，
+    // 它在版本启动时解析，解析不出来会明确报「钉死的基点解析不出来」。
+    if (vPatch.baseCommit !== undefined) {
+      const before = version.baseCommit ?? null;
+      if (before !== vPatch.baseCommit) {
+        changed.push({
+          version: vPatch.version,
+          slice: null,
+          field: 'baseCommit',
+          before,
+          after: vPatch.baseCommit ?? null,
+        });
+        version.baseCommit = vPatch.baseCommit;
+      }
     }
 
     // ── 版本 tag（D-78）──
