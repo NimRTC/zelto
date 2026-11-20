@@ -456,6 +456,185 @@ detach 监督进程的重试回路（`supervisor.ts` 的 `waitForAgentExit`）�
 
 ---
 
+## ZD-019 占位符检查把规格里提到的 `test.todo` 这个 API 名当成了占位符
+
+**场景**：nimrtc-v14 的 `v1-audio-p2` 切片写规格时，验收标准第 7 条需要明确要求
+「验收测试文件里不许残留 `test.todo`」——这句话本身是对 agent 的**约束**，
+但 `zelto check` 报了一条警告：
+
+```
+Warn:  Spec contains placeholder markers (TBD/TODO/FIXME) — Replace placeholders with concrete content before freezing
+```
+
+规格里**根本没有**占位符。这条警告是误报。
+
+**根因**：`core/spec/semantic/analyzer.ts` 的 `checkPlaceholders` 用一条正则扫全文：
+
+```40:44:D:/MyOpen/Zelto/src/core/spec/semantic/analyzer.ts
+  const placeholderMatches = specContent.match(
+    /TBD|TODO|FIXME|coming soon|not yet determined|to be filled/i,
+  );
+```
+
+`TODO` 是**大小写不敏感**地匹配的，而 `test.todo` 里的 `todo` 正好命中。
+规格里提一个 API 名（`test.todo`）、一个命令名、或者一句「这里应该用 TODO 的写法」
+都会被当成「规格里留了占位符」。
+
+**后果**：闸门误报比闸门漏报更糟（AGENTS.md 明确写了这条）：
+- 人看到警告会去**改正确的规格**——比如把「不许残留 `test.todo`」改成
+  「不许残留未实现的用例」，反而把一条精确的约束写模糊了；
+- 或者人会去**改工具**（绕过检查），把一个真问题（规格里真留了 TBD）也一起放过去；
+- 警告本身不阻断冻结，所以它只在**肉眼看输出**时起作用——但输出就在人眼前。
+
+**修复方向**：判据不能是「文本里出现了 TODO 这个词」，而要是
+「TODO 出现在**占位符该出现的位置**」——典型形态是：
+- 独立成行、整行只有占位符（`TBD` / `TODO: 实现细节`）；
+- 或者前面跟着「待定 / 待补 / 暂缺」这类**占位语义**的词。
+
+反之，出现在**标识符或 API 名内部**（`test.todo`、`createTodo`、`TODO_LIST`）
+或紧跟在反引号里的命令，不该算占位符。
+
+**复现**：
+
+```bash
+node -e "const {analyzeSemantic}=require('./dist/core/spec/semantic/analyzer.js');
+console.log(analyzeSemantic({}, '验收测试文件不许残留 \`test.todo\`。').issues)"
+```
+
+**修复**：已修（2026-11-21）。新增 `core/spec/semantic/placeholder.ts`，
+把判据从「文本里出现了这个词」改成「这个词出现在**占位符该出现的位置**」：
+
+| 形态 | 判定 |
+|---|---|
+| `test.todo` / `createTodo` / `TODO_LIST` | **不是**占位符（词是标识符的一部分） |
+| 独立成行的 `TBD` / `TODO` | 是占位符 |
+| `TODO: 还没想清楚` | 是占位符（标记 + 连接词 + 内容） |
+| `not yet determined` / `coming soon` / `to be filled` | 是占位符（短语整体出现） |
+| `待定：\`src/foo.cpp\`` | 是占位符（占位语义 + 具体东西） |
+| 「这个值待定由上层决定」 | **不是**占位符（普通叙述，没有跟具体的东西） |
+
+关键设计点：
+- **标识符边界判定**：`isIdentifierPart()` 判断词前后的字符是不是
+  `[A-Za-z0-9_.\-/]`。`test.todo` 的 `todo` 前面是 `.` → 是 API 名的一部分。
+  注意 `:` **不在**这个集合里 —— 「`TODO: 说明`」是占位符的典型形态。
+- **中文占位语义要跟具体的东西**：不能「后面有字就算」，
+  否则「值待定由上层决定」这种普通叙述会全部误报。
+  形态一：`待定：xxx`（连接词）；形态二：紧跟路径或反引号标识符。
+
+**回归测试**：`tests/zd019-zd020-regression.test.ts` 的「ZD-019 占位符检查
+不把 API 名当占位符」一组，9 个用例，含**负向用例**
+（真留了 `TBD` / `TODO:` / `not yet determined` 仍要报）。
+
+---
+
+## ZD-020 写集全是 glob 时，规格里提到的裸文件名判成「未覆盖」，冻结被拦
+
+**场景**：nimrtc-v14 的 `v1-audio-p2` 切片，写集是 glob：
+
+```
+src/modules/opus/**
+src/modules/audio_rx/**
+src/plugins/include/nimrtc/plugins/audio_decoder.hpp
+src/engine/src/engine_media.cpp
+...
+```
+
+规格里写了「模块内 `opus.cpp` 的 `depacketise()`…」这种**只写文件名**的表述
+（很自然——同一个模块里的文件不值得每次都写全路径）。
+`zelto freeze` 报错：
+
+```
+zelto freeze v1-audio-p2 — 规格与写集不一致，拒绝冻结
+  - 规格提到「opus.cpp」，但它不在写集里 —— agent 改不了它
+  - 规格提到「codec_plugin.cpp」，但它不在写集里 —— agent 改不了它
+  - 规格提到「audio_decoder_plugin.cpp」，但它不在写集里 —— agent 改不了它
+```
+
+但 `opus.cpp` 明明在 `src/modules/opus/**` 里面。
+
+**根因**：`core/spec/write-set.ts` 的 `isInWriteSet` 有两条路径：
+
+```365:380:D:/MyOpen/Zelto/src/core/spec/write-set.ts
+    if (pattern.includes('*') || pattern.includes('?')) {
+      if (globToRegExp(pattern).test(normalized)) return true;
+      continue;
+    }
+    const dir = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern;
+    if (normalized === dir || normalized.startsWith(`${dir}/`)) return true;
+
+    // basename 匹配：规格只写文件名时也算覆盖
+    const patternBase = pattern.slice(pattern.lastIndexOf('/') + 1);
+    if (patternBase && patternBase === base) return true;
+```
+
+**basename 匹配（ZD-006 修的那条）只对非 glob 条目生效**。
+glob 条目在 `continue` 处就跳过了——因为 glob 只能拿**完整路径**去匹配，
+裸文件名 `opus.cpp` 跟 `src/modules/opus/**` 正则对不上。
+
+于是出现一个**不对称**：写集条目写成 `src/modules/opus/src/opus.cpp`（非 glob）
+→ basename 匹配生效 → 覆盖；写成 `src/modules/opus/**`（glob）
+→ basename 匹配失效 → 不覆盖。
+
+**后果**：同样是「写集覆盖了那个文件」，**写法不同结论相反**。
+人被迫把写集从 glob 改成逐文件列举（丧失 glob 的简洁与完备性），
+或者把规格里的裸文件名全改成全路径（规格变得难读）。
+
+而这条闸门本身的意图是好的（D-4：「规格说要改 + 写集不允许改」
+这个矛盾应该在冻结时暴露，而不是等 agent 撞上写集守卫）。
+
+**修复方向**：glob 条目的 basename 匹配不能直接做（`src/**` 会匹配全仓库
+任何叫 `opus.cpp` 的文件），但可以做**受限的**匹配：
+glob 的**字面前缀** + 裸文件名的 basename 组合起来判定——
+即「`src/modules/opus/**` 是否覆盖 `opus.cpp`」应理解为
+「`src/modules/opus/` 目录下是否有叫 `opus.cpp` 的文件」。
+这需要在判定时**读一下目录**（存在性检查），而不是纯字符串比较——
+需要权衡它是否还满足 C3 的「纯计算、不触网」（读本地文件是可以的，
+C3 禁的是调模型和触网）。
+
+**复现**：
+
+```js
+const {isInWriteSet} = require('./dist/core/spec/write-set.js');
+isInWriteSet('opus.cpp', ['src/modules/opus/**']);            // false ← 应该是 true
+isInWriteSet('opus.cpp', ['src/modules/opus/src/opus.cpp']);  // true
+```
+
+**修复**：已修（2026-11-21）。`isInWriteSet` 增加第三条路径 ——
+glob 条目 + **裸文件名**时，回到文件系统核实：
+
+```
+src/modules/opus/**  是否覆盖  opus.cpp
+  ↓
+glob 的字面前缀是 src/modules/opus/
+  ↓
+该目录下确实存在 opus.cpp，且其完整相对路径命中 glob？
+  ↓ 是 → 覆盖
+```
+
+关键设计点：
+- **只对裸文件名做这个回退**（不含 `/` 的写法）。带路径的写法走
+  正则判定，语义精确，不需要读文件系统。
+- **必须落到文件级别核实**，不能靠猜。
+  `src/**` 若无脑 basename 匹配，会让全仓库任何叫 `opus.cpp` 的文件都算覆盖
+  → D-4 漏报（该授权的文件被放过，agent 撞写集守卫时才炸）。
+  漏报比误报更糟。
+- **扫描有界**：只扫 glob 的字面前缀目录，跳过 `.git` / `node_modules` /
+  `.zelto`，访问数封顶 5000。
+- **C3 兼容**：读本地文件不算「触网」，也不调模型，判定仍是确定性的
+  （同一份文件树 → 同一结论）。
+
+**回归测试**：`tests/zd019-zd020-regression.test.ts` 的「ZD-020 glob 写集
+覆盖裸文件名」一组，7 个用例，含**反向用例**：
+glob 范围外的 `engine_media.cpp` / `CHANGELOG.md` 仍必须报未覆盖
+（不能为了修误报而放松真判据）。
+
+**遗留**：裸文件名在**多个** glob 目录里存在同名文件时的歧义 ——
+当前判据是「任一命中即覆盖」，与逐文件列举写集时的 basename 匹配语义一致，
+暂不区分。若将来出现同名文件分属不同模块且改动语义不同的情况，
+需要再收紧为「唯一命中才算」。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。

@@ -161,7 +161,7 @@ export async function freezeSlice(
   const mentionedPaths = parseMentionedPaths(specContent);
   const referencedPaths = new Set(parseReferencedPaths(specContent));
   const requiredPaths = mentionedPaths.filter((p) => !referencedPaths.has(p));
-  const coverage = evaluateWriteSetCoverage(requiredPaths, effectiveWrites);
+  const coverage = evaluateWriteSetCoverage(requiredPaths, effectiveWrites, ctx.repoRoot);
   if (coverage.uncovered.length > 0) {
     const details = coverage.uncovered.map(
       (p) => `规格提到「${p}」，但它不在写集里 —— agent 改不了它`,

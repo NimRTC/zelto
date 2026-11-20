@@ -5,6 +5,7 @@
 import type { SliceData } from '../../slice/store.js';
 import type { SpecAnalysis, SpecIssue, SemanticCheck } from '../types.js';
 import { extractSection, sectionByConcept } from '../format.js';
+import { findPlaceholders } from './placeholder.js';
 
 function countSections(specContent: string): number {
   const matches = specContent.match(/^#{2,3}\s+.+$/gm);
@@ -22,9 +23,7 @@ function estimateCompleteness(specContent: string): number {
   const codeLines = lines.filter((l) => /^\s{4}/.test(l) || /^```/.test(l)).length;
 
   // Check for placeholder markers
-  const placeholderLines = lines.filter(
-    (l) => /TBD|TODO|FIXME|XXX|\/\/\s+TODO|coming soon|not yet|to be determined/i.test(l),
-  ).length;
+  const placeholderLines = findPlaceholders(specContent).length;
 
   // Score: content volume + structure + detail
   const volumeScore = Math.min(1, nonEmpty / 40);
@@ -36,14 +35,15 @@ function estimateCompleteness(specContent: string): number {
 }
 
 function checkPlaceholders(slice: SliceData, specContent: string): SpecIssue | null {
-  const placeholderMatches = specContent.match(
-    /TBD|TODO|FIXME|coming soon|not yet determined|to be filled/i,
-  );
-  if (placeholderMatches) {
+  const hits = findPlaceholders(specContent);
+  if (hits.length > 0) {
     return {
       severity: 'warning',
       category: 'semantic',
-      message: 'Spec contains placeholder markers (TBD/TODO/FIXME)',
+      message: `Spec contains placeholder markers (${hits
+        .slice(0, 3)
+        .map((h) => h.slice(0, 60))
+        .join('; ')})`,
       suggestion: 'Replace placeholders with concrete content before freezing',
     };
   }

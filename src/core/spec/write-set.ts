@@ -182,6 +182,76 @@ function globMatchesSomething(pattern: string, projectRoot: string): boolean {
 }
 
 /**
+ * glob 写集是否**实际包含**某个 basename 的文件（ZD-020）。
+ *
+ * 病灶（实测于 nimrtc-v14 v1-audio-p2）：
+ *
+ *   写集声明为 `src/modules/opus/**`，规格正文里写「`opus.cpp` 的
+ *   `packetise` 需要…」—— 只给了**文件名**，没给完整路径。
+ *   D-4 覆盖判据问「`opus.cpp` 在写集里吗」，
+ *   而 glob 条目跟裸文件名做**字面比较**必然不相等
+ *   → 报「规格提到 opus.cpp，但它不在写集里」→ 冻结被拦。
+ *
+ *   规格**完全没问题** —— `src/modules/opus/src/opus.cpp` 就在写集覆盖的
+ *   目录里。这是典型的**闸门误报**：把一份正确的规格拦下来，
+ *   逼人去改规格（AGENTS.md：「遇到不确定时停下来问」）。
+ *
+ * 判据：glob 覆盖的目录里**确实存在**同名文件，且该文件的完整相对路径
+ * 命中 glob → 算覆盖。
+ *
+ * 为什么不是「无脑 basename 匹配」：
+ *   `src/**` 会让任何裸文件名都算覆盖 → D-4 漏报
+ *   （该授权的文件被放过，agent 撞写集守卫时才炸）。
+ *   所以必须**落到文件级别**核实，不能靠猜。
+ *
+ * 代价控制：只扫 glob 字面前缀目录，深度与文件量都有限。
+ */
+function globCoversBasename(
+  pattern: string,
+  base: string,
+  projectRoot: string,
+): boolean {
+  if (!base) return false;
+  const normalized = toPosix(pattern);
+  const prefix = literalPrefix(normalized);
+  const scanRoot = resolve(projectRoot, prefix || '.');
+  if (!existsSync(scanRoot)) return false;
+
+  const regex = globToRegExp(normalized);
+  const skipDirs = new Set(['.git', 'node_modules', '.zelto']);
+
+  const stack: string[] = [scanRoot];
+  let visited = 0;
+  while (stack.length > 0 && visited < 5000) {
+    const dir = stack.pop()!;
+    visited++;
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = resolve(dir, entry);
+      const rel = toPosix(relative(resolve(projectRoot), full));
+      let isDir = false;
+      try {
+        isDir = statSync(full).isDirectory();
+      } catch {
+        continue;
+      }
+      if (isDir) {
+        if (skipDirs.has(entry)) continue;
+        stack.push(full);
+        continue;
+      }
+      if (entry === base && regex.test(rel)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 在仓库里找「同名文件在别的目录」的候选。
  *
  * 病灶（实测于 nimrtc-zelto v2-input-binder）：
@@ -359,7 +429,11 @@ export function findUnproducedWriteSetPaths(writes: string[], changedPaths: stri
  * 判据：写集里存在某个**非 glob** 条目，其 basename 与被提及路径的 basename 相同
  * → 算覆盖。glob 条目（`tests/**`）本来就覆盖一切，不受影响。
  */
-export function isInWriteSet(filePath: string, writes: string[]): boolean {
+export function isInWriteSet(
+  filePath: string,
+  writes: string[],
+  projectRoot: string = process.cwd(),
+): boolean {
   const normalized = toPosix(filePath);
   const base = normalized.slice(normalized.lastIndexOf('/') + 1);
 
@@ -368,6 +442,14 @@ export function isInWriteSet(filePath: string, writes: string[]): boolean {
     if (!pattern) continue;
     if (pattern.includes('*') || pattern.includes('?')) {
       if (globToRegExp(pattern).test(normalized)) return true;
+      // glob + 裸文件名：核实 glob 覆盖的目录里确实有同名文件（ZD-020）
+      //
+      // 只对**裸文件名**（不含目录分隔符）做这个回退 ——
+      // 带路径的写法走上面的正则判定，语义精确；
+      // 裸文件名（「opus.cpp」）本身信息不足，才需要回到文件系统里核实。
+      if (!normalized.includes('/') && globCoversBasename(pattern, normalized, projectRoot)) {
+        return true;
+      }
       continue;
     }
     const dir = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern;
@@ -436,12 +518,13 @@ export interface WriteSetCoverageResult {
 export function evaluateWriteSetCoverage(
   mentioned: string[],
   writes: string[],
+  projectRoot: string = process.cwd(),
 ): WriteSetCoverageResult {
   const uncovered: string[] = [];
   const extra: string[] = [];
 
   for (const path of mentioned) {
-    if (!isInWriteSet(path, writes)) {
+    if (!isInWriteSet(path, writes, projectRoot)) {
       uncovered.push(path);
     }
   }
