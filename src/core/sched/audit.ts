@@ -256,6 +256,73 @@ export function isSubmoduleOnlyDirty(repoRoot: string, path: string): boolean {
   }
 }
 
+/**
+ * 判断一个「脏」路径是不是**submodule 指针与 index 记录不一致**。
+ *
+ * 病灶（实测于 nimrtc-v14 v1-audio-p2 合并，2026-11-21）：
+ *
+ *   版本工作目录 `.zelto/version-worktrees/v1` 里，
+ *   `git status --porcelain` 报 11 个 ` M src/third_party/<x>`，
+ *   合并守卫判成「目标工作区有未提交改动」→ **合并被拦下**。
+ *
+ *   但那 11 条**不是人改的代码**：
+ *     - index 里记录的 gitlink 是 `22244de5`（version/v1 分支上的旧指针）
+ *     - 而工作区里那个 submodule **实际 checkout 的是** `acdb9e26`
+ *       （主仓工作区当前在的那个 commit）
+ *
+ *   也就是说：**主仓工作区里 submodule 被切过 commit**，
+ *   worktree 建出来时继承了这个状态。`alignSubmodulesToMainRepo`
+ *   本该把它对齐回 index 记录的指针，但它 `checkout --force` 失败了
+ *   —— 目标 commit 的对象**不在本地**（`--no-fetch` 不触网，C3 要求）。
+ *
+ *   判据为什么重要：合并**只碰待合分支改过的路径**
+ *   （`git diff version/v1 slice/v1-audio-p2` 里根本没有 `src/third_party`）。
+ *   工作区里 submodule 的指针状态与这次合并**无关** ——
+ *   拦住它等于「因为仓库里有一处与本次无关的不一致，就把这次合并也拦下」。
+ *
+ * 判据：
+ *   1. 该路径在 index 里是 gitlink（mode 160000）→ 确实是 submodule；
+ *   2. 工作区里那个 submodule 实际 checkout 的 commit 与 index 记录的不一致
+ *      （含「工作区里根本没有 .git、不是仓库」这种更明显的错位）。
+ *
+ * 方向：**只豁免「指针错位」这一种形态**。
+ * 「submodule 内部有未提交改动」（`-dirty`）由 `isSubmoduleOnlyDirty` 管。
+ * 两者都不豁免「人真的改了 submodule 指向的源码」—— 那种情况
+ * `git diff` 会报出具体的文件，不是指针错位。
+ *
+ * @param repoRoot 仓库根（版本工作目录或主仓）
+ * @param path 相对仓库根的路径（正斜杠）
+ */
+export function isSubmodulePointerMismatch(repoRoot: string, path: string): boolean {
+  try {
+    // index 里记的 gitlink
+    const recorded = execFileSync(
+      'git',
+      ['ls-files', '-s', '--', path],
+      { cwd: repoRoot, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+    ).trim();
+    const match = recorded.match(/^160000 ([0-9a-f]{40})/);
+    if (!match) return false; // 不是 gitlink → 不是 submodule
+    const target = match[1];
+
+    // 工作区里那个 submodule 实际 checkout 的 commit
+    const subDir = join(repoRoot, path);
+    if (!existsSync(subDir)) return false;
+    const head = execFileSync(
+      'git',
+      ['rev-parse', 'HEAD'],
+      { cwd: subDir, encoding: 'utf-8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+    ).trim();
+    if (!/^[0-9a-f]{40}$/.test(head)) return false;
+
+    return head !== target;
+  } catch {
+    // 读不出来 → 保守判成「不是指针错位」→ 维持拦截。
+    // 误报（拦住一次本来能合的）比漏报（盖掉人的真实改动）便宜。
+    return false;
+  }
+}
+
 /** 计算文件内容哈希（`sha256:<hex>`）；文件不存在时返回 null。 */
 export function hashFile(path: string): string | null {
   try {

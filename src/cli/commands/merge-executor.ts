@@ -14,7 +14,7 @@ import {
   isZeltoManagedSpecPath,
   isZeltoStatePath,
 } from '../../core/project/managed-paths.js';
-import { parsePorcelainStatus, isSubmoduleOnlyDirty } from '../../core/sched/audit.js';
+import { parsePorcelainStatus, isSubmoduleOnlyDirty, isSubmodulePointerMismatch } from '../../core/sched/audit.js';
 import { clearUntrackedManagedSpecs } from '../../core/project/untracked-specs.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import {
@@ -406,6 +406,7 @@ export async function executeMergePlan(
     const managedSkeletons: string[] = [];
     const managedState: string[] = [];
     const submoduleDirtyOnly: string[] = [];
+    const submodulePointerMismatch: string[] = [];
     // 待合分支（合并会碰到的来源）—— 用来判断 zelto 状态文件会不会被覆盖
     //
     // ADR-071：**空操作切片没有分支** —— 它的产物本来就在目标分支上，
@@ -437,6 +438,16 @@ export async function executeMergePlan(
         // 弄脏，主仓 gitlink 指针一模一样 —— 守卫判成「工作区不干净」→
         // **每一片都合不进去**。这不是「人改了代码还没提交」，不该拦。
         submoduleDirtyOnly.push(entry);
+      } else if (isSubmodulePointerMismatch(targetDir, path)) {
+        // submodule 的**指针**与 index 记录不一致（ZD-021）→ 也不算脏。
+        //
+        // 实测（nimrtc-v14 v1-audio-p2 合并，2026-11-21）：
+        //   版本工作目录里 11 个 submodule 全报「未提交改动」，合并被拦下。
+        //   但那 11 条是**主仓工作区里 submodule 被切过 commit** 继承下来的状态，
+        //   而这次合并**根本不碰 `src/third_party`**（待合分支没改那些路径）。
+        //
+        // 拦住它 = 「因为仓库里有一处与本次无关的不一致，把这次合并也拦下」。
+        submodulePointerMismatch.push(entry);
       } else {
         dirty.push(entry);
       }
@@ -464,6 +475,12 @@ export async function executeMergePlan(
       log(`  ℹ️  ${submoduleDirtyOnly.length} 个 submodule 只有内部脏标记（指针未变，不影响合并）：`);
       for (const m of submoduleDirtyOnly.slice(0, 5)) log(`     ${m}`);
       if (submoduleDirtyOnly.length > 5) log('     …');
+    }
+
+    if (submodulePointerMismatch.length > 0) {
+      log(`  ℹ️  ${submodulePointerMismatch.length} 个 submodule 的指针与 index 记录不一致（与本次合并无关，不影响合并）：`);
+      for (const m of submodulePointerMismatch.slice(0, 5)) log(`     ${m}`);
+      if (submodulePointerMismatch.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {

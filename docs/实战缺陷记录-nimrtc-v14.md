@@ -635,6 +635,77 @@ glob 范围外的 `engine_media.cpp` / `CHANGELOG.md` 仍必须报未覆盖
 
 ---
 
+## ZD-021 submodule 指针错位把合并拦下，而那次合并根本不碰那些路径
+
+**场景**：nimrtc-v14 的 `v1-audio-p2` 切片签字通过后跑 `zelto merge v1-audio-p2`：
+
+```
+合并目标：version/v1（工作目录 .zelto\version-worktrees\v1）
+  ⚠️  目标工作区有未提交改动，已跳过自动合并
+     M src/third_party/googletest
+     M src/third_party/libopus/src
+     M src/third_party/libsamplerate/src
+     M src/third_party/libsrtp/src
+     M src/third_party/libyuv/src
+     M src/third_party/msquic
+     …（11 项）
+Merge aborted — 目标工作区有未提交改动（11 项），已跳过合并.
+```
+
+那 11 条**不是人改的代码**。
+
+**根因**：submodule 的**指针**与 index 记录不一致。
+
+- index 里记的 gitlink 是 `22244de5`（`version/v1` 分支上的旧指针）；
+- 而版本工作目录里那个 submodule **实际 checkout 的是** `acdb9e26`
+  （主仓工作区当前在的那个 commit）。
+
+来源是**主仓工作区里 submodule 被切过 commit**，worktree 建出来时继承了这个状态。
+`alignSubmodulesToMainRepo` 本该把它对齐回 index 记录的指针，
+但它的 `checkout --force` 失败了 —— 目标 commit 的对象**不在本地**
+（`--no-fetch` 不触网，这是 C3 要求的正确行为）。
+
+已有的 `isSubmoduleOnlyDirty` 只处理**一种**形态：
+「指针没变、只是 submodule 内部有未提交改动」（`-dirty` 后缀，D-29 修的）。
+本条是**另一种**形态：指针本身就不一样。守卫认不出来 → 判成「未提交改动」。
+
+**后果**：
+
+- 这次合并**根本不碰 `src/third_party`** ——
+  `git diff version/v1 slice/v1-audio-p2` 里那些路径一个都没出现
+  （待合分支只改了 `src/engine/src/`、`src/modules/opus/`、`src/modules/audio_rx/`、
+  `src/plugins/include/`、`specs/`、`tests/acceptance/`）。
+- 拦住它 = 「因为仓库里有一处与本次无关的不一致，把这次合并也拦下」。
+  人被逼着去 `git commit` 或 `git stash` 那些 vendor 路径 ——
+  而那要求把 submodule 指针**提交进版本分支**，等于把主仓工作区的
+  临时状态固化成历史。
+
+**修复**：已修（2026-11-21）。新增 `core/sched/audit.ts` 的
+`isSubmodulePointerMismatch(repoRoot, path)`，判据两条：
+
+1. 该路径在 index 里是 gitlink（mode `160000`）→ 确实是 submodule；
+2. 工作区里那个 submodule 实际 checkout 的 commit 与 index 记录的不一致。
+
+合并守卫新增一条通道 `submodulePointerMismatch`，输出为
+「ℹ️ N 个 submodule 的指针与 index 记录不一致（与本次合并无关，不影响合并）」。
+
+**方向**：只豁免「指针错位」这一种形态。
+「人真的改了 submodule 指向的源码」不在此列 —— 那种情况 `git diff`
+会报出具体文件，不是指针错位。「submodule 内部有未提交改动」仍由
+`isSubmoduleOnlyDirty` 管。读不出来（git 调用失败）→ 保守判成「不是错位」
+→ 维持拦截（误报比漏报便宜）。
+
+**回归测试**：`tests/zd021-submodule-pointer-mismatch.test.ts`，4 个用例：
+- 指针错位 → 判成「错位」（豁免）
+- 指针一致 → 不判成错位（由 `-dirty` 通道管）
+- 普通文件 → 不判成错位（真实改动必须拦）
+- 不存在的路径 → 不判成错位
+
+**修复后的验证**：`zelto merge v1-audio-p2` 成功 fast-forward 合入 `version/v1`，
+输出 11 条「指针错位（不影响合并）」的提示，worktree 与切片分支被清理。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
