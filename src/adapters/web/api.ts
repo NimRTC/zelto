@@ -1123,7 +1123,10 @@ export class WebApi {
       };
     }
 
-    const launch = await launchRun(this.repoRoot, sliceId, options);
+    const launch = await launchRun(this.repoRoot, sliceId, {
+      ...options,
+      ...(this.launchTimeoutMs() !== undefined ? { launchTimeoutMs: this.launchTimeoutMs() } : {}),
+    });
     if (!launch.ok) {
       return { ok: false, reason: launch.reason ?? '发起运行失败' };
     }
@@ -1202,6 +1205,25 @@ export class WebApi {
       // 读不到配置 —— 用默认值
     }
     return 1;
+  }
+
+  /**
+   * 拉起 `zelto run --detach` 的等待上限（毫秒）。
+   *
+   * 人可以在 `.zelto/config.yaml` 的 `web.launchTimeoutMs` 里调。
+   * 默认见 `DEFAULT_LAUNCH_TIMEOUT_MS`（2 分钟）。
+   */
+  private launchTimeoutMs(): number | undefined {
+    try {
+      const config = loadConfigAt(this.repoRoot);
+      const raw = config.web?.launchTimeoutMs;
+      if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 1000) {
+        return Math.floor(raw);
+      }
+    } catch {
+      // 读不到配置 —— 用默认值
+    }
+    return undefined;
   }
 }
 

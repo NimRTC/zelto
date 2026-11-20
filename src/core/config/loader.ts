@@ -76,6 +76,20 @@ export interface ZeltoConfig {
   web?: {
     /** 同时在跑的 detached 任务数上限（默认 1） */
     maxConcurrentRuns?: number;
+    /**
+     * 拉起 `zelto run --detach` 的等待上限（毫秒，默认 120000）。
+     *
+     * 这一段等的是 **CLI 的「准入与准备」** —— 解析写集、建 worktree、
+     * 同步 submodule、拉起监督进程。**agent 本身不在里面**
+     * （agent 跑在独立进程里，见 ADR-086 §3）。
+     *
+     * 原来的 30 秒是个**没有依据的魔法数字**：worktree 准备在
+     * 含 submodule 的工程上实测要 127 秒（nimrtc v1.4，2026-11-20），
+     * 于是「正常开跑」被误判成「超时失败」，而实际上一个 agent 都没起。
+     *
+     * 2 分钟给准备阶段留足余量；agent 的运行是异步的，不占这个预算。
+     */
+    launchTimeoutMs?: number;
   };
   llm?: { provider: string; apiKey?: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
   /** External project configuration for cross-repo workflows.
@@ -321,6 +335,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   // web: 段（ADR-086 §7）—— 驾驶舱的同时在跑任务数上限
   let inWebSection = false;
   let webMaxConcurrentRuns: number | undefined;
+  let webLaunchTimeoutMs: number | undefined;
   const llmPricing: Record<string, { inputPer1k: number; outputPer1k: number }> = {};
   let targetProjectPath = '';
   let targetProjectSpecDir = '';
@@ -633,6 +648,13 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       continue;
     }
 
+    if (inWebSection && trimmed.startsWith('launchTimeoutMs:')) {
+      const raw = Number.parseInt(trimmed.slice(16).trim(), 10);
+      // 小于 1000 视为无效 —— 太短的开跑预算必然误报超时。
+      webLaunchTimeoutMs = Number.isFinite(raw) && raw >= 1000 ? raw : undefined;
+      continue;
+    }
+
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
@@ -840,7 +862,13 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       }
     : undefined;
 
-  const web = webMaxConcurrentRuns !== undefined ? { maxConcurrentRuns: webMaxConcurrentRuns } : undefined;
+  const web =
+    webMaxConcurrentRuns !== undefined || webLaunchTimeoutMs !== undefined
+      ? {
+          ...(webMaxConcurrentRuns !== undefined ? { maxConcurrentRuns: webMaxConcurrentRuns } : {}),
+          ...(webLaunchTimeoutMs !== undefined ? { launchTimeoutMs: webLaunchTimeoutMs } : {}),
+        }
+      : undefined;
 
   return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web
     ? {

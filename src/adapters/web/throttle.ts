@@ -21,6 +21,19 @@ import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * 拉起 `zelto run --detach` 的等待上限（毫秒）。
+ *
+ * 等的是 CLI 的**「准入与准备」**：解析写集、建 worktree、同步 submodule、
+ * 拉起监督进程。**agent 本身不在这里**（它跑在独立进程里，ADR-086 §3）。
+ *
+ * 为什么是 2 分钟而不是原来的 30 秒（实测：nimrtc v1.4，2026-11-20）：
+ * 含 submodule 的工程里，worktree 准备实测 **127 秒**。30 秒的预算会把
+ * 「正常开跑」误判成「超时失败」—— 人看到的是一句「发起运行超时（30 秒）」，
+ * 而实际上一个 agent 都没起过，切片却已经卡在 `running`。
+ */
+export const DEFAULT_LAUNCH_TIMEOUT_MS = 120_000;
+
 /** 拉起 run 的结果。 */
 export interface RunLaunchResult {
   ok: boolean;
@@ -82,14 +95,19 @@ export function locateCliEntry(repoRoot: string): string | null {
  *
  * @param hotfix 是否 hotfix 模式（跳过门禁②）
  * @param confirmHotfix hotfix 的显式确认（ADR-015：hotfix 必须显式确认）
+ * @param launchTimeoutMs 等 CLI「准入与准备」的上限（毫秒）。
+ *   这一段包含建 worktree 与同步 submodule —— 实测含 submodule 的工程
+ *   要 127 秒（nimrtc v1.4，2026-11-20），所以默认值从原来的 30 秒
+ *   提到 2 分钟。**agent 的运行不在这个预算里**（它跑在独立进程里）。
  */
 export async function launchRun(
   repoRoot: string,
   sliceId: string,
-  options: { hotfix?: boolean; confirmHotfix?: boolean } = {},
+  options: { hotfix?: boolean; confirmHotfix?: boolean; launchTimeoutMs?: number } = {},
 ): Promise<RunLaunchResult> {
   const hotfix = options.hotfix === true;
   const confirmHotfix = options.confirmHotfix === true;
+  const launchTimeoutMs = options.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
 
   // ADR-015 §3.1：hotfix 跳过门禁② —— 等于放弃「签字前必须过门禁」。
   // 所以必须显式确认。Web 端要求**两个独立字段**（hotfix + confirmHotfix），
@@ -135,9 +153,14 @@ export async function launchRun(
       stderr += c.toString();
     });
 
-    // 超时上限 —— CLI 的 run 只做「准入与准备」，正常几秒内就返回。
-    // 超过 30 秒还没回来说明卡住了（多半是写集预约拿不到，
-    // 或者 worktree 创建失败）—— 那时必须告诉人，而不是一直挂着。
+    // 超时上限 —— CLI 的 run 只做「准入与准备」，agent 不在这段里。
+    //
+    // 预算不是随便定的：准备阶段包含建 worktree 与同步 submodule，
+    // 含 submodule 的工程实测要 **127 秒**（nimrtc v1.4，2026-11-20）。
+    // 原来的 30 秒会把「正常开跑」判成「超时失败」，而实际上一个
+    // agent 都没起 —— 人看到的是一句假报错，切片却卡在 `running`。
+    //
+    // 超时后必须告诉人，而不是一直挂着。
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
@@ -148,10 +171,12 @@ export async function launchRun(
       }
       resolvePromise({
         ok: false,
-        reason: '发起运行超时（30 秒）—— 请在终端里执行 zelto run 查看详情',
+        reason:
+          `发起运行超时（${Math.round(launchTimeoutMs / 1000)} 秒）—— ` +
+          '请在终端里执行 zelto run 查看详情',
         output: (stdout + stderr).trim(),
       });
-    }, 30_000);
+    }, launchTimeoutMs);
 
     child.on('close', (code) => {
       if (settled) return;
