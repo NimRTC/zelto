@@ -81,6 +81,7 @@ import { materializeRequirements, evaluateFreezeTrace } from '../../core/spec/tr
 import { freezeSlice, computeBoundaryHash } from '../../core/lifecycle/freeze.js';
 import { register } from './shared.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
+import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
@@ -290,15 +291,37 @@ async function collectWatchdogProgress(
   }
 }
 
-async function waitForExitWithWatchdog(opts: {
+/**
+ * 等 agent 结束 —— 同时盯着活进程看门狗与拉闸请求。
+ *
+ * 导出是为了可测：拉闸「在等 agent 的时候生效」这件事，
+ * 只有真的挂着一个假 adapter 才能验（源码 grep 只能证明代码在，
+ * 不能证明它真的会让等待方停下来）。
+ */
+export async function waitForExitWithWatchdog(opts: {
   sliceId: string;
   sessionId: string;
   adapter: ExecutorAdapter;
   runStartedAt: string;
   maxRetries: number;
-}): Promise<{ exitCode: number | null; watchdogReaped: boolean }> {
+  /**
+   * 拉闸通道（测试注入用）。
+   *
+   * 默认按 `.zelto/halts/` 读 —— 传进来是为了让测试能指向临时目录，
+   * 免得真去动项目根下的暂停请求。
+   */
+  haltStore?: HaltStore;
+  /** 拉闸作用域（默认用切片 id） */
+  haltScope?: string;
+}): Promise<{ exitCode: number | null; watchdogReaped: boolean; halted?: boolean; haltReason?: string }> {
   const { sliceId, sessionId, adapter, runStartedAt, maxRetries } = opts;
   const exitPromise = adapter.waitForExit(sessionId).then((code) => ({ exitCode: code, watchdogReaped: false }));
+
+  // 拉闸通道（单片前台路径）—— 见下面 setInterval 里的说明。
+  // 作用域：单片运行没有批次键，用切片 id 当自己的作用域；
+  // `scope='all'` 的全局拉闸对它同样生效（HaltStore.isHalted 的语义）。
+  const haltStore = opts.haltStore ?? new HaltStore(ZELTO_DIR);
+  const haltScope = opts.haltScope ?? sliceId;
 
   // D-55：进展探针 —— agent 每调用一次工具，hook 就往事件流写一条。
   // 有新事件 = 它还在推进 → 告诉适配器「倒计时重新开始」。
@@ -309,12 +332,48 @@ async function waitForExitWithWatchdog(opts: {
   const progress = new SliceProgressProbe(process.cwd(), sliceId);
 
   let timer: ReturnType<typeof setInterval> | null = null;
-  const watchdogPromise = new Promise<{ exitCode: number | null; watchdogReaped: boolean }>((resolve) => {
+  const watchdogPromise = new Promise<{ exitCode: number | null; watchdogReaped: boolean; halted?: boolean; haltReason?: string }>((resolve) => {
     timer = setInterval(async () => {
       // 进展探针先行 —— 它只读文件大小，不会因失败阻断看门狗。
       try {
         if (progress.poll()) adapter.markProgress?.(sessionId);
       } catch { /* 探针失败不影响看门狗判定 */ }
+
+      // ── 拉闸（halt）—— 单片前台路径也要听 ──────────────────────────
+      //
+      // 病灶（实测 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+      //   人跑 `zelto halt --reason "..."` 想让跑偏的 agent 停下，
+      //   命令回了「已拉闸」，**但 agent 照跑不误** ——
+      //   因为只有 `parallel-executor`（`run --parallel`）那条路径
+      //   调了 `haltStore.isHalted()`，单片 `zelto run <id>` 压根没读过
+      //   `.zelto/halts/`。
+      //
+      //   人以为喊停了，其实没喊停 —— 这比「喊了停不了」更糟：
+      //   人会带着「已经停了」的错觉去处理现场（比如改文件），
+      //   而 agent 还在同时改同一批文件。
+      //
+      // 修法：单片路径同样在等 agent 的间隙听拉闸。收到就停掉 agent，
+      // 现场保留（worktree / 预约都不动），切片退回 frozen。
+      const haltReq = await haltStore.isHalted(haltScope).catch(() => null);
+      if (haltReq) {
+        // **先 resolve 再 stop** —— 顺序反了的话：
+        //   `adapter.stop()` 会让 `waitForExit` 的 promise resolve，
+        //   `Promise.race` 于是抢在 watchdogPromise 之前返回 ——
+        //   拿到的就是「agent 退出了」那个结果（没有 halted 字段），
+        //   拉闸信息整个丢掉。
+        resolve({
+          exitCode: null,
+          watchdogReaped: false,
+          halted: true,
+          haltReason: haltReq.reason,
+        });
+        try {
+          await adapter.stop(sessionId);
+        } catch {
+          // agent 已经退了 —— 停不到也没关系
+        }
+        return;
+      }
 
       let action: RunWatchdogAction;
       try {
@@ -1679,6 +1738,32 @@ register('run', async (args) => {
       if (waited.watchdogReaped) {
         finalExitCode = null;
         watchdogRecorded = true;
+        break;
+      }
+
+      // ── 被拉闸打断 ──────────────────────────────────────────────────
+      //
+      // 人喊停之后：停掉 agent、现场保留（worktree / 预约都不动）、
+      // 切片退回 frozen —— 人处理完 `zelto halt --clear` 就能重跑。
+      //
+      // **不记账成失败**：这一轮不是「agent 跑废了」，是「人叫停的」。
+      // 记成失败会让人在 run 记录里看到一片红色，而真实原因是一次人为干预。
+      if (waited.halted) {
+        finalExitCode = null;
+        const reason = waited.haltReason ?? '人工拉闸';
+        const rollback = await rollbackHaltedSlice(store, events, id, {
+          reason,
+          scope: id,
+          actor: 'human',
+        });
+        await events.append(id, 'batch.halted', 'human', {
+          sliceId: id,
+          scope: id,
+          reason,
+        });
+        console.error(`\n⏸️  已拉闸：${reason}`);
+        console.error(`   状态: ${rollback.from} → ${rollback.to}（stall: human_halt）`);
+        console.error('   现场保留。处理完：zelto halt --clear → zelto resume ' + id + ' → zelto run ' + id);
         break;
       }
 

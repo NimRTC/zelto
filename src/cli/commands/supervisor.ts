@@ -392,6 +392,33 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       const waitResult = await waitForAgentExit(args, sessionId, log, adapter);
       exitCode = waitResult.exitCode;
       processAlive = waitResult.processAlive;
+
+      // ── 拉闸（halt）──────────────────────────────────────────────────
+      //
+      // 病灶（实测 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+      //   detach 路径（`zelto run` 默认走监督进程）的监督循环**只重试**，
+      //   从不读 `.zelto/halts/` —— 人喊停后，agent 被杀掉，
+      //   监督进程立刻**换个会话重启它**，一轮接一轮永不停止。
+      //   实测：人杀掉 agent 三次，监督进程就重启三次。
+      //
+      //   修法：每一轮开跑前先问一次「有没有人喊停」。
+      //   喊停就**不再重试**，把现场交回给人。
+      const { HaltStore } = await import('../../core/halt/index.js');
+      // HaltStore 的 baseDir 是 `.zelto` 本身（它自己再拼 `halts/`）——
+      // 传项目根会读成 `<root>/halts/`，读不到任何东西。
+      const haltStore = new HaltStore(join(args.projectRoot, '.zelto'));
+      const haltReq = await haltStore.isHalted(args.sliceId).catch(() => null);
+      if (haltReq) {
+        log(`已拉闸（${haltReq.reason}）—— 不再重试，现场交回给人`);
+        await events.append(args.sliceId, 'batch.halted', 'human', {
+          sliceId: args.sliceId,
+          scope: args.sliceId,
+          reason: haltReq.reason,
+        });
+        exitCode = null;
+        break;
+      }
+
       if (exitCode === 0) break;
 
       // D-59：**结果不明 ≠ 失败** → 不重试。
