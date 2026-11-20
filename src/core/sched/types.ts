@@ -3,6 +3,8 @@
 // See docs/adr-012-parallel-coordination.md
 
 import type { PolicyRule } from '../policy/types.js';
+import type { GateFeedback } from '../gate/feedback.js';
+export type { GateFeedback } from '../gate/feedback.js';
 export type { DepGraphNode, CycleInfo } from './depgraph.js';
 export type { ArtifactMapping, ArtifactConflict, ArtifactCategory, ConflictSeverity } from './artifact.js';
 export type { MergeStrategy, MergePhase, MergeConflict, MergePlan } from './merge.js';
@@ -46,6 +48,17 @@ export interface ConstraintBundle {
    * 门禁会用哪一套。
    */
   gateCommands?: GateCommandSummary[];
+  /**
+   * 上一轮门禁/验收的失败反馈（ZD-013）。
+   *
+   * **为什么需要**：重跑的 agent 拿不到「上次为什么失败」——
+   * 它只能看到规格、写集、门禁命令。上一轮已经做对的部分它不知道，
+   * 上一轮错在哪它更不知道。于是它可能把对的东西改错。
+   *
+   * 这里放的是**原文**（门禁/验收的真实输出），不是人转述的版本 ——
+   * 人转述会把关键细节转掉。
+   */
+  gateFeedback?: GateFeedback[];
 }
 
 /** 门禁命令摘要（只给 agent 看，不参与任何判定） */

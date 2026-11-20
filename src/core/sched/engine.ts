@@ -5,10 +5,11 @@
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
-import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary } from './types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateFeedback } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
+import { readGateFeedback, renderGateFeedback } from '../gate/feedback.js';
 
 /**
  * 找出写集里那个「全是 test.todo 的验收骨架」。
@@ -192,6 +193,7 @@ export class Scheduler {
     slice: SliceData,
     affinity?: AffinityContext | null,
     gateCommands?: GateCommandSummary[],
+    gateFeedback?: GateFeedback[],
   ): ConstraintBundle {
     // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
     const relevantRules = this.policy.rules.filter((r) => {
@@ -213,10 +215,25 @@ export class Scheduler {
         '.cursor/rules/**',
       ],
       policyRules: relevantRules,
-      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands),
+      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands, gateFeedback),
       affinity: affinity ?? null,
       ...(gateCommands && gateCommands.length > 0 ? { gateCommands } : {}),
+      ...(gateFeedback && gateFeedback.length > 0 ? { gateFeedback } : {}),
     };
+  }
+
+  /**
+   * 读上一轮的门禁/验收失败（ZD-013）。
+   *
+   * 给重跑的 agent 用的 —— 它需要知道「上次为什么失败」。
+   */
+  async readFeedbackFor(sliceId: string): Promise<GateFeedback[]> {
+    try {
+      return await readGateFeedback(this.events, sliceId);
+    } catch {
+      // 读不到反馈不是阻断 —— agent 只是少了一段上下文
+      return [];
+    }
   }
 
   /**
@@ -461,6 +478,7 @@ export class Scheduler {
     slice: SliceData,
     affinity?: AffinityContext | null,
     gateCommands?: GateCommandSummary[],
+    gateFeedback?: GateFeedback[],
   ): string {
     const lines = [
       `You are implementing slice "${slice.id}": ${slice.title}`,
@@ -522,6 +540,12 @@ export class Scheduler {
         `makes the gate fail for reasons that have nothing to do with your code.`,
         '',
       );
+    }
+
+    // 上一轮的失败证据（ZD-013）—— 放在门禁命令**之后**：
+    // agent 先知道「门禁会怎么验」，再知道「上次哪里没验过」。
+    if (gateFeedback && gateFeedback.length > 0) {
+      lines.push(...renderGateFeedback(gateFeedback));
     }
 
     // 亲和上下文只是只读建议（C7）：前片做了什么、供参考，不参与任何判定

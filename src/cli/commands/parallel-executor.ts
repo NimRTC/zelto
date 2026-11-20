@@ -473,7 +473,12 @@ export async function executeSlicesParallel(
       affinityGroup !== null
         ? await scheduler.buildAffinityContext(st.id, affinityGroup, affinityPrev)
         : null;
-    const bundle = scheduler.buildConstraints(slice, affinityCtx, gateCommandsForSlice(slice));
+    const bundle = scheduler.buildConstraints(
+      slice,
+      affinityCtx,
+      gateCommandsForSlice(slice),
+      await scheduler.readFeedbackFor(st.id),
+    );
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
 

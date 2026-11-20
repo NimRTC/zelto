@@ -1418,7 +1418,12 @@ register('run', async (args) => {
     const isDryRun = args.includes('--dry-run');
 
     if (isDryRun) {
-      const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
+      const bundle = scheduler.buildConstraints(
+        slice,
+        null,
+        gateCommandsForSlice(slice),
+        await scheduler.readFeedbackFor(id),
+      );
       if (isJson) {
         console.log(JSON.stringify({
           sliceId: id, decision: 'admitted', dryRun: true,
@@ -2145,7 +2150,12 @@ register('start', async (args) => {
     await scheduler.startRun(id);
 
     const slice = await store.read(id);
-    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
+    const bundle = scheduler.buildConstraints(
+      slice,
+      null,
+      gateCommandsForSlice(slice),
+      await scheduler.readFeedbackFor(id),
+    );
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     const { writeFileSync: write } = await import('node:fs');
     write(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
