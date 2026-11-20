@@ -103,9 +103,24 @@ const KNOWN_EXTENSIONS = [
  * 而 D-4 的判据正是「规格点名了但写集没覆盖」——
  * 认不出这两个文件，这道闸门就在最该拦的地方漏了。
  */
+/**
+ * 无扩展名的常见文件 —— 靠**文件名**识别。
+ *
+ * 这些文件没有扩展名，靠扩展名白名单永远认不出来：
+ * `Makefile`、`Dockerfile`、`CMakeLists.txt`（这个有扩展名但不在常见清单里）、
+ * `LICENSE`、`README`。
+ *
+ * **为什么没有 `install`**（ZD-006）：`install` 既是文件名的常见写法，
+ * 也是 shell 命令的常见动词 —— `apt-get install coturn` 里的 `install`
+ * 会被当成「规格提到了文件 install」而报「它不在写集里」。
+ * 规格里出现 `apt-get install`、`make install`、`npm install` 是家常便饭，
+ * 而一个叫 `install` 的无扩展名文件极少（真要写也会带路径）。
+ * 误报比漏报更糟（AGENTS.md：「闸门误报会把人引去改正确的规格」），
+ * 所以这里不收 `install`。
+ */
 const KNOWN_EXTENSIONLESS_FILENAMES = [
   'makefile', 'gnumakefile', 'dockerfile', 'license', 'licence', 'readme', 'changelog',
-  'contributing', 'codeowners', 'notice', 'authors', 'copying', 'install', 'news',
+  'contributing', 'codeowners', 'notice', 'authors', 'copying', 'news',
 ];
 
 /**
@@ -133,6 +148,13 @@ const KNOWN_EXTENSIONLESS_FILENAMES = [
  */
 function looksLikePath(text: string): boolean {
   if (!text) return false;
+
+  // glob 模式就是**路径模式**（ZD-006）：
+  // 规格「范围」章节里写 `- examples/turn-server/**` 是最常见的写法 ——
+  // 而 `**` 不是已知扩展名、也不是已知文件名，于是整条被丢掉，
+  // 「范围」解析结果为空，写集兜底到目录探测（错的）。
+  // 判据：含通配符 → 是路径模式。
+  if (text.includes('*') || text.includes('?')) return true;
 
   // 末段单独判定
   const segments = text.split('/').filter((s) => s.length > 0);
@@ -250,9 +272,15 @@ export function parseMentionedPaths(content: string): string[] {
   const backticked = /`([^`\n]+)`/g;
   let m: RegExpExecArray | null;
   while ((m = backticked.exec(content)) !== null) {
-    for (const candidate of expandBraces(m[1].trim())) {
-      if (!looksLikePath(candidate)) continue;
-      const normalized = normalizeMentionedPath(candidate);
+    const candidate = m[1].trim();
+    // 反引号里是**命令行 / 短语**而不是路径（ZD-006）：
+    // 「运行 `node --test tests/acceptance/x/acceptance.test.cjs`」
+    // 是一整条命令，当成路径会报「它不在写集里」。
+    // 判据：含空白 → 不是路径（路径不该有空格）。
+    if (/\s/.test(candidate)) continue;
+    for (const expanded of expandBraces(candidate)) {
+      if (!looksLikePath(expanded)) continue;
+      const normalized = normalizeMentionedPath(expanded);
       if (!normalized) continue;
       if (seen.has(normalized)) continue;
       seen.add(normalized);

@@ -348,9 +348,21 @@ export function findUnproducedWriteSetPaths(writes: string[], changedPaths: stri
   return missing;
 }
 
-/** 写集里某个具体路径是否被声明（用于「这个文件是不是本片该产的」判定） */
+/**
+ * 写集里某个具体路径是否被声明（用于「这个文件是不是本片该产的」判定）。
+ *
+ * **basename 匹配**（ZD-006）：规格里常常只写文件名不写全路径
+ * （「`acceptance.test.cjs` 只读取一个 TURN URI」），
+ * 而写集里是完整路径（`tests/acceptance/v1-n5-turn-server/acceptance.test.cjs`）。
+ * 精确比较会判成「没覆盖」→ 冻结被拦，而规格**完全没问题**。
+ *
+ * 判据：写集里存在某个**非 glob** 条目，其 basename 与被提及路径的 basename 相同
+ * → 算覆盖。glob 条目（`tests/**`）本来就覆盖一切，不受影响。
+ */
 export function isInWriteSet(filePath: string, writes: string[]): boolean {
   const normalized = toPosix(filePath);
+  const base = normalized.slice(normalized.lastIndexOf('/') + 1);
+
   for (const raw of writes) {
     const pattern = toPosix(raw.trim());
     if (!pattern) continue;
@@ -360,6 +372,10 @@ export function isInWriteSet(filePath: string, writes: string[]): boolean {
     }
     const dir = pattern.endsWith('/') ? pattern.slice(0, -1) : pattern;
     if (normalized === dir || normalized.startsWith(`${dir}/`)) return true;
+
+    // basename 匹配：规格只写文件名时也算覆盖
+    const patternBase = pattern.slice(pattern.lastIndexOf('/') + 1);
+    if (patternBase && patternBase === base) return true;
   }
   return false;
 }

@@ -92,6 +92,21 @@ const DOC_EXTENSIONS = new Set(['md', 'mdx', 'txt', 'rst', 'adoc']);
 
 /** 候选路径：反引号包裹的，或带扩展名的裸路径。 */
 const BACKTICKED = /`([^`\n]+)`/g;
+
+/**
+ * 反引号里的内容**不是**路径 —— 命令行、选项、标识符等。
+ *
+ * 病灶（ZD-006）：规格里写
+ * 「验证方式：运行 `node --test tests/acceptance/x/acceptance.test.cjs`」
+ * —— 反引号里是一整条**命令**，不是路径。把它当路径 → 报
+ * 「规格提到 node --test tests/... 但它不在写集里」。
+ *
+ * 判据：反引号内容里含**空白**就是命令/短语，不是路径。
+ * 路径里不该有空格（真要有，`\ ` 转义或 `%20`）。
+ */
+function looksLikeCommand(candidate: string): boolean {
+  return /\s/.test(candidate.trim());
+}
 // 路径段允许非 ASCII 字母 —— 中文目录名（`docs/其它.md`）是真实存在的，
 // 只认 ASCII 会让含中文的路径既不被识别为「提到」也不被识别为「引用」。
 const INLINE_PATH = /(?<![/:\\\w.])([\p{L}\p{N}_.-]+(?:\/[\p{L}\p{N}_.-]+)*\.[A-Za-z0-9]{1,6})(?![A-Za-z0-9_.-])/gu;
@@ -227,6 +242,8 @@ function candidatesWithIndex(line: string): { candidate: string; index: number }
   let m: RegExpExecArray | null;
   while ((m = BACKTICKED.exec(line)) !== null) {
     const candidate = m[1].trim();
+    // 命令行 / 短语不是路径（ZD-006）
+    if (looksLikeCommand(candidate)) continue;
     if (seen.has(candidate)) continue;
     seen.add(candidate);
     out.push({ candidate, index: m.index });
