@@ -312,9 +312,18 @@ export function validateSliceIdArg(
 /**
  * Shared worktree manager rooted at the current working directory.
  * Path convention: `.zelto/worktrees/<sliceId>`, branch `slice/<sliceId>`.
+ *
+ * **是单例** —— 不是为了省内存，而是为了让 `submoduleFailures` 这类
+ * 「上一次同步的结果」能被读得到：每次调用都 new 一个的话，
+ * 写进去的失败原因随实例一起没了，调用方永远读到空列表。
  */
+let sharedWorktreeManager: WorktreeManager | null = null;
+
 export function worktreeManager(): WorktreeManager {
-  return new WorktreeManager(process.cwd());
+  if (!sharedWorktreeManager) {
+    sharedWorktreeManager = new WorktreeManager(process.cwd());
+  }
+  return sharedWorktreeManager;
 }
 
 /**

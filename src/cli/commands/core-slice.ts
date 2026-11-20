@@ -1431,12 +1431,41 @@ register('run', async (args) => {
         const wtBundleDir = join(worktree.path, ZELTO_DIR);
         if (!existsSync(wtBundleDir)) mkdirSync(wtBundleDir, { recursive: true });
         writeFileSync(join(wtBundleDir, `${id}-bundle.json`), JSON.stringify(bundle, null, 2), 'utf-8');
+
+        // submodule 没同步上 —— 必须**说出来**。
+        //
+        // 为什么不能静默：同步失败原本被 `catch {}` 吞掉，于是「worktree 里
+        // 少了 12 个 vendor」完全不显形 —— 等到门禁报「找不到 googletest」，
+        // 人看到的是源码缺失，跟「隔离目录没同步 vendor」毫无关系
+        // （ADR-044 记的就是这个病灶）。现在把原因直接摆出来。
+        const failures = worktreeManager().submoduleFailures;
+        if (failures.length > 0) {
+          console.error(`  ⚠️  ${failures.length} 个 submodule 没能同步到 worktree：`);
+          for (const f of failures.slice(0, 8)) {
+            console.error(`     · ${f.path}：${f.reason}`);
+          }
+          if (failures.length > 8) {
+            console.error(`     … 还有 ${failures.length - 8} 个`);
+          }
+          console.error('     这些依赖在 worktree 里可能是空的 —— 门禁可能会因此失败。');
+        }
       } else {
         console.log(`  Worktree:      (none — not a git repository, running in current directory)`);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`  ❌ 无法创建隔离 worktree: ${msg}`);
+      // 切片已经在 `startRun` 时被推到 `running` —— 但 agent 还没起。
+      // 不退回 `frozen` 的话，这片就**没人能救**：
+      //   - `zelto run` 拒绝跑（准入只认 frozen / completed）
+      //   - `zelto merge` 不收它（没签字）
+      //   - `zelto stall --reap` 看不见它（连会话文件都没写，
+      //     `classifyLiveness(null)` 返回 finished → 不算空壳）
+      //   - 唯一出路是 `zelto abandon` —— 整个切片作废，规格得重写
+      //
+      // 也就是「环境抖一下，切片就废了」（D-64 同款病灶）。
+      // 这里退回 frozen：这一轮不算数，但可以再跑。
+      await revertRunAbortedBeforeStart(id, { reason: `无法创建隔离 worktree: ${msg}` });
       return 1;
     }
 

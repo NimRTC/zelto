@@ -22,6 +22,17 @@ export const WORKTREE_BASE_DIR = join('.zelto', 'worktrees');
 export const VERSION_WORKTREE_BASE_DIR = join('.zelto', 'version-worktrees');
 
 /**
+ * submodule 同步的单次超时（毫秒）。
+ *
+ * 15 秒的来历（实测于 nimrtc v1.4，2026-11-20）：
+ * 本地克隆源同步 14 个 submodule 共约 **1 秒**；而 Web 驾驶舱只给
+ * `zelto run --detach` **30 秒**（`adapters/web/throttle.ts`）。
+ * 15 秒给慢盘留了足够余量，同时保证「本地缺 commit」这种异常
+ * 在总预算内**明确失败**，而不是把开跑拖到超时被杀。
+ */
+export const DEFAULT_SUBMODULE_TIMEOUT_MS = 15_000;
+
+/**
  * 工作目录的种类。
  *
  * - `slice` —— 切片的执行目录（ADR-011），`.zelto/worktrees/<sliceId>`
@@ -62,6 +73,21 @@ export interface CreateWorktreeOptions {
    * 关掉它只为了「只读审阅」这类不编译的场景。
    */
   initSubmodules?: boolean;
+
+  /**
+   * submodule 同步的**超时**（毫秒，单个 submodule）。
+   *
+   * 为什么要有：submodule 同步在「本地缺目标 commit」时会去联网 fetch，
+   * 而 fetch 可能挂住（SSH 等密码、网络不通、代理超时）。挂住 = 开跑
+   * 无限期卡住，而 Web 驾驶舱只给 30 秒（见 `adapters/web/throttle.ts`），
+   * 于是 Web 端先把 CLI 杀了，切片卡在 `running` —— 一个 agent 都没起，
+   * 人只看到一句「发起运行超时」（实测：nimrtc v1.4 演练，2026-11-20）。
+   *
+   * 默认 15 秒：本地克隆源同步 14 个 submodule 实测总共约 1 秒，
+   * 15 秒已经宽松到足以覆盖慢盘；本地没有的 commit 应该在 15 秒内
+   * **明确失败**，而不是挂到天荒地老。
+   */
+  submoduleTimeoutMs?: number;
 }
 
 export class WorktreeError extends Error {
@@ -89,8 +115,32 @@ export class WorktreeManager {
    */
   removeRetryDelayMs = 3_000;
 
+  /**
+   * submodule 同步的单次超时（毫秒）。
+   *
+   * 可被测试改小。生产值见 `DEFAULT_SUBMODULE_TIMEOUT_MS`。
+   */
+  submoduleTimeoutMsOverride: number | undefined;
+
+  /**
+   * 最近一次 submodule 同步里**失败**的条目（路径 + 原因）。
+   *
+   * 为什么要有：同步失败原本被 `catch {}` 吞掉，只留下一个 `skipped` 列表
+   * ——而那个列表在调用方也没人读。于是「worktree 里少了 12 个 vendor」
+   * 这件事**完全不显形**，等到门禁报「找不到 googletest」时，
+   * 人看到的是源码缺失，跟「隔离目录没同步 vendor」毫无关系。
+   *
+   * 现在失败原因留在这里，调用方能把它说成人话。
+   */
+  submoduleFailures: Array<{ path: string; reason: string }> = [];
+
   constructor(repoRoot: string = process.cwd()) {
     this.repoRoot = repoRoot;
+  }
+
+  /** 这次同步用哪个超时。 */
+  private submoduleTimeoutMs(): number {
+    return this.submoduleTimeoutMsOverride ?? DEFAULT_SUBMODULE_TIMEOUT_MS;
   }
 
   /**
@@ -409,6 +459,10 @@ export class WorktreeManager {
     const initialized: string[] = [];
     const skipped: string[] = [];
 
+    // 每次同步前清空 —— 这一份「上一次同步的结果」不能跨轮次残留，
+    // 否则上轮的失败会在本轮被当成新失败报出来。
+    this.submoduleFailures = [];
+
     let submodules: Array<{ name: string; path: string }> = [];
     try {
       const raw = this.git(['config', '--file', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$'], undefined, true);
@@ -472,7 +526,7 @@ export class WorktreeManager {
       }
 
       try {
-        this.git(
+        this.gitOffline(
           [
             '-c', 'protocol.file.allow=always',
             // 把克隆源指向主仓里已存在的 module git 目录：
@@ -500,15 +554,26 @@ export class WorktreeManager {
             //
             // 嵌套 submodule 由 `syncNestedSubmodules` 处理 ——
             // 从主仓的 module git 目录**本地克隆**（不触网）。
-            'submodule', 'update', '--init', sub.path,
+            //
+            // ── `--no-fetch` 是这里的关键 ──────────────────────────────
+            // 没有它，git 在「本地缺目标 commit」时会去 fetch 远程
+            // （`.gitmodules` 里写的公网 URL）—— 违反 C3，且会挂住。
+            // 加上它：本地有就用本地的，本地没有就**如实失败**，
+            // 由调用方记成 skipped（并给出可执行的修法）。
+            'submodule', 'update', '--init', '--no-fetch', sub.path,
           ],
-          undefined,
-          false,
           worktreePath,
+          this.submoduleTimeoutMs(),
         );
         initialized.push(sub.path);
-      } catch {
+      } catch (err) {
         skipped.push(sub.path);
+        // 记下原因 —— 「本地缺这个 commit」和「根本没有本地副本」是两种
+        // 完全不同的问题，修法也不同。人不该只看到「少了个 vendor」。
+        this.submoduleFailures.push({
+          path: sub.path,
+          reason: describeSubmoduleFailure(err),
+        });
       }
     }
 
@@ -598,7 +663,7 @@ export class WorktreeManager {
         if (!existsSync(topDest)) continue;
 
         try {
-          this.git(
+          this.gitOffline(
             [
               // ── `-c` 必须在子命令**之前** ──────────────────────────
               // 放在 `submodule update --init` 之后 git 会直接报 usage 错误
@@ -612,11 +677,11 @@ export class WorktreeManager {
               // 配置键用的是嵌套层 `.gitmodules` 的 **section 名**
               // （msquic 的是 `submodules/googletest`），不是 path。
               '-c', `submodule.${sub.name}.url=${moduleGitDir}`,
-              'submodule', 'update', '--init', sub.path,
+              // `--no-fetch`：嵌套层本地缺 commit 时不许去联网（见 gitOffline 的说明）
+              'submodule', 'update', '--init', '--no-fetch', sub.path,
             ],
-            undefined,
-            false,
             topDest,
+            this.submoduleTimeoutMs(),
           );
         } catch {
           // 克隆失败不阻断 —— 门禁会因缺依赖报错，信息更明确
@@ -1382,6 +1447,54 @@ export class WorktreeManager {
       throw new WorktreeError(`${errorMessage ?? 'git 命令失败'}: ${detail}`, args.join(' '), detail);
     }
   }
+
+  /**
+   * 跑一条**离线**的 git 命令 —— 绝不触网，且有硬超时。
+   *
+   * 为什么需要（C3 + 实测于 nimrtc v1.4，2026-11-20）：
+   *
+   * `git submodule update --init` 在「本地缺目标 commit」时会去 **fetch**。
+   * fetch 的对象是 `.gitmodules` 里写的远程 URL —— 那是**公网**。
+   * 于是判定路径（worktree 准备）居然在联网，直接违反 C3
+   * 「`core/` 不触网、判定只读文件、纯计算」。
+   *
+   * 更糟的是**挂住**而不是失败：
+   *   - SSH 通向公网仓库但没配 key → 一直等确认/等密码；
+   *   - HTTPS 极慢 → 几十秒才回来；
+   *   - 全局 `url.<x>.insteadOf` 把 https 改写成 ssh → 变成第一种。
+   * 实测：14 个 submodule 串行同步耗时 **127 秒**，其中两个各挂满 60 秒。
+   * 而 Web 驾驶舱只给 `zelto run --detach` 30 秒（`adapters/web/throttle.ts`），
+   * 于是 Web 端先杀 CLI 进程 → 切片卡在 `running` → 人只看到
+   * 「发起运行超时（30 秒）」，而一个 agent 都没起过。
+   *
+   * 所以这里做三件事：
+   *   1. **禁网**：`GIT_TERMINAL_PROMPT=0`（不等密码）+ `GIT_ASKPASS`/`SSH_ASKPASS`
+   *      置空 + `GIT_SSH_COMMAND` 带 `BatchMode=yes`（不等确认）——
+   *      这些让任何一次触网尝试**立刻失败**而不是挂住；
+   *   2. **限时**：`submoduleTimeoutMs`（默认 15 秒）—— 挂住也只挂到这里；
+   *   3. **`--no-fetch`**：明确告诉 git 不要去取 —— 本地有就用本地的，
+   *      本地没有就**如实失败**（由调用方记成 skipped）。
+   *
+   * 本地有目标 commit 时，这条路径实测 14 个 submodule 共约 1 秒。
+   */
+  private gitOffline(args: string[], cwd: string, timeoutMs: number): string {
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf-8',
+      timeout: timeoutMs,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        // 不弹密码提示（没有终端时它会挂住等输入）
+        GIT_TERMINAL_PROMPT: '0',
+        // 不弹 GUI 凭据框（Windows 上会挂住等点击）
+        GIT_ASKPASS: '',
+        SSH_ASKPASS: '',
+        // SSH 一律非交互（BatchMode=yes → 缺 key 时立刻失败，不等确认）
+        GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new',
+      },
+    });
+  }
 }
 
 /** 判断路径是否已存在且是目录 */
@@ -1391,4 +1504,51 @@ export function isDirectory(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * 把 submodule 同步的失败归类成一句人话。
+ *
+ * 为什么需要分类（实测：nimrtc v1.4，2026-11-20）：
+ * 同一条「submodule 没同步上」有三种成因，修法完全不同：
+ *
+ *  1. `unable to read tree (<sha>)` —— **本地 module git 目录里没有这个
+ *     commit**。git 本来要去远程取，而我们用 `--no-fetch` 把它掐断了。
+ *     修法：在主仓里 `git submodule update --init` 把 commit 补到本地。
+ *  2. 超时（ETIMEDOUT）—— git 卡在网络上。修法：查网络/SSH 配置。
+ *  3. 其它 —— 贴原始 stderr，别装懂。
+ *
+ * 第 1 类是绝大多数情况（12/14），也是最容易被误读成「源码丢了」的一类 ——
+ * 所以必须单独识别出来。
+ */
+export function describeSubmoduleFailure(err: unknown): string {
+  // 错误对象可能是 Error，也可能只是 `{ message, stderr }` 形态的普通对象
+  // （execFileSync 抛的就是后者）—— 两种都要认，否则错误信息会变成
+  // 毫无意义的 '[object Object]'。
+  const raw = err as { message?: unknown; stderr?: Buffer | string } | null | undefined;
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof raw?.message === 'string'
+        ? raw.message
+        : typeof err === 'string'
+          ? err
+          : '';
+  const stderr = raw?.stderr;
+  const detail = stderr ? String(stderr).trim() : '';
+  const combined = `${message}\n${detail}`;
+
+  if (/ETIMEDOUT|timed out|timeout/i.test(combined)) {
+    return '同步超时（git 卡在网络上）—— 检查网络与 SSH 配置';
+  }
+  if (/unable to read tree|does not contain|could not read/i.test(combined)) {
+    return (
+      '本地 module git 目录里没有 index 记录的 commit —— ' +
+      '在主仓里执行 `git submodule update --init` 把依赖补到本地后重试'
+    );
+  }
+  if (/Permission denied|Could not read from remote/i.test(combined)) {
+    return '没有权限访问 submodule 的远程仓库 —— 检查凭据配置';
+  }
+  return detail || message || '未知原因';
 }
