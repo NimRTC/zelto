@@ -1468,16 +1468,39 @@ register('run', async (args) => {
           } else {
             console.error(`zelto run ${id} — ❌ ${msg}`);
           }
+          // 守卫拒绝时 agent **一个都没起** —— 切片必须退回 `frozen`（D-64/D-65）。
+          //
+          // 病灶（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+          //   `startRun` 把切片推到 `running` → 重复 agent 守卫命中（上一轮
+          //   的遗留会话记录还在）→ 直接 `return 1`，**没退状态**。
+          //   于是这片卡在 `running`，而四条路全堵死：
+          //     - `run` 拒绝跑（准入只认 frozen / completed）
+          //     - `merge` 不收它（没签字）
+          //     - `stall --reap` 看不见它（这一轮**有**会话文件，
+          //       所以不是「一条记录都没有」的空壳；但那条记录的 status
+          //       已是 `completed` → 活性判定 `finished` → 也不算 stale/dead）
+          //     - `resume` 说它没停机（stall.class 是 null）
+          //   唯一出路是 `abandon` —— 整个切片作废，规格得重写。
+          //
+          // 也就是说「撞上一个假活记录」= 切片作废。这不是设计意图。
+          await revertRunAbortedBeforeStart(id, { reason: `重复 agent 守卫拒绝：${live.reason}` });
           return 1;
         }
       }
     }
 
-    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice));
+    // 上一轮的失败证据（ZD-013）：重跑时 agent 必须知道上次错在哪，
+    // 否则它只能从头摸，而且可能把已经做对的东西改错。
+    const gateFeedback = await scheduler.readFeedbackFor(id);
+
+    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice), gateFeedback);
     console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
     console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
     console.log(`  Protected:     ${bundle.protectedPaths.join(', ')}`);
     console.log(`  Policy rules:  ${bundle.policyRules.length}`);
+    if (gateFeedback.length > 0) {
+      console.log(`  Last failure:  ${gateFeedback.length} item(s) — passing the evidence to the agent`);
+    }
 
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
@@ -1564,6 +1587,9 @@ register('run', async (args) => {
       const agentError = await checkAgentAvailable(agentName, agentCmd);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
+        // agent 命令都找不到 → 这一轮一定跑不成。切片已被 `startRun`
+        // 推到 `running`，退回 `frozen`（D-64 同款病灶）。
+        await revertRunAbortedBeforeStart(id, { reason: agentError });
         return 1;
       }
     } catch {
@@ -1642,6 +1668,9 @@ register('run', async (args) => {
         console.error(`     ${launch.reason}`);
         console.error(`     监督进程入口：${supervisorEntryPath()}`);
         console.error(`     请改用前台运行： zelto run ${id}`);
+        // 切片已经被 `startRun` 推到 `running`，但这一轮没人跑 ——
+        // 退回 `frozen`（D-64 同款病灶），否则这片没人能救。
+        await revertRunAbortedBeforeStart(id, { reason: `无法拉起后台监督进程: ${launch.reason}` });
         return 1;
       }
 

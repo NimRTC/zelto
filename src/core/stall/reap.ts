@@ -138,37 +138,8 @@ export function findOrphanShells(
     // 有停机分类的归 findDeadSlices 管，不在这里重复报
     if (slice.stall.class !== null) continue;
 
-    let liveness: LivenessInfo;
-    try {
-      const rec = readSliceLivenessRecord(projectRoot, slice.id);
-      if (rec === null) {
-        // `readSliceLivenessRecord` 只返回 status==='running' 的记录，所以
-        // rec===null 有**两种**可能，必须分开：
-        //
-        //   (a) 盘上**一条记录都没有** → agent 从来没起过（准备阶段就挂了）
-        //   (b) 有记录但都不是 running → 那一轮**已经收尾**了
-        //
-        // (b) 不是空壳：那一轮跑过了，收尾路径该自己把切片退回 frozen；
-        // 这时去抢着改状态会与正常路径打架。所以只认 (a)。
-        //
-        // 判据用 `readSliceLivenessRecords`（它**不**按 status 过滤）——
-        // 它为空才说明真的什么记录都没有。
-        const anyRecord = readSliceLivenessRecords(projectRoot, slice.id);
-        if (anyRecord.length > 0) continue;
-
-        liveness = {
-          state: 'dead',
-          lastActivityAt: null,
-          idleMs: null,
-          pid: null,
-          reason: '没有任何运行记录（agent 从未开跑）',
-        };
-      } else {
-        liveness = classifyLiveness(rec, { isProcessAlive });
-      }
-    } catch {
-      continue;
-    }
+    const liveness = classifyOrphanShell(projectRoot, slice.id, isProcessAlive);
+    if (liveness === null) continue;
     if (liveness.state !== 'stale' && liveness.state !== 'dead') continue;
 
     const rec = readRecoveries(projectRoot, slice.id);
@@ -182,6 +153,76 @@ export function findOrphanShells(
     });
   }
   return shells;
+}
+
+/**
+ * 空壳判据 —— **唯一一份**（`findOrphanShells` 与 `reapDeadSlices` 共用）。
+ *
+ * 为什么必须只有一份：
+ * 判据分叉的后果是「列表里看得见、清理时却不认」——
+ * 人看着 `zelto stall --reap` 的列表里有这片，命令却说「没找到」。
+ * 这不是小毛病：它意味着「清理」这条路对某些切片**根本不存在**，
+ * 而人看不出哪些切片属于那一类。
+ *
+ * @returns 活性判定；`null` = 不是空壳（或判据读不出来）
+ */
+export function classifyOrphanShell(
+  projectRoot: string,
+  sliceId: string,
+  isProcessAlive?: (pid: number) => boolean,
+): LivenessInfo | null {
+  try {
+    const rec = readSliceLivenessRecord(projectRoot, sliceId);
+    if (rec !== null) {
+      // 有 running 记录 → 可能是活着的 agent。活性判定说了算
+      // （active → 不算空壳；stale/dead → 算）。
+      return classifyLiveness(rec, { isProcessAlive });
+    }
+
+    // `readSliceLivenessRecord` 只返回 status==='running' 的记录，所以
+    // rec===null 有**两种**可能，必须分开：
+    //
+    //   (a) 盘上**一条记录都没有** → agent 从来没起过（准备阶段就挂了）
+    //   (b) 有记录但都不是 running → 那一轮**已经收尾**了
+    //
+    // (b) 曾经被判为「不是空壳」（D-64 的原始判据），但那是错的：
+    //
+    //   病灶（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+    //   切片卡在 `running`（`startRun` 推的），盘上的会话记录全是
+    //   `status: completed` —— 那是**上一轮**留下的。那一轮收尾时
+    //   应该把切片退回 frozen，但没退（跑完超预算 → 收尾提前 return）。
+    //
+    //   于是这一片卡在 running，而四条路全堵死：
+    //     - `run` 拒绝跑（准入只认 frozen / completed）
+    //     - `merge` 不收它（没签字）
+    //     - `stall --reap` 看不见它（这里就是原因）
+    //     - `resume` 说它没停机（stall.class 是 null）
+    //   唯一出路是 `abandon` —— 整个切片作废，规格得重写。
+    //
+    // 现在的判据：**没有一条 running 记录 = 没人再管这一轮 = 空壳**。
+    //
+    // 为什么不看「记录有多旧」：记录时间不是判据 —— 判据是
+    // 「现在还有没有人在管这一轮」。没有 running 记录 = 没人管。
+    // 有 running 记录时绝不能碰（那可能是 agent 还活着）——
+    // 上面 `rec !== null` 分支已经处理了那种情况。
+    const anyRecord = readSliceLivenessRecords(projectRoot, sliceId);
+    const hasRunning = anyRecord.some((r) => r.status === undefined || r.status === 'running');
+    if (hasRunning) return null;
+
+    const statuses = anyRecord.map((r) => r.status ?? 'running').join(', ');
+    return {
+      state: 'dead',
+      lastActivityAt: null,
+      idleMs: null,
+      pid: null,
+      reason:
+        anyRecord.length === 0
+          ? '没有任何运行记录（agent 从未开跑）'
+          : `运行记录都已收尾（${statuses}），但切片仍停在 running —— 没人再管这一轮`,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -238,28 +279,14 @@ export async function reapDeadSlices(
       // 无分类的：只有调用方显式要求，且现场判据说它已经不在了，才动
       const orphanOpt = options?.includeOrphans;
       if (!orphanOpt) continue;
-      let live: LivenessInfo;
-      try {
-        const rec = readSliceLivenessRecord(orphanOpt.projectRoot, sliceId);
-        if (rec === null) {
-          // 没有任何运行记录 —— agent 从来没起过（D-64）。
-          //
-          // 判据与 `findOrphanShells` 保持一致：那边把它算空壳，
-          // 这边若只认 stale/dead，就会出现「列表里看得见、
-          // 清理时却不认」的错位 —— 人看着列表，命令却说「没找到」。
-          live = {
-            state: 'dead',
-            lastActivityAt: null,
-            idleMs: null,
-            pid: null,
-            reason: '没有任何运行记录（agent 从未开跑）',
-          };
-        } else {
-          live = classifyLiveness(rec, { isProcessAlive: orphanOpt.isProcessAlive });
-        }
-      } catch {
-        continue;
-      }
+      // 判据用**同一份**（`classifyOrphanShell`）—— 见那里的说明：
+      // 判据分叉的后果是「列表里看得见、清理时却不认」。
+      const live = classifyOrphanShell(
+        orphanOpt.projectRoot,
+        sliceId,
+        orphanOpt.isProcessAlive,
+      );
+      if (live === null) continue;
       if (live.state !== 'stale' && live.state !== 'dead') continue;
       // 清理事件里要写清「为什么认为是空壳」—— 没有分类可写，就把活性判定写上
       stallClass = null;

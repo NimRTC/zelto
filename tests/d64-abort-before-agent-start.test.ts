@@ -81,7 +81,24 @@ describe('D-64：agent 未开跑就中止的切片不能留在 running', () => {
     }
   });
 
-  it('有会话文件但已结束的 running 切片不算空壳（别误伤正常收尾）', () => {
+  it('有会话文件但已结束的 running 切片算空壳（D-65：没人再管这一轮）', () => {
+    // 判据在 D-65 里被修正过一次。
+    //
+    // 原判据：「有记录（哪怕全是 completed）→ 不算空壳」，理由是
+    // 「那一轮跑过了，收尾路径该自己把切片退 frozen」。
+    //
+    // 那是**错的** —— 收尾路径**确实可能不退回**（实测 nimrtc-v14
+    // v1-n5-turn-server，2026-11-20：跑完超预算 → 收尾提前 return →
+    // 切片停在 `running`）。于是：
+    //   - `run` 拒绝跑（准入只认 frozen / completed）
+    //   - `merge` 不收它（没签字）
+    //   - `stall --reap` 看不见它（就是这里）
+    //   - `resume` 说它没停机（stall.class 是 null）
+    // 唯一出路是 `abandon` —— 整个切片作废，规格得重写。
+    //
+    // 现在的判据：**没有一条 `running` 记录 = 没人再管这一轮 = 空壳**。
+    // 「有人管」的唯一证据是 `status: running` 的那条记录。
+    // 见 `tests/d065-stuck-running-shell.test.ts`。
     const root = mkdtempSync(join(tmpdir(), 'zelto-d64-shell-'));
     try {
       const sessionsDir = join(root, '.zelto', 'sessions');
@@ -99,7 +116,12 @@ describe('D-64：agent 未开跑就中止的切片不能留在 running', () => {
       );
 
       const shells = findOrphanShells([makeSlice()], root, () => false);
-      assert.equal(shells.length, 0, '有已收尾记录的切片不该被当成空壳');
+      assert.equal(
+        shells.length,
+        1,
+        '记录都收尾了但切片还停在 running = 没人管这一轮 = 空壳（要能救回来）',
+      );
+      assert.equal(shells[0].liveness.state, 'dead');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
