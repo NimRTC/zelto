@@ -7,12 +7,23 @@ import { DESIGN_PROMPT } from '../prompts/design.js';
 import { REFINE_DESIGN_PROMPT } from '../prompts/refine-design.js';
 import { isPlaceholderTitle, fallbackTitleFrom } from './placeholder-title.js';
 
+/**
+ * 生成设计文档。
+ *
+ * `projectStructure` 是**可选**的真实仓库摘要（见 `llm/project-context.ts`）。
+ * 有它时模型能看见真实目录与文件，写出来的「文件路径」才落得进切片写集；
+ * 没有它时退回旧行为（只凭需求文本臆造模块）—— 那条路在老项目上踩过，
+ * 设计会编出不存在的目录（nimrtc v1.4 演练，2026-11-20）。
+ */
 export async function generateDesign(
   llm: LlmAdapter,
   requirementSpec: string,
   existingId: string,
+  projectStructure?: string,
 ): Promise<Pick<DesignDoc, 'title' | 'body' | 'modules'>> {
-  const prompt = DESIGN_PROMPT.replace('{{REQUIREMENT_SPEC}}', requirementSpec);
+  const prompt = DESIGN_PROMPT
+    .replace('{{PROJECT_STRUCTURE}}', projectStructure && projectStructure.trim() ? projectStructure : '（本次没有提供项目扫描结果 —— 若需求没有写明目录结构，模块路径只写「沿用现有模块」而不要虚构。）')
+    .replace('{{REQUIREMENT_SPEC}}', requirementSpec);
 
   const response = await llm.chat({
     messages: [

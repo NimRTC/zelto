@@ -586,7 +586,18 @@ register('design', async (args) => {
   }
 
   f.out('Generating design document...');
-  const result = await generateDesign(llm, req.spec, '');
+  // 先扫一遍真实仓库 —— 模型看见目录才会把模块路径写对（nimrtc v1.4 演练的教训）
+  const { scanProject } = await import('../../core/project/scanner.js');
+  const { summarizeProjectStructure, renderStructureSection } = await import('../../llm/project-context.js');
+  let projectStructure: string | undefined;
+  try {
+    const map = scanProject(process.cwd());
+    projectStructure = renderStructureSection(summarizeProjectStructure(map));
+  } catch {
+    // 扫描失败不阻断设计生成 —— 只是少了上下文，设计会退回旧行为
+    projectStructure = undefined;
+  }
+  const result = await generateDesign(llm, req.spec, '', projectStructure);
 
   const id = `dsg-${Date.now()}`;
   const doc: DesignDoc = {
