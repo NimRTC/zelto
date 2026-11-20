@@ -32,12 +32,36 @@ export interface SliceSpecInput {
   version: string;
   /** 该切片关联的需求条目（人批准的出处） */
   requirements?: string[];
+  /**
+   * 需求条目的**正文**（ZD-005）。
+   *
+   * 为什么必须有正文：只给 id（如 "N5"）模型只能写通用套话 ——
+   * 实战里它把「部署 coturn 参考实现」写成了「实现一个基本的 TURN 服务器」，
+   * 方向都反了。判定追溯链是否成立，需要知道这条需求**要求了什么**。
+   */
+  requirementDetails?: Array<{ id: string; text: string }>;
   /** 所属版本的前置切片 */
   prerequisites?: string[];
 }
 
 /** 未确认处的占位符 —— 明确标记「这里需要人填」，不编造内容 */
 export const TBD_PLACEHOLDER = 'TBD（需人确认）';
+
+/**
+ * 把需求条目正文渲染成 prompt 片段。
+ *
+ * 找不到正文的条目如实说找不到 —— 不编造。凭空推测一条需求的含义，
+ * 等于把「人批准的出处」换成「模型的猜测」，追溯链就断了。
+ */
+export function renderRequirementDetails(input: SliceSpecInput): string {
+  const details = input.requirementDetails ?? [];
+  if (details.length === 0) {
+    return '（本片没有关联的需求条目 —— 规格的「需求」章节写「无」，验收标准需人补齐后再确认规格）';
+  }
+  return details
+    .map((d) => (d.text ? `- ${d.id}：${d.text}` : `- ${d.id}：（需求文档里找不到这一条的正文 —— 不要凭空推测它要什么，规格里如实标注「需人补齐」）`))
+    .join('\n');
+}
 
 /** 没有可物化的验收标准时的占位（**刻意不写成编号条目**） */
 export const NO_CRITERIA_PLACEHOLDER =
@@ -66,6 +90,7 @@ export async function generateSliceSpec(
     .replace('{{VERSION}}', input.version)
     .replace('{{WRITES_JSON}}', JSON.stringify(input.writes, null, 2))
     .replace('{{REQUIREMENTS_JSON}}', JSON.stringify(input.requirements ?? [], null, 2))
+    .replace('{{REQUIREMENT_DETAILS}}', renderRequirementDetails(input))
     .replace('{{PREREQUISITES_JSON}}', JSON.stringify(input.prerequisites ?? [], null, 2));
 
   const response = await llm.chat({

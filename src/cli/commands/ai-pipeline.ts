@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { VersionPlan } from '../../core/version/types.js';
 import { RequirementStore } from '../../core/requirements/store.js';
+import { collectCriterionIds, extractCriterionIds } from '../../core/requirements/criteria.js';
 import { DesignStore } from '../../core/design/store.js';
 import { deriveModules } from '../../core/design/derive.js';
 import { VersionStore } from '../../core/version/store.js';
@@ -56,6 +57,50 @@ import {
  */
 function versionEventKey(versionLabel: string): string {
   return `version-${versionLabel}`;
+}
+
+/**
+ * 从切片定义里**推导**它关联的需求条目（ZD-005 的遗留）。
+ *
+ * 追溯链要求每片都能追到需求条目。但切片定义里没有这个字段，
+ * 需求条目的正文在已确认的需求文档里 —— 两者之间**从来没有自动通道**。
+ * 后果：`zelto spec draft` 给模型的输入里需求部分是空的，
+ * 只能写通用套话（实战里把「部署 coturn」写成「实现一个 TURN 服务器」）。
+ *
+ * 推导规则：
+ *   1. 从切片标题里找形如 `N5` / `D3` / `N2-1` 的 token
+ *   2. **核实**这些 id 在已确认的需求文档里真的存在 —— 不存在的不填
+ *      （填了就是追溯链上挂着一个不存在的出处，比不填更糟）
+ *
+ * 只取**最新一份已确认**需求（superseded 的不算）。
+ *
+ * @param sliceDef 计划里的切片定义
+ * @returns 关联的需求条目 id（可能为空）
+ */
+async function deriveSliceRequirements(sliceDef: {
+  id: string;
+  title: string;
+  description?: string;
+}): Promise<string[]> {
+  const candidates = extractCriterionIds(`${sliceDef.title} ${sliceDef.description ?? ''}`);
+  if (candidates.length === 0) return [];
+
+  try {
+    const reqStore = new RequirementStore(ZELTO_DIR);
+    const all = await reqStore.list();
+    const confirmed = all
+      .filter((r) => r.status === 'confirmed')
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    for (const summary of confirmed) {
+      const doc = await reqStore.read(summary.id);
+      const real = collectCriterionIds(doc.spec, doc.acceptanceCriteria);
+      const hit = candidates.filter((c) => real.has(c));
+      if (hit.length > 0) return hit;
+    }
+  } catch {
+    // 读不到需求文档 → 不填（不编造）
+  }
+  return [];
 }
 
 /**
@@ -1367,6 +1412,25 @@ register('version', async (args) => {
       }
 
       const sliceData = await sliceStore.read(sliceDef.id);
+
+      // 需求追溯的自动关联（ZD-005 的遗留）
+      //
+      // 病灶：切片的 `trace.requirements` 一直是**空的** ——
+      // 需求条目的正文在已确认的需求文档里，但从没被连到切片上。
+      // 于是 `zelto spec draft` 给模型的输入里需求部分是空的，
+      // 只能写通用套话（实战里把「部署 coturn」写成「实现一个 TURN 服务器」）。
+      //
+      // 这里从切片标题里提取形如 `N5` / `D3` 的条目 id，
+      // 并**核实它在已确认的需求文档里真的存在** —— 不存在的不填
+      // （填了就是追溯链上挂着一个不存在的出处）。
+      if (sliceData.trace.requirements.length === 0) {
+        const derived = await deriveSliceRequirements(sliceDef);
+        if (derived.length > 0) {
+          sliceData.trace.requirements = derived;
+          await sliceStore.write(sliceData);
+          f.out(`  🔗 "${sliceDef.id}" 关联需求条目：${derived.join(', ')}`);
+        }
+      }
 
       // 规格写到切片自己的路径 —— worktree 复制的是这一份
       const specPath = sliceData.spec.path;

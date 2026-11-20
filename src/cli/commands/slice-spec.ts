@@ -69,15 +69,51 @@ async function findPlanContext(id: string): Promise<SlicePlanContext> {
 async function buildSpecInput(id: string): Promise<SliceSpecInput> {
   const slice = await store.read(id);
   const ctx = await findPlanContext(id);
+  const requirementIds = slice.trace.requirements ?? [];
   return {
     sliceId: slice.id,
     title: slice.title,
     module: ctx.module,
     writes: slice.writes ?? [],
     version: ctx.version,
-    requirements: slice.trace.requirements ?? [],
+    requirements: requirementIds,
+    // 需求条目的**正文**（ZD-005）—— 只给 id 模型只能写套话
+    requirementDetails: await loadRequirementDetails(requirementIds),
     prerequisites: ctx.prerequisites,
   };
+}
+
+/**
+ * 把需求条目的正文从已确认的需求文档里取出来。
+ *
+ * 取哪一份需求文档：与这个切片同属一条链上的**已确认**需求 ——
+ * 取最新的一份已确认的（superseded 的不取）。找不到就返回空数组，
+ * 规格里如实写「没有关联的需求条目」，不编造。
+ */
+async function loadRequirementDetails(
+  ids: string[],
+): Promise<Array<{ id: string; text: string }>> {
+  if (ids.length === 0) return [];
+  try {
+    const { RequirementStore } = await import('../../core/requirements/store.js');
+    const { extractCriteria } = await import('../../core/requirements/criteria.js');
+    const reqStore = new RequirementStore(ZELTO_DIR);
+    const all = await reqStore.list();
+    // 最新的一份已确认需求（superseded 的排除）
+    const confirmed = all
+      .filter((r) => r.status === 'confirmed')
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    for (const summary of confirmed) {
+      const doc = await reqStore.read(summary.id);
+      const criteria = extractCriteria(doc.spec, doc.acceptanceCriteria, ids);
+      if (criteria.some((c) => c.text.length > 0)) {
+        return criteria.map((c) => ({ id: c.id, text: c.text }));
+      }
+    }
+    return ids.map((id) => ({ id, text: '' }));
+  } catch {
+    return ids.map((id) => ({ id, text: '' }));
+  }
 }
 
 /** 草稿生成的结果 */
