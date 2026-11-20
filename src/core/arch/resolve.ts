@@ -27,6 +27,39 @@
 import type { ModuleSpec, ScanResult } from './types.js';
 
 /**
+ * 模块名的**括号短名**。
+ *
+ * 设计里的模块名常写成「中文描述 (标识符)」：
+ *
+ *   `网络适配层 (ice)`
+ *   `设备管理层 (device)`
+ *   `参考实现 (examples)`
+ *
+ * 而**依赖模块**那一栏写的是短名（`ice` / `device` / `engine`）。
+ * 于是依赖名与模块名对不上 —— 精确匹配一个都匹配不上，
+ * 全被报成「未知模块」（实战 ZD-011）。
+ *
+ * 括号里那一段就是模块**自称的标识符**：作者把它放在括号里，
+ * 就是为了让别处能用它指代这个模块。所以它必须能被依赖名匹配上。
+ *
+ * 认不出来的两种写法（不猜）：
+ *   - 没有括号 → 没有短名
+ *   - 括号里不是标识符形状（不是 `词` / `词-词`）→ 没有短名
+ *
+ * 形状：字母或数字开头，允许字母数字、`-`、`_`、`.`、`/`。
+ *
+ * **允许斜杠** —— 短名可能本身是路径（`plugins/hw`）：
+ * 那是「某个目录下的子集」的写法，作者用它指代那一块。
+ * 不允许斜杠的话这种写法一个都匹配不上 → 全被报成未知模块。
+ */
+export function moduleAliases(name: string): string[] {
+  const match = name.match(/[（(]\s*([A-Za-z0-9][A-Za-z0-9._/-]*)\s*[）)]\s*$/);
+  if (!match) return [];
+  const alias = match[1];
+  return alias === name ? [] : [alias];
+}
+
+/**
  * 解析一组依赖名。
  *
  * @returns 依赖名 → 模块名；解析不出来时值为 null（保持原样交给上层报错）
@@ -37,11 +70,35 @@ export function resolveDependencyNames(
   scan: ScanResult,
 ): Map<string, string | null> {
   const moduleNames = new Set(modules.map((m) => m.name));
+
+  // 短名 → 模块名。**一对一**：两个模块抢同一个短名时不算数
+  // （那说明设计本身有歧义，不该由解析层替它选一个）。
+  const aliasToModule = new Map<string, string>();
+  const aliasConflicts = new Set<string>();
+  for (const mod of modules) {
+    for (const alias of moduleAliases(mod.name)) {
+      if (aliasToModule.has(alias) && aliasToModule.get(alias) !== mod.name) {
+        aliasConflicts.add(alias);
+        continue;
+      }
+      aliasToModule.set(alias, mod.name);
+    }
+  }
+  for (const alias of aliasConflicts) aliasToModule.delete(alias);
+
   const resolved = new Map<string, string | null>();
 
   for (const dep of dependencies) {
     if (moduleNames.has(dep)) {
       resolved.set(dep, dep);
+      continue;
+    }
+    // 短名匹配 —— 必须在路径解析**之前**：
+    // `ice` 既是某个模块的短名，也可能是条路径，
+    // 但「作者给它起了这个短名」比「某个目录下正好有文件」更可信。
+    const byAlias = aliasToModule.get(dep);
+    if (byAlias) {
+      resolved.set(dep, byAlias);
       continue;
     }
     resolved.set(dep, resolveByOwnership(dep, modules, scan));

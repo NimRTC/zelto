@@ -199,6 +199,100 @@ describe('ADR-063：设计正文的确定性修正', () => {
     });
   });
 
+  describe('新增缺失的模块段（ZD-012）', () => {
+    // 实战病灶：设计的模块图**不完整** —— 模块 A 声明依赖 `core`，
+    // 但模块图里根本没有 `core`。架构护栏报「未知模块」→ deny → 门禁开不了。
+    //
+    // 修法有两条：补上缺失的模块段，或删掉那条依赖。
+    // 前者需要「加一段」—— 原来的 `design patch` 只能改现有段。
+
+    it('新增模块段：正文多出该段，且能解析出它的字段', () => {
+      const result = patchDesignBody(SINGLE_LINE_BODY, [
+        {
+          module: '',
+          add: {
+            name: 'src/core-api',
+            description: '公共 API 头文件',
+            filePatterns: ['src/core/api/**'],
+            dependencies: [],
+          },
+        },
+      ]);
+      assert.equal(result.changed.length, 1);
+      assert.ok(result.body.includes('### src/core-api'));
+      assert.ok(result.body.includes('- **职责**：公共 API 头文件'));
+
+      const modules = parseDesignModules(result.body);
+      const added = modules.find((m) => m.name === 'src/core-api');
+      assert.ok(added, '新增的模块必须能被解析出来');
+      assert.deepEqual(added.filePatterns, ['src/core/api/**']);
+      assert.deepEqual(added.dependencies, []);
+    });
+
+    it('新增段插在最后一个 ### 段之后、## 段之前', () => {
+      // 用一个尾部还有 `##` 段的正文 —— 新段必须落在两者之间
+      const bodyWithTail = `${SINGLE_LINE_BODY}
+## 数据流
+1. 初始化
+`;
+      const result = patchDesignBody(bodyWithTail, [
+        {
+          module: '',
+          add: { name: 'src/extra', description: 'x', filePatterns: ['src/extra/**'], dependencies: [] },
+        },
+      ]);
+      const body = result.body;
+      const engineIdx = body.indexOf('### src/engine');
+      const extraIdx = body.indexOf('### src/extra');
+      assert.ok(engineIdx > 0 && extraIdx > engineIdx, '新段必须在现有模块段之后');
+      // 新段还在下一个 `##` 标题之前（模块声明只在 ## 之下）
+      const tailIdx = body.indexOf('## 数据流');
+      assert.ok(tailIdx > 0 && extraIdx < tailIdx, '新段必须在下一个 ## 标题之前');
+    });
+
+    it('依赖为空的段也写「依赖模块：无」', () => {
+      const result = patchDesignBody(SINGLE_LINE_BODY, [
+        {
+          module: '',
+          add: { name: 'src/lonely', description: 'x', filePatterns: ['src/lonely/**'], dependencies: [] },
+        },
+      ]);
+      assert.ok(result.body.includes('- **依赖模块**：无'));
+    });
+
+    it('已有同名模块时不重复加', () => {
+      const result = patchDesignBody(SINGLE_LINE_BODY, [
+        {
+          module: '',
+          add: { name: 'src/core', description: 'x', filePatterns: ['src/core/**'], dependencies: [] },
+        },
+      ]);
+      const count = (result.body.match(/### src\/core\b/g) ?? []).length;
+      assert.equal(count, 1, '不该出现两个同名模块段');
+    });
+
+    it('新增段不破坏原有模块的字段', () => {
+      const result = patchDesignBody(SINGLE_LINE_BODY, [
+        {
+          module: '',
+          add: { name: 'src/extra', description: 'x', filePatterns: ['src/extra/**'], dependencies: [] },
+        },
+      ]);
+      assert.ok(result.body.includes('- **文件路径**：src/core/*, src/core/**/*'));
+      assert.ok(result.body.includes('- **依赖模块**：src/core, src/third_party'));
+    });
+
+    it('modules 与正文一致（新增后仍然同步）', () => {
+      const result = patchDesignBody(SINGLE_LINE_BODY, [
+        {
+          module: '',
+          add: { name: 'src/extra', description: 'x', filePatterns: ['src/extra/**'], dependencies: [] },
+        },
+      ]);
+      assert.deepEqual(result.modules, parseDesignModules(result.body));
+    });
+  });
+
   describe('确定性（C3）', () => {
     it('同样输入两次结果完全相同', () => {
       const a = patchDesignBody(SINGLE_LINE_BODY, [

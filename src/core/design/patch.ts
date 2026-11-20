@@ -38,6 +38,30 @@ export interface ModulePatch {
   filePatterns?: string[];
   /** 新的依赖模块列表 */
   dependencies?: string[];
+  /**
+   * **新增**一个模块段（而不是改现有段）。
+   *
+   * 为什么需要（实战 ZD-012）：
+   * 设计的模块图常常**不完整** —— 模块 A 声明了依赖 `core`，
+   * 但模块图里根本没有 `core` 这个模块。于是架构护栏报
+   * 「未知模块」并 deny，门禁开不了。
+   *
+   * 修法有两种：补上缺失的模块声明，或删掉那条依赖。
+   * 前者需要「加一段」，后者用 `--dep` 就能做。
+   *
+   * 补的段必须**长成设计模板的样子**（职责 / 文件路径 / 依赖模块），
+   * 否则解析层认不出它的字段 —— 加了等于没加。
+   */
+  add?: {
+    /** 模块名（正文里的 `### <name>`） */
+    name: string;
+    /** 一句话职责 */
+    description: string;
+    /** 文件路径列表 */
+    filePatterns: string[];
+    /** 依赖模块列表 */
+    dependencies: string[];
+  };
 }
 
 /** 修正结果 */
@@ -72,6 +96,43 @@ export function patchDesignBody(body: string, patches: ModulePatch[]): PatchResu
   const sections = findModuleSections(lines);
 
   for (const patch of patches) {
+    // ── 新增模块段 ──────────────────────────────────────────────────
+    //
+    // 必须插在**最后一个 `###` 段之后**、`##` 段落之前 ——
+    // 插错了位置，`findModuleSections` 会把它算进别的段落里。
+    //
+    // 插在哪：所有 `###` 段的末尾（最后一个段的 end）。
+    // 若正文里一个 `###` 都没有，就插在第一个 `##` 标题之前。
+    if (patch.add) {
+      const name = patch.add.name.trim();
+      if (sections.has(name)) {
+        // 已经有了 → 当成改它（不重复加）
+        const existing: ModulePatch = { module: name };
+        if (patch.add.filePatterns.length > 0) existing.filePatterns = patch.add.filePatterns;
+        if (patch.add.dependencies.length > 0) existing.dependencies = patch.add.dependencies;
+        if (existing.filePatterns || existing.dependencies) {
+          const sub = patchDesignBody(lines.join('\n'), [existing]);
+          changed.push(...sub.changed);
+          missing.push(...sub.missing);
+        }
+        continue;
+      }
+
+      const block = renderModuleBlock(patch.add);
+      const insertAt = findInsertionPoint(lines, sections);
+      lines.splice(insertAt, 0, ...block);
+      changed.push({
+        module: name,
+        field: 'filePatterns',
+        before: [],
+        after: patch.add.filePatterns,
+      });
+      // 重新定位 —— 插入后行号全变了
+      const resections = findModuleSections(lines);
+      for (const [k, v] of resections) sections.set(k, v);
+      continue;
+    }
+
     const section = sections.get(patch.module);
     if (!section) {
       missing.push(patch.module);
@@ -105,6 +166,56 @@ export function patchDesignBody(body: string, patches: ModulePatch[]): PatchResu
     changed,
     missing,
   };
+}
+
+/**
+ * 把新增模块渲染成设计模板的形状。
+ *
+ * 模板（和 `parseDesignModules` 认的格式一致）：
+ *
+ * ```
+ * ### <name>
+ * - **职责**：<description>
+ * - **文件路径**：<paths>
+ * - **依赖模块**：<deps>
+ * ```
+ *
+ * **依赖模块**那行必须写 —— 哪怕没有依赖，也要写「无」。
+ * 少了这一行，解析层读出的依赖是空数组，看起来一样，
+ * 但正文与设计模板不一致，下一个读的人会以为漏了。
+ */
+function renderModuleBlock(add: NonNullable<ModulePatch['add']>): string[] {
+  const paths = add.filePatterns.length > 0 ? add.filePatterns.join(', ') : '无';
+  const deps = add.dependencies.length > 0 ? add.dependencies.join(', ') : '无';
+  return [
+    `### ${add.name}`,
+    `- **职责**：${add.description}`,
+    `- **文件路径**：${paths}`,
+    `- **依赖模块**：${deps}`,
+    '',
+  ];
+}
+
+/**
+ * 新增模块段插在哪一行。
+ *
+ * 规则：插在**最后一个 `###` 段的末尾**（也就是它的 end 行）——
+ * 那里正好是下一个 `##` 标题之前，模块段连成一片。
+ *
+ * 正文里一个 `###` 都没有 → 插在第一个 `##` 标题之前；
+ * 连 `##` 都没有 → 插在正文末尾。
+ */
+function findInsertionPoint(lines: string[], sections: Map<string, Section>): number {
+  let lastEnd = -1;
+  for (const section of sections.values()) {
+    if (section.end > lastEnd) lastEnd = section.end;
+  }
+  if (lastEnd >= 0) return lastEnd;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s/.test(lines[i].trim())) return i;
+  }
+  return lines.length;
 }
 
 /** 一个模块段落 */

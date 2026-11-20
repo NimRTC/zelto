@@ -73,19 +73,61 @@ function optionValues(args: string[], name: string): string[] {
 function parsePatches(args: string[]): ModulePatch[] {
   const patches: ModulePatch[] = [];
   let current: ModulePatch | null = null;
+  // `--add-module` 的累积参数（下一个 `--` 之前）
+  let add: ModulePatch['add'] | null = null;
+
+  const flushAdd = (): void => {
+    if (add) {
+      // 新增模块自成一条修正 —— 它不属于任何 `--module` 段。
+      // 单独 push，不跟 `--module` 混在一起（混了会让「已存在同名模块」
+      // 那条分支的语义变得含糊）。
+      patches.push({ module: '', add });
+    }
+    add = null;
+  };
 
   for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--add-module') {
+      flushAdd();
+      const name = args[i + 1];
+      if (!name || name.startsWith('--')) continue;
+      add = { name, description: '', filePatterns: [], dependencies: [] };
+      i++;
+      continue;
+    }
+    if (args[i] === '--desc' || args[i] === '--description') {
+      if (!add) continue;
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) continue;
+      add.description = value;
+      i++;
+      continue;
+    }
+    if (args[i] === '--add-dep') {
+      if (!add) continue;
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) continue;
+      add.dependencies.push(value);
+      i++;
+      continue;
+    }
     if (args[i] === '--module') {
+      flushAdd();
       const name = args[i + 1];
       if (!name || name.startsWith('--')) continue;
       current = { module: name };
       patches.push(current);
       i++;
       continue;
-    }
-    if (args[i] === '--path') {
+    }    if (args[i] === '--path') {
       const value = args[i + 1];
       if (!value || value.startsWith('--')) continue;
+      // `--add-module` 的模式下，`--path` 属于新模块
+      if (add) {
+        add.filePatterns.push(value);
+        i++;
+        continue;
+      }
       if (!current) continue;
       (current.filePatterns ??= []).push(value);
       i++;
@@ -94,13 +136,19 @@ function parsePatches(args: string[]): ModulePatch[] {
     if (args[i] === '--dep') {
       const value = args[i + 1];
       if (!value || value.startsWith('--')) continue;
+      if (add) {
+        add.dependencies.push(value);
+        i++;
+        continue;
+      }
       if (!current) continue;
       (current.dependencies ??= []).push(value);
       i++;
     }
   }
+  flushAdd();
 
-  return patches.filter((p) => p.filePatterns || p.dependencies);
+  return patches.filter((p) => p.add || p.filePatterns || p.dependencies);
 }
 
 /** 把一批 glob 拆成列表（支持逗号分隔） */
@@ -122,13 +170,21 @@ function draftEventKey(kind: string, id: string): string {
 export async function designPatch(args: string[]): Promise<number> {
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto design patch <id> --module <name> --path <glob> [--dep <module>] [--yes]');
+    f.error(
+      'USAGE',
+      'Usage: zelto design patch <id> --module <name> --path <glob> [--dep <module>] [--yes]\n' +
+        '       zelto design patch <id> --add-module <name> --desc <text> --path <glob> [--add-dep <module>] [--yes]',
+    );
     return 1;
   }
 
   const patches = parsePatches(args);
   if (patches.length === 0) {
-    f.error('USAGE', 'Nothing to patch. Use --module <name> --path <glob> (or --dep <module>).');
+    f.error(
+      'USAGE',
+      'Nothing to patch. Use --module <name> --path <glob> (or --dep <module>), ' +
+        'or --add-module <name> --desc <text> --path <glob> to add a missing module.',
+    );
     return 1;
   }
 
@@ -136,6 +192,10 @@ export async function designPatch(args: string[]): Promise<number> {
   for (const patch of patches) {
     if (patch.filePatterns) patch.filePatterns = splitPatterns(patch.filePatterns);
     if (patch.dependencies) patch.dependencies = splitPatterns(patch.dependencies);
+    if (patch.add) {
+      patch.add.filePatterns = splitPatterns(patch.add.filePatterns);
+      patch.add.dependencies = splitPatterns(patch.add.dependencies);
+    }
   }
 
   const designStore = new DesignStore(ZELTO_DIR);
@@ -171,7 +231,6 @@ export async function designPatch(args: string[]): Promise<number> {
     f.out(`    旧：${change.before.length > 0 ? change.before.join(', ') : '（无）'}`);
     f.out(`    新：${change.after.join(', ')}`);
   }
-
   // ─── 确认 ────────────────────────────────────────────────────────────────
   // 改的是**已确认**的设计 —— 这是治理动作，必须人点头。
   // `--yes` 跳过交互（供脚本用），但默认要人确认。
