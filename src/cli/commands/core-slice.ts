@@ -1441,6 +1441,42 @@ register('run', async (args) => {
       return 0;
     }
 
+    // ── 暂停（拉闸）准入检查（ZD-023）────────────────────────────────────
+    //
+    // 病灶（实测于 nimrtc-v14 v1-device-policy，2026-11-21）：
+    //   一个**陈旧的**全局暂停请求（`.zelto/halts/all.json`）在 agent
+    //   起跑前 3 分钟就写好了，但 `zelto run` 的准入**完全不看它** ——
+    //   agent 一路跑了 2h45m，看门狗读到那个请求才把 agent 停掉，
+    //   这一轮被记成「人工拉闸」（actor=human），而人根本没干预过。
+    //
+    // 为什么必须在这里拦：
+    //   - 暂停是**人的明确意图**（「现在我要接管」），不该被下一个切片静默继承；
+    //   - 事后看事件流会以为人干预过这一轮 —— 追溯链凭空多一次人为干预；
+    //   - 那个 `all.json` **不会被自动清除**，一次误操作污染后面所有切片。
+    //
+    // 处置：**拒绝起跑**，说清怎么解除。不静默消费 —— 静默消费等于
+    // 替人解除了他自己踩下的刹车。
+    {
+      const haltStore = new HaltStore(ZELTO_DIR);
+      const halted = await haltStore.isHalted(id).catch(() => null);
+      if (halted) {
+        const msg =
+          `当前处于暂停中（${halted.scope === 'all' ? '全局暂停' : `scope=${halted.scope}`}，` +
+          `理由「${halted.reason}」，请求于 ${halted.requestedAt}）—— 拒绝起跑。` +
+          `处理完现场后先解除暂停：zelto halt --clear` +
+          (halted.scope === 'all' ? '' : ` --scope ${halted.scope}`);
+        if (isJson) {
+          console.log(JSON.stringify({
+            sliceId: id, decision: 'blocked', reason: msg,
+            halt: { scope: halted.scope, reason: halted.reason, requestedAt: halted.requestedAt },
+          }));
+        } else {
+          console.error(`zelto run ${id} — ❌ ${msg}`);
+        }
+        return 1;
+      }
+    }
+
     await scheduler.startRun(id);
 
     // ── 重复 agent 守卫 ──────────────────────────────────────────────────
