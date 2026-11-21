@@ -154,6 +154,55 @@ const SLICE_SETTABLE_FIELDS = new Set([
   'baseCommit', 'baseline', 'spec.gateCommands',
 ]);
 
+/**
+ * 解析数组字段的 `--value`（ZD-022）。
+ *
+ * **两种格式都收**：
+ *
+ * 1. **JSON 数组** —— `["src/a/**","src/b/**"]`。首选格式：无歧义。
+ * 2. **逗号分隔** —— `src/a/**,src/b/**`。历史格式，保持可用。
+ *
+ * 为什么必须两种都收：只支持逗号分隔时，喂 JSON 数组串会**静默**产出
+ * 带方括号的垃圾条目（`[src/a/**`）—— 且**报告成功**。
+ * 写集里混进这种条目，既覆盖不到任何真实路径，又让「写集写了什么」说不清。
+ * 而同一条命令里的 `spec.gateCommands` 早就是 JSON 格式（ADR-051）——
+ * 同一个命令的数组字段判据不一致，用户只能靠猜。
+ *
+ * @throws 两种格式都不匹配时抛错（**不猜** —— 猜错就是静默写坏边界）
+ */
+function parseArrayField(rawValue: string, field: string): string[] {
+  const trimmed = rawValue.trim();
+
+  // 以 `[` 开头 → 当 JSON 数组解析（解析失败就报错，不当逗号串兜底：
+  // 兜底会把「JSON 写错了」变成「写集里多了几个奇怪条目」）
+  if (trimmed.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (err) {
+      throw new Error(
+        `${field} 的值看起来是 JSON 数组，但解析失败：` +
+        `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(`${field} 的值应该是 JSON 数组或逗号分隔的路径列表`);
+    }
+    const out: string[] = [];
+    for (const item of parsed) {
+      if (typeof item !== 'string') {
+        throw new Error(`${field} 的 JSON 数组里只能有字符串，不能有 ${typeof item}`);
+      }
+      const t = item.trim();
+      if (t) out.push(t);
+    }
+    return out;
+  }
+
+  // 兜底：逗号分隔（历史格式）
+  return trimmed.split(',').map((v) => v.trim()).filter(Boolean);
+}
+
 register('set', async (args) => {
   const [id] = args;
   const f = getDefaultFormatter();
@@ -230,7 +279,19 @@ register('set', async (args) => {
 
     // Parse value: comma-separated for array fields, boolean for boolean fields
     if (field === 'writes' || field === 'trace.requirements' || field === 'trace.contracts' || field === 'trace.tests') {
-      const values = rawValue.split(',').map((v: string) => v.trim()).filter(Boolean);
+      // ZD-022：数组字段**两种格式都收** —— 逗号分隔 与 JSON 数组。
+      //
+      // 病灶：只支持逗号分隔时，用户喂 JSON 数组串
+      // （`--value '["a/**","b/**"]'`）会**静默**产出带方括号的垃圾条目
+      // （`[a/**`）—— 而且**报告成功**。写集里混进 `[src/modules/...`
+      // 这种条目，既覆盖不到任何真实路径，又让「写集写了什么」说不清。
+      //
+      // 同一个文件里 `spec.gateCommands` 已经用 JSON（ADR-051）——
+      // 判据不一致本身就是根因：同一个 `set` 命令的数组字段，
+      // 一个吃 JSON 一个不吃，用户只能靠猜。
+      //
+      // 现状（逗号分隔）**保持可用**（很多脚本在用），只是多认一种格式。
+      const values = parseArrayField(rawValue, field);
       if (field === 'writes') {
         // 写集路径统一成**正斜杠**并去重（ADR-051 配套）：
         // 写集路径要与策略引擎、hook 的判定对齐，那些地方都按正斜杠归一。

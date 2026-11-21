@@ -267,6 +267,45 @@ test('D-73：失败原因分类 —— 区分「本地缺 commit」与「超时�
   assert.match(other, /something else entirely/, '认不出来的原因要贴原文，不装懂');
 });
 
+test('D-73：Linux 的 git 措辞也要识别成「本地缺 commit」（跨平台同一故障条件）', () => {
+  // 同一个故障条件，git 在两个平台上的措辞不同：
+  //   Windows：`unable to read tree (<sha>)`
+  //   Linux：  `repository '<...>/.git/modules/vendor/sub' does not exist`
+  //
+  // 只认一种措辞 = 换个平台就退化成「贴原文」，人拿不到那条可执行的修法。
+  const linuxWording = describeSubmoduleFailure({
+    stderr: Buffer.from(
+      "fatal: repository '/tmp/zelto-d73/.git/modules/vendor/sub' does not exist\n" +
+        "fatal: clone of '/tmp/zelto-d73/.git/modules/vendor/sub' into submodule path " +
+        "'/tmp/zelto-d73/.zelto/worktrees/d73c/vendor/sub' failed\n",
+    ),
+    message: 'Command failed',
+  });
+  assert.match(
+    linuxWording,
+    /本地 module git 目录里没有/,
+    'Linux 措辞也应识别出「本地缺 commit」',
+  );
+  assert.match(linuxWording, /submodule update --init/, '应给出可执行的修法');
+});
+
+test('D-73：「远程仓库不可达」不能被误判成「本地缺 commit」（修法不同）', () => {
+  // 远程不可达与本地缺 commit 的修法完全不同：
+  //   - 本地缺 commit → 跑 `git submodule update --init` 补到本地
+  //   - 远程不可达   → 查网络 / SSH / 凭据
+  // 混起来会把人引去跑一条没用的命令。
+  const remoteUnreachable = describeSubmoduleFailure({
+    stderr: Buffer.from('fatal: Could not read from remote repository.\n'),
+    message: 'Command failed',
+  });
+  assert.doesNotMatch(
+    remoteUnreachable,
+    /本地 module git 目录里没有/,
+    '远程不可达不该被误判成「本地缺 commit」',
+  );
+  assert.match(remoteUnreachable, /凭据|权限/, '应指向凭据/权限');
+});
+
 test('D-73：同步成功时不产生失败记录（不误报）', async () => {
   const s = await makeScaffold('d73d');
   try {

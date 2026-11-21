@@ -706,6 +706,74 @@ Merge aborted — 目标工作区有未提交改动（11 项），已跳过合�
 
 ---
 
+## ZD-022 `zelto set` 的数组字段只吃逗号分隔，喂 JSON 数组会**静默**写坏写集
+
+**场景**：nimrtc-v14 的 `v1-device-policy` 切片要扩写集（补 `src/modules/video_capture/**`）。
+我按直觉喂了 JSON 数组：
+
+```
+zelto set v1-device-policy --field writes --value '["src/modules/video_capture/**","src/modules/audio_device/**","src/engine/**"]'
+```
+
+命令**报告成功**（`✅ Updated writes`），但切片 JSON 里写进去的是：
+
+```json
+"writes": ["[src/modules/video_capture/**", "src/modules/audio_device/**", "src/engine/**]"]
+```
+
+第一个条目带着**左方括号** —— 它覆盖不到任何真实路径。
+更糟的是这条垃圾条目**永远不会被发现**：写集判定里 glob 条目
+（`src/modules/video_capture/**`）能覆盖一切，但 `[src/...` 这个条目本身
+既覆盖不到东西、也不报错 —— 它只是**安静地烂在那里**。
+
+**根因**：`cli/commands/slice-detail.ts` 的数组字段解析是：
+
+```ts
+const values = rawValue.split(',').map((v) => v.trim()).filter(Boolean);
+```
+
+只认逗号分隔。JSON 数组串走这条路 = 按逗号切完，**方括号原样留在首尾项里**。
+
+**判据不一致才是根因**：同一条 `zelto set` 命令里的另一个数组字段
+`spec.gateCommands` **早就是 JSON 格式**（ADR-051）—— 因为门禁命令里
+经常有逗号和引号（`-DFOO=a,b`、`-G "Visual Studio 17 2022"`），逗号分隔切不准。
+
+于是同一条命令、同类字段，**一个吃 JSON 一个不吃**，用户只能靠猜。
+人猜错的那一次，zelto 不报错、不提示，直接把边界写坏。
+
+**后果**：
+
+- 写集里混进永不生效的条目 → 「写集覆盖了什么」这件事说不清；
+- 门禁的写集判定会把垃圾条目算进写集 —— 越界豁免的判定基于它；
+- **最坏的情况**：本该被拦住的越界写，因为垃圾条目让写集看起来更大而**被放过**。
+  边界形同虚设，而全程**没有任何报错**。
+
+**修复**：已修（2026-11-21）。`cli/commands/slice-detail.ts` 新增
+`parseArrayField(rawValue, field)`，数组字段**两种格式都收**：
+
+1. **JSON 数组**（首选）：`["src/a/**","src/b/**"]`；
+2. **逗号分隔**（历史格式，保持可用）：`src/a/**,src/b/**`。
+
+以 `[` 开头就当 JSON 解析，**解析失败直接报错** ——
+不兜底回逗号分隔（兜底会把「JSON 写错了」变成「写集里多了几个奇怪条目」，
+那是同一个病）。JSON 数组里混入非字符串元素也报错。
+
+**为什么不能只留 JSON**：逗号分隔格式**已有大量既有用法**，直接砍掉是破坏性变更。
+多认一种格式是零风险的。
+
+**回归测试**：`tests/acceptance/cli-commands.test.ts`，5 个用例：
+- JSON 数组格式被接受，且写集条目**无方括号残留**
+- JSON 数组里混入非字符串 → 报错并说明「只能是字符串」
+- 坏 JSON → 报错，且**写集保持为空**（不静默写坏）
+- 逗号分隔格式仍然可用（向后兼容）
+- `trace.requirements` 同样接受 JSON 数组
+
+**剩余问题**：`zelto set` 的 `--help` 里没说明数组字段接受哪两种格式 ——
+下一个人还是会猜。下一步要么在 `--help` 里写清，要么让 `set` 在检测到
+「以 `[` 开头但解析失败」时给出「你是不是想写 JSON 数组」的提示。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。

@@ -305,4 +305,85 @@ void describe('zelto set', () => {
     assert.equal(code, 1);
     assert.ok(stderr.includes('required') || stderr.includes('require a value'));
   });
+
+  // ─── ZD-022：数组字段的 JSON 数组格式 ──────────────────────────────────
+  //
+  // 病灶：只支持逗号分隔时，喂 JSON 数组串会**静默**产出带方括号的垃圾条目
+  // （`[src/a/**`）—— 而且**报告成功**。写集里混进这种条目，
+  // 既覆盖不到任何真实路径，又让「写集写了什么」说不清。
+
+  void it('set writes 接受 JSON 数组格式，且不残留方括号', async () => {
+    await runCli('create', 'set-json-writes');
+    const res = await runCli(
+      'set', 'set-json-writes',
+      '--field', 'writes',
+      '--value', '["src/modules/video_capture/**","src/engine/**"]',
+    );
+    assert.equal(res.code, 0, `JSON 数组格式应当被接受: ${res.stdout}${res.stderr}`);
+
+    const raw = await readFile(join(TEST_DIR, '.zelto', 'slices', 'set-json-writes.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { writes: string[] };
+    assert.deepEqual(
+      parsed.writes,
+      ['src/modules/video_capture/**', 'src/engine/**'],
+      `写集应当是两条干净的路径，实际 ${JSON.stringify(parsed.writes)}`,
+    );
+    for (const w of parsed.writes) {
+      assert.ok(!w.includes('[') && !w.includes(']'), `写集条目不该有方括号: ${w}`);
+    }
+  });
+
+  void it('set writes 的 JSON 数组里每项必须是字符串', async () => {
+    await runCli('create', 'set-json-writes-bad');
+    const res = await runCli(
+      'set', 'set-json-writes-bad',
+      '--field', 'writes',
+      '--value', '["src/a/**", 42]',
+    );
+    assert.equal(res.code, 1, `数组里混入非字符串应当报错`);
+    assert.ok(res.stderr.includes('字符串'), `错误信息应说明只能是字符串: ${res.stderr}`);
+  });
+
+  void it('set writes 的 JSON 数组解析失败时报错而不是静默写坏', async () => {
+    await runCli('create', 'set-json-writes-broken');
+    const res = await runCli(
+      'set', 'set-json-writes-broken',
+      '--field', 'writes',
+      '--value', '["src/a/**",',
+    );
+    assert.equal(res.code, 1, `坏 JSON 应当报错`);
+    assert.ok(res.stderr.includes('JSON'), `错误信息应提到 JSON: ${res.stderr}`);
+
+    const raw = await readFile(join(TEST_DIR, '.zelto', 'slices', 'set-json-writes-broken.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { writes: string[] };
+    assert.deepEqual(parsed.writes, [], `坏 JSON 不该写进任何条目`);
+  });
+
+  void it('set writes 的逗号分隔格式仍然可用（向后兼容）', async () => {
+    await runCli('create', 'set-comma-writes');
+    const res = await runCli(
+      'set', 'set-comma-writes',
+      '--field', 'writes',
+      '--value', 'src/a/**,src/b/**',
+    );
+    assert.equal(res.code, 0, `逗号分隔格式应当仍然可用: ${res.stdout}${res.stderr}`);
+
+    const raw = await readFile(join(TEST_DIR, '.zelto', 'slices', 'set-comma-writes.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { writes: string[] };
+    assert.deepEqual(parsed.writes, ['src/a/**', 'src/b/**']);
+  });
+
+  void it('set trace.requirements 接受 JSON 数组格式', async () => {
+    await runCli('create', 'set-json-trace');
+    const res = await runCli(
+      'set', 'set-json-trace',
+      '--field', 'trace.requirements',
+      '--value', '["D3","D4"]',
+    );
+    assert.equal(res.code, 0, `trace.requirements 的 JSON 数组应当被接受: ${res.stdout}${res.stderr}`);
+
+    const raw = await readFile(join(TEST_DIR, '.zelto', 'slices', 'set-json-trace.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { trace: { requirements: string[] } };
+    assert.deepEqual(parsed.trace.requirements, ['D3', 'D4']);
+  });
 });

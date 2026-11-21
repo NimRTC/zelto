@@ -1520,6 +1520,15 @@ export function isDirectory(path: string): boolean {
  *
  * 第 1 类是绝大多数情况（12/14），也是最容易被误读成「源码丢了」的一类 ——
  * 所以必须单独识别出来。
+ *
+ * **同一故障条件，git 在不同平台上的措辞不同**（实测）：
+ *   - Windows：`fatal: unable to read tree (ac01707f...)`
+ *   - Linux：`fatal: repository '<...>/.git/modules/vendor/sub' does not exist`
+ *     （git 从 module git 目录克隆到 worktree 时，源目录「不可用」）
+ *
+ * 只认一种措辞 = 换个平台就退化成「贴原文」，人拿不到那条可执行的修法 ——
+ * 而这条修法恰恰是这类故障最值钱的部分。所以判据按**故障条件**写，
+ * 不按**某个平台的措辞**写。
  */
 export function describeSubmoduleFailure(err: unknown): string {
   // 错误对象可能是 Error，也可能只是 `{ message, stderr }` 形态的普通对象
@@ -1541,14 +1550,43 @@ export function describeSubmoduleFailure(err: unknown): string {
   if (/ETIMEDOUT|timed out|timeout/i.test(combined)) {
     return '同步超时（git 卡在网络上）—— 检查网络与 SSH 配置';
   }
-  if (/unable to read tree|does not contain|could not read/i.test(combined)) {
+
+  // ── 远程不可达：先判它 ──────────────────────────────────────────
+  //
+  // 「远程不可达」与「本地缺 commit」的修法**完全不同**：
+  //   - 本地缺 commit → 在主仓里 `git submodule update --init` 补到本地
+  //   - 远程不可达   → 查网络 / SSH / 凭据
+  // 混起来会把人引去跑一条没用的命令，所以它必须先判。
+  //
+  // 而且它必须**排在「本地缺 commit」之前**：`Could not read from remote
+  // repository` 里含 `could not read`，若不先摘出去就会被下面那条
+  // （宽松的 `could not read`）抢走 —— 那条判据是为了覆盖
+  // `could not read <sha>` 形态的本地缺 commit。
+  if (
+    /Could not read from remote|Permission denied|Authentication failed|could not resolve host|Connection refused|unable to access/i.test(
+      combined,
+    )
+  ) {
+    return '没有权限访问 submodule 的远程仓库 —— 检查凭据配置';
+  }
+
+  // ── 本地 module git 目录里没有 index 记录的 commit ─────────────────
+  //
+  // 两种措辞、同一故障条件（见上面的说明）：
+  //   - Windows：`unable to read tree (<sha>)`
+  //   - Linux：  `repository '<...>/.git/modules/<path>' does not exist`
+  //
+  // 第二种措辞必须带 `.git/modules` 才算 —— 否则「远程仓库路径不存在」
+  // 也会被误判成本地缺 commit。
+  if (
+    /unable to read tree|does not contain|could not read/i.test(combined) ||
+    (/does not exist/i.test(combined) && /\.git[/\\]modules/i.test(combined))
+  ) {
     return (
       '本地 module git 目录里没有 index 记录的 commit —— ' +
       '在主仓里执行 `git submodule update --init` 把依赖补到本地后重试'
     );
   }
-  if (/Permission denied|Could not read from remote/i.test(combined)) {
-    return '没有权限访问 submodule 的远程仓库 —— 检查凭据配置';
-  }
+
   return detail || message || '未知原因';
 }

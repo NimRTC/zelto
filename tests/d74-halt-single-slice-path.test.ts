@@ -32,7 +32,23 @@ import { join } from 'node:path';
 import { HaltStore } from '../src/core/halt/index.js';
 import { waitForExitWithWatchdog } from '../src/cli/commands/core-slice.js';
 
-/** 假 adapter：waitForExit 一直挂着，直到被 stop 或超时 */
+/**
+ * 假 adapter：waitForExit 一直挂着，直到被 stop 或超时。
+ *
+ * **必须持有一个真实的句柄**（`setInterval`）：
+ * `waitForExitWithWatchdog` 里的看门狗定时器是 `unref()` 过的 ——
+ * 它的存在只是为了让「进程能退出」，不是让事件循环活着。
+ * 于是**事件循环的存活完全取决于有没有别的句柄**。
+ *
+ * 真实适配器里那个句柄是 agent 的**子进程**（`child_process.spawn`）；
+ * 假适配器没有子进程，如果不自己造一个句柄，事件循环会在 agent
+ * 「还活着」期间就空掉 —— Node 报
+ * `Promise resolution is still pending but the event loop has already resolved`。
+ *
+ * 这个坑只在 **Linux + Node 22** 上暴露：Windows 上测试文件里其它
+ * 未 await 的定时器（`afterEach` 里的 `rmSync` 之类）恰好撑住了循环，
+ * 于是本地全绿、CI 全红。
+ */
 function fakeAdapter(opts: { exitAfterMs?: number } = {}) {
   const stopped: string[] = [];
   let release: (code: number | null) => void = () => {};
@@ -43,6 +59,11 @@ function fakeAdapter(opts: { exitAfterMs?: number } = {}) {
       setTimeout(() => resolve(0), opts.exitAfterMs);
     }
   });
+
+  // 代替子进程的「存活句柄」—— 见上面的说明。
+  // agent 退出（release 被调用）之后不需要再撑循环，但多留一个 unref
+  // 的定时器无害（它不会让进程退不出去）。
+  const keepAlive = setInterval(() => {}, 1000);
 
   return {
     stopped,
@@ -55,6 +76,7 @@ function fakeAdapter(opts: { exitAfterMs?: number } = {}) {
       markProgress: () => {},
     },
     release,
+    dispose: () => clearInterval(keepAlive),
   };
 }
 
@@ -72,7 +94,7 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
   });
 
   it('拉闸后 agent 被停掉，等待方拿到 halted 与原因', async () => {
-    const { adapter, stopped } = fakeAdapter();
+    const { adapter, stopped, dispose } = fakeAdapter();
     // 先拉闸，再开始等 —— watcher 一轮询就会看到
     await store.request('sess-slice-1', 'human', '跑偏了');
 
@@ -88,10 +110,11 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
     assert.equal(result.halted, true, '单片前台路径必须听拉闸');
     assert.equal(result.haltReason, '跑偏了');
     assert.deepEqual(stopped, ['agent-session-1'], '被拉闸的 agent 应该被停掉');
+    dispose();
   });
 
   it('没人拉闸时，等 agent 正常退出（不被拉闸逻辑误伤）', async () => {
-    const { adapter, release } = fakeAdapter();
+    const { adapter, release, dispose } = fakeAdapter();
 
     const waiting = waitForExitWithWatchdog({
       sliceId: 'sess-slice-2',
@@ -108,10 +131,11 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
     const result = await waiting;
     assert.equal(result.halted, undefined, '没人拉闸就不该报 halted');
     assert.equal(result.exitCode, 0, 'agent 正常退出时退出码要如实带出来');
+    dispose();
   });
 
   it('批次作用域的拉闸不影响别的切片', async () => {
-    const { adapter, stopped } = fakeAdapter({ exitAfterMs: 50 });
+    const { adapter, stopped, dispose } = fakeAdapter({ exitAfterMs: 50 });
     await store.request('other-slice', 'human', '别的切片');
 
     const result = await waitForExitWithWatchdog({
@@ -125,10 +149,11 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
 
     assert.equal(result.halted, undefined);
     assert.deepEqual(stopped, [], '别的切片的拉闸不该停掉本切片');
+    dispose();
   });
 
   it('全局拉闸（scope=all）对单片路径同样生效', async () => {
-    const { adapter, stopped } = fakeAdapter();
+    const { adapter, stopped, dispose } = fakeAdapter();
     await store.request('all', 'human', '全部停');
 
     const result = await waitForExitWithWatchdog({
@@ -143,6 +168,7 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
     assert.equal(result.halted, true, '全局拉闸必须对单片路径生效');
     assert.equal(result.haltReason, '全部停');
     assert.deepEqual(stopped, ['agent-session-4']);
+    dispose();
   });
 
   it('源码层面：detach 监督进程的重试回路必须先问一次拉闸', () => {
