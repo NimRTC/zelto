@@ -178,9 +178,11 @@ describe('D-74：拉闸在单片前台路径上也生效', () => {
       join(process.cwd(), 'src', 'cli', 'commands', 'supervisor.ts'),
       'utf-8',
     );
-    assert.match(src, /isHalted/, '监督进程必须读拉闸请求');
+    // ZD-023 补：重试前问的是「要不要开新一轮 agent」→ 用 isBlockingNewWork
+    // （过期的请求不再拦新工作）。看门狗那边停正在跑的活才用 isHalted。
+    assert.match(src, /isBlockingNewWork/, '监督进程必须读拉闸请求');
     // 拉闸检查必须在重试判断之前
-    const haltIdx = src.indexOf('isHalted');
+    const haltIdx = src.indexOf('isBlockingNewWork');
     const retryIdx = src.indexOf('isAutoResolvable');
     assert.ok(haltIdx > 0, '监督进程里必须有拉闸检查');
     assert.ok(

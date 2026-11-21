@@ -100,6 +100,9 @@ register('halt', async (args) => {
     console.log('       zelto halt --rollback [--reason <text>] 回退卡在 running 的切片（批次已崩时用）');
     console.log('');
     console.log('Scopes: all（所有批次）| batch（zelto run --parallel）| version-<label>');
+    console.log('');
+    console.log('有效期：默认 30 分钟。过期后不再拦住新工作（但仍会停下当时正在跑的活）。');
+    console.log('过期不等于解除 —— 请求仍在盘上，要彻底清掉请用 --clear。');
     return 0;
   }
 
@@ -157,8 +160,19 @@ register('halt', async (args) => {
     }
     console.log('暂停请求：');
     for (const h of list) {
+      const expired = halts.isExpired(h);
       console.log(`  ${h.scope} — ${h.requestedAt.slice(0, 19)} by ${h.requestedBy}`);
       if (h.reason) console.log(`    原因: ${h.reason}`);
+      // 有效期要说清楚：过期之后它**不再拦新工作**，
+      // 但**仍然会停下正在跑的活**（人喊停就是喊停）。
+      if (h.expiresAt) {
+        console.log(
+          `    有效期: 至 ${h.expiresAt.slice(0, 19)}` +
+          (expired ? '（已过期 —— 不再拦新工作，但仍会停下正在跑的活）' : ''),
+        );
+      } else {
+        console.log('    有效期: 永不过期');
+      }
     }
     return 0;
   }
@@ -260,6 +274,11 @@ register('halt', async (args) => {
 
   console.log(`⏸️  已拉闸（scope: ${scope}）`);
   console.log(`   原因: ${reason}`);
+  if (req.expiresAt) {
+    console.log(`   有效期: 至 ${req.expiresAt.slice(0, 19)}（过期后不再拦新工作，但仍会停下正在跑的活）`);
+  } else {
+    console.log('   有效期: 永不过期');
+  }
   console.log('');
   await printScene();
   console.log('');

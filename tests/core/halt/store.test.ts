@@ -120,3 +120,117 @@ describe('HaltStore — 文件化的拉闸请求（C1: 状态只在文件里）'
     assert.equal(list[0].scope, 'batch');
   });
 });
+
+describe('HaltStore — 暂停请求有 TTL（ZD-023 补）', () => {
+  let dir: string;
+  let store: HaltStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'zelto-halt-ttl-'));
+    store = new HaltStore(dir);
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('新写的请求带 expiresAt（默认 30 分钟）', async () => {
+    const req = await store.request('all', 'human', '停');
+    assert.ok(req.expiresAt, '新写的请求应当带 expiresAt');
+    const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
+    // 允许 1 秒的写入耗时误差
+    assert.ok(ttl > 29 * 60 * 1000 && ttl <= 30 * 60 * 1000, `TTL 应当是 30 分钟（实际 ${ttl}ms）`);
+  });
+
+  it('显式永不过期时 expiresAt 为 null', async () => {
+    const req = await store.request('all', 'human', '永久停', 0);
+    assert.equal(req.expiresAt, null);
+  });
+
+  it('显式指定 TTL 时按指定的算', async () => {
+    const req = await store.request('all', 'human', '短停', 5 * 60 * 1000);
+    const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
+    assert.ok(ttl > 4 * 60 * 1000 && ttl <= 5 * 60 * 1000, `TTL 应当是 5 分钟（实际 ${ttl}ms）`);
+  });
+
+  it('isExpired：没过期 → false，过期 → true', async () => {
+    const req = await store.request('all', 'human', '停');
+    assert.equal(store.isExpired(req), false, '刚写的请求不该算过期');
+
+    const future = Date.now() + 31 * 60 * 1000;
+    assert.equal(store.isExpired(req, future), true, '31 分钟后应当算过期');
+  });
+
+  it('永不过期的请求永远不算过期', async () => {
+    const req = await store.request('all', 'human', '永久停', 0);
+    assert.equal(store.isExpired(req, Date.now() + 365 * 24 * 60 * 60 * 1000), false);
+  });
+
+  it('isHalted 不看过期 —— 人喊停就是喊停（在跑的活该停还得停）', async () => {
+    const req = await store.request('all', 'human', '停');
+    const later = Date.now() + 31 * 60 * 1000;
+    const got = await store.isHalted('batch');
+    assert.ok(got, 'isHalted 应当仍能读到请求');
+
+    // 用显式的 now 验证过期不影响 isHalted —— isHalted 不带 now 参数，
+    // 所以这里直接验 isExpired 与 isBlockingNewWork 的分工。
+    assert.equal(store.isExpired(req, later), true);
+    assert.ok(got, 'isHalted 不过期 —— 请求仍在');
+  });
+
+  it('isBlockingNewWork：过期 → null（放行新工作）', async () => {
+    await store.request('all', 'human', '停');
+    const later = Date.now() + 31 * 60 * 1000;
+    assert.equal(await store.isBlockingNewWork('batch', later), null, '过期后不该再拦新工作');
+  });
+
+  it('isBlockingNewWork：没过期 → 返回请求（拦住新工作）', async () => {
+    const req = await store.request('all', 'human', '停');
+    const got = await store.isBlockingNewWork('batch');
+    assert.ok(got, '没过期时应当拦住新工作');
+    assert.equal(got?.id, req.id);
+  });
+
+  it('旧格式请求（没有 expiresAt 字段）按 requestedAt 回填 TTL', async () => {
+    // 模拟 TTL 上线前写的请求文件
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(dir, 'halts'), { recursive: true });
+    const old = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+    writeFileSync(
+      join(dir, 'halts', 'all.json'),
+      JSON.stringify({
+        id: 'halt-legacy',
+        scope: 'all',
+        requestedBy: 'human',
+        reason: '旧的暂停请求',
+        requestedAt: old,
+      }),
+      'utf-8',
+    );
+
+    const req = await store.get('all');
+    assert.ok(req, '旧请求应当能读出来');
+    assert.ok(req?.expiresAt, '旧请求应当被回填 expiresAt');
+    assert.equal(store.isExpired(req as NonNullable<typeof req>), true, '31 分钟前的旧请求应当算过期');
+  });
+
+  it('旧格式请求：requestedAt 坏掉时按「从现在起算」处理', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    mkdirSync(join(dir, 'halts'), { recursive: true });
+    writeFileSync(
+      join(dir, 'halts', 'all.json'),
+      JSON.stringify({
+        id: 'halt-bad',
+        scope: 'all',
+        requestedBy: 'human',
+        reason: '时间戳坏掉',
+        requestedAt: 'not-a-date',
+      }),
+      'utf-8',
+    );
+
+    const req = await store.get('all');
+    assert.ok(req?.expiresAt, '应当被回填');
+    assert.equal(store.isExpired(req as NonNullable<typeof req>), false, '坏时间戳 → 当作没过期（fail closed）');
+  });
+});

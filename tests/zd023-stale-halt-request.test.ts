@@ -18,7 +18,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -105,5 +105,73 @@ describe('ZD-023：陈旧的暂停请求不得毒化后续切片', () => {
 
     const code = await commands['run'](['zd023-d']);
     assert.equal(code, 1, 'scope=切片id 的暂停请求同样应当拦得住');
+  });
+});
+
+describe('ZD-023 补：暂停请求有 TTL —— 踩下刹车忘了松，不该堵死后续切片', () => {
+  const originalCwd = process.cwd();
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'zelto-zd023-ttl-'));
+    process.chdir(dir);
+    mkdirSync(join(dir, '.zelto', 'slices'), { recursive: true });
+    mkdirSync(join(dir, '.zelto', 'events'), { recursive: true });
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function makeSlice(id: string): Promise<void> {
+    await commands['create']([id, '--title', `Slice ${id}`, '--writes', 'src/**']);
+    await commands['set']([id, '--field', 'trace.requirements', '--value', 'ZD-023']);
+    await commands['freeze']([id]);
+  }
+
+  /** 把 all.json 改写成「N 分钟前写下的」样子 */
+  function backdate(minutes: number): string {
+    const file = join(dir, '.zelto', 'halts', 'all.json');
+    const raw = JSON.parse(readFileSync(file, 'utf-8')) as Record<string, unknown>;
+    const old = new Date(Date.now() - minutes * 60 * 1000).toISOString();
+    raw.requestedAt = old;
+    raw.expiresAt = new Date(Date.parse(old) + 30 * 60 * 1000).toISOString();
+    writeFileSync(file, JSON.stringify(raw, null, 2), 'utf-8');
+    return file;
+  }
+
+  it('新鲜的暂停请求仍然拦得住起跑', async () => {
+    await makeSlice('zd023-ttl-a');
+    const halts = new HaltStore(join(dir, '.zelto'));
+    await halts.request('all', 'human', '人工拉闸');
+
+    const code = await commands['run'](['zd023-ttl-a']);
+    assert.equal(code, 1, '新鲜的暂停请求应当拦得住起跑');
+  });
+
+  it('过期的暂停请求不再拦新工作（TTL 到期自动放行）', async () => {
+    await makeSlice('zd023-ttl-b');
+    const halts = new HaltStore(join(dir, '.zelto'));
+    await halts.request('all', 'human', '人工拉闸');
+    backdate(31);
+
+    const code = await commands['run'](['zd023-ttl-b', '--dry-run']);
+    assert.equal(code, 0, '过期的暂停请求不该再拦住起跑');
+  });
+
+  it('过期的请求仍在磁盘上（不静默消费 —— 替人解除刹车是越权）', async () => {
+    await makeSlice('zd023-ttl-c');
+    const halts = new HaltStore(join(dir, '.zelto'));
+    await halts.request('all', 'human', '人工拉闸');
+    const file = backdate(31);
+
+    await commands['run'](['zd023-ttl-c', '--dry-run']);
+
+    assert.equal(
+      existsSync(file),
+      true,
+      '过期的暂停请求不该被自动删掉 —— 静默消费等于替人解除了他自己踩下的刹车',
+    );
   });
 });

@@ -1451,14 +1451,17 @@ register('run', async (args) => {
     //
     // 为什么必须在这里拦：
     //   - 暂停是**人的明确意图**（「现在我要接管」），不该被下一个切片静默继承；
-    //   - 事后看事件流会以为人干预过这一轮 —— 追溯链凭空多一次人为干预；
-    //   - 那个 `all.json` **不会被自动清除**，一次误操作污染后面所有切片。
+    //   - 事后看事件流会以为人干预过这一轮 —— 追溯链凭空多一次人为干预。
     //
     // 处置：**拒绝起跑**，说清怎么解除。不静默消费 —— 静默消费等于
     // 替人解除了他自己踩下的刹车。
+    //
+    // 用 `isBlockingNewWork` 而不是 `isHalted`：**过期的请求不再拦新工作**
+    // （踩下刹车忘了松，不该把后面大半个工作日都堵死）；
+    // 而 `isHalted` 那边（看门狗停正在跑的活）不看过期 —— 人喊停就是喊停。
     {
       const haltStore = new HaltStore(ZELTO_DIR);
-      const halted = await haltStore.isHalted(id).catch(() => null);
+      const halted = await haltStore.isBlockingNewWork(id).catch(() => null);
       if (halted) {
         const msg =
           `当前处于暂停中（${halted.scope === 'all' ? '全局暂停' : `scope=${halted.scope}`}，` +

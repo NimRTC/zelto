@@ -826,7 +826,7 @@ const values = rawValue.split(',').map((v) => v.trim()).filter(Boolean);
 
 ```ts
 const haltStore = new HaltStore(ZELTO_DIR);
-const halted = await haltStore.isHalted(id).catch(() => null);
+const halted = await haltStore.isBlockingNewWork(id).catch(() => null);
 if (halted) {
   // 拒绝起跑，说清怎么解除
   return 1;
@@ -847,15 +847,69 @@ if (halted) {
 - 解除暂停后 `zelto run` 恢复可跑
 - 切片作用域（scope=切片id）的暂停请求同样拦得住（不只是 `all`）
 
+**补充修复（2026-11-21，同日）—— 暂停请求加 TTL（30 分钟）**：
+
+上面这条修完之后，「踩下刹车忘了松」从「悄悄打断」变成了「明确拒绝」——
+但仍然会挡路：人处理完现场忘了 `zelto halt --clear`，
+后续**所有**切片都会被拒绝起跑。这不是「明确拒绝」该有的样子。
+
+给 `HaltRequest` 加了 `expiresAt` 字段（`null` = 永不过期），
+默认 TTL 30 分钟（`DEFAULT_HALT_TTL_MS`）：
+
+```json
+{
+  "id": "halt-1795220375428",
+  "scope": "all",
+  "requestedBy": "human",
+  "reason": "人工拉闸",
+  "requestedAt": "2026-11-21T00:19:35.428Z",
+  "expiresAt": "2026-11-21T00:49:35.428Z"
+}
+```
+
+**关键设计：过期只影响「拦不拦新工作」，不影响「停不停在跑的活」**。
+
+`HaltStore` 因此拆成两个判定：
+
+| 方法 | 语义 | 过期后 |
+|---|---|---|
+| `isHalted(scope)` | 「在跑的活要不要停」 | **仍然停** —— 人喊停就是喊停 |
+| `isBlockingNewWork(scope)` | 「新的活要不要开始」 | **放行** —— 刹车不该一直咬着 |
+
+对应到三个调用点：
+
+- **看门狗**（`core-slice.ts` 的 `waitForExitOrHalt`）→ 仍用 `isHalted`。
+  人喊停是为了让现在跑的停下来，那份请求两小时后过期了，
+  正在跑的 agent 也还是得停。
+- **准入**（`zelto run` 起跑前、`parallel-executor` 的安全点①③、
+  `supervisor` 的重试回路）→ 改用 `isBlockingNewWork`。
+  这些都是「要不要开始新工作」，过期的请求不该再拦。
+
+**为什么不静默删除过期请求**：静默消费等于替人解除了他自己踩下的刹车。
+过期只是让它**不再拦路**，文件仍在盘上 —— 人随时可以 `--clear`，
+也可以在 `zelto halt --list` 里看到它（会标注「已过期」）。
+
+**旧格式文件的处理**：TTL 是后加的，之前写的请求文件里没有 `expiresAt` 字段。
+如果把它们当成「永不过期」，那 ZD-023 里那份**真实的**陈旧请求就永远堵着后面的切片 ——
+修了等于没修。所以 `get()` 会把**字段缺失**（`undefined`）与
+**显式 `null`**（明确表示永不过期）区分开：
+字段缺失 → 按 `requestedAt + 默认TTL` 回填；显式 `null` → 尊重人的意图。
+
+**回归测试**：
+- `tests/core/halt/store.test.ts` 新增 8 个用例（TTL 计算、显式永不过期、
+  `isExpired` 边界、`isHalted` 不看过期、`isBlockingNewWork` 放行/拦截、
+  旧格式回填、坏时间戳 fail closed）
+- `tests/zd023-stale-halt-request.test.ts` 新增 3 个用例
+  （新鲜的仍拦、过期的放行、过期的**仍在盘上**不被静默删除）
+
 **剩余问题**（未做）：
 
-1. 暂停请求没有**时效**。修完之后，`zelto halt` 之后忘了 `--clear`，
-   后续所有切片都会被拒绝起跑 —— 从「悄悄打断」变成「明确拒绝」，
-   但仍然会挡路。合理的做法是给全局暂停请求加一个 TTL
-   （比如 30 分钟），过期的请求不再拦新切片（只对当时正在跑的生效）。
-2. 事件流里的 `batch.halted` 没区分「人真的喊停」与「读到陈旧请求」。
-   修完准入后这条路径基本不会误触发了，但记下 `requestedAt` 与
+1. 事件流里的 `batch.halted` 没区分「人真的喊停」与「读到陈旧请求」。
+   修完准入 + TTL 后这条路径基本不会误触发了，但记下 `requestedAt` 与
    `runStartedAt` 仍能让事后追溯一眼看出差了多少。
+2. TTL 是硬编码的 30 分钟，没有配置项，也没暴露到 `zelto config`。
+   有人想「我这一轮暂停要留 2 小时」时只能用 `--ttl` 之类的入口 ——
+   目前 `HaltStore.request()` 支持传 TTL 参数，但 CLI 没暴露。
 
 ---
 

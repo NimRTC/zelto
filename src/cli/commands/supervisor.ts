@@ -407,7 +407,10 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       // HaltStore 的 baseDir 是 `.zelto` 本身（它自己再拼 `halts/`）——
       // 传项目根会读成 `<root>/halts/`，读不到任何东西。
       const haltStore = new HaltStore(join(args.projectRoot, '.zelto'));
-      const haltReq = await haltStore.isHalted(args.sliceId).catch(() => null);
+      // 这是「要不要开新一轮 agent」→ 过期的请求不再拦（ZD-023）。
+      // 人喊停的当下请求一定是新鲜的，所以「喊停就停」的行为不变；
+      // 只是不会因为一份一小时前的旧请求把重试也一起掐掉。
+      const haltReq = await haltStore.isBlockingNewWork(args.sliceId).catch(() => null);
       if (haltReq) {
         log(`已拉闸（${haltReq.reason}）—— 不再重试，现场交回给人`);
         await events.append(args.sliceId, 'batch.halted', 'human', {

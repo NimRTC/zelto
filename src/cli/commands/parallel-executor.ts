@@ -564,7 +564,11 @@ export async function executeSlicesParallel(
 
   // 安全点 ①：拉起之前先看有没有人喊停
   // 喊停了就不该再开新 agent —— 已跑起来的那个会在安全点 ② 收手。
-  const haltBeforeStart = await haltStore.isHalted(haltScope);
+  //
+  // 用 `isBlockingNewWork`：**过期的请求不再拦新工作**（ZD-023）。
+  // 「这块地方我一会儿再处理」本来就是临时状态；刹车踩下没人松，
+  // 不该把后面大半个工作日都堵死。安全点 ②（停正在跑的活）不看过期。
+  const haltBeforeStart = await haltStore.isBlockingNewWork(haltScope);
   if (haltBeforeStart) {
     haltReason = haltBeforeStart.reason;
     console.log(`⏸️  已拉闸（${haltBeforeStart.reason}）—— 本批次不再启动新的 agent`);
@@ -582,7 +586,7 @@ export async function executeSlicesParallel(
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
 
     // 安全点 ①（逐片）：批次跑到一半人才喊停的，后面的 agent 不再开
-    if (haltBeforeStart || (await haltStore.isHalted(haltScope))) {
+    if (haltBeforeStart || (await haltStore.isBlockingNewWork(haltScope))) {
       st.status = 'failed';
       st.exitCode = null;
       haltedIds.add(st.id);
@@ -1011,8 +1015,10 @@ export async function executeSlicesByPhase(
     const parallel = phaseIds.length > 1 ? `（${phaseIds.length} 个并行）` : '';
 
     // 安全点 ③：阶段之间检查拉闸
+    //
+    // 这一条是「要不要开始新工作」→ 过期的请求不再拦（ZD-023）。
     if (p > 0) {
-      const haltReq = await haltStore.isHalted(haltScope);
+      const haltReq = await haltStore.isBlockingNewWork(haltScope);
       if (haltReq) {
         console.log('');
         console.log(`⏸️  已拉闸（${haltReq.reason}）—— 后续 ${phases.length - p} 个阶段不再启动`);
