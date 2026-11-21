@@ -269,7 +269,26 @@ export function parseMentionedPaths(content: string): string[] {
   const seen = new Set<string>();
 
   // 反引号包裹的优先 —— 这是规格里写路径的规范形式
+  //
+  // ZD-024：反引号段之间要保留**行内上下文**。
+  //
+  //   病灶（nimrtc-v14 v2-ice，2026-11-21）：
+  //   规格的表格里写「`src/modules/ice/src/tcp_socket.hpp` + `tcp_socket.cpp`」——
+  //   第二段是**裸文件名**，而 `tcp_socket.cpp` 是这一片要**新建**的文件
+  //   （此刻不存在）。裸文件名没有目录信息，D-4 覆盖判据查不到它
+  //   → 报「不在写集里」→ 冻结被拦。规格完全没问题。
+  //
+  //   修法：裸文件名**带上它所在目录的上下文**再进覆盖判据。
+  //   证据在**同一行**里：「`a/b/x.hpp` + `x.cpp`」中的 `x.cpp`
+  //   与 `a/b/x.hpp` 同目录 —— 这是确定的信息，不是猜。
+  //
+  //   为什么只在「同名（仅扩展名不同）」时借目录：
+  //     「`a/b/x.hpp` + `y.cpp`」里的 `y.cpp` 是**另一个文件**，
+  //     它在哪个目录规格没说 → 不借（借了就是猜 → 漏报）。
+  //     而 `x.cpp` 与 `x.hpp` 是**同名不同扩展名** —— 标准的
+  //     「头文件 + 实现文件」对，目录必然相同。
   const backticked = /`([^`\n]+)`/g;
+  const backtickSegments: { text: string; start: number; end: number }[] = [];
   let m: RegExpExecArray | null;
   while ((m = backticked.exec(content)) !== null) {
     const candidate = m[1].trim();
@@ -277,7 +296,92 @@ export function parseMentionedPaths(content: string): string[] {
     // 「运行 `node --test tests/acceptance/x/acceptance.test.cjs`」
     // 是一整条命令，当成路径会报「它不在写集里」。
     // 判据：含空白 → 不是路径（路径不该有空格）。
+    //
+    // 这种段**不进入 backtickSegments**，但它里面的路径片段
+    // 仍要被行内裸路径扫描抓到 —— 所以它的区间不列入跳过清单。
     if (/\s/.test(candidate)) continue;
+    backtickSegments.push({ text: candidate, start: m.index, end: m.index + m[0].length });
+  }
+
+  // ZD-024：先把**裸文件名**的段补上同行的目录上下文，
+  // 再统一收集路径。
+  //
+  // 补齐的判据（四条都要满足，缺一不可）：
+  //   1. 该段是**裸文件名**（不含 `/`）且扩展名已知；
+  //   2. 同一行内、**在它之前**有一个反引号段，其路径**带目录**，
+  //      且**basename 去掉扩展名后与本段相同**（`x.hpp` ↔ `x.cpp`）；
+  //   3. 两个段的扩展名**不同**（同扩展名不是「头/实现」对）；
+  //   4. 补齐后的完整路径确实存在**或**不在写集里 ——
+  //      不在这里判，留给覆盖判据。
+  //
+  // 为什么**替换**而不是**追加**裸名：
+  //   `evaluateWriteSetCoverage` 要求 mentioned 里的**每一条**都被覆盖。
+  //   裸名那条路对**新建**文件必然不覆盖（文件还不存在），
+  //   所以裸名必须被补齐后的路径**取代**，而不是与之并存 ——
+  //   并存的话 uncovered 里仍会有那个裸名，覆盖判据照样报未覆盖。
+  //
+  //   替换的**安全性**：补齐的前提是「同一行里有一个带目录的同名兄弟」，
+  //   那是有确切证据的目录，不是猜。猜不出来的（不同名 / 跨行）
+  //   保持裸名原样，走 ZD-020 的同名文件判定。
+  // 补齐结果按**段的起始位置**索引（不是按文件名）。
+  //
+  // 为什么不用文件名当键：同一个裸文件名可以在规格里出现多次，
+  // 每次在不同的行、对应不同的目录（`a/x.hpp` + `x.cpp` 与
+  // `b/x.hpp` + `x.cpp`）—— 按文件名当键会让后一个覆盖前一个，
+  // 于是第一条被错误地补到第二个的目录去。用位置索引就没有这个歧义。
+  const completedByPos = new Map<number, string>();
+  for (const seg of backtickSegments) {
+    if (seg.text.includes('/')) continue;
+    if (!hasKnownExtension(seg.text)) continue;
+
+    const segDot = seg.text.lastIndexOf('.');
+    if (segDot <= 0) continue;
+    const stem = seg.text.slice(0, segDot);
+    const ext = seg.text.slice(segDot + 1).toLowerCase();
+    if (!KNOWN_EXTENSIONS.includes(ext)) continue;
+
+    // 同一行内的前序段
+    const lineStart = content.lastIndexOf('\n', seg.start) + 1;
+    for (const prev of backtickSegments) {
+      if (prev.end > seg.start) continue;               // 必须在它之前
+      if (prev.start < lineStart) continue;              // 同一行内
+      if (!prev.text.includes('/')) continue;            // 前序段要带目录
+      if (!hasKnownExtension(prev.text)) continue;
+
+      const prevBase = prev.text.slice(prev.text.lastIndexOf('/') + 1);
+      const prevBaseDot = prevBase.lastIndexOf('.');
+      if (prevBaseDot <= 0) continue;
+      // 比**basename 的 stem**，不是整条路径的 stem：
+      //   prev.text = `src/modules/ice/src/tcp_socket.hpp`
+      //   直接比整条路径的 stem 永远不等于裸名的 stem（`tcp_socket`）→ 补齐永不生效。
+      if (prevBase.slice(0, prevBaseDot) !== stem) continue; // 同名不同扩展名
+      if (prevBase.slice(prevBaseDot + 1).toLowerCase() === ext) continue; // 同扩展名 → 不是「头/实现」对
+
+      const dir = prev.text.slice(0, prev.text.lastIndexOf('/'));
+      const full = `${dir}/${seg.text}`;
+      const normalized = normalizeMentionedPath(full);
+      if (!normalized) continue;
+      completedByPos.set(seg.start, normalized);
+      break; // 一个候选就够（最近的同名前序段）
+    }
+  }
+
+  // 已处理过的**字符区间**（反引号段）—— 行内裸路径扫描要跳过它们。
+  //
+  // ZD-024：行内裸路径正则会把反引号里的裸文件名也再抓一遍
+  // （`tcp_socket.cpp` 的前置字符是反引号，不在排除集里 → 命中），
+  // 于是「已补齐目录的名字」又以**裸名**形式回到列表里
+  // → 覆盖判据仍报「tcp_socket.cpp 不在写集里」。
+  //
+  // 修法：行内扫描**跳过反引号区间**。反引号里的内容已由上面的
+  // 反引号分支处理过（含 ZD-024 的补齐），再扫一遍只会把它退回去。
+  const backtickRanges: Array<[number, number]> = backtickSegments.map((s) => [s.start, s.end]);
+  const inBacktick = (pos: number): boolean =>
+    backtickRanges.some(([a, b]) => pos >= a && pos < b);
+
+  for (const seg of backtickSegments) {
+    // ZD-024：裸文件名被补齐后，用补齐后的路径取代它。
+    const candidate = completedByPos.get(seg.start) ?? seg.text;
     for (const expanded of expandBraces(candidate)) {
       if (!looksLikePath(expanded)) continue;
       const normalized = normalizeMentionedPath(expanded);
@@ -303,6 +407,7 @@ export function parseMentionedPaths(content: string): string[] {
     'gi',
   );
   while ((m = inline.exec(content)) !== null) {
+    if (inBacktick(m.index)) continue; // 反引号区间已由上面处理过
     const candidate = m[1];
     const normalized = normalizeMentionedPath(candidate);
     if (!normalized) continue;
@@ -321,6 +426,7 @@ export function parseMentionedPaths(content: string): string[] {
     'gi',
   );
   while ((m = extensionless.exec(content)) !== null) {
+    if (inBacktick(m.index)) continue; // 反引号区间已由上面处理过
     const candidate = m[1];
     const normalized = normalizeMentionedPath(candidate);
     if (!normalized) continue;

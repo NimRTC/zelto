@@ -31,6 +31,7 @@ import { tmpdir } from 'node:os';
 
 import { findPlaceholders, hasPlaceholder } from '../src/core/spec/semantic/placeholder.js';
 import { evaluateWriteSetCoverage, isInWriteSet } from '../src/core/spec/write-set.js';
+import { parseMentionedPaths } from '../src/core/spec/scope.js';
 
 // ─────────────────────────── ZD-019 ───────────────────────────
 

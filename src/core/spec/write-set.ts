@@ -205,6 +205,39 @@ function globMatchesSomething(pattern: string, projectRoot: string): boolean {
  *   所以必须**落到文件级别**核实，不能靠猜。
  *
  * 代价控制：只扫 glob 字面前缀目录，深度与文件量都有限。
+ *
+ * ── ZD-024：新建文件也必须算覆盖 ──────────────────────────────────────
+ *
+ * 上面那条判据有个盲区：它要求**同名文件已经存在**。
+ * 于是「这一片要新建 `tcp_socket.cpp`」这种规格必然误报：
+ *
+ *   写集 `src/modules/ice/**`，规格正文写
+ *   「`src/modules/ice/src/tcp_socket.hpp` + `tcp_socket.cpp`」——
+ *   第二项是**裸文件名**（同行的目录上下文对解析器不可见），
+ *   而 `tcp_socket.cpp` 此刻**还不存在**（它是这一片要新建的）
+ *   → 同名文件查不到 → 报「不在写集里」→ 冻结被拦。
+ *
+ *   规格**完全没问题**：`src/modules/ice/**` 明确授权了整棵树的写入，
+ *   而 `tcp_socket.cpp` 显然是 `tcp_socket.hpp` 的兄弟文件。
+ *   这是闸门误报，且它**系统性地**挡住所有「新建文件」的切片 ——
+ *   也就是最需要写集授权的那一类。
+ *
+ * 修法**不在这一层**，在规格解析层（`scope.ts` 的 `parseMentionedPaths`）：
+ * 让裸文件名**带上它所在目录的上下文**再进这里。
+ *
+ * 为什么不能在这里用「同扩展名兄弟」来放行（试过，否决）：
+ *   裸文件名**没有目录信息**，「它是不是 glob 范围内某个文件的兄弟」
+ *   只能靠猜。而这个猜测必然漏报：
+ *
+ *     写集 `src/modules/ice/**`，规格提到 `engine_media.cpp`
+ *     → glob 范围内有 `ice.cpp`（同扩展名）→ 猜「是兄弟」→ 放行
+ *     → `src/engine/src/engine_media.cpp` **根本没被授权**，却没报。
+ *
+ *   漏报比误报更糟：未授权的文件被放过，agent 撞写集守卫时才炸。
+ *   所以这一路只能走「**有确切证据**」的判定 —— 而裸文件名给不出证据。
+ *
+ *   证据在**规格的行内上下文**里：「`a/b/x.hpp` + `x.cpp`」里的
+ *   `x.cpp` 目录是 `a/b/`。那是确定的信息，不是猜。
  */
 function globCoversBasename(
   pattern: string,
