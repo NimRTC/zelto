@@ -116,6 +116,123 @@ git 只带**被跟踪**的内容，这个残留不带过去。
 
 于是主仓能构建、任何新 worktree 不能 —— **差异不在代码，在工作区的历史**。
 
+#### 2.4.1 主仓那份残留到底是什么（2026-11-22 实测更正）
+
+写这份 ADR 时曾断言主仓的 `ecc-key.pem` 是「跑过一次 `build_dtls_cert.py`
+留下的残留」。**这个断言是错的**，实测结论如下：
+
+| 文件 | 主仓里的实际内容 | 来源 |
+|---|---|---|
+| `src/third_party/wolfssl/src/certs/server-ecc.pem` | `CN=www.wolfssl.com`，**无 SAN** | **wolfSSL 上游自带**（子模块里被 git 跟踪） |
+| `src/third_party/wolfssl/src/certs/ecc-key.pem` | `ASN1 OID: prime256v1` + `BEGIN EC PRIVATE KEY` | **wolfSSL 自己的 keygen 工具**的输出 |
+
+判据是**格式**：脚本写的是 PKCS8（`-----BEGIN PRIVATE KEY-----`），
+而主仓那份是 wolfSSL keygen 的传统格式（`-----BEGIN EC PRIVATE KEY-----`）。
+所以主仓那份**不是**那个 Python 脚本产的。
+
+**这意味着主仓从来没有成功跑过那个脚本** —— 主仓能构建，靠的是
+wolfSSL 上游自带的 cert（它有 SAN 缺失的老问题，但**构建期不需要它**：
+证书只在 Chrome 互操作的**运行期**才被用到）。
+
+**这不影响本 ADR 的结论**，但改变了一条「怎么修」的说法：
+不是「把主仓那份拷过去就行」（那份连 SAN 都没有，拷过去也过不了
+Chrome 的 DTLS 握手），而是**必须重新生成**。这恰好是 §3.2 选
+「生成」而非「拷贝」的理由之一 —— 拷贝的是**上游的旧证书**，
+生成的是**带 SAN 的新证书**。
+
+#### 2.4.2 顺带查清的一件事：为什么脚本跑不起来
+
+第一版实测时 `build_dtls_cert.py` 直接崩：
+
+```
+ImportError: DLL load failed while importing _rust: 找不到指定的程序。
+```
+
+第一直觉是「用错 python 环境」。**实测排除了这个可能**：
+
+- `where python` 只有 `D:\ProgramData\Miniconda3\python.exe`（3.9.1），
+  另有两个 pyenv / uv 的解释器，但**都没装** `cryptography`；
+- `conda` 的包缓存里装的是 **`cryptography-3.3.1-py39hcd4344a_0`**
+  （纯 C 实现，依赖 OpenSSL 1.1）—— 它**本来是好的**；
+- 但 site-packages 里却是 **`cryptography 42.0.8`** —— 某次 `pip install`
+  把它升到了 Rust 实现。
+
+**42.0.8 的 PyPI wheel 不带 `cryptography_rust.dll`**（实测 42.0.7 / 42.0.8 /
+43.0.3 / 41.0.7 四个 wheel 全都只有 `_rust.pyd`，没有配套 dll），
+而 `_rust.pyd` 静态依赖它 —— 于是 `import cryptography` 直接失败。
+**只有 conda-forge 的构建才会把那个 dll 打包进去。**
+
+修法：卸掉 pip 装的 42.0.8，把 conda 缓存里的 3.3.1 拷回去。
+之后 `python scripts/build_dtls_cert.py` 正常，产出
+`CN=localhost` + SAN（`DNS:localhost` / `IP:127.0.0.1` / 本机各网卡 IP）的
+自签 ECC 证书。
+
+**这条不写进 ADR 的「决策」部分**（那是 nimrtc 的环境问题，不是 zelto 的），
+但值得记一笔：**它印证了 §3.2「重新生成」这条路依赖项目自己的脚本能跑** ——
+如果项目的生成脚本本身跑不起来，`worktree.prepare` 会**明确报错**并
+不放行到 agent，而不是让 agent 在缺产物的目录里跑一小时再在门禁②炸掉。
+
+#### 2.4.3 真正的根因：本地 wolfSSL 是一份「删过文件」的碳拷贝（2026-11-22 深夜更正）
+
+§2.4.1 解释了「主仓那份 `ecc-key.pem` 不是脚本产的」，但没解释
+**为什么主仓构建会失败**。答案在当天深夜的核查里才浮出来，
+而且推翻了一个更省事的假设。
+
+**假设 A（曾被默认）：** 「上游 wolfSSL 本来就不跟踪 `ecc-key.pem`，
+所以谁 clone 都缺」—— **错**。
+
+实测（`gh api repos/wolfSSL/wolfssl/contents/certs/ecc-key.pem?ref=v5.9.2-stable`）：
+**上游 wolfSSL 的 `v5.9.2-stable` 分支是跟踪 `certs/ecc-key.pem` 的。**
+钉死的 commit 是 `ac01707552c611fbd135cc723b2682b3e7f80f2`
+（`src/third_party/vendor.json` 里记的就是它）。
+
+**假设 B（曾被默认）：** 「CI 也是绿的，所以 CI 也有这个文件」—— **对，
+但不是因为 CI 特殊**。
+
+CI 日志（run `44688171635`）里明明白白：
+
+```
+Submodule 'src/third_party/wolfssl/src' (https://github.com/wolfSSL/wolfssl.git) registered ...
+Submodule path 'src/third_party/wolfssl/src': checked out 'ac01707552c611fbd135cc723b2682b3e7f80f2'
+```
+
+CI 拿到的**就是上游那份**，带着 `certs/ecc-key.pem`，
+所以 `nimrtc_copy_wolfssl_certs()` 的 POST_BUILD 拷贝成功，2310 个测试全绿。
+
+**而本地主仓的子模块不在这个 commit 上：**
+
+| | commit | `certs/` 条目数 | 有 `ecc-key.pem` 吗 |
+|---|---|---|---|
+| 上游 / CI | `ac01707` | 161 | **有** |
+| 本地主仓 | `da2d676`（提交信息就叫 "carbon copy"） | 159 | **没有** |
+
+差集正好两个文件：`certs/ecc-key.pem` 和 `certs/ecc-key.der`。
+
+**所以 ZD-026 的真实根因是：** 主仓的 wolfSSL 子模块是一份**本地碳拷贝**，
+它相对上游**少了两个证书文件**；而 `nimrtc_copy_wolfssl_certs()`
+无条件拷贝 `ecc-key.pem`，于是构建期必然失败。CI 之所以绿，
+是因为 CI 用的是上游那份，不受这份碳拷贝影响。
+
+**这条对 zelto 意味着什么（§3.2 的选型因此更站得住）：**
+
+- 修复点**不在**「把缺失的证书补回去」—— 补回去只能补一份**上游的
+  `CN=www.wolfssl.com`、无 SAN** 的旧证书，而运行期要的是
+  **带 SAN 的新证书**（§2.4.1）；
+- 修复点**在**「让构建期产物由项目自己的脚本生成，且不落在别人的仓库里」。
+
+**对 §3.2「生成 vs 拷贝」的影响：**
+
+原方案是「从主仓拷贝 `ecc-key.pem` 到 worktree」。这个方案**在本地根本无从执行** ——
+主仓自己就缺这个文件，而且就算不缺，拷来的也是无 SAN 的上游证书。
+所以「生成」不只是更干净，是**唯一可行**的选项。
+
+**顺带一条工程结论（2026-11-22 已落地到 nimrtc 侧）：**
+「构建期产物写进 vendored 子模块的跟踪文件」这个做法本身要被淘汰 ——
+`server-ecc.pem` 在子模块里是**被跟踪**的，脚本覆盖它会让子模块长期显示
+`-dirty`。nimrtc 侧已改为：脚本只写 `tests/wolfssl_dtls/certs/`
+（该目录被 `.gitignore:227` 忽略），CMake 从那里取，
+CI 侧显式加一步生成证书。
+
 ---
 
 ## 3. 决策
@@ -168,6 +285,11 @@ worktree:
     # 为什么是「生成」而不是「拷贝」：拷贝旧的产物可能带来**过期**的
     # 内容（过期的证书、过期的 protobuf），而重新生成保证产物与当前
     # 代码一致。
+    #
+    # 而且在 ZD-026 这个具体案例里，「拷贝」根本**不可行**：
+    # 主仓自己就缺 `ecc-key.pem`（本地 wolfSSL 是一份少了两个文件的
+    # 碳拷贝，见 §2.4.3），而且主仓那份上游证书**没有 SAN**，
+    # 拷过去也过不了 Chrome 的 DTLS 握手。「生成」是唯一可行选项。
     #
     # 约束：
     #   - 在 worktree 目录里执行（cwd = worktree 根）
@@ -322,7 +444,7 @@ fatal: cannot chdir to '../../../../vendor/lib': No such file or directory
 3. `run:` 为空的条目**跳过** —— 宁可少一条，也不要拿空命令去跑
    （必然失败，且失败原因会误导人）。
 
-### 4.3 C3 合规性
+### 4.4 C3 合规性
 
 | 动作 | 触网？ | 调模型？ | 说明 |
 |---|---|---|---|
@@ -399,3 +521,95 @@ D-73 立的契约（「本地缺 commit 时快速失败，且失败被记下来�
    承载「与主机无关」的那部分配置（门禁命令、生成物清单），
    而 `.zelto/config.yaml` 承载「与主机相关」的那部分（端点、密钥）。
    那是**另一件事**，不在本 ADR 范围内。
+
+---
+
+## 7. 验证记录（2026-11-22）
+
+### 7.1 端到端：真实 worktree + 真实生成脚本
+
+在 nimrtc-v14 主仓里用 `WorktreeManager.create()` 造了一个**真实**的
+新 worktree，带上 `prepareCommands: [{ run: 'python scripts/build_dtls_cert.py' }]`：
+
+| 检查项 | 结果 |
+|---|---|
+| 新 worktree 里 prepare 前有 `ecc-key.pem` 吗 | **没有**（git 只带被跟踪的内容） |
+| prepare 后有吗 | **有** |
+| 内容是 PKCS8（= 重新生成的，不是 wolfSSL keygen 的旧格式） | **是**（`BEGIN PRIVATE KEY`，241 字节） |
+| `server-ecc.pem` 是带 SAN 的自签证书 | **是**：`CN=localhost` + `DNS:localhost` / `IP:127.0.0.1` / 本机各网卡 IP |
+
+（主仓那份 2938 字节、worktree 里 806 字节 —— 差异只是 `cryptography`
+3.3.1 与 42.x 的 PEM 编码行宽不同，**证书内容等价**，`certutil -dump`
+两边解析出的 SAN 一致。）
+
+### 7.2 回归测试
+
+- `tests/adr095-worktree-build-prerequisites.test.ts` —— 单元层面
+  （子模块校验、prepare 的 cwd / fail fast / 超时 / 配置解析）
+- `tests/adr095-submodule-missing-commit.test.ts` —— 真实 submodule 集成
+- 全量 `npm test`：**2938 pass / 0 fail**
+
+### 7.3 根因收敛：碳拷贝差异（2026-11-22 深夜）
+
+§2.4.1 只解释了「主仓那份证书不是脚本产的」。真正让构建失败的
+是**主仓的 wolfSSL 子模块不是上游那份**：
+
+| | commit | `certs/` 条目 | `ecc-key.pem` |
+|---|---|---|---|
+| 上游 `v5.9.2-stable` / CI | `ac01707` | 161 | 有 |
+| 本地主仓 | `da2d676`（"carbon copy"） | 159 | **无** |
+
+差集：`certs/ecc-key.pem`、`certs/ecc-key.der`。
+
+CI 日志证据（run `44688171635`）：
+
+```
+Submodule path 'src/third_party/wolfssl/src': checked out 'ac01707552c611fbd135cc723b2682b3e7f80f2'
+```
+
+CI 用上游那份 → POST_BUILD 拷贝成功 → 2310 测试全绿；
+本地用碳拷贝 → 拷 `ecc-key.pem` 必然失败。
+
+### 7.4 nimrtc 侧的落地（2026-11-22）
+
+ZD-026 的修复落在 nimrtc 仓库，本 ADR 只记录它对本方案的影响：
+
+1. **脚本不再写 vendored 子模块。** `build_dtls_cert.py` 只写
+   `tests/wolfssl_dtls/certs/`（该目录被 `.gitignore:227` 忽略）。
+   此前它会覆盖子模块里**被跟踪**的 `certs/server-ecc.pem`，
+   让主仓长期显示 `m src/third_party/wolfssl/src`（`-dirty`）。
+2. **CMake 从新位置取证书**（4 处）：
+   `cmake/NimRTCTest.cmake`、`cmake/NimRTCRuntime.cmake`、
+   `src/modules/dtls/CMakeLists.txt`（编译期兜底路径）、
+   以及 `dtls_wolfssl_session.cpp` 的运行期查找候选表
+   （同时**移除**了 wolfSSL 子模块路径作为候选 —— 留着它，
+   上游那份无 SAN 的旧证书会在某些 CWD 下**赢过**新证书，
+   Chrome 随即以 alert 46 拒绝握手）。
+3. **CI 显式生成证书。** 6 个 workflow、14 个 job 加了
+   `Generate the DTLS test certificate pair` 步骤
+   （`ci.yml` / `ci-fast.yml` / `interop.yml` / `release.yml` /
+   `soak.yml` / `hardware.yml`）。
+   此前 CI 靠上游跟踪的 `ecc-key.pem` 免这一步。
+4. **子模块保持干净。** 实测：新 worktree 走完
+   `WorktreeManager.create()` + prepare 后，
+   主仓与 worktree 的 `git submodule status` **都不带 `-dirty`**。
+
+### 7.5 CI 侧踩到的第二个坑：`cryptography` 的版本
+
+CI 步骤里写的是 `pip install "cryptography<42"`，**不是** `>=42`。
+原因与 §2.4.2 是同一个坑，但发生在 CI 上：
+
+- `cryptography>=42` 的 PyPI Windows wheel 是 Rust 实现，
+  只带 `_rust.pyd`、**不带** `cryptography_rust.dll`，
+  `import cryptography` 直接 `ImportError: DLL load failed while importing _rust`；
+- 41.x 是最后一条纯 C 线，实测在干净 venv 里 `import` 正常，
+  且 `scripts/build_dtls_cert.py` 跑通、产出 `CN=localhost` + 8 条 SAN。
+
+### 7.6 一处遗留（未在本轮修）
+
+本地主仓的 wolfSSL 碳拷贝与上游的 2 文件差异**本身**没修 ——
+它属于 nimrtc 的 vendoring 问题，不在本 ADR 范围。
+修掉之后，本地与 CI 的子模块内容一致，
+构建期就不再依赖「本地缺不缺那两个文件」这件偶然的事。
+
+

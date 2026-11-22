@@ -1084,11 +1084,65 @@ wolfssl 自己的 cert 树里，好让 CMake 的 `copy_if_different` 规则能�
 连带整个测试目标构建失败。
 
 **为什么主仓没事、worktree 有事**：主仓的 `src/third_party/wolfssl/src/certs/`
-里**有** `ecc-key.pem` —— 那是历史上跑过一次 `build_dtls_cert.py` 留下的
-**未被跟踪的残留文件**。新建 worktree 时 git 只带**被跟踪**的内容，
-这个残留不带过去。
+里**有** `ecc-key.pem` —— 一个**未被跟踪的**文件。新建 worktree 时
+git 只带**被跟踪**的内容，这个文件不带过去。
 
 于是主仓能构建、任何新 worktree 不能 —— **差异不在代码，在工作区的历史**。
+
+> **更正（2026-11-22 二次实测）**：本节最初断言主仓那份
+> `ecc-key.pem` 是「跑过一次 `build_dtls_cert.py` 留下的残留」。**这是错的**。
+>
+> 判据是**格式** —— 脚本写的是 PKCS8（`BEGIN PRIVATE KEY`），
+> 主仓那份是 `ASN1 OID: prime256v1` + `BEGIN EC PRIVATE KEY`，
+> 是 **wolfSSL 自己的 keygen 工具**的输出。
+> 同样地，主仓的 `server-ecc.pem` 是 `CN=www.wolfssl.com`、**无 SAN**
+> 的 **wolfSSL 上游自带**证书（它在 wolfssl 子模块里被 git 跟踪）。
+>
+> 所以真实情况是：**主仓从来没成功跑过那个脚本**。主仓能构建，
+> 靠的是上游自带的那份证书 —— 而它**构建期不需要**（证书只在
+> Chrome 互操作的**运行期**才被用到）。
+>
+> 这不改变本条的结论，但改变了「怎么修」的说法：不是「把主仓那份拷过去就行」
+> （那份连 SAN 都没有，拷过去也过不了 Chrome 的 DTLS 握手），
+> 而是**必须重新生成**。这正是下面选「生成」而非「拷贝」的理由之一。
+
+> **再更正（2026-11-22 三次实测）：主仓为什么也构建失败？**
+>
+> 上面的更正解释了「主仓那份证书不是脚本产的」，但没解释
+> **为什么主仓自己构建也会炸**。答案查到了，而且要往上游追一层：
+>
+> ```
+> 上游 wolfSSL v5.9.2-stable (commit ac01707)  certs/ 有 161 项，含 ecc-key.pem  ← CI 用这份
+> 本地主仓的子模块           (commit da2d676)  certs/ 有 159 项，缺 ecc-key.pem  ← "carbon copy"
+> 差集正好两个：certs/ecc-key.pem、certs/ecc-key.der
+> ```
+>
+> CI 日志（run `44688171635`）里明明白白：
+>
+> ```
+> Submodule path 'src/third_party/wolfssl/src': checked out 'ac01707552c611fbd135cc723b2682b3e7f80f2'
+> ```
+>
+> CI 拿到的就是上游那份，带着 `certs/ecc-key.pem`，
+> POST_BUILD 拷贝成功，2310 个测试全绿。
+> 而**本地主仓的 wolfSSL 是一份「carbon copy」**（提交信息原话），
+> 相对上游**少了两个证书文件** —— 所以本地拷贝 `ecc-key.pem` 必然失败。
+>
+> 所以本条的真实根因链是：
+> **本地 vendored 副本与上游不一致 → 缺 `ecc-key.pem` → POST_BUILD 无条件拷贝 → 构建炸。**
+>
+> **这条怎么改变了「怎么修」：**
+> 修复点不在「把缺失的证书补回去」—— 补回去只能补一份**上游的无 SAN 旧证书**，
+> 运行期要的是带 SAN 的新证书；
+> 修复点在「让构建期产物由项目自己的脚本生成，且不落在别人的仓库里」。
+>
+> 顺带查出另一条：**「生成物写进 vendored 子模块的跟踪文件」这个做法本身要淘汰。**
+> `server-ecc.pem` 在子模块里是**被跟踪**的，脚本覆盖它会让子模块长期显示 `-dirty`。
+> nimrtc 侧已改：脚本只写 `tests/wolfssl_dtls/certs/`（该目录被 `.gitignore:227` 忽略），
+> CMake 从那里取，CI 显式加一步生成证书（6 个 workflow / 14 个 job）。
+>
+> 详见 **ADR-095 §2.4.3 / §7.3–§7.6**。
+
 
 **为什么这是个真缺陷（而不只是「环境没配好」）**：
 
@@ -1216,8 +1270,64 @@ fail fast：前一条失败就不跑后一条 —— 后一条大概率也依赖
 2. `worktree.prepare` 没有「校验产物在位」的能力。命令跑完，
    但产物可能在（脚本静默失败、输出到别处）。要严格得再声明一份产物清单。
 3. 准备阶段的耗时没进任何统计 —— `zelto status` 里看不出来。
-4. nimrtc 侧还没配 `worktree.prepare` —— 配了
-   `python scripts/build_dtls_cert.py` 之后，这条就不用再手工绕了。
+
+**已落实**：
+
+- nimrtc 侧已配 `worktree.prepare`（`.zelto/config.yaml`）：
+  `python scripts/build_dtls_cert.py`（60 秒超时），
+  以后建 worktree 不用再手工绕。
+- 端到端验证（2026-11-22）：在 nimrtc 主仓用 `WorktreeManager.create()`
+  造了**真实**的新 worktree —— prepare 前没有 `ecc-key.pem`，
+  prepare 后**有**了，且是**新生成的** PKCS8 格式（241 字节），
+  `server-ecc.pem` 解析出 `CN=localhost` + SAN（`DNS:localhost` /
+  `IP:127.0.0.1` / 本机各网卡 IP）—— Chrome/BoringSSL 能认的那份。
+- **根因收敛（2026-11-22 三次实测）**：本地主仓的 wolfSSL 是一份
+  相对上游**少两个证书文件**的「carbon copy」（`da2d676` vs 上游 `ac01707`，
+  缺 `certs/ecc-key.pem` 与 `certs/ecc-key.der`）。CI 用的是上游那份，
+  所以 CI 绿；本地构建必然炸。详见上面的「再更正」与 ADR-095 §2.4.3。
+- **nimrtc 侧修复已落地（2026-11-22）**：
+  1. `build_dtls_cert.py` 不再写 vendored 子模块，只写
+     `tests/wolfssl_dtls/certs/`（该目录被 `.gitignore:227` 忽略）；
+  2. CMake 4 处取证书路径改到新位置，**并移除**运行期查找候选表里的
+     wolfSSL 子模块路径（留着它，上游那份无 SAN 的旧证书会在某些 CWD 下
+     赢过新证书，Chrome 随即以 alert 46 拒绝握手）；
+  3. CI 显式生成证书 —— 6 个 workflow / 14 个 job；
+  4. 实测新 worktree 走完 prepare 后，主仓与 worktree 的
+     `git submodule status` **都不带 `-dirty`**。
+- **未修（留在 nimrtc 侧）**：本地那份碳拷贝与上游的 2 文件差异本身没动。
+  修掉之后本地与 CI 的子模块内容一致，构建期就不再依赖
+  「本地缺不缺那两个文件」这件偶然的事。
+
+**顺带查清的 nimrtc 环境问题**（不是 zelto 的缺陷，但挡住了验证）：
+
+`build_dtls_cert.py` 一开始直接崩：
+
+```
+ImportError: DLL load failed while importing _rust: 找不到指定的程序。
+```
+
+第一直觉是「用错 python 环境」。**实测排除了这个可能**：
+
+- `where python` 只有 `D:\ProgramData\Miniconda3\python.exe`（3.9.1）；
+  另有两个 pyenv / uv 的解释器，但**都没装** `cryptography`；
+- conda 的包缓存里装的是 **`cryptography-3.3.1-py39hcd4344a_0`**
+  （纯 C 实现）—— 它**本来是好的**；
+- 但 site-packages 里却是 **`cryptography 42.0.8`** —— 某次 `pip install`
+  把它升到了 Rust 实现。
+
+**42.0.8 的 PyPI wheel 不带 `cryptography_rust.dll`**（实测 41.0.7 / 42.0.7 /
+42.0.8 / 43.0.3 四个 wheel 全都只有 `_rust.pyd`），而 `_rust.pyd` 静态依赖它
+—— 于是 `import cryptography` 直接失败。**只有 conda-forge 的构建才会把那个
+dll 打包进去。**
+
+修法：卸掉 pip 装的 42.0.8，把 conda 缓存里的 3.3.1 拷回去
+（注意 `_rust.pyd` 可能被别的进程占着 —— 本次是一个 uvicorn 服务占的，
+要先停掉才能删）。之后脚本正常。
+
+**这条印证了 ADR-095 的一个设计选择**：`worktree.prepare` 依赖项目自己的
+脚本能跑 —— 如果脚本本身跑不起来，准备阶段会**明确报错**并**不放行**到 agent，
+而不是让 agent 在缺产物的目录里跑一小时再在门禁②炸掉。
+
 
 ---
 
