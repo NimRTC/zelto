@@ -36,6 +36,9 @@ import './merge.js';
 import './architecture.js';
 import './slice-spec.js';
 import './contract.js';
+import './spec-check.js';
+import './glossary.js';
+import './forge.js';
 import './web.js';
 
 /**

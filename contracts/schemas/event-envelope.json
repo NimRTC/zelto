@@ -50,7 +50,13 @@
         "contract.evolution_checked",
         "contract.baseline_updated",
         "version.regression_recorded",
-        "version.regression_detected"
+        "version.regression_detected",
+        "spec.conformance_checked",
+        "glossary.updated",
+        "glossary.usage_checked",
+        "sign.revised",
+        "sign.returned",
+        "forge.pr_opened"
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },

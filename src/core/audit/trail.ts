@@ -174,6 +174,32 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
     `Regression detected in version ${String(e.payload?.version ?? '?')} — ${String(e.payload?.regressed ?? 0)} broken, ${String(
       e.payload?.degraded ?? 0,
     )} degraded, ${String(e.payload?.missing ?? 0)} missing`,
+  'spec.conformance_checked': (e) =>
+    `Spec conformance checked — ${String(e.payload?.requirements ?? 0)} requirement(s): ${String(
+      e.payload?.implemented ?? 0,
+    )} implemented, ${String(e.payload?.missing ?? 0)} missing, ${String(e.payload?.unknown ?? 0)} undetermined`,
+  'glossary.updated': (e) =>
+    `Glossary updated by human — ${String(e.payload?.action ?? '?')} "${String(e.payload?.term ?? '')}" (${
+      String(e.payload?.totalTerms ?? 0)
+    } term(s))`,
+  'glossary.usage_checked': (e) =>
+    `Glossary usage checked — ${String(e.payload?.specs ?? 0)} spec(s), ${String(
+      e.payload?.unknownTerms ?? 0,
+    )} candidate term(s) outside the glossary`,
+  // ADR-094：人类门的退回两档 —— 意见原文要出现在摘要里，
+  // 否则「人说了什么」在审计报告里查不到（审计是给人看的）。
+  'sign.revised': (e) =>
+    `Sign sent back for rework by ${String(e.payload?.decidedBy ?? e.actor ?? 'human')}: ${String(
+      e.payload?.comment ?? '',
+    )}`,
+  'sign.returned': (e) =>
+    `Sign returned upstream by ${String(e.payload?.decidedBy ?? e.actor ?? 'human')}: ${String(
+      e.payload?.comment ?? '',
+    )}`,
+  'forge.pr_opened': (e) =>
+    `PR opened: ${String(e.payload?.url ?? e.payload?.number ?? '?')} (base ${String(
+      e.payload?.base ?? '?',
+    )}, head ${String(e.payload?.head ?? '?')})`,
 };
 
 export class AuditTrail {

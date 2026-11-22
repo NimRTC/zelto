@@ -252,7 +252,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Policy Engine** | `src/core/policy/engine.ts` | 策略规则匹配、保护域、路径逃逸检测、锚点校验 |
 | **Slice State Machine** | `src/core/slice/state.ts` | 6 状态状态机，9 事件转换 |
 | **Slice Store** | `src/core/slice/store.ts` | 切片文件持久化（`.zelto/slices/<id>.json`） |
-| **Event Stream** | `src/core/events/stream.ts` | 61 种事件的 append-only JSONL 流 |
+| **Event Stream** | `src/core/events/stream.ts` | 67 种事件的 append-only JSONL 流 |
 | **Gate Executor** | `src/core/gate/executor.ts` | Shell 命令执行器（门禁②） |
 | **Sign Manager** | `src/core/gate/sign.ts` | 签名请求、审批/拒绝工作流 |
 | **Stall Classifier** | `src/core/stall/classifier.ts` | 9 类停机分类 |
@@ -260,7 +260,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
 | **Metrics Collector** | `src/core/metrics/collector.ts` | rework rate、cycle time、stall counts |
-| **Audit Trail** | `src/core/audit/trail.ts` | 61 种事件摘要、可读审计报告 |
+| **Audit Trail** | `src/core/audit/trail.ts` | 67 种事件摘要、可读审计报告 |
 | **Spec Executor** | `src/core/spec/SpecMdExecutor.ts` | Markdown 规格文件自校验（parse/validate/runChecklists） |
 | **Spec Format** | `src/core/spec/format.ts` | 规格章节契约唯一真源（概念 + 双语别名，ADR-016） |
 | **Hook** | `src/hook/index.ts` | 独立可执行判定进程 |
@@ -305,6 +305,8 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto inbox` | 待签名队列 | sign 前 |
 | `zelto sign <id> --approve [--json]` | 审批切片 | sign |
 | `zelto sign <id> --reject [--json]` | 拒绝切片 | sign |
+| `zelto sign <id> --revise --comment "…"` | 退回重跑：方向对、细节要改，意见带进下一轮上下文 | sign |
+| `zelto spec revise <id> --comment "…"` | 退回上游：方向不对，规格要改 | sign |
 | `zelto abandon <id>` | 废弃切片 | 通用 |
 | `zelto events <id> [--json] [--tail <N>]` | 查看切片事件流 | 通用 |
 | `zelto summary` | 项目概况 | 通用 |
@@ -354,6 +356,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto set <id> --field <f> --value <v>` | 设置切片的可写字段 | 通用 |
 | `zelto reservation list\|active\|show\|release\|reap` | 写集预约的查看与释放 | 治理 |
 | `zelto merge [plan] [<id...>] [--strategy <s>] [--dry-run] [--push]` | 显式合并已签字的切片（不带 id = 全部已批准且未合入） | 治理 |
+| `zelto forge pr <id> [--open] [--base <b>]` | 开 PR 并把追溯链内嵌进正文（批准权仍在 zelto） | 治理 |
 | `zelto hook --install\|--uninstall\|--status` | 安装 / 卸载 git hooks | 治理 |
 | `zelto project scan\|init\|design\|slice\|status` | 接管既有项目 | 接管 |
 | `zelto depgraph <id...> [--depends-on <id>=<dep>]` | 查看切片之间的依赖图 | 全景 |
@@ -365,6 +368,8 @@ worktree 与写集预约都保留，**现场交回给人**。
 | `zelto require\|design\|plan show <id> [--diff] [--full]` | 草稿评审：摘要 + 决策点 + 与上一版的差异（ADR-023） | 规划 |
 | `zelto arch check [--design <id>] [--root <dir>] [--strict] [--json]` | 架构偏离检查：设计模块图 vs 实际 import 图（纯报告；`--strict` 按 `policy.yaml` 的 `arch:` 段定级，`deny` 类偏离时退出码 1，ADR-027） | 治理 |
 | `zelto contract [check\|baseline\|status] [--json]` | 契约演进检查：当前契约 vs 人工确认的基线，分清写入方 / 读取方破坏（ADR-036）；`baseline` 是人签字接受这次变化 | 治理 |
+| `zelto spec-check <slice-id> [--json]` | 规格符合性检查：改动是否忠实于规格 —— 已实现 / 未实现 / 范围蔓延（确定性判定，ADR-057） | 治理 |
+| `zelto glossary [show\|add\|remove\|check] [--json]` | 领域词汇表：维护项目的共享语言，并检查规格用词与词表是否一致（ADR-057） | 治理 |
 
 ### 3.3 独立 Hook
 
@@ -398,7 +403,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 
 ---
 
-## 5. 事件类型（61 种）
+## 5. 事件类型（67 种）
 
 事件类型是**契约**：`contracts/schemas/event-envelope.json` 的 enum 是真源，
 `core/events/stream.ts` 与 `core/audit/trail.ts` 必须与它一致。
@@ -414,6 +419,8 @@ worktree 与写集预约都保留，**现场交回给人**。
 |---|---|
 | 切片 | `slice.state.changed`, `slice.baseline_registered`, `slice.drift_detected`, `slice.hotfix` |
 | 规格 | `spec.drafted`, `spec.checked`, `spec.frozen` |
+| 规格符合性 | `spec.conformance_checked` |
+| 词汇表 | `glossary.updated`, `glossary.usage_checked` |
 | 澄清 | `clarify.question`, `clarify.answer` |
 | 运行 | `run.started`, `run.resumed`, `run.stalled`, `run.finished`, `run.aborted` |
 | 策略 | `policy.decision`, `policy.anchor_mismatch`, `policy.violation` |
@@ -423,9 +430,10 @@ worktree 与写集预约都保留，**现场交回给人**。
 | 提问 | `question.raised`, `question.answered` |
 | 资源 | `budget.spent`, `llm.called` |
 | 队列 | `queue.enqueued`, `queue.dequeued` |
-| 签名 | `sign.requested`, `sign.approved`, `sign.rejected`, `sign.revoked` |
+| 签名 | `sign.requested`, `sign.approved`, `sign.rejected`, `sign.revoked`, `sign.revised`, `sign.returned` |
 | 拉闸 | `batch.halted` |
 | 合并 | `merge.completed`, `merge.planned`, `merge.phase_complete`, `merge.conflict`, `merge.stale_base` |
+| 远端评审 | `forge.pr_opened` |
 | 调度 | `sched.admitted`, `sched.blocked` |
 | 隔离 | `worktree.created`, `worktree.removed`, `worktree.base_resolved` |
 | 协调 | `coord.dep_added`, `coord.phase_ready`, `coord.phase_complete`, `coord.cycle_detected` |

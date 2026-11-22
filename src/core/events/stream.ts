@@ -81,6 +81,14 @@ export const EVENT_TYPES = [
   'contract.baseline_updated',
   'version.regression_recorded',
   'version.regression_detected',
+  // ADR-057：规格符合性检查（Spec 轴）与词汇表检查
+  'spec.conformance_checked',
+  'glossary.updated',
+  'glossary.usage_checked',
+  // ADR-094：人类门三动作（退回重跑 / 退回上游）与 GitHub 追溯链 PR
+  'sign.revised',
+  'sign.returned',
+  'forge.pr_opened',
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];

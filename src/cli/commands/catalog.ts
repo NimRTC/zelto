@@ -46,7 +46,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'start', group: '核心切片', args: '<id>', summary: '一条命令走完 create → check → freeze → run', detail: '--yes, --agent, --adapter' },
   { name: 'admit', group: '核心切片', args: '<id>', summary: '检查切片准入', detail: '--json' },
   { name: 'gate', group: '核心切片', args: '<id>', summary: '门禁② 跑验收测试', detail: '--dry-run, --retry, --spec-md, --json' },
-  { name: 'sign', group: '核心切片', args: '<id>', summary: '批准、拒绝或撤销已完成的切片', detail: '--approve | --reject | --revoke, --comment' },
+  { name: 'sign', group: '核心切片', args: '<id>', summary: '批准、拒绝、撤销或退回重跑已完成的切片', detail: '--approve | --reject | --revoke | --revise, --comment' },
   { name: 'inbox', group: '核心切片', args: '', summary: '查看待签字队列' },
   { name: 'abandon', group: '核心切片', args: '<id>', summary: '废弃一个切片' },
   { name: 'next', group: '核心切片', args: '', summary: '推荐该切片的下一步动作' },
@@ -82,6 +82,9 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
   { name: 'arch', group: '治理与运行时', args: 'check', summary: '架构偏离检查：设计模块图 vs 实际 import 图（只读报告）', detail: '--design, --root, --strict, --json' },
   { name: 'contract', group: '治理与运行时', args: '[check|baseline|status]', summary: '契约演进检查：当前契约 vs 人工确认的基线，算出破坏性变化', detail: '--json' },
+  { name: 'spec-check', group: '治理与运行时', args: '<slice-id>', summary: '规格符合性检查：改动是否忠实于规格（确定性判定）', detail: '--json' },
+  { name: 'glossary', group: '治理与运行时', args: '<subcommand>', summary: '领域词汇表：维护共享语言并检查规格用词', detail: 'show, add <term>, remove <term>, check [slice-id]' },
+  { name: 'forge', group: '治理与运行时', args: 'pr <slice-id>', summary: '开 PR 并把追溯链内嵌进 PR 正文（批准权仍在 zelto）', detail: '--open, --base <branch>, --print-body, --json' },
 
   // ─── AI 流水线 ─────────────────────────────────────────────────────────
   { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
@@ -89,7 +92,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, show <id>, confirm <id>, add-version <id> <d>, patch <id> --version <v> [--add-slice <id> | --slice <id> --write <p>...]' },
   { name: 'plan-patch', group: 'AI 流水线', args: '<plan-id>', summary: '确定性修正已确认版本计划的切片清单（不经 LLM）', detail: '--version, --add-slice, --remove-slice, --slice, --write, --yes' },
   { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>, adopt <ver>（老版本补建分支）, ship <ver>, cleanup <ver>' },
-  { name: 'spec', group: 'AI 流水线', args: '<subcommand> <slice-id>', summary: '切片规格的草稿与确认：生成草稿 → 人确认后写进正式规格', detail: 'draft, show, confirm' },
+  { name: 'spec', group: 'AI 流水线', args: '<subcommand> <slice-id>', summary: '切片规格的草稿与确认：生成草稿 → 人确认后写进正式规格', detail: 'draft, show, confirm, revise（退回上游改规格）' },
   { name: 'pipeline', group: 'AI 流水线', args: 'status', summary: '需求→设计→计划→版本→切片 全链一览' },
 
   // ─── 项目接管 ──────────────────────────────────────────────────────────
