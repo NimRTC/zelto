@@ -88,7 +88,41 @@ export interface CreateWorktreeOptions {
    * **明确失败**，而不是挂到天荒地老。
    */
   submoduleTimeoutMs?: number;
+
+  /**
+   * 生成物清单 —— 建 worktree 时要跑的命令（ADR-095 §3.2）。
+   *
+   * 用途：生成「不进版本库」的构建产物（证书、protobuf、代码生成…）。
+   * 没传 = 不做任何准备（不产生行为变化）。
+   */
+  prepareCommands?: Array<{ run: string; timeoutSec?: number }>;
 }
+
+/**
+ * 准备阶段的结果（ADR-095 §3.2）。
+ *
+ * 现在只有「全成功」这一种可能 —— 失败会抛 `WorktreeError`。
+ * 保留这个形状是为了将来能加「部分失败但仍放行」的模式（比如某条命令
+ * 是可选的优化项）而不改调用方的类型。
+ */
+export interface PrepareResult {
+  /** 跑成功的命令（按顺序）。 */
+  ran: string[];
+  /** 失败的那条命令及其原因（没有失败则为空）。 */
+  failed?: { run: string; reason: string };
+}
+
+/**
+ * 准备阶段的单条命令默认超时（秒）。
+ *
+ * 120 秒的来历（ADR-095 §3.2）：生成物脚本通常是秒级（生成证书、跑
+ * codegen），120 秒给足余量而不至于挂死。
+ *
+ * 与 `DEFAULT_SUBMODULE_TIMEOUT_MS`（15 秒）不同 —— 那条是**本地**操作
+ * （克隆 + checkout），15 秒实测够用；这里的命令**可能**要做重活
+ * （装依赖、跑 protoc），不能按本地操作的量级给。
+ */
+export const DEFAULT_PREPARE_TIMEOUT_SEC = 120;
 
 export class WorktreeError extends Error {
   constructor(
@@ -405,6 +439,16 @@ export class WorktreeManager {
       if (options.acceptanceDir) {
         this.copyMissingIntoWorktree(target, options.acceptanceDir);
       }
+      // 生成物**也要**在复用时补一次（ADR-095 §3.4）。
+      //
+      // 为什么不能只在「创建时」准备：agent 上一轮跑挂了、或人手动清了
+      // worktree 里的产物，产物就不在位了。而产物不在位 → 门禁②的 build
+      // 阶段必然失败 —— 代价是 agent 的**整轮**时间。
+      //
+      // 判据：「每次 agent 开跑前，产物必须在位」。
+      if (options.prepareCommands && options.prepareCommands.length > 0) {
+        this.prepareArtifacts(target, options.prepareCommands);
+      }
       return {
         sliceId,
         path: target,
@@ -523,6 +567,65 @@ export class WorktreeManager {
       if (!moduleGitDir) {
         skipped.push(sub.path);
         continue;
+      }
+
+      // ── 钉死的 commit 本地有没有？先查，再动 ──────────────────────
+      //
+      // 病灶（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
+      //   `version/v3` 的树钉住了较老的子模块 commit（googletest `15460959`、
+      //   libopus `22244de5`），而本地 module 仓库里只有较新的
+      //   「carbon copy」commit（`05d7a9b`）。
+      //
+      //   于是 `submodule update --init --no-fetch` **失败**（本地缺 commit），
+      //   失败被记成 `submoduleFailures` —— 而那只是一条**警告**。
+      //   worktree 照样建好，vendor 目录是**空的**，
+      //   然后门禁②的 build 阶段才炸，报错是「找不到 googletest」
+      //   或「复制某个头文件失败」—— 跟真正的原因毫无关系（ADR-095 §2.3）。
+      //
+      // 为什么在**这里**查（而不是只在 align 阶段查）：
+      //   update 失败在 align **之前**，align 根本没机会跑。
+      //   所以「commit 存在性」的判据必须放在 update 之前。
+      //
+      // 判据：`git cat-file -e <sha>` —— 只读本地对象库，不触网（C3）。
+      //
+      // **在哪个目录里问**：问**主仓工作区里那个 submodule 的工作树**
+      // （`<主仓>/<sub.path>`），不是 module git 目录本身。
+      //
+      // 为什么（实测踩坑，2026-11-22）：
+      //   独立嵌套克隆（`.git` 是**目录**）的 module git 目录里有一条
+      //   `core.worktree` —— 它是**相对路径**（`../../../../vendor/lib`），
+      //   指回主仓工作区里那个 submodule。
+      //   在 module git 目录里跑 `git cat-file` 时，git 会去 chdir 到那个
+      //   相对路径 —— 从别的 cwd 进去就**找不到**了：
+      //     fatal: cannot chdir to '../../../../vendor/lib': No such file or directory
+      //   于是明明有那个 commit，却判成「没有」→ 误拦一个好的工程。
+      //
+      //   共享 module git 目录（`.git/modules/...`）没有这个问题，
+      //   但从工作树问同样是对的 —— 所以统一问工作树。
+      const pinned = this.pinnedCommitOf(sub.path);
+      if (pinned && !this.commitAvailable(mainSubPath, pinned)) {
+        // 本地缺这个 commit → **记下来并抛错**，不继续建一个空 vendor 的 worktree。
+        //
+        // 为什么是抛错而不是警告（ADR-095 §3.1）：worktree 建出来是**坏的**，
+        // 门禁②**必然**失败。让它在建 worktree 的时候失败（早几分钟、
+        // 错误信息直达），比在门禁的时候失败（信息被几千行编译输出淹没）
+        // 好得多。
+        //
+        // 与 C9 同一原则：**依赖缺失时的正确动作是停下**，
+        // 不是带着缺口继续跑。
+        //
+        // **为什么还要先记进 `submoduleFailures`**：D-73 立的契约是
+        // 「同步失败必须被记下来 —— 否则『vendor 没同步上』完全不显形」。
+        // 两条契约不冲突：记下来（留痕，事后可查）+ 抛错（当场停下）。
+        // 只抛错的话，调用方拿不到「是哪个 vendor」的结构化信息。
+        const reason = `本地 module git 目录里没有 index 记录的 commit ${pinned.slice(0, 8)}`;
+        this.submoduleFailures.push({ path: sub.path, reason });
+
+        throw new WorktreeError(
+          missingSubmoduleCommitMessage(sub.path, pinned, this.repoRoot),
+          `submodule update ${sub.path}`,
+          reason,
+        );
       }
 
       try {
@@ -763,15 +866,78 @@ export class WorktreeManager {
       const wtHead = this.submoduleHead(wtSub);
       if (wtHead === target) continue;
 
+      // ── 钉死的 commit 本地根本没有？→ 明确报错，别静默 ────────────
+      //
+      // 病灶（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
+      //   `version/v3` 的树钉住了较老的子模块 commit（googletest `15460959`、
+      //   libopus `22244de5`），而本地 module 仓库里只有较新的
+      //   「carbon copy」commit（`05d7a9b`）。
+      //   `git checkout --force <pin>` 在本地缺该 commit 时**失败**，
+      //   原来的 `catch {}` 把它吞了 —— worktree 的 vendor 目录于是是**空的**。
+      //
+      //   然后：错误在**门禁②的 build 阶段**炸出来，
+      //   报错是「找不到 googletest」/「复制某个头文件失败」，
+      //   跟「这个 commit 本地没有」毫无关系（ADR-095 §2.3）。
+      //
+      // 判据用 `cat-file -e`：只读本地对象库，不触网（C3），且是确定性的。
+      // 「commit 不存在」与「checkout 因别的原因失败」必须分开 ——
+      // 前者必须拦（worktree 建出来就是坏的），后者不该拦（可能只是一次占用）。
+      if (!this.commitAvailable(wtSub, target)) {
+        throw new WorktreeError(
+          missingSubmoduleCommitMessage(sub.path, target, this.repoRoot),
+          `checkout ${target}`,
+          `本地 module git 目录里没有 commit ${target}`,
+        );
+      }
+
       try {
         this.git(['checkout', '--force', target], undefined, false, wtSub);
         aligned.push(sub.path);
       } catch {
-        // 对不齐就留着 —— git status 会显示差异，审计会报出来（不静默）
+        // 对不齐就留着 —— git status 会显示差异，审计会报出来（不静默）。
+        //
+        // 注意：这里只吞「checkout 失败」，**不吞「commit 不存在」** ——
+        // 后者已经在上面单独判过了（ADR-095 §3.1）。
+        this.submoduleFailures.push({
+          path: sub.path,
+          reason: `检出到 ${target} 失败（commit 在本地存在，但 checkout 没成功）`,
+        });
       }
     }
 
     return aligned;
+  }
+
+  /**
+   * 主仓 index 里钉死的那个 submodule commit（gitlink 记录的 sha）。
+   *
+   * 读的是**主仓**的 index —— 不是 worktree 的。
+   *
+   * 为什么（实测踩坑，2026-11-22）：
+   *   `git submodule add` 会把 gitlink **暂存**进 index，但它**不提交**。
+   *   所以主仓工作区的 index 里有那个 gitlink，而主仓 HEAD 里没有。
+   *   而 worktree 是从 **HEAD** 建出来的 —— 它的 index 里于是**没有** gitlink。
+   *
+   *   读 worktree 的 index 的话，永远读到空 → 判据形同虚设。
+   *
+   * 哪个才是「钉死的那个」？主仓 index 里的 gitlink 才是 —— 它是
+   * `git submodule update` 会检出的那个 commit。
+   *
+   * 读不到（没钉 / 不是 submodule）→ null（= 不查，不拦）。
+   */
+  private pinnedCommitOf(subPath: string): string | null {
+    try {
+      const recorded = this.git(
+        ['ls-files', '-s', '--', subPath],
+        undefined,
+        true,
+        this.repoRoot,
+      ).trim();
+      const match = recorded.match(/^160000 ([0-9a-f]{40})/);
+      return match ? match[1] : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1144,6 +1310,7 @@ export class WorktreeManager {
    * - 规格文件（复制，覆盖可能未提交的版本）
    * - 验收测试目录（复制）
    * - node_modules（平台连接，共享主仓库依赖）
+   * - 生成物（跑 `worktree.prepare` 里的命令，ADR-095 §3.2）
    */
   syncContext(info: WorktreeInfo, options: CreateWorktreeOptions): void {
     if (options.initSubmodules !== false) {
@@ -1160,6 +1327,82 @@ export class WorktreeManager {
       this.copyIntoWorktree(info.path, options.acceptanceDir, true);
     }
     this.linkNodeModules(info.path);
+    // 生成物**最后**准备 —— 它依赖前面积累好的目录结构
+    //（spec / acceptance / node_modules 链接）。
+    if (options.prepareCommands && options.prepareCommands.length > 0) {
+      this.prepareArtifacts(info.path, options.prepareCommands);
+    }
+  }
+
+  /**
+   * 跑「生成物清单」里的命令，把不进版本库的构建产物**重新生成**出来。
+   *
+   * 为什么需要（ADR-095 §3.2，实测 nimrtc-v14 v3-n4-d6-connectivity）：
+   *   新建的 worktree 只含**被 git 跟踪**的内容。有些项目的构建**依赖**
+   *   生成的产物 —— 那文件在 `.gitignore` 里（wolfssl 的
+   *   `certs/ecc-key.pem`），git 不会带过去。于是门禁②的 build 阶段必然失败，
+   *   报错是「复制某个 pem 失败」/「找不到头文件」——
+   *   跟「这个文件是生成的」毫无关系。
+   *
+   * 为什么是「生成」而不是「拷贝」：拷贝旧的产物可能带来**过期**的内容
+   * （过期证书），而重新生成保证产物与当前代码一致。
+   *
+   * **fail fast**：前一条失败就不跑后一条。理由有二：
+   *   1. 后一条大概率也依赖前一条的产物，跑下去只是浪费；
+   *   2. 连着跑一串注定失败的命令，报错会指向最后一条 —— 又是「报错指向错的地方」。
+   *
+   * **失败就抛**：不放行到 agent。这与 C9 的 fail closed 同一原则 ——
+   * 依赖缺失时的正确动作是停下，不是带着缺口继续跑。
+   */
+  prepareArtifacts(
+    worktreePath: string,
+    commands: Array<{ run: string; timeoutSec?: number }>,
+  ): PrepareResult {
+    const ran: string[] = [];
+
+    for (const cmd of commands) {
+      const run = cmd.run.trim();
+      if (!run) continue;
+
+      const timeoutMs = Math.max(
+        1_000,
+        (cmd.timeoutSec ?? DEFAULT_PREPARE_TIMEOUT_SEC) * 1000,
+      );
+
+      try {
+        execFileSync(run, [], {
+          cwd: worktreePath,
+          encoding: 'utf-8',
+          timeout: timeoutMs,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          // Windows 上准备命令常是 `.cmd` / `.bat`（`npm` 就是），
+          // 不走 shell 的话 `ENOENT`。
+          shell: true,
+        });
+      } catch (err) {
+        const raw = err as { stderr?: Buffer | string; message?: string };
+        const stderr = raw?.stderr ? String(raw.stderr).trim() : '';
+        const reason = stderr || (err instanceof Error ? err.message : String(err));
+
+        throw new WorktreeError(
+          [
+            `准备阶段失败：第 ${ran.length + 1} 条命令退出码非零`,
+            `命令：${run}`,
+            '',
+            'worktree 还没准备好，agent **没有**开跑。',
+            '修好这条命令（或从 worktree.prepare 里去掉它）后重建 worktree。',
+            '',
+            reason,
+          ].join('\n'),
+          run,
+          reason,
+        );
+      }
+
+      ran.push(run);
+    }
+
+    return { ran };
   }
 
   private copyIntoWorktree(worktreePath: string, relativePath: string, overwrite: boolean): void {
@@ -1449,6 +1692,46 @@ export class WorktreeManager {
   }
 
   /**
+   * 某个 commit 在某个 submodule 的**本地**对象库里存在吗？
+   *
+   * 判据：`git cat-file -e <sha>` —— 只读本地对象库，
+   * **不触网**（C3），也不修改任何东西。
+   *
+   * 为什么不用 `git rev-parse <sha>^{commit}`：那会做**引用解析**，
+   * 在「对象在库里但不是一个 commit」时给出别的答案；
+   * `cat-file -e` 只问「这个对象在不在」。
+   *
+   * **为什么必须设 `GIT_WORK_TREE`**（实测踩坑，2026-11-22）：
+   *   独立嵌套克隆（submodule 的 `.git` 是**目录**）的 config 里有
+   *   `core.worktree` —— 通常是**相对路径**（`../../../../vendor/lib`）。
+   *   git 在任何 git 命令前都会 chdir 到它；从别的 cwd 进去就找不到：
+   *     fatal: cannot chdir to '../../../../vendor/lib': No such file or directory
+   *   于是明明有那个 commit，却判成「没有」→ **误拦一个好的工程**。
+   *
+   *   设 `GIT_WORK_TREE` 把那个相对路径**顶掉**（环境变量优先于 config），
+   *   git 就不再去 chdir 那个陈旧的路径。
+   *
+   *   `-c core.worktree=…` **不管用** —— chdir 发生在读 config 之后，
+   *   命令行覆盖救不了它（实测过）。
+   *
+   * @param subPath submodule 的**工作树**路径（`<主仓>/<sub.path>`）。
+   */
+  private commitAvailable(subPath: string, sha: string): boolean {
+    try {
+      execFileSync('git', ['cat-file', '-e', `${sha}^{commit}`], {
+        cwd: subPath,
+        encoding: 'utf-8',
+        timeout: 60_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, GIT_WORK_TREE: subPath },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * 跑一条**离线**的 git 命令 —— 绝不触网，且有硬超时。
    *
    * 为什么需要（C3 + 实测于 nimrtc v1.4，2026-11-20）：
@@ -1534,6 +1817,44 @@ export function isDirectory(path: string): boolean {
  * 不按**某个平台的措辞**写。只认一种措辞 = 换个平台就退化成「贴原文」，
  * 人拿不到那条可执行的修法 —— 而这条修法恰恰是这类故障最值钱的部分。
  */
+/**
+ * 「本地缺钉死的子模块 commit」这条错误的**人话版本**。
+ *
+ * 为什么要有这个函数（ADR-095 §3.1）：报错信息必须**给可执行的修法**，
+ * 不能只说「失败了」。三种成因的修法完全不同：
+ *
+ *   1. commit 在**远程**仓库里 → fetch 远程
+ *   2. commit 在**别的本地副本**里 → fetch 那个副本
+ *   3. 主仓 index 记的 commit **本来就是错的** → 修正主仓
+ *
+ * 只给一句「本地没有这个 commit」，人会去瞎试 —— 试错了就是几十分钟。
+ */
+export function missingSubmoduleCommitMessage(
+  subPath: string,
+  sha: string,
+  repoRoot: string,
+): string {
+  const subDir = join(repoRoot, subPath);
+  const short = sha.slice(0, 8);
+
+  return [
+    `本地 module git 目录里没有 index 记录的 commit ${short}（submodule: ${subPath}）`,
+    '',
+    '这个 worktree 的 vendor 目录会是空的 —— 门禁②的 build 阶段必然失败，',
+    '而且报错会指向「找不到头文件」，与真正的原因无关。所以在这里就停下。',
+    '',
+    '三种修法，按适用场景选：',
+    `  1) 该 commit 在远程仓库里（推荐）：`,
+    `     git -C "${subDir}" fetch origin ${sha}`,
+    `  2) 该 commit 只在别的本地副本里：`,
+    `     git -C "${subDir}" fetch <那个副本的路径> ${sha}`,
+    '  3) 主仓 index 记录的 commit 本来就是错的（少见）：',
+    '     在主仓里 git submodule update --init 修正后重新建 worktree',
+    '',
+    `补齐后重建 worktree 即可（zelto 会重新校验）。`,
+  ].join('\n');
+}
+
 export function describeSubmoduleFailure(err: unknown): string {
   // 错误对象可能是 Error，也可能只是 `{ message, stderr }` 形态的普通对象
   // （execFileSync 抛的就是后者）—— 两种都要认，否则错误信息会变成

@@ -478,6 +478,19 @@ export async function ensureWorktree(
   const manager = worktreeManager();
   if (!manager.isGitRepo()) return null;
 
+  // 生成物清单（ADR-095 §3.2）—— 项目配了 `worktree.prepare` 才带。
+  //
+  // 为什么在这里读配置而不是在 manager 里读：manager 是**纯执行器**，
+  // 它不该知道配置文件的形状（那是 core/config/ 的事）。
+  // 读配置失败 → 当作「没配」→ 不做任何准备（保守，但不会误伤）。
+  let prepareCommands: Array<{ run: string; timeoutSec?: number }> = [];
+  try {
+    const cfg = loadConfig();
+    prepareCommands = cfg?.worktree?.prepare?.commands ?? [];
+  } catch {
+    prepareCommands = [];
+  }
+
   const slice = await store.read(id);
 
   const existed = manager.exists(id);
@@ -506,6 +519,9 @@ export async function ensureWorktree(
     baseCommit: base.commit ?? slice.baseCommit ?? null,
     specPath: slice.spec.path,
     acceptanceDir: slice.acceptance.dir,
+    // 生成物清单（ADR-095 §3.2）—— 项目配了 `worktree.prepare` 才带。
+    // 没配 = 不传 = 不做任何准备（不产生行为变化）。
+    ...(prepareCommands.length > 0 ? { prepareCommands } : {}),
   });
 
   // 基点回写（ADR-041 §3.2）：worktree 管理器知道基点是谁，但没人把它记下来。

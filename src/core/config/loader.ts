@@ -92,6 +92,28 @@ export interface ZeltoConfig {
     launchTimeoutMs?: number;
   };
   llm?: { provider: string; apiKey?: string; baseUrl?: string; model?: string; pricing?: Record<string, { inputPer1k: number; outputPer1k: number }> };
+  /**
+   * worktree 的**准备阶段**（ADR-095 §3.2）。
+   *
+   * 用途：生成「不进版本库」的构建产物（证书、protobuf、代码生成…）。
+   *
+   * **为什么要有**：新建的 worktree 只含**被 git 跟踪**的内容。
+   * 而有些项目的构建**依赖**生成的产物 —— 那文件在 `.gitignore` 里
+   * （实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22：
+   * wolfssl 的 `certs/ecc-key.pem`），git 不会带过去，
+   * 于是门禁②的 build 阶段必然失败，且报错指向「找不到头文件」
+   * —— 跟真正的原因毫无关系。
+   *
+   * **为什么是「生成」而不是「拷贝」**：拷贝旧的产物可能带来**过期**的
+   * 内容（过期的证书），而重新生成保证产物与当前代码一致。
+   *
+   * 没配这一节 = 不做任何准备 = 不产生行为变化。
+   */
+  worktree?: {
+    prepare?: {
+      commands: Array<{ run: string; timeoutSec?: number }>;
+    };
+  };
   /** External project configuration for cross-repo workflows.
    *  When set, `zelto gate` and `zelto slice create` operate in the
    *  target project directory instead of the current working directory. */
@@ -221,6 +243,8 @@ export function loadConfigAt(repoRoot: string): ZeltoConfig {
         gate: parsed.gate,
         agent: parsed.agent ?? defaultConfig.agent,
         ...(parsed.web ? { web: parsed.web } : {}),
+        // 生成物清单（ADR-095 §3.2）—— 不配就没有这一节（= 不做准备）。
+        ...(parsed.worktree ? { worktree: parsed.worktree } : {}),
         llm: parsed.llm,
         targetProject: parsed.targetProject,
       };
@@ -336,6 +360,14 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let inWebSection = false;
   let webMaxConcurrentRuns: number | undefined;
   let webLaunchTimeoutMs: number | undefined;
+  // worktree: 段（ADR-095 §3.2）—— 生成物清单
+  let inWorktreeSection = false;
+  let inWorktreePrepareSection = false;
+  let worktreePrepareIndent = 0;
+  /** 当前正在攒的 prepare 命令（`run:` + 可选 `timeoutSec:`） */
+  let currentPrepareCommand: { run: string; timeoutSec?: number } | null = null;
+  let currentPrepareCommandIndent = 0;
+  const worktreePrepareCommands: Array<{ run: string; timeoutSec?: number }> = [];
   const llmPricing: Record<string, { inputPer1k: number; outputPer1k: number }> = {};
   let targetProjectPath = '';
   let targetProjectSpecDir = '';
@@ -391,6 +423,21 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       inGateSection = false;
       inAgentSection = false;
       inLlmSection = false;
+      inProfileSection = false;
+      inLlmPricingSection = false;
+      currentProfile = null;
+      continue;
+    }
+    // worktree: 段（ADR-095 §3.2）—— 生成物清单。
+    //
+    // 与其它段一样是**平级**的顶层节，且会**关掉**其它段的标志位 ——
+    // 否则 `worktree.prepare` 下面的 `run:` 会被当成 gate 命令读走。
+    if (trimmed === 'worktree:' && !inTargetProjectSection) {
+      inWorktreeSection = true;
+      inGateSection = false;
+      inAgentSection = false;
+      inLlmSection = false;
+      inWebSection = false;
       inProfileSection = false;
       inLlmPricingSection = false;
       currentProfile = null;
@@ -655,6 +702,60 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       continue;
     }
 
+    // ── worktree.prepare 段（ADR-095 §3.2）──────────────────────────
+    if (inWorktreeSection) {
+      // 嵌套节 `prepare:` —— 缩进比 `worktree:` 深。
+      if (trimmed === 'prepare:') {
+        inWorktreePrepareSection = true;
+        worktreePrepareIndent = indent;
+        currentPrepareCommand = null;
+        continue;
+      }
+      // `prepare:` 里又出现更深的 `prepare:` → 已退出该节（防御纵深）。
+      if (inWorktreePrepareSection && indent <= worktreePrepareIndent && trimmed.endsWith(':')) {
+        inWorktreePrepareSection = false;
+        currentPrepareCommand = null;
+      }
+      if (inWorktreePrepareSection) {
+        // `- run: <命令>` —— YAML 的列表项前缀 `- ` 也在 `trimmed` 里。
+        //
+        // 判据要**同时**认「带 `- ` 前缀」和「不带」两种形态：
+        //   - `- run: xxx`（列表项，这是本文档的写法）
+        //   - `run: xxx`（裸键）
+        //
+        // gate 段用的是另一种办法（先剥 `- ` 再比），
+        // 这里是**独立**状态机，所以自己处理。
+        const withoutDash = trimmed.startsWith('- ') ? trimmed.slice(2).trim() : trimmed;
+
+        // `run:` —— 一条准备命令。
+        if (withoutDash.startsWith('run:')) {
+          const run = stripSurroundingQuotes(withoutDash.slice(4).trim());
+          // 空命令等于「没配」—— 宁可跳过，也不要拿空命令去跑（必然失败，
+          // 且失败原因会误导人）。见 acceptance 段的同类处理。
+          if (run) {
+            currentPrepareCommand = { run };
+            currentPrepareCommandIndent = indent;
+            worktreePrepareCommands.push(currentPrepareCommand);
+          }
+          continue;
+        }
+        // `timeoutSec:` —— 缩进比 `run:` 更深 → 该命令专属。
+        if (withoutDash.startsWith('timeoutSec:')) {
+          const isPerCommand =
+            currentPrepareCommand !== null && indent > currentPrepareCommandIndent;
+          if (isPerCommand && currentPrepareCommand) {
+            const sec = Number.parseInt(withoutDash.slice(11).trim(), 10);
+            currentPrepareCommand.timeoutSec =
+              Number.isFinite(sec) && sec > 0 ? sec : undefined;
+          }
+          continue;
+        }
+        continue;
+      }
+      // 认不出的 worktree 子键 → 结束该节。
+      inWorktreeSection = false;
+    }
+
     if (inLlmSection) {
       if (trimmed.startsWith('provider:')) {
         llmProvider = stripSurroundingQuotes(trimmed.slice(9).trim());
@@ -870,7 +971,16 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         }
       : undefined;
 
-  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web
+  // worktree 准备段（ADR-095 §3.2）。
+  //
+  // 「配了 prepare 段但一条命令都没有」= 没配 —— 不产生 `worktree` 字段，
+  // 免得下游以为「配了但清单是空的」是个错误配置。
+  const worktree =
+    worktreePrepareCommands.length > 0
+      ? { prepare: { commands: worktreePrepareCommands } }
+      : undefined;
+
+  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web || worktree
     ? {
         gate,
         agent: {
@@ -889,6 +999,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
             : {}),
         },
         ...(web ? { web } : {}),
+        ...(worktree ? { worktree } : {}),
         llm,
         ...(targetProject ? { targetProject } : {}),
       }

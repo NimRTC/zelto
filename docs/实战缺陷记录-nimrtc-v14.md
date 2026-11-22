@@ -1043,3 +1043,184 @@ ZD-006 修的）**不进入** `backtickSegments`，所以它们的区间不在�
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
+
+## ZD-026 新建 worktree 时，**生成的产物**不会跟过去 —— 门禁②在构建阶段炸，而罪魁在 setup 阶段
+
+**场景**：nimrtc-v14 的 `v3-n4-d6-connectivity` 切片，agent 跑完了（101 分钟），
+自动门禁②**红了**：
+
+```
+❌ build (10700ms, exit 1)
+  'vswhere.exe' 不是内部或外部命令
+❌ test (231929ms, exit 8)
+  Errors while running CTest
+Gate: ❌ Failed (518069ms)
+```
+
+`vswhere.exe` 那行是**噪声** —— v2-ice 那轮门禁也有同样的 stderr，
+但 `exit 0` 通过了（说明 VS 环境本身是好的）。真正的错误被埋在后面几百行里：
+
+```
+error MSB3073: "cmake.exe" -E copy_if_different
+  .../src/third_party/wolfssl/src/certs/ecc-key.pem
+  .../build/tests/Debug/certs/
+Error copying file (if different) from ".../certs/ecc-key.pem"
+```
+
+**根因**：`ecc-key.pem` 是**生成的**，不是签入的。
+
+```
+$ cd src/third_party/wolfssl/src
+$ git check-ignore -v certs/ecc-key.pem
+.gitignore:109:ecc-key.pem   certs/ecc-key.pem
+```
+
+wolfssl 的 `.gitignore` 第 109 行明确忽略它。它由
+`scripts/build_dtls_cert.py` 生成（那个脚本把自签的 ECC 证书同时镜像到
+wolfssl 自己的 cert 树里，好让 CMake 的 `copy_if_different` 规则能捡到）。
+
+而 CMake 的 `nimrtc_copy_wolfssl_certs()`（`cmake/NimRTCTest.cmake`）
+**无条件** `copy_if_different` 这两个文件 —— 源文件不在，POST_BUILD 就炸，
+连带整个测试目标构建失败。
+
+**为什么主仓没事、worktree 有事**：主仓的 `src/third_party/wolfssl/src/certs/`
+里**有** `ecc-key.pem` —— 那是历史上跑过一次 `build_dtls_cert.py` 留下的
+**未被跟踪的残留文件**。新建 worktree 时 git 只带**被跟踪**的内容，
+这个残留不带过去。
+
+于是主仓能构建、任何新 worktree 不能 —— **差异不在代码，在工作区的历史**。
+
+**为什么这是个真缺陷（而不只是「环境没配好」）**：
+
+1. worktree 是 zelto **自己**造的（`core/worktree/`），不是人手工建的。
+   zelto 造出来的 worktree 应当是**可构建的** —— 否则门禁②必然红，
+   而红的理由跟切片内容毫无关系。
+2. 门禁②的失败信息**指向了错的地方**。人看到「build 失败」，
+   第一反应是「agent 把代码写坏了」—— 但 agent 一个字节都没碰证书。
+3. 更糟的是：门禁②红了之后，agent 已经烧掉的 101 分钟无法复用，
+   而**人无法从门禁输出里推出真正的原因**（`MSB3073` 那一坨
+   `if %errorlevel% neq 0 goto :cmEnd` 没有任何可读信息）。
+
+**还有一条同源的**：`version/v3` 的树钉住了较老的子模块 commit
+（googletest `15460959`、libopus `22244de5`），而本地 module 仓库里
+只有较新的「carbon copy」commit。zelto 的 `alignSubmodulesToMainRepo`
+按 C3（确定性、不触网）用 `git checkout --force <pin> --no-fetch` ——
+pinned commit 在本地**不存在**时**静默失败**，worktree 的子模块目录于是
+**是空的**。
+
+现象几乎一样（构建缺东西），但成因不同、修法也不同。
+
+**修复**：已修（2026-11-22），见 **ADR-095**
+（`docs/adr-095-worktree-build-prerequisites.md`）。分两处：
+
+**其一（子模块）：钉死的 commit 本地不存在 → 明确报错，不静默**
+
+判据是 `git cat-file -e <sha>` —— 只读本地对象库，不触网（C3），
+且是确定性的。
+
+关键点：**这个检查必须放在 `submodule update` 之前**。
+原来的失败发生在 update 阶段（被记成一条警告），
+而 `alignSubmodulesToMainRepo` 在 update **之后** —— update 失败，
+align 根本没机会跑。所以「commit 存在性」的判据必须前置。
+
+另外还有一个坑：`git submodule add` 只把 gitlink **暂存**进 index，
+**不提交**。而 worktree 是从 **HEAD** 建出来的 ——
+worktree 的 index 里于是**没有**那个 gitlink。
+所以「钉死的 commit」要从**主仓的 index** 读，不是 worktree 的。
+（这个坑是写集成测试时才发现的：判据写对了但永远读到空。）
+
+报错信息带**三种可执行的修法**（成因不同，修法不同）：
+
+```
+本地 module git 目录里没有 index 记录的 commit 15460959（submodule: src/third_party/googletest/src）
+
+这个 worktree 的 vendor 目录会是空的 —— 门禁②的 build 阶段必然失败，
+而且报错会指向「找不到头文件」，与真正的原因无关。所以在这里就停下。
+
+三种修法，按适用场景选：
+  1) 该 commit 在远程仓库里（推荐）：
+     git -C "<主仓>/src/third_party/googletest/src" fetch origin 15460959
+  2) 该 commit 只在别的本地副本里：
+     git -C "<主仓>/src/third_party/googletest/src" fetch <那个副本的路径> 15460959
+  3) 主仓 index 记录的 commit 本来就是错的（少见）：
+     在主仓里 git submodule update --init 修正后重新建 worktree
+```
+
+**为什么是「抛错」而不是「警告」**：worktree 建出来是**坏的**，
+门禁②**必然**失败。让它在**建 worktree 的时候**失败（早几分钟、
+信息直达），比在**门禁的时候**失败（信息被几千行编译输出淹没）好得多。
+与 C9 同一原则：**依赖缺失时的正确动作是停下**，不是带着缺口继续跑。
+
+**其二（生成物）：新增 `worktree.prepare` 配置节 —— 建 worktree 时跑前置脚本**
+
+```yaml
+worktree:
+  prepare:
+    commands:
+      - run: python scripts/build_dtls_cert.py
+        timeoutSec: 60
+```
+
+**为什么是「生成」而不是「拷贝」**：拷贝旧的生成物可能带来**过期**的
+内容（过期的证书、过期的 protobuf），而重新生成保证产物与当前代码一致。
+
+**为什么放 config.yaml 而不是 policy.yaml**：policy 是**策略**
+（谁能写什么、什么必须拦），`worktree.prepare` 是**环境准备**。
+policy 的规则会被 gate/sched 消费，混进「要跑什么脚本」会让策略层
+变成脚本执行器。
+
+**为什么不复用 `gate.commands`**：`gate.commands` 是**判定**用的
+（跑测试、验契约），它的失败是「门禁红」；
+这里是**准备**用的（生成产物），它的失败是「worktree 不可用」。
+时机也不同：准备在 agent 开跑**之前**，判定在 agent 跑完**之后**。
+混在一起的话，准备失败会被报成「门禁红」—— 人会去查 agent 的代码，
+而问题在准备阶段（就是本条的老毛病：报错指向错的地方）。
+
+**准备阶段的失败 → 不放行到 agent**（fail closed）。
+fail fast：前一条失败就不跑后一条 —— 后一条大概率也依赖前一条的产物，
+且连着跑一串注定失败的命令，报错会指向最后一条（又是「报错指错地方」）。
+每条命令有超时（默认 120 秒），挂死的命令不能无限等。
+
+**没配这一节 = 不做任何准备 = 不产生行为变化**。
+
+**回归测试**：
+
+- `tests/adr095-worktree-build-prerequisites.test.ts`（13 个用例）——
+  单元层：判据、报错信息含三种修法、命令在 worktree 目录里跑、
+  产物是重新生成而非拷贝、失败不放行、fail fast、超时、空清单不跑、
+  配置解析（含 `run:` 为空被跳过、`worktree.prepare` 的 `run:`
+  不被 gate 的命令解析吃掉）。
+- `tests/adr095-submodule-missing-commit.test.ts`（4 个用例）——
+  集成层：**真的 submodule**。本地有 pinned commit → 对齐成功，vendor 有内容；
+  本地没有 → 抛错，信息带三种修法 + 点名真正的原因 + 说清后果 + 带短 sha。
+
+**踩坑记录（两条，都值得记）**：
+
+1. **造不出「本地缺 commit」这个状态**。以为 `gc --prune=now` 能把旧 commit
+   删掉 —— 实测 expire reflog + gc + repack 之后那个 commit **仍然可读**
+   （git 对近期对象有宽限期）。最后改成「把 `.git/modules/<name>` 换成一个
+   **无关**的仓库」—— 这反而**更真实**（本地副本与上游脱节本来就是更常见的
+   故障形态：有人重新 clone 过、module 仓库被换掉了）。
+2. **判据写对了但永远读到空**。`pinnedCommitOf` 最初读 worktree 的 index，
+   而 worktree 是从 HEAD 建的，HEAD 里没有 submodule 的 gitlink
+   （`git submodule add` 不提交）→ 永远读到 null → 判据形同虚设。
+   改成读**主仓**的 index 才对。
+
+（这两条都是**测试逼出来的**，不是想出来的 —— 集成测试的价值就在这儿。）
+
+**剩余问题**（未做）：
+
+1. 子模块的「自动修复」没做：现在只报错并给三种修法，
+   不自动 `git fetch` —— 因为自动 fetch **触网**（C3 的地盘），
+   且「fetch 哪个 URL」需要项目知识。
+2. `worktree.prepare` 没有「校验产物在位」的能力。命令跑完，
+   但产物可能在（脚本静默失败、输出到别处）。要严格得再声明一份产物清单。
+3. 准备阶段的耗时没进任何统计 —— `zelto status` 里看不出来。
+4. nimrtc 侧还没配 `worktree.prepare` —— 配了
+   `python scripts/build_dtls_cert.py` 之后，这条就不用再手工绕了。
+
+---
+
+## 记录格式约定
+
+新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。

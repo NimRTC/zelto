@@ -30,6 +30,12 @@
 //   4. 失败原因分类：能区分「本地缺 commit」与「超时」
 //   5. 同步成功时不产生失败记录
 //   6. 超时上限可配置（测试里改小）
+//
+// ADR-095 之后的形态变化：第 3 点从「记一条警告继续走」变成
+// 「**当场抛错**」—— 因为本地缺钉死的 commit 时 worktree 建出来是**坏的**
+// （vendor 目录是空的），门禁②**必然**失败。
+// 「失败被记下来」这条契约**保留**：记进 `submoduleFailures`（结构化留痕），
+// 与抛错并存。
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -217,7 +223,23 @@ test('D-73：本地缺 commit 时快速失败（不是挂住），且失败被�
     s.manager.submoduleTimeoutMsOverride = 5_000;
 
     const started = Date.now();
-    s.manager.syncSubmodules(s.worktreePath);
+    // ADR-095 之后：本地缺钉死的 commit 不再是「记一条警告继续走」，
+    // 而是**当场抛错**（worktree 建出来是坏的，门禁②必然失败）。
+    //
+    // D-73 立的契约仍然成立 —— 只是形态变了：
+    //   - 「快速失败，不是挂住」 → 抛错，而且**更快**（前置判据，不用等 git 超时）
+    //   - 「失败被记下来」       → 记进 `submoduleFailures`（结构化留痕）
+    assert.throws(
+      () => s.manager.syncSubmodules(s.worktreePath),
+      (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        // 错误信息要点名真正的原因，不能只说「失败了」。
+        assert.match(msg, /本地 module git 目录里没有/, `信息要点名原因：${msg}`);
+        // 还要给**可执行的修法**（ADR-095 §3.1）。
+        assert.match(msg, /fetch origin/, '要给出可执行的修法');
+        return true;
+      },
+    );
     const elapsed = Date.now() - started;
 
     assert.ok(
