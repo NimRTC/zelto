@@ -5,6 +5,12 @@ import type { EventEnvelope, EventType } from '../events/index.js';
 
 export { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from './executor.js';
 export type { LlmAdapter, LlmMessage, LlmRequest, LlmResponse } from './llm.js';
+export type {
+  ForgePort,
+  ForgePrRequest,
+  ForgePrResult,
+  ForgeAvailability,
+} from './forge.js';
 
 export interface SessionPort {
   start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }>;

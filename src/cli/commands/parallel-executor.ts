@@ -478,6 +478,7 @@ export async function executeSlicesParallel(
       affinityCtx,
       gateCommandsForSlice(slice),
       await scheduler.readFeedbackFor(st.id),
+      await scheduler.readHumanFeedbackFor(st.id),
     );
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');

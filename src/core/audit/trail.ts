@@ -196,6 +196,10 @@ const EVENT_SUMMARIES: Record<EventType, (e: EventEnvelope) => string> = {
     `Sign returned upstream by ${String(e.payload?.decidedBy ?? e.actor ?? 'human')}: ${String(
       e.payload?.comment ?? '',
     )}`,
+  // ADR-094 D-19：签字与切片状态对不上 —— 这是**不一致**，必须可见。
+  'sign.state_mismatch': (e) =>
+    `⚠️ Sign state mismatch — slice is ${String(e.payload?.sliceState ?? '?')} ` +
+    `(expected ${String(e.payload?.expected ?? '?')}); the approval did not change the slice state`,
   'forge.pr_opened': (e) =>
     `PR opened: ${String(e.payload?.url ?? e.payload?.number ?? '?')} (base ${String(
       e.payload?.base ?? '?',

@@ -20,6 +20,16 @@ export { renderFacts } from './render.js';
 
 export { RevisionStore, type RevisionMeta } from './revisions.js';
 
+// 人的审阅意见（ADR-094 §5.2）—— 与上面的「草稿评审」是两条路：
+// 那一条评的是**草稿**（规划期），这一条送的是**人退回切片时提的意见**
+//（执行期），由事件流读出、进 agent 的约束包。
+export {
+  readHumanFeedback,
+  renderHumanFeedback,
+  type HumanFeedback,
+  type HumanFeedbackKind,
+} from './human-feedback.js';
+
 export type {
   DecisionPoint,
   DecisionPointKind,

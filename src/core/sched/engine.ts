@@ -5,11 +5,12 @@
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
-import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateFeedback } from './types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateFeedback, HumanFeedback } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
 import { readGateFeedback, renderGateFeedback } from '../gate/feedback.js';
+import { readHumanFeedback, renderHumanFeedback } from '../review/human-feedback.js';
 
 /**
  * 找出写集里那个「全是 test.todo 的验收骨架」。
@@ -194,6 +195,7 @@ export class Scheduler {
     affinity?: AffinityContext | null,
     gateCommands?: GateCommandSummary[],
     gateFeedback?: GateFeedback[],
+    humanFeedback?: HumanFeedback[],
   ): ConstraintBundle {
     // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
     const relevantRules = this.policy.rules.filter((r) => {
@@ -215,10 +217,11 @@ export class Scheduler {
         '.cursor/rules/**',
       ],
       policyRules: relevantRules,
-      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands, gateFeedback),
+      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands, gateFeedback, humanFeedback),
       affinity: affinity ?? null,
       ...(gateCommands && gateCommands.length > 0 ? { gateCommands } : {}),
       ...(gateFeedback && gateFeedback.length > 0 ? { gateFeedback } : {}),
+      ...(humanFeedback && humanFeedback.length > 0 ? { humanFeedback } : {}),
     };
   }
 
@@ -232,6 +235,23 @@ export class Scheduler {
       return await readGateFeedback(this.events, sliceId);
     } catch {
       // 读不到反馈不是阻断 —— agent 只是少了一段上下文
+      return [];
+    }
+  }
+
+  /**
+   * 读人审阅时提的意见（ADR-094 §5.2）。
+   *
+   * 给被退回重跑的 agent 用的 —— 它需要知道「人上次说了什么」。
+   *
+   * 与 `readFeedbackFor` 同一条路的第二个来源：那一个送机器的失败证据，
+   * 这一个送人的原话。
+   */
+  async readHumanFeedbackFor(sliceId: string): Promise<HumanFeedback[]> {
+    try {
+      return await readHumanFeedback(this.events, sliceId);
+    } catch {
+      // 读不到意见不是阻断 —— agent 只是少了一段上下文
       return [];
     }
   }
@@ -479,6 +499,7 @@ export class Scheduler {
     affinity?: AffinityContext | null,
     gateCommands?: GateCommandSummary[],
     gateFeedback?: GateFeedback[],
+    humanFeedback?: HumanFeedback[],
   ): string {
     const lines = [
       `You are implementing slice "${slice.id}": ${slice.title}`,
@@ -518,6 +539,19 @@ export class Scheduler {
         `where no test really ran — todos and skips do not count as verification.`,
         '',
       );
+    }
+
+    // 人的意见（ADR-094 §5.3）—— 放在门禁命令**之前**。
+    //
+    // 顺序理由：人的意见是**这轮要做什么**的指令，门禁失败是
+    // **上一轮为什么没过**的证据。指令在前，agent 先知道要改什么，
+    // 再看上次崩在哪。
+    //
+    // 反过来放（先证据后意见）会让 agent 把「上次门禁怎么挂的」
+    // 当成这轮的重点 —— 而人的意见可能根本不是关于门禁的
+    // （「3 号那个 null 处理不对」说的是实现细节，不是测试挂了）。
+    if (humanFeedback && humanFeedback.length > 0) {
+      lines.push(...renderHumanFeedback(humanFeedback));
     }
 
     // 门禁命令原文（ADR-045）：agent 必须用同一套命令验证自己的产物。

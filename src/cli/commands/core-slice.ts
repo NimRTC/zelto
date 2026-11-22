@@ -1423,6 +1423,7 @@ register('run', async (args) => {
         null,
         gateCommandsForSlice(slice),
         await scheduler.readFeedbackFor(id),
+        await scheduler.readHumanFeedbackFor(id),
       );
       if (isJson) {
         console.log(JSON.stringify({
@@ -1532,13 +1533,26 @@ register('run', async (args) => {
     // 否则它只能从头摸，而且可能把已经做对的东西改错。
     const gateFeedback = await scheduler.readFeedbackFor(id);
 
-    const bundle = scheduler.buildConstraints(slice, null, gateCommandsForSlice(slice), gateFeedback);
+    // 人的意见（ADR-094 §5.2）：被退回重跑时，agent 必须知道
+    // 「人上次说了什么」。这是追溯链上唯一不由工具生成的判断。
+    const humanFeedback = await scheduler.readHumanFeedbackFor(id);
+
+    const bundle = scheduler.buildConstraints(
+      slice,
+      null,
+      gateCommandsForSlice(slice),
+      gateFeedback,
+      humanFeedback,
+    );
     console.log(`zelto run ${id} — ✅ Admitted and starting execution...`);
     console.log(`  Write-set:     ${bundle.writes.join(', ') || '(none)'}`);
     console.log(`  Protected:     ${bundle.protectedPaths.join(', ')}`);
     console.log(`  Policy rules:  ${bundle.policyRules.length}`);
     if (gateFeedback.length > 0) {
       console.log(`  Last failure:  ${gateFeedback.length} item(s) — passing the evidence to the agent`);
+    }
+    if (humanFeedback.length > 0) {
+      console.log(`  Human notes:   ${humanFeedback.length} item(s) — passing the reviewer's notes to the agent`);
     }
 
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
@@ -2223,6 +2237,7 @@ register('start', async (args) => {
       null,
       gateCommandsForSlice(slice),
       await scheduler.readFeedbackFor(id),
+      await scheduler.readHumanFeedbackFor(id),
     );
     const bundlePath = join(ZELTO_DIR, `${id}-bundle.json`);
     const { writeFileSync: write } = await import('node:fs');

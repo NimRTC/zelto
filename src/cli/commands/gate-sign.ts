@@ -457,10 +457,12 @@ register('sign', async (args) => {
 
   const [id, action] = args;
   if (!id || !action) {
-    console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke] [--comment <text>]');
+    console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke|--revise] [--comment <text>]');
     console.error('       zelto sign <slice-id> --approve [--force]');
     console.error('         --approve 会先跑签字前确认（追溯/验收/写集）；有不过的就拦下（D-48）');
     console.error('         --force   明知故犯地跳过确认项（会在输出里留痕）');
+    console.error('       zelto sign <slice-id> --revise --comment "要改什么"');
+    console.error('         --revise  退回重跑：方向对、细节要改。意见会带进下一轮 agent 的上下文');
     return 1;
   }
 
@@ -523,21 +525,51 @@ register('sign', async (args) => {
 
       const pending = await signManager.list('pending');
       const req = pending.find((r) => r.sliceId === id);
+
+      // 签字是**人的决定** —— 工具不替人拒绝。
+      // 切片状态对不上时（`sign.state_mismatch`），如实报出来，
+      // 但不推翻签字 —— `--force` 存在的意义就是明知故犯地签。
+      let approved;
+      let autoRequested = false;
       if (!req) {
         const newReq = await signManager.request(id, 'human');
-        await signManager.approve(newReq.id, 'human', comment);
-        if (isJson) {
-          console.log(JSON.stringify({ sliceId: id, action: 'approved', autoRequested: true }));
-        } else {
-          console.log(`zelto sign ${id} -- ✅ Approved (auto-requested)`);
-        }
+        approved = await signManager.approve(newReq.id, 'human', comment);
+        autoRequested = true;
       } else {
-        await signManager.approve(req.id, 'human', comment);
-        if (isJson) {
-          console.log(JSON.stringify({ sliceId: id, action: 'approved' }));
-        } else {
-          console.log(`zelto sign ${id} -- ✅ Approved`);
-        }
+        approved = await signManager.approve(req.id, 'human', comment);
+      }
+
+      // 状态转移有没有真的发生？读了才知道 —— 不猜。
+      const sliceAfter = await store.read(id).catch(() => null);
+      const stateMismatch =
+        sliceAfter !== null &&
+        sliceAfter.state !== 'completed' &&
+        (req === undefined || approved.status === 'approved');
+
+      if (isJson) {
+        console.log(
+          JSON.stringify({
+            sliceId: id,
+            action: 'approved',
+            signId: approved.id,
+            sliceState: sliceAfter?.state ?? null,
+            ...(stateMismatch ? { stateMismatch: true } : {}),
+            ...(autoRequested ? { autoRequested: true } : {}),
+          }),
+        );
+      } else if (autoRequested) {
+        console.log(`zelto sign ${id} -- ✅ Approved (auto-requested)`);
+      } else {
+        console.log(`zelto sign ${id} -- ✅ Approved`);
+      }
+
+      if (stateMismatch) {
+        console.error('');
+        console.error(`  ⚠️  切片状态仍是 ${sliceAfter!.state} —— 签字已记录，但状态没跟着变。`);
+        console.error('     这两件事在追溯链里对不上。多数情况是这片还没跑完门禁②。');
+        console.error('');
+        console.error('     要让状态与签字一致，先把片跑到 completed：');
+        console.error(`       zelto gate ${id} && zelto sign ${id} --approve`);
       }
 
       // ADR-018：签字只改状态。合并是显式动作 —— zelto merge <id>
@@ -555,11 +587,144 @@ register('sign', async (args) => {
         }
         return 1;
       }
-      await signManager.reject(req.id, 'human', comment);
+      // 拒绝是**人的决定** —— 工具不替人拒绝。
+      // 状态对不上就**如实报出来**，但不推翻拒绝。
+      const rejected = await signManager.reject(req.id, 'human', comment);
+
+      const sliceAfter = await store.read(id).catch(() => null);
+      const stateMismatch = sliceAfter !== null && sliceAfter.state !== 'abandoned';
+
       if (isJson) {
-        console.log(JSON.stringify({ sliceId: id, action: 'rejected' }));
+        console.log(
+          JSON.stringify({
+            sliceId: id,
+            action: 'rejected',
+            signId: rejected.id,
+            sliceState: sliceAfter?.state ?? null,
+            ...(stateMismatch ? { stateMismatch: true } : {}),
+          }),
+        );
       } else {
         console.log(`zelto sign ${id} -- ❌ Rejected`);
+      }
+
+      if (stateMismatch) {
+        console.error('');
+        console.error(`  ⚠️  切片状态仍是 ${sliceAfter!.state} —— 拒绝已记录，但状态没跟着变。`);
+        console.error('     多数情况是这片还没到 completed（门禁②没过）。');
+        console.error('');
+        console.error('     要让状态与拒绝一致，先把片跑到 completed 再拒：');
+        console.error(`       zelto gate ${id} && zelto sign ${id} --reject`);
+      }
+    } else if (action === '--revise') {
+      // ── 退回重跑（ADR-094 §5.1）────────────────────────────────────────
+      //
+      // 人审出毛病但**方向是对的** —— 让片回 frozen 带着意见重跑。
+      //
+      // 与 `--reject` 的区别是这一档的全部意义：
+      //   --reject  → 切片进终态 abandoned，规格得重写，整片作废
+      //   --revise  → 切片回 frozen，规格与写集都不动，意见进下一轮上下文
+      //
+      // 与 `--revoke` 的区别：
+      //   --revoke  → 只作废「批准」这条记录，切片状态不动，门禁结论还在
+      //   --revise  → **改变切片状态**，且意见会真的到达 agent
+      //
+      // **必须有意见**（ADR-094 §5.2）：不给意见就让人重跑 = 人自己也不
+      // 清楚要改什么，重跑必然白跑（agent 拿到的信息与上一轮完全等价）。
+      if (!comment || !comment.trim()) {
+        if (isJson) {
+          console.log(JSON.stringify({
+            sliceId: id,
+            action: 'blocked',
+            error: '退回重跑必须带意见',
+            hint: 'zelto sign <id> --revise --comment "要改什么"',
+          }));
+        } else {
+          console.error('❌ 退回重跑必须带意见（--comment）。');
+          console.error('   没有意见，agent 拿到的信息与上一轮完全等价 —— 重跑必然白跑。');
+          console.error('   用法：zelto sign <id> --revise --comment "要改什么"');
+        }
+        return 1;
+      }
+
+      // ── 找可退的签字请求 ────────────────────────────────────────────────
+      //
+      // 两种状态都能退（ADR-094 D11）：
+      //
+      // - `pending` —— 还没批就发现问题；
+      // - `approved` —— **批了之后又发现问题** —— 这是最常见的场景！
+      //
+      // 后者以前会撞「No pending sign request」而退不掉 ——
+      // 但「签了字又发现毛病」恰恰是最该退的时候。
+      //
+      // 优先取 `pending`（最新的那条）；没有 pending 就取 `approved`。
+      const pendingReq = (await signManager.list('pending')).find((r) => r.sliceId === id);
+      const approvedReq = (await signManager.list('approved')).find((r) => r.sliceId === id);
+      const req = pendingReq ?? approvedReq;
+      if (!req) {
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'revised', error: 'No sign request to revise' }));
+        } else {
+          console.error(`No sign request to revise for slice "${id}".`);
+          console.error('  退回重跑要求有**待签字**或**已批准**的请求 —— 没请求就没法退。');
+        }
+        return 1;
+      }
+
+      // ── D11：连带作废已批准的状态 ────────────────────────────────────────
+      //
+      // `merge` 的判据是「存在 approved 的签字请求」。若批准之后再退回，
+      // approved 请求还在 → merge 照样会收它 → 「已批准的片被退回」与
+      // 「已批准的片可合并」同时成立 = 追溯链自相矛盾。
+      //
+      // `reviseRequest()` 把 approved 请求**就地**转成 revised ——
+      // 所以 approved 状态自然不再成立，不需要「先 revoke 再 revise」
+      // 两步（两步之间会有一个「既没批准也没退回」的中间态）。
+      //
+      // 但「批准被作废了」这件事**必须在输出里明说** ——
+      // 人以为在退回，实际连带撤了批准，这件事不能悄悄做。
+      const revokedApproval = approvedReq !== undefined && approvedReq !== null;
+
+      // `reviseRequest()` 在**动手之前**校验切片状态 ——
+      // 状态不对就抛错，且**一个字都没改**（签字请求没被消耗）。
+      //
+      // 这里必须接住并说清楚：让异常冒到顶层会打印栈，对人没用。
+      let revised;
+      try {
+        revised = await signManager.reviseRequest(req.id, 'human', comment);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isJson) {
+          console.log(JSON.stringify({ sliceId: id, action: 'blocked', error: msg }));
+        } else {
+          console.error(`zelto sign ${id} -- ❌ 退回重跑失败：${msg}`);
+          console.error('');
+          console.error('  **没有退回**：签字请求与切片状态都没动。');
+          console.error('');
+          console.error('  退回重跑要求切片处于 completed（门禁②过了、等签字）。');
+          console.error('  各状态下的出路：');
+          console.error('    - draft     —— 还没冻结：改完规格直接 freeze');
+          console.error('    - frozen   —— 已冻结未完成：zelto run ' + id);
+          console.error('    - running   —— 正在跑：等它跑完，或 zelto stall ' + id);
+        }
+        return 1;
+      }
+
+      if (isJson) {
+        console.log(JSON.stringify({
+          sliceId: id,
+          action: 'revised',
+          signId: revised.id,
+          ...(revokedApproval ? { revokedApproval: true } : {}),
+        }));
+      } else {
+        console.log(`zelto sign ${id} -- ↩️  Sent back for rework`);
+        if (revokedApproval) {
+          console.log(`  ⚠️  此前的批准已作废（${approvedReq!.id}）—— 否则它仍可被合并。`);
+        }
+        console.log('  切片回到 frozen：规格与写集不动，可以重跑。');
+        console.log('  你的意见会带进下一轮 agent 的上下文。');
+        console.log('下一步：zelto run ' + id);
       }
     } else if (action === '--revoke') {
       // 签错了要能回退：撤销已经通过的签字记录（ADR-021）
@@ -587,7 +752,7 @@ register('sign', async (args) => {
         console.log(JSON.stringify({ error: `Unknown action: ${action}` }));
       } else {
         console.error(`Unknown action: ${action}`);
-        console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke]');
+        console.error('Usage: zelto sign <slice-id> [--approve|--reject|--revoke|--revise]');
       }
       return 1;
     }

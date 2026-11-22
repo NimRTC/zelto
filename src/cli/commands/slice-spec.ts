@@ -544,10 +544,12 @@ register('spec', async (args: string[]): Promise<number> => {
   const subcmd = args[0];
 
   if (!subcmd) {
-    f.error('USAGE', 'Usage: zelto spec <draft|show|confirm|skeleton> <slice-id>');
+    f.error('USAGE', 'Usage: zelto spec <draft|show|confirm|revise|skeleton> <slice-id>');
     f.out('       zelto spec draft <slice-id>    生成规格草稿 + 验收测试骨架');
     f.out('       zelto spec show <slice-id>     看草稿 / 正式规格');
     f.out('       zelto spec confirm <slice-id> [--force] [--refreeze]  确认草稿 → 写进正式规格');
+    f.out('       zelto spec revise <slice-id> --comment "要改什么"');
+    f.out('         退回上游：方向不对，规格要改。切片回到 draft，意见带进下一轮上下文');
     f.out('       zelto spec skeleton <slice-id> [--force]  从正式规格重新生成验收骨架');
     f.out('         （含已实现断言的骨架默认保全；--force 才覆盖；frozen 切片需 --refreeze）');
     return 1;
@@ -556,9 +558,122 @@ register('spec', async (args: string[]): Promise<number> => {
   if (subcmd === 'draft') return handleDraft(args.slice(1));
   if (subcmd === 'show') return handleShow(args.slice(1));
   if (subcmd === 'confirm') return handleConfirm(args.slice(1));
+  if (subcmd === 'revise') return handleRevise(args.slice(1));
   if (subcmd === 'skeleton') return handleSkeleton(args.slice(1));
 
   f.error('USAGE', `Unknown spec subcommand: ${subcmd}`);
-  f.out('       zelto spec draft|show|confirm|skeleton <slice-id>');
+  f.out('       zelto spec draft|show|confirm|revise|skeleton <slice-id>');
   return 1;
 });
+
+// ─── revise（退回上游，ADR-094 §5.1）────────────────────────────────────────
+
+/**
+ * 退回上游 —— 人审出**方向**不对，要改规格。
+ *
+ * 与 `zelto sign <id> --revise`（退回重跑）的区别在**回哪个状态**：
+ *
+ *   sign --revise  → frozen   规格不动，重跑即可
+ *   spec revise     → draft    规格要改，改完重新走门禁① + 冻结
+ *
+ * 回 `draft` 而不是 `frozen`（ADR-094 D5）：直接回 frozen 会**跳过
+ * 门禁①** —— 而规格改了之后门禁①必须重跑（追溯要重新物化、写集要
+ * 重新核覆盖）。
+ *
+ * **必须有意见**（ADR-094 §5.2）：不给意见就让人改规格，改的方向还是
+ * 只有人自己知道 —— 那等于没退。
+ */
+async function handleRevise(args: string[]): Promise<number> {
+  const f = getDefaultFormatter();
+  const id = args[0];
+  if (!id || id.startsWith('--')) {
+    f.error('USAGE', 'Usage: zelto spec revise <slice-id> --comment "要改什么"');
+    return 1;
+  }
+
+  if (!(await store.exists(id))) {
+    f.error('NOT_FOUND', `Slice "${id}" not found.`);
+    return 1;
+  }
+
+  const commentIdx = args.indexOf('--comment');
+  const comment = commentIdx >= 0 ? args[commentIdx + 1] : null;
+  if (!comment || !comment.trim() || comment.startsWith('--')) {
+    f.error('MISSING_COMMENT', '退回上游必须带意见（--comment）。');
+    f.out('');
+    f.out('  没有意见，agent 拿到的信息与上一轮完全等价 —— 重跑必然白跑。');
+    f.out('  用法：zelto spec revise ' + id + ' --comment "方向哪里不对"');
+    return 1;
+  }
+
+  const slice = await store.read(id);
+
+  // 状态门：只有 completed 的切片能被「退回上游」。
+  //
+  // 别的状态各有各的出路（frozen → freeze --refreeze；draft → 直接改），
+  // 混在这里只会让人以为「退回」能做所有事。
+  if (slice.state !== 'completed') {
+    f.error(
+      'BAD_STATE',
+      `切片 "${id}" 处于 ${slice.state} —— 只有 completed 的切片能被退回上游。`,
+    );
+    f.out('');
+    if (slice.state === 'frozen') {
+      f.out('  已冻结但未完成：改规格请用 zelto freeze ' + id + ' --refreeze');
+    } else if (slice.state === 'draft') {
+      f.out('  还没冻结：直接改规格草稿（zelto spec draft ' + id + '）');
+    } else {
+      f.out('  还没完成：先让它跑完（zelto run ' + id + '）');
+    }
+    return 1;
+  }
+
+  // 需要一条可退的请求 —— 没有请求就无从「退」。
+  //
+  // `pending` 与 `approved` 都能退（ADR-094 D11）：签了字又发现方向不对，
+  // 是最该退的场景 —— 那时已经没有 pending 请求了。
+  const { SignManager } = await import('../../core/gate/sign.js');
+  const signManager = new SignManager(ZELTO_DIR, events, store);
+  const pendingReq = (await signManager.list('pending')).find((r) => r.sliceId === id);
+  const approvedReq = (await signManager.list('approved')).find((r) => r.sliceId === id);
+  const req = pendingReq ?? approvedReq;
+  if (!req) {
+    f.error('NO_SIGN_REQUEST', `切片 "${id}" 没有可退的签字请求 —— 无从退回。`);
+    f.out('');
+    f.out('  退回是对「签字请求」的处置。先发起签字请求（门禁②通过时会自动发起）。');
+    return 1;
+  }
+
+  // D11：已批准的就地作废 —— `returnRequest()` 把 approved 转成 returned，
+  // 所以 approved 状态自然不再成立（「已批准的片可合并」不再为真）。
+  //
+  // 但「批准被作废了」这件事**必须在输出里明说** ——
+  // 人以为在退回，实际连带撤了批准，这件事不能悄悄做。
+  const revokedApproval = approvedReq !== undefined && approvedReq !== null;
+
+  // `returnRequest()` 在动手之前校验切片状态 —— 状态不对就抛错，
+  // 且**一个字都没改**（签字请求没被消耗）。
+  let returned;
+  try {
+    returned = await signManager.returnRequest(req.id, 'human', comment);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    f.error('RETURN_FAILED', `退回上游失败：${msg}`);
+    f.out('');
+    f.out('  **没有退回**：签字请求与切片状态都没动。');
+    return 1;
+  }
+
+  f.out(`zelto spec revise ${id} -- ↩️  Returned upstream (${returned.id})`);
+  if (revokedApproval) {
+    f.out(`  ⚠️  此前的批准已作废（${approvedReq!.id}）—— 否则它仍可被合并。`);
+  }
+  f.out('  切片回到 draft：规格可以改了。');
+  f.out('  你的意见会带进下一轮 agent 的上下文。');
+  f.out('');
+  f.out('下一步：');
+  f.out('  1) 改规格：zelto spec draft ' + id + '   （写清楚这次要改成什么样）');
+  f.out('  2) 确认：zelto spec confirm ' + id);
+  f.out('  3) 重新冻结：zelto freeze ' + id);
+  return 0;
+}

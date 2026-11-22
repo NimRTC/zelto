@@ -38,11 +38,21 @@ function runCli(...args: string[]): Promise<{ stdout: string; stderr: string; co
 
 /** 写一个已完成的切片（状态 completed） */
 async function writeSlice(id: string, title: string): Promise<void> {
+  await writeSliceWithState(id, title, 'completed');
+}
+
+/**
+ * 写一个指定状态的切片。
+ *
+ * 退回报错之后切片要回到 `frozen`（退回重跑）或 `draft`（退回上游）——
+ * 那两个状态不是 `completed`，所以要能单独写。
+ */
+async function writeSliceWithState(id: string, title: string, state: string): Promise<void> {
   const now = new Date().toISOString();
   const slice = {
     id,
     title,
-    state: 'completed',
+    state,
     spec: { path: `specs/slices/${id}.md`, frozenHash: null, frozenAt: null },
     acceptance: { dir: `tests/acceptance/${id}`, frozenHash: null, oracleSrc: null },
     baseCommit: null,
@@ -62,7 +72,7 @@ async function writeSlice(id: string, title: string): Promise<void> {
 /** 写一条签字请求 */
 async function writeSignRequest(
   sliceId: string,
-  status: 'pending' | 'approved' | 'rejected' | 'revoked',
+  status: 'pending' | 'approved' | 'rejected' | 'revoked' | 'revised' | 'returned',
   requestedAt: string,
 ): Promise<void> {
   const req = {
@@ -142,5 +152,80 @@ describe('next / suggest 的待办判据', () => {
   it('待办排序：先签字，再合并', async () => {
     const next = await runCli('next');
     assert.ok(next.stdout.includes('awaiting-sign'), `待签字切片应排在最前：\n${next.stdout}`);
+  });
+
+  it('退回重跑的切片该出现在 next 里，并给出重跑命令', async () => {
+    await writeSliceWithState('sent-back', '被退回重跑的切片', 'frozen');
+    await writeSignRequest('sent-back', 'revised', '2026-11-02T00:00:00.000Z');
+
+    const next = await runCli('next');
+    assert.equal(next.code, 0);
+    assert.ok(
+      next.stdout.includes('sent-back'),
+      `next 应提到被退回的切片，实际输出：\n${next.stdout}`,
+    );
+    assert.ok(
+      next.stdout.includes('zelto run sent-back'),
+      `next 应给出重跑命令，实际输出：\n${next.stdout}`,
+    );
+  });
+
+  it('退回上游的切片该出现在 next 里，并指向改规格', async () => {
+    await writeSliceWithState('returned-up', '被退回上游的切片', 'draft');
+    await writeSignRequest('returned-up', 'returned', '2026-11-02T00:00:00.000Z');
+
+    const next = await runCli('next');
+    assert.equal(next.code, 0);
+    assert.ok(
+      next.stdout.includes('returned-up'),
+      `next 应提到被退回上游的切片，实际输出：\n${next.stdout}`,
+    );
+    assert.ok(
+      next.stdout.includes('zelto check returned-up'),
+      `退回上游的下一步是改规格，实际输出：\n${next.stdout}`,
+    );
+  });
+
+  it('退回的切片在 suggest 里该有专门的一段', async () => {
+    const suggest = await runCli('suggest');
+    assert.equal(suggest.code, 0);
+    assert.ok(
+      suggest.stdout.includes('Sent Back For Rework'),
+      `suggest 应有「Sent Back For Rework」段，实际输出：\n${suggest.stdout}`,
+    );
+  });
+
+  it('suggest 不该把被退回的切片重复列两次', async () => {
+    const suggest = await runCli('suggest');
+    const occurrences = suggest.stdout.split('sent-back').length - 1;
+    assert.ok(
+      occurrences <= 2,
+      `suggest 里 sent-back 出现了 ${occurrences} 次（切片名 + 动作行算 2 次），不该按状态再列一遍：\n${suggest.stdout}`,
+    );
+  });
+
+  it('状态与签字请求对不上时，不该报成待重跑', async () => {
+    // 退完之后人又跑了（状态回到 running）—— 中间有人动过，
+    // 不该在这里报「待重跑」，交给别的分支处理。
+    await writeSliceWithState('moved-on', '退完又跑了的切片', 'running');
+    await writeSignRequest('moved-on', 'revised', '2026-11-02T00:00:00.000Z');
+
+    const next = await runCli('next');
+    assert.ok(
+      !next.stdout.includes('moved-on'),
+      `状态对不上的切片不该报成待重跑，实际输出：\n${next.stdout}`,
+    );
+  });
+
+  it('待重跑排在待签字前面（人刚说要改的片最该先做）', async () => {
+    const next = await runCli('next');
+    assert.ok(
+      next.stdout.includes('sent-back'),
+      `待重跑应排在最前（待签字的片还在队列里）：\n${next.stdout}`,
+    );
+    assert.ok(
+      !next.stdout.includes('awaiting-sign'),
+      `待重跑存在时不该先报待签字，实际输出：\n${next.stdout}`,
+    );
   });
 });

@@ -34,6 +34,17 @@ export interface PendingActions {
   merge: PendingAction[];
   /** 门禁过了却连签字请求都还没发起 —— 需要人先发起 */
   requestSign: PendingAction[];
+  /**
+   * 被退回重跑，等着人再跑一次（ADR-094 §5.1）。
+   *
+   * 人说「退回去改」之后，下一步是**人**去跑它 —— 工具不自动重跑
+   * （重跑要花 agent 配额、要花时间，那是人的决定）。
+   *
+   * 但**必须**出现在待办里：退回的语义是「这片还要做」，
+   * 而 `completed` 之外的切片在待办里一个都看不见 ——
+   * 人退完就「这片没了」，它会静静躺在 `frozen` 里直到被忘掉。
+   */
+  rerun: PendingAction[];
 }
 
 /**
@@ -134,5 +145,68 @@ export async function collectPendingActions(): Promise<PendingActions> {
     });
   }
 
-  return { sign, merge, requestSign };
+  // ── 待重跑（被退回重跑 / 退回上游）────────────────────────────────────
+  //
+  // 判据：**最新一条签字请求是 `revised` 或 `returned`**。
+  //
+  // 为什么用签字请求的状态而不是切片状态：
+  //   - `revised` → 切片回 `frozen`（规格与写集不动，重跑即可）；
+  //   - `returned` → 切片回 `draft`（**规格要改**，先改规格再冻结）。
+  //
+  // 两种都归到「待重跑」但**下一步不一样** —— `returned` 的下一步是
+  // 「改规格」，不是「直接跑」。所以动作提示要分开写。
+  //
+  // 为什么这条重要（ADR-094 §5.1）：
+  // 退回之后，切片不再 `completed`，于是**在待办里彻底消失**。
+  // 人退完就「这片没了」—— 它静静躺在 `frozen`/`draft` 里直到被忘掉。
+  // 而「人说要改」的那一片恰恰是**最不该被忘掉**的一片。
+  //
+  // **不要求分支存在**（与 `requestSign` 不同）：
+  // 那一条问的是「产物还在树上、等着进主干吗」，所以要分支在。
+  // 这一条问的是「人说了要改、还没改吗」—— 而
+  //   - 分支可能还没建（人审的是**规格**与产物，`zelto run` 还没跑过）；
+  //   - 分支可能已清理（`zelto merge` 后删掉了）。
+  // 两种情况下这片**都还要做**，所以不能因为「没分支」就装作没有这回事。
+  // 判据用**切片状态** —— 退回时状态机把它从 `completed` 挪到了
+  // `frozen`/`draft`，那本身就是「这片还没做完」的确证。
+  const rerun: PendingAction[] = [];
+  for (const req of latest.values()) {
+    if (req.status !== 'revised' && req.status !== 'returned') continue;
+
+    let state: string;
+    try {
+      state = (await store.read(req.sliceId)).state;
+    } catch {
+      continue;
+    }
+
+    // 状态与请求状态**必须对得上** —— 对不上说明中间有人动过
+    // （比如退完之后又跑了），那就交给别的分支处理，别在这里报。
+    const expected = req.status === 'revised' ? 'frozen' : 'draft';
+    if (state !== expected) continue;
+
+    rerun.push({
+      sliceId: req.sliceId,
+      title: await titleOf(req.sliceId),
+      prepare:
+        req.status === 'revised'
+          ? 'Sent back for rework — rerun with the reviewer notes'
+          : 'Returned upstream — update the spec, then freeze and run',
+      action:
+        req.status === 'revised'
+          ? `zelto run ${req.sliceId}`
+          : `zelto check ${req.sliceId} && zelto freeze ${req.sliceId}`,
+    });
+  }
+
+  // 排队最久的先办 —— 与 `sign` 一致。
+  rerun.sort((a, b) => {
+    const ra = latest.get(a.sliceId);
+    const rb = latest.get(b.sliceId);
+    const ta = ra ? new Date(ra.decidedAt ?? ra.requestedAt).getTime() : 0;
+    const tb = rb ? new Date(rb.decidedAt ?? rb.requestedAt).getTime() : 0;
+    return ta - tb;
+  });
+
+  return { sign, merge, requestSign, rerun };
 }

@@ -202,4 +202,73 @@ describe('SignManager', () => {
       await manager.approve(req.id, 'human');
     });
   });
+
+  // ─── D-19：签字与切片状态对不上，必须**可见** ────────────────────────
+  //
+  // 病灶：状态转移失败被 `catch {}` 吞掉，于是留下「已批准」与
+  // 「切片还在 draft」两份对不上的事实，而人只看到「Approved」。
+  // 而 `merge` 的判据是「存在 approved 的签字请求」——
+  // 于是一片压根没跑过的切片也能进合并候选。
+  //
+  // 修法（**报出来，不推翻签字**）：
+  // 签字是人的决定，工具不替人拒绝（`--force` 存在的意义就是这个）。
+  // 但「状态没跟着变」这件事要写进事件流，让追溯链看得见。
+
+  it('records sign.state_mismatch when approving a slice in the wrong state', async () => {
+    const slice = store.create('sign-mismatch-approve', 'Mismatch Approve');
+    slice.state = 'draft';
+    await store.write(slice);
+
+    const req = await manager.request('sign-mismatch-approve', 'agent');
+    await manager.approve(req.id, 'human');
+
+    const evts = await events.read('sign-mismatch-approve');
+    const mismatch = evts.find((e: EventEnvelope) => e.type === 'sign.state_mismatch');
+    assert.ok(mismatch, 'a sign.state_mismatch event should exist');
+    assert.equal(mismatch?.payload['sliceState'], 'draft');
+  });
+
+  it('still records the approval even when the state does not change', async () => {
+    const slice = store.create('sign-mismatch-approve-2', 'Mismatch Approve 2');
+    slice.state = 'draft';
+    await store.write(slice);
+
+    const req = await manager.request('sign-mismatch-approve-2', 'agent');
+    const approved = await manager.approve(req.id, 'human');
+
+    // 签字是人的决定 —— 工具不替人拒绝
+    assert.equal(approved.status, 'approved');
+
+    const updated = await store.read('sign-mismatch-approve-2');
+    assert.equal(updated.state, 'draft', 'the slice state must NOT be silently changed');
+  });
+
+  it('records sign.state_mismatch when rejecting a slice in the wrong state', async () => {
+    const slice = store.create('sign-mismatch-reject', 'Mismatch Reject');
+    slice.state = 'draft';
+    await store.write(slice);
+
+    const req = await manager.request('sign-mismatch-reject', 'agent');
+    await manager.reject(req.id, 'human', '不要');
+
+    const evts = await events.read('sign-mismatch-reject');
+    const mismatch = evts.find((e: EventEnvelope) => e.type === 'sign.state_mismatch');
+    assert.ok(mismatch, 'a sign.state_mismatch event should exist');
+  });
+
+  it('does NOT emit sign.state_mismatch when the transition succeeds', async () => {
+    const slice = store.create('sign-no-mismatch', 'No Mismatch');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'sha256:test';
+    slice.spec.frozenAt = new Date().toISOString();
+    await store.write(slice);
+    await store.transit('sign-no-mismatch', 'GATE_PASS');
+
+    const req = await manager.request('sign-no-mismatch', 'agent');
+    await manager.approve(req.id, 'human');
+
+    const evts = await events.read('sign-no-mismatch');
+    const mismatch = evts.find((e: EventEnvelope) => e.type === 'sign.state_mismatch');
+    assert.equal(mismatch, undefined, 'no mismatch event when things line up');
+  });
 });

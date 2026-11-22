@@ -585,9 +585,19 @@ export class WebApi {
 
   /** 签字请求清单。 */
   async listSignRequests(status?: string): Promise<unknown[]> {
-    const valid = status === 'pending' || status === 'approved' || status === 'rejected' || status === 'revoked'
-      ? status
-      : undefined;
+    // ADR-094 §5.1：签字请求多了两个状态 —— `revised`（退回重跑）与
+    // `returned`（退回上游）。白名单漏掉它们的话，驾驶舱按这两个状态
+    // 过滤会**返回全部**（status 变成 undefined），页面上的待签字列表
+    // 就会把「已退回的片」混进「待签字的片」。
+    const valid =
+      status === 'pending' ||
+      status === 'approved' ||
+      status === 'rejected' ||
+      status === 'revoked' ||
+      status === 'revised' ||
+      status === 'returned'
+        ? status
+        : undefined;
     return this.signs.list(valid);
   }
 

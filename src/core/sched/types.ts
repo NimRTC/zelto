@@ -4,7 +4,9 @@
 
 import type { PolicyRule } from '../policy/types.js';
 import type { GateFeedback } from '../gate/feedback.js';
+import type { HumanFeedback } from '../review/human-feedback.js';
 export type { GateFeedback } from '../gate/feedback.js';
+export type { HumanFeedback } from '../review/human-feedback.js';
 export type { DepGraphNode, CycleInfo } from './depgraph.js';
 export type { ArtifactMapping, ArtifactConflict, ArtifactCategory, ConflictSeverity } from './artifact.js';
 export type { MergeStrategy, MergePhase, MergeConflict, MergePlan } from './merge.js';
@@ -59,6 +61,19 @@ export interface ConstraintBundle {
    * 人转述会把关键细节转掉。
    */
   gateFeedback?: GateFeedback[];
+  /**
+   * 人审阅时提的意见（ADR-094 §5.2）。
+   *
+   * **为什么需要**：人被退回打回重跑时，说的「哪里不对」是这条追溯链上
+   * **唯一不由工具生成的判断**。它不进上下文，agent 就只能从头再摸一遍，
+   * 甚至可能把已经做对的东西改错。
+   *
+   * 与 `gateFeedback` 是同一条路的两个来源：那一个送「机器验失败」的
+   * 证据（ZD-013），这一个送「人提意见」的原文。
+   *
+   * 这里是**原文**（ADR-094 D3）—— 人转述会把关键细节转掉。
+   */
+  humanFeedback?: HumanFeedback[];
 }
 
 /** 门禁命令摘要（只给 agent 看，不参与任何判定） */

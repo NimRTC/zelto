@@ -19,6 +19,16 @@ export type SliceEvent =
   | 'GATE_PASS'
   | 'SIGN_APPROVE'
   | 'SIGN_REJECT'
+  // ADR-094 §5.1：人类门的另外两档 —— 人审出毛病时把片打回去重来，
+  // 而不是像 SIGN_REJECT 那样整片作废（终态 abandoned）。
+  //
+  //   SIGN_REVISE  completed → frozen  退回重跑：方向对，细节要改
+  //   SIGN_RETURN  completed → draft   退回上游：方向不对，规格要改
+  //
+  // 两者都**只退状态、不起跑** —— 起跑是人的显式动作（ADR-094 D4，
+  // 与 ADR-018「签字不自动合并」同一条原则）。
+  | 'SIGN_REVISE'
+  | 'SIGN_RETURN'
   | 'ABANDON';
 
 export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, SliceState>>> = {
@@ -47,6 +57,13 @@ export const SLICE_TRANSITIONS: Record<SliceState, Partial<Record<SliceEvent, Sl
   completed: {
     SIGN_APPROVE: 'completed',
     SIGN_REJECT: 'abandoned',
+    // ADR-094 §5.1：退回重跑 → frozen（可以再跑一次）
+    SIGN_REVISE: 'frozen',
+    // ADR-094 D5：退回上游 → draft。
+    //
+    // 回 draft 而不是 frozen —— 规格**还没改**，得让人改完再走门禁① + 冻结。
+    // 直接回 frozen 会跳过门禁①。
+    SIGN_RETURN: 'draft',
     RUN_START: 'running',
     ABANDON: 'abandoned',
   },

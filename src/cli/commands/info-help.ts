@@ -84,6 +84,26 @@ register('next', async () => {
   // 与「已签字」（ADR-018），只看状态会把早已签过的切片也报成待签字。
   const pendingActions = await collectPendingActions();
 
+  // 待重跑**排最前**（ADR-094 §5.1）。
+  //
+  // 为什么压在签字前面：
+  //   - 待签字的是**已经做完**的片 —— 只差人点一下；
+  //   - 待重跑的是**人刚说过「要改」**的片 —— 还没做完，带着意见。
+  //
+  // 人刚把控制权要回去改东西 —— 那就是眼下最该做的事。
+  // 而签字队列里的片已经躺了不知道多久，多等一天少一天，
+  // 退回的这片每多放一天就多错一天。
+  if (pendingActions.rerun.length > 0) {
+    const first = pendingActions.rerun[0];
+    console.log(`Next: ${first.sliceId} (sent back for rework)`);
+    console.log(`  ${first.title}`);
+    console.log(`  Action: ${first.action}`);
+    if (pendingActions.rerun.length > 1) {
+      console.log(`  (还有 ${pendingActions.rerun.length - 1} 个待重跑：${pendingActions.rerun.slice(1).map((a) => a.sliceId).join('、')})`);
+    }
+    return 0;
+  }
+
   if (pendingActions.sign.length > 0) {
     const first = pendingActions.sign[0];
     console.log(`Next: ${first.sliceId} (awaiting signature)`);
@@ -231,6 +251,10 @@ register('suggest', async () => {
       }
     };
 
+    if (pendingActions.rerun.length > 0) {
+      console.log(formatSection('Sent Back For Rework'));
+      printActions(pendingActions.rerun);
+    }
     if (pendingActions.sign.length > 0) {
       console.log(formatSection('Awaiting Signature'));
       printActions(pendingActions.sign);
@@ -251,8 +275,14 @@ register('suggest', async () => {
       { state: 'running', action: 'zelto events <id>', prepare: 'Monitor execution' },
     ];
 
+    // 已经在「Sent Back For Rework」里列过的切片不再按状态重复列 ——
+    // 那一条的提示更准（带着「人说了什么」的上下文），
+    // 泛泛的「Execute slice」反而把那条信息盖掉了。
+    const alreadyShown = new Set(pendingActions.rerun.map((a) => a.sliceId));
+
     for (const p of priority) {
       for (const id of list) {
+        if (alreadyShown.has(id)) continue;
         try {
           const s = await store.read(id);
           if (s.state === p.state) {

@@ -88,6 +88,7 @@ export const EVENT_TYPES = [
   // ADR-094：人类门三动作（退回重跑 / 退回上游）与 GitHub 追溯链 PR
   'sign.revised',
   'sign.returned',
+  'sign.state_mismatch',
   'forge.pr_opened',
 ] as const;
 
