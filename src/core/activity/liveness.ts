@@ -376,6 +376,110 @@ export function lastOutputLine(record: LivenessRecord | null | undefined): strin
 }
 
 /**
+ * 从**事件流**推出「这一片在推进吗」。
+ *
+ * 为什么需要它（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
+ *
+ *   Claude Code 用 `--output-format json` 跑 —— stdout **一次性**到达，
+ *   整轮 101 分钟里 `output` 只有最后那一个 JSON blob。
+ *   所以「最后一条输出」这条信号在运行期间**恒为空**，
+ *   界面只能显示「1 小时没输出」—— 而 agent 明明在改 15 个文件。
+ *
+ *   但 agent 的**每一次工具调用**都被 hook 判过，写进了 append-only
+ *   事件流（`policy.decision`）。那才是运行期间**真实存在**的进展证据。
+ *
+ * 所以判据分两层：
+ *   1. 有输出 → 用输出（最直接）；
+ *   2. 没输出 → 用**最近一次事件**的时刻与摘要（agent 在跑工具 = 在推进）。
+ *
+ * 纯读文件、纯计算（C3：不调模型、不触网）。
+ *
+ * @param eventsDir 事件流根目录（`.zelto/events`）
+ * @param sliceId   切片 id
+ * @param since     只看这个时刻之后的事件（ISO）；null = 全部
+ */
+export function readEventProgress(
+  eventsDir: string,
+  sliceId: string,
+  since?: string | null,
+): { at: string; line: string } | null {
+  const path = join(eventsDir, sliceId, 'events.jsonl');
+  if (!existsSync(path)) return null;
+
+  let content: string;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const cutoff = since ? Date.parse(since) : Number.NaN;
+  let best: { at: string; line: string } | null = null;
+
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    let event: { ts?: string; type?: string; payload?: Record<string, unknown> };
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event?.ts) continue;
+    if (Number.isFinite(cutoff) && Date.parse(event.ts) < cutoff) continue;
+
+    const summary = summarizeEvent(event);
+    if (!summary) continue;
+    // 取**最后一条**有内容的事件（append-only 流里最后一条 = 最新）。
+    if (!best || Date.parse(event.ts) >= Date.parse(best.at)) {
+      best = { at: event.ts, line: summary };
+    }
+  }
+
+  return best;
+}
+
+/**
+ * 把一个事件压成一句人话（给人看「它在干什么」）。
+ *
+ * 说不出话就返回 null —— **不拿事件类型名充数**。
+ * 「policy.decision」四个字对判断「在不在推进」没有帮助。
+ */
+function summarizeEvent(event: {
+  type?: string;
+  payload?: Record<string, unknown>;
+}): string | null {
+  const payload = event.payload ?? {};
+  const type = event.type ?? '';
+
+  switch (type) {
+    case 'policy.decision': {
+      const decision = typeof payload.decision === 'string' ? payload.decision : '';
+      const reason = typeof payload.reason === 'string' ? payload.reason : '';
+      const tool = typeof payload.tool === 'string' ? payload.tool : '';
+      if (decision === 'allow' && reason === '没有可判定的写入目标') {
+        // Claude Code 跑 Bash 时的常规噪声（读文件、跑 git…）。
+        // 说「允许了一次没有目标的写入」比什么都不说更让人困惑 —— 略过。
+        return null;
+      }
+      const parts = [decision && `判定 ${decision}`, tool && `工具 ${tool}`, reason];
+      const text = parts.filter(Boolean).join(' · ');
+      return text || null;
+    }
+    case 'gate.executed':
+      return '门禁开始';
+    case 'gate.result':
+      return '门禁结束';
+    case 'run.finished':
+      return 'agent 运行结束';
+    case 'run.aborted':
+      return 'agent 运行中断';
+    default:
+      return null;
+  }
+}
+
+/**
  * 读一个会话文件的活性记录。
  *
  * 读不到 / 坏掉 → 返回 null（调用方按「没有运行记录」处理，

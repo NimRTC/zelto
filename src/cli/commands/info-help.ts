@@ -11,6 +11,8 @@ import {
   readSessionLiveness,
   readSliceLivenessRecord,
   readRecoveries,
+  lastOutputLine,
+  readEventProgress,
 } from '../../core/activity/index.js';
 import { isProcessAlive, isProcessTreeAlive } from '../../core/sched/index.js';
 import type { SliceData } from '../../core/slice/store.js';
@@ -1227,6 +1229,54 @@ register('status', async (args) => {
         f.out(`    Session:  ${slice.sessionId}`);
       }
 
+      // 进度与静默时长 —— D-30 补。
+      //
+      // 为什么单列一行：只说「running」的话，人无从判断「还在推进」还是
+      // 「卡住了」。两个数要分清：
+      //   - **没动静多久**：距上次**任何**活动（心跳）多久
+      //   - **进展是什么**：最近一次**有实质进展**的动作
+      //
+      // 病灶（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
+      //   Claude Code 跑 `--output-format json` —— stdout **一次性**到达，
+      //   整轮 101 分钟里 `output` 只有最后那个 JSON blob。
+      //   所以「最后一条输出」这条信号在运行期间**恒为空**，
+      //   界面只能显示「1 小时没输出」——而 agent 明明在改 15 个文件。
+      //
+      // 修法：进展**不只看 stdout**，也看**事件流** ——
+      // agent 的每次工具调用都被 hook 判过并写了事件，
+      // 那是运行期间真实存在的进展证据。
+      const rec = readSliceLivenessRecord(process.cwd(), slice.id);
+      if (rec) {
+        const idle = rec.lastActivityAt
+          ? Date.now() - Date.parse(rec.lastActivityAt)
+          : null;
+        if (idle !== null && Number.isFinite(idle)) {
+          f.out(`    静默:     ${formatIdleDuration(idle)}没动静`);
+        }
+      }
+
+      // 进展：先看 stdout（最直接），没有再看事件流。
+      const outputProgress = lastOutputLine(rec);
+      if (outputProgress) {
+        f.out(`    进展:     ${colors.dim(outputProgress.slice(0, 110))}`);
+      } else {
+        const eventProgress = readEventProgress(EVENTS_DIR, slice.id);
+        if (eventProgress) {
+          const since = Math.max(
+            0,
+            Date.now() - Date.parse(eventProgress.at),
+          );
+          f.out(
+            `    进展:     ${colors.dim(eventProgress.line.slice(0, 100))}` +
+              colors.dim(`（${formatIdleDuration(since)}前）`),
+          );
+        } else {
+          f.out(
+            `    进展:     ${colors.dim('（暂无输出与事件——agent 可能刚起跑）')}`,
+          );
+        }
+      }
+
       // Show recent output from session file
       if (slice.sessionId) {
         const sessionPath = join(SESSIONS_DIR, `${slice.sessionId}.json`);
@@ -1261,6 +1311,22 @@ register('status', async (args) => {
     const secs = elapsed % 60;
     if (mins > 0) return `${mins}m ${secs}s`;
     return `${secs}s`;
+  }
+
+  /**
+   * 把「多久没动静」说成人能一眼看懂的时长。
+   *
+   * 用「秒 / 分 / 小时」三档而不是「天」—— agent 运行不会跨天，
+   * 而「3 小时 12 分没动静」比「11232 秒没动静」有用得多。
+   */
+  function formatIdleDuration(ms: number): string {
+    if (!Number.isFinite(ms) || ms < 0) return '—';
+    const sec = Math.floor(ms / 1000);
+    if (sec < 60) return `${sec} 秒`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min} 分 ${sec % 60} 秒`;
+    const hour = Math.floor(min / 60);
+    return `${hour} 小时 ${min % 60} 分`;
   }
 
   if (watchMode) {

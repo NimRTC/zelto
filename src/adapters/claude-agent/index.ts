@@ -386,6 +386,16 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     );
 
     // Capture stdout
+    //
+    // 注意（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
+    //   Claude Code 用 `--output-format json` 跑 —— stdout **一次性**到达，
+    //   整轮运行里 `output` 只有最后那个 JSON blob。
+    //   所以「运行期间 output 是空的」**不是缺陷**，是 `--output-format json`
+    //   的必然结果（见 claudeCodeFlags 的说明）。
+    //
+    //   想在运行期间看到 agent 在干什么，要看**事件流**（每次工具调用
+    //   都被 hook 判过并写了事件），不是看 stdout —— 见
+    //   `core/activity/liveness.ts` 的 `readEventProgress`。
     const touchActivity = (): void => {
       const now = new Date().toISOString();
       sessionData.lastOutputAt = now;

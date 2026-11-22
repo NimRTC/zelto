@@ -8,6 +8,7 @@ export {
   classifyLivenessAsync,
   lastActivityOf,
   lastOutputLine,
+  readEventProgress,
   formatIdle,
   SESSIONS_DIR_REL,
   TASKS_DIR_REL,
