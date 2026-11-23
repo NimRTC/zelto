@@ -21,6 +21,7 @@ import { atomicWriteText } from '../../core/io/atomic-write.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { register, events, store, ZELTO_DIR, createLlmFromConfig } from './shared.js';
 import { generateSliceSpec, type SliceSpecInput } from '../../llm/generators/slice-spec.js';
+import type { DesignContext } from '../../llm/design-context.js';
 import { writeAcceptanceSkeleton } from '../../core/spec/skeleton.js';
 import { VersionStore } from '../../core/version/store.js';
 
@@ -70,6 +71,7 @@ async function buildSpecInput(id: string): Promise<SliceSpecInput> {
   const slice = await store.read(id);
   const ctx = await findPlanContext(id);
   const requirementIds = slice.trace.requirements ?? [];
+  const details = await loadRequirementDetails(requirementIds);
   return {
     sliceId: slice.id,
     title: slice.title,
@@ -78,9 +80,40 @@ async function buildSpecInput(id: string): Promise<SliceSpecInput> {
     version: ctx.version,
     requirements: requirementIds,
     // 需求条目的**正文**（ZD-005）—— 只给 id 模型只能写套话
-    requirementDetails: await loadRequirementDetails(requirementIds),
+    requirementDetails: details.map((d) => ({ id: d.id, text: d.text })),
+    // 需求条目的**全部侧面**（ZD-031）—— 只给主体那一行，
+    // 模型看不到「验收口径」与「测试形态」，规格的验收标准就得自己编。
+    requirementAspects: details
+      .filter((d) => (d.aspects?.length ?? 0) > 1)
+      .map((d) => ({ id: d.id, aspects: d.aspects! })),
+    // 设计上下文（ZD-032）—— 本片所属模块的路径与依赖事实。
+    // 读不到就降级为 null（规格少点上下文，但不阻断起草）。
+    designContext: await loadDesignContext(ctx.module, slice.writes ?? [], requirementIds),
     prerequisites: ctx.prerequisites,
   };
+}
+
+/**
+ * 取本片的设计上下文（模块路径 / 依赖）。
+ *
+ * 降级不阻断：读不到已确认的设计时返回 null ——
+ * 规格起草照旧进行，只是模型拿不到模块事实。
+ */
+async function loadDesignContext(
+  module: string,
+  writes: string[],
+  requirementIds: string[],
+): Promise<DesignContext | null> {
+  try {
+    const { buildDesignContext } = await import('../../llm/design-context.js');
+    return await buildDesignContext(ZELTO_DIR, {
+      sliceModule: module,
+      writes,
+      requirementIds,
+    });
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -92,7 +125,7 @@ async function buildSpecInput(id: string): Promise<SliceSpecInput> {
  */
 async function loadRequirementDetails(
   ids: string[],
-): Promise<Array<{ id: string; text: string }>> {
+): Promise<Array<{ id: string; text: string; aspects?: string[] }>> {
   if (ids.length === 0) return [];
   try {
     const { RequirementStore } = await import('../../core/requirements/store.js');
@@ -107,7 +140,11 @@ async function loadRequirementDetails(
       const doc = await reqStore.read(summary.id);
       const criteria = extractCriteria(doc.spec, doc.acceptanceCriteria, ids);
       if (criteria.some((c) => c.text.length > 0)) {
-        return criteria.map((c) => ({ id: c.id, text: c.text }));
+        return criteria.map((c) => ({
+          id: c.id,
+          text: c.text,
+          aspects: c.aspects,
+        }));
       }
     }
     return ids.map((id) => ({ id, text: '' }));

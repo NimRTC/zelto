@@ -761,6 +761,67 @@ export function resolveCursorGateway(
  * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
  * @param cwd — Optional working directory (e.g. an isolated worktree). Defaults to process.cwd().
  */
+/**
+ * 取出「每 1k token 的单价」（ZD-007）。
+ *
+ * 配置里的 `llm.pricing` 是**按模型**分档的：
+ *
+ * ```yaml
+ * llm:
+ *   model: deepseek-chat
+ *   pricing:
+ *     deepseek-chat:
+ *       inputPer1k: 0.00027
+ *       outputPer1k: 0.0011
+ * ```
+ *
+ * 要翻成金额，先得知道**用哪个模型**的那一档。
+ *
+ * 找不到对应档 → 返回 null（= 报不出金额 → 运行中闸门拦不了）。
+ * 宁可「拦不了」也不要拿别的模型的价去折算 ——
+ * 折错了会让闸门**提前**或**延后**开火，两种都是错的判据。
+ *
+ * 兜底：**恰好一档**时用它（不猜模型名，但价格唯一，没得选错）。
+ * 两档以上且模型对不上 → 不猜 → null。
+ */
+export function resolvePricePerKToken(
+  model: string | undefined,
+  pricing: Record<string, { inputPer1k: number; outputPer1k: number }> | undefined,
+): { input: number; output: number } | null {
+  if (!pricing) return null;
+
+  const entries = Object.entries(pricing);
+  if (entries.length === 0) return null;
+
+  if (model) {
+    // 模型名可能带前缀（`deepseek/deepseek-chat`）—— 后缀匹配。
+    const exact = pricing[model];
+    if (exact) {
+      return { input: exact.inputPer1k, output: exact.outputPer1k };
+    }
+    const suffixMatch = entries.find(([key]) => model.endsWith(key));
+    if (suffixMatch) {
+      const entry = suffixMatch[1];
+      return { input: entry.inputPer1k, output: entry.outputPer1k };
+    }
+  }
+
+  // 恰好一档 → 用它（没得选错）
+  if (entries.length === 1) {
+    const entry = entries[0][1];
+    return { input: entry.inputPer1k, output: entry.outputPer1k };
+  }
+
+  return null;
+}
+
+/**
+ * Create executor adapter based on config and optional override.
+ * @param overrideType — Optional override from CLI --adapter flag
+ * @param agentCommand — Agent command string (for claude-agent adapter)
+ * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
+ * @param cwd — Optional working directory (e.g. an isolated worktree). Defaults to process.cwd().
+ */
 export function createExecutorAdapter(
   overrideType?: string,
   agentCommand?: string,
@@ -786,21 +847,37 @@ export function createExecutorAdapter(
   }
 
   if (type === 'claude-agent-sdk') {
+    const pricePerKToken = resolvePricePerKToken(cfg.llm?.model, cfg.llm?.pricing);
     return new ClaudeAgentSdkAdapter({
       cwd: workDir,
       model: cfg.llm?.model,
       // ADR-090：`agent.env` 对所有适配器生效 —— 这样「把凭证放配置里」
       // 这条规则不会变成「只有 Cursor 能这么干」的特例。
       env: mergeAgentEnv(cfg.agent.env) as Record<string, string>,
+      // ZD-007：把**运行中**预算拦截需要的能力接上 ——
+      // ① `maxBudgetUsd` 是 SDK 的**事前**约束（比事后查更硬：它让 SDK 自己停）；
+      // ② `pricePerKToken` 让适配器能把运行中的 token 折成金额，
+      //    于是 zelto 的运行中闸门才拦得住（没有单价 = 拦不了）。
+      ...(cfg.budgetLimitUsd && cfg.budgetLimitUsd > 0
+        ? { maxBudgetUsd: cfg.budgetLimitUsd }
+        : {}),
+      ...(pricePerKToken ? { pricePerKToken } : {}),
     });
   }
 
   // Default: claude-agent (shell spawn)
+  //
+  // ZD-007 阶段2：`agent.streamJson: true` 时用 stream-json 跑，
+  // 让运行中预算拦截对 shell 适配器生效 —— 前提是配了 `llm.pricing`
+  // （否则只累加 token、报不出金额，仍然拦不了）。
+  const shellPrice = resolvePricePerKToken(cfg.llm?.model, cfg.llm?.pricing);
   return new ClaudeAgentAdapter({
     cwd: workDir,
     agentCommand: resolveAgentCommand(type, agentCommand, cfg),
     timeoutMs,
     env: mergeAgentEnv(cfg.agent.env),
+    ...(cfg.agent.streamJson ? { streamJson: true } : {}),
+    ...(cfg.agent.streamJson && shellPrice ? { pricePerKToken: shellPrice } : {}),
   });
 }
 

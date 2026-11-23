@@ -124,6 +124,33 @@ export interface ExecutorAdapter {
   getUsage?(sessionId: string): AdapterUsage | null;
 
   /**
+   * 报告**运行中**的累计用量（ZD-007）。
+   *
+   * 与 `getUsage` 的区别是**什么时候**能拿到：
+   * - `getUsage` —— 通常要等 agent **退出**（Claude Code 的 `--output-format json`
+   *   在最后才吐出整段 JSON，中途没有）；
+   * - `getLiveUsage` —— **运行中**就能报出当前累计花费。
+   *
+   * 为什么需要（ZD-007）：
+   * 病灶（nimrtc v1.4，2026-11-20）：`checkBudget` 只在**起跑前**调一次，
+   * 跑完后由 `settleRunCost` 记账时复判 —— **运行期间没有任何地方查预算**。
+   * 于是 agent 想烧多少烧多少：实测一轮烧了 $5.86（上限 $1.00），
+   * 产物其实做完了，但因为超预算**没进门禁**，切片卡在 frozen。
+   * 更糟的是「预算耗尽」这个停机分类**误导人** —— 它看起来像「agent 跑砸了」，
+   * 实际是「agent 跑成了但超了闸门」，人第一反应是重跑 → 再烧一遍。
+   *
+   * 实现者：
+   * - Agent SDK 适配器 —— SDK 自己有 `maxBudgetUsd`（**事前**约束，更强），
+   *   但也可以在每条消息上报一次累计花费；
+   * - shell 适配器 —— Claude Code 的 json 输出中途拿不到，
+   *   所以实现不了（返回 null = 「测不到」，不谎报）。
+   *
+   * **返回 null 的语义是「测不到」**（不是「零」）——
+   * 与 `getUsage` 同一个原则：没数据不等于没花钱。
+   */
+  getLiveUsage?(sessionId: string): AdapterUsage | null;
+
+  /**
    * Stop/kill an agent session.
    * @param sessionId — The session to stop
    */

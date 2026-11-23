@@ -51,6 +51,20 @@ export interface ConstraintBundle {
    */
   gateCommands?: GateCommandSummary[];
   /**
+   * 门禁作用域（ADR-097）—— 这轮门禁会**验哪些用例**。
+   *
+   * **为什么需要**：ADR-045 让 agent 知道「门禁会跑哪条命令」，但命令是
+   * **项目级**的（跑全部用例），而门禁实际会**按写集收窄**（ADR-097）。
+   *
+   * 不告诉 agent 的话，它会以为「门禁跑全量、我跑 3 个用例就行」——
+   * 两边口径不一致。后果不是「门禁太严」，而是**门禁过了但 agent
+   * 没验过它该验的**（或者反过来，agent 以为全量过了就收工）。
+   *
+   * 这是**事实陈述**，不是判定 —— agent 仍然可以跑别的命令，但要知道
+   * 门禁会用哪一套。
+   */
+  gateScope?: GateScopeSummary;
+  /**
    * 上一轮门禁/验收的失败反馈（ZD-013）。
    *
    * **为什么需要**：重跑的 agent 拿不到「上次为什么失败」——
@@ -80,6 +94,20 @@ export interface ConstraintBundle {
 export interface GateCommandSummary {
   name: string;
   run: string;
+}
+
+/**
+ * 门禁作用域摘要（ADR-097）—— 只给 agent 看，不参与任何判定。
+ *
+ * `scoped` 为 false 时 `labels` 为空 —— 门禁跑全量。
+ */
+export interface GateScopeSummary {
+  /** 这轮门禁是不是收窄跑的。 */
+  scoped: boolean;
+  /** 收窄到的作用域标签（CTest LABELS）。 */
+  labels: string[];
+  /** 为什么收窄 / 为什么没收窄。 */
+  reason: string;
 }
 
 /** 亲和组前序切片的确定性摘要（只读文件与 git，不调模型） */

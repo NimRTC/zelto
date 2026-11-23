@@ -45,6 +45,69 @@ const nullEvents = {
 
 const emptyPolicy: PolicyConfig = { rules: [], protected: [] };
 
+describe('Scheduler.buildConstraints — 门禁作用域（ADR-097）', () => {
+  it('carries the scope into the bundle', () => {
+    const scheduler = new Scheduler({ read: async () => makeSlice() } as never, nullEvents, emptyPolicy);
+
+    const bundle = scheduler.buildConstraints(
+      makeSlice(),
+      null,
+      [{ name: 'test', run: 'ctest --test-dir build' }],
+      undefined,
+      undefined,
+      { scoped: true, labels: ['ice', 'sdp'], reason: '写集命中 2 条作用域规则 → 收窄到标签：ice、sdp' },
+    );
+
+    assert.ok(bundle.gateScope);
+    assert.equal(bundle.gateScope.scoped, true);
+    assert.deepEqual(bundle.gateScope.labels, ['ice', 'sdp']);
+  });
+
+  it('tells the agent which tests the gate will run', () => {
+    const scheduler = new Scheduler({ read: async () => makeSlice() } as never, nullEvents, emptyPolicy);
+
+    const bundle = scheduler.buildConstraints(
+      makeSlice(),
+      null,
+      [{ name: 'test', run: 'ctest --test-dir build' }],
+      undefined,
+      undefined,
+      { scoped: true, labels: ['ice'], reason: '写集命中 1 条作用域规则' },
+    );
+
+    assert.match(bundle.instructions, /Which tests the gate will run/);
+    assert.match(bundle.instructions, /`ice`/);
+    // 关键：不能让 agent 以为「门禁跑全量、我跑几个就行」。
+    assert.match(bundle.instructions, /same scope/i);
+  });
+
+  it('says the gate runs the full suite when it is not scoped', () => {
+    const scheduler = new Scheduler({ read: async () => makeSlice() } as never, nullEvents, emptyPolicy);
+
+    const bundle = scheduler.buildConstraints(
+      makeSlice(),
+      null,
+      [{ name: 'test', run: 'ctest --test-dir build' }],
+      undefined,
+      undefined,
+      { scoped: false, labels: [], reason: '未配置 gate.scope —— 门禁跑全量（老行为）' },
+    );
+
+    assert.match(bundle.instructions, /full/i);
+  });
+
+  it('omits the scope section entirely when there is no scope', () => {
+    const scheduler = new Scheduler({ read: async () => makeSlice() } as never, nullEvents, emptyPolicy);
+
+    const bundle = scheduler.buildConstraints(makeSlice(), null, [
+      { name: 'test', run: 'ctest --test-dir build' },
+    ]);
+
+    assert.equal(bundle.gateScope, undefined);
+    assert.ok(!bundle.instructions.includes('Which tests the gate will run'));
+  });
+});
+
 describe('Scheduler.buildConstraints — 门禁命令（ADR-045）', () => {
   it('carries the gate commands into the bundle', () => {
     const scheduler = new Scheduler({ read: async () => makeSlice() } as never, nullEvents, emptyPolicy);
