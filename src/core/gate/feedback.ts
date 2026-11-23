@@ -93,13 +93,19 @@ export async function readGateFeedback(
         passed?: boolean;
         stderr?: string | null;
         stdout?: string | null;
+        failures?: Array<{ test?: string; message?: string; location?: string }>;
+        reportedFailureCount?: number | null;
+        runner?: string;
       }>;
       const failed = results.find((r) => r.passed === false);
       if (failed) {
+        // ZD-027：优先把**失败用例清单**作为 reason —— 比裸 stderr 精准得多
+        // （stderr 往往只有一句 `Errors while running CTest`）。
+        const summary = renderFailureSummary(failed);
         feedback.push({
           stage: 'gate',
           command: failed.command ?? 'gate',
-          reason: failed.stderr ?? '门禁命令未通过',
+          reason: summary ?? failed.stderr ?? '门禁命令未通过',
           output: extractOutput(last),
         });
       }
@@ -107,6 +113,42 @@ export async function readGateFeedback(
   }
 
   return feedback.slice(0, MAX_FEEDBACK_ITEMS);
+}
+
+/**
+ * 把失败用例清单渲染成一段人/agent 可读的文字（ZD-027）。
+ *
+ * 没有结构化失败清单时返回 null —— 调用方退回裸 stderr（不编造）。
+ * 抽到的条数少于运行器声明的失败总数时，明说「还有 N 条没抽到」——
+ * 不许让 agent 以为只有这几条坏了。
+ */
+function renderFailureSummary(failed: {
+  failures?: Array<{ test?: string; message?: string; location?: string }>;
+  reportedFailureCount?: number | null;
+  runner?: string;
+}): string | null {
+  const failures = failed.failures ?? [];
+  if (failures.length === 0) return null;
+
+  const lines: string[] = [];
+  const runner = failed.runner && failed.runner !== 'unknown' ? `（${failed.runner}）` : '';
+  lines.push(`失败的用例${runner}：`);
+  for (const f of failures) {
+    const name = f.test?.trim() || '(未命名用例)';
+    const loc = f.location ? `  ${f.location}` : '';
+    lines.push(`  ✗ ${name}${loc}`);
+    if (f.message && f.message.trim()) {
+      // 缩进断言消息，多行也能看清归属
+      for (const ml of f.message.split('\n')) {
+        lines.push(`      ${ml}`);
+      }
+    }
+  }
+  const reported = failed.reportedFailureCount;
+  if (typeof reported === 'number' && reported > failures.length) {
+    lines.push(`（运行器共报 ${reported} 个失败，上面列出 ${failures.length} 个）`);
+  }
+  return lines.join('\n');
 }
 
 /** 从门禁结果事件里取失败输出 */
