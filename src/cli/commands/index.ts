@@ -13,6 +13,7 @@ import './slice-detail.js';
 import './config.js';
 import './gate-sign.js';
 import './info-help.js';
+import './policy-why.js';
 import './ai-pipeline.js';
 import './plan-patch.js';
 import './panoramic-project.js';
