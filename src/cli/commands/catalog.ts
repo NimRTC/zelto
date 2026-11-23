@@ -107,7 +107,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'artifact', group: '全景与依赖', args: 'check <id> <id> ...', summary: '检测切片之间的工件级冲突', detail: '--json' },
   { name: 'batch', group: '全景与依赖', args: '<id> [id ...]', summary: '审核这批切片能否一起开工，并排出执行阶段', detail: '--depends-on, --json' },
   { name: 'dashboard', group: '全景与依赖', args: '', summary: '生成项目看板 HTML', detail: '--watch, --open, --output, --tty, --json' },
-  { name: 'web', group: '全景与依赖', args: '', summary: '启动浏览器驾驶舱（只读 + 签字）', detail: '--port, --open' },
+  { name: 'web', group: '全景与依赖', args: '', summary: '启动浏览器驾驶舱（只读 + 签字）', detail: '--port, --open（--port 0 = 系统分配空闲端口）' },
 
   // ─── 其他 ──────────────────────────────────────────────────────────────
   { name: 'spec-md', group: '其他', args: '<validate|run> <slice-id>', summary: '校验切片规格文件结构 / 执行规格 checklist' },
