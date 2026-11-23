@@ -73,6 +73,25 @@ export interface ZeltoConfig {
     timeout?: number;
     maxRetries?: number;
     /**
+     * **agent 用的模型**（不是规格起草用的那个）。
+     *
+     * 为什么必须有这一节（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+     *   `claude-agent-sdk` 适配器原先拿 `llm.model` 当 agent 的模型 ——
+     *   而 `llm.model` 是**规格起草**用的模型（nimrtc 那边配的是
+     *   `deepseek-ai/DeepSeek-V3`，走自建网关）。
+     *
+     *   Claude Code 不认识那个模型名 → agent **秒退**（exit 0、无输出、
+     *   零改动）。症状极像「agent 干了活但没改文件」，而真正原因是
+     *   「模型名不认，agent 根本没跑起来」。
+     *
+     *   代价是**整轮**（agent 跑 10 秒 → 门禁报「vendor 缺失」→
+     *   人以为是自己代码的问题）。这种错误必须当场显形。
+     *
+     * 所以：agent 的模型**单独配**，不与 `llm.model` 混用。
+     * 不配 = 用 Claude Code 自己的默认（不传 model）。
+     */
+    model?: string;
+    /**
      * Claude Code 用 `--output-format stream-json` 跑（ZD-007 阶段2，默认 false）。
      *
      * 为什么默认关：`json` 模式是一次性输出（既有行为），切成 `stream-json`
@@ -401,6 +420,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentTimeout: number | undefined;
   let agentMaxRetries: number | undefined;
   let agentStreamJson = false;
+  let agentModel: string | undefined;
   // agent 段的嵌套节（ADR-090）—— 需要跟缩进，否则会把 agent 顶层的
   // timeout: / maxRetries: 误吞成 env 的键
   let inAgentEnvSection = false;
@@ -842,6 +862,13 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
+      // agent 段的 `model:` —— agent 执行用的模型，**与 `llm.model`（规格起草）
+      // 是两回事**。混用会让 Claude Code 认不出模型名而秒退（ADR-101 附注）。
+      if (trimmed.startsWith('model:')) {
+        agentModel = stripSurroundingQuotes(trimmed.slice(6).trim());
+        continue;
+      }
+
       // ZD-007 阶段2：Claude Code 用 `--output-format stream-json` 跑。
       // 默认关（保持 `json` 一次性输出的既有行为）；开了之后 agent 运行中
       // 就能报出累计用量，运行中预算拦截才对 shell 适配器生效。
@@ -1219,6 +1246,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
           ...(agentTimeout ? { timeout: agentTimeout } : {}),
           ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}),
           ...(agentStreamJson ? { streamJson: true } : {}),
+          ...(agentModel ? { model: agentModel } : {}),
           ...(Object.keys(agentEnv).length > 0 ? { env: { ...agentEnv } } : {}),
           ...(agentCursorEndpoint || agentCursorApiKeyEnv
             ? {
