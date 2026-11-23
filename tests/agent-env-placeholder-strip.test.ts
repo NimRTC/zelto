@@ -11,7 +11,7 @@
 //   症状极像「agent 干了活但没改文件」，真正原因却是「凭据没生效」。
 //   代价是**整轮**：agent 跑 3 分钟 → 门禁报 vendor 缺失 → 人怀疑自己的代码。
 //
-// 所以：值是 `${VAR}` 形状就当它不存在，让 Claude Code 回落��
+// 所以：值是 `${VAR}` 形状就当它不存在，让 Claude Code 回落到
 // `ANTHROPIC_AUTH_TOKEN` → `~/.claude/settings.json` → `~/.claude/.credentials.json`。
 
 import { describe, it } from 'node:test';

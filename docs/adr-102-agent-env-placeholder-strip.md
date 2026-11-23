@@ -17,8 +17,7 @@ agent 子进程的环境里可能残留**没展开的 `${VAR}` 占位符**（例
 却会**顶掉**一个本来能用的凭据来源 —— 于是 agent 秒退（401），
 症状看起来像「agent 干了活但没改文件」。
 
-本 ADR 规定：**值是 `${VAR}` 形状 → 当它不存在**，让 agent 回落��
-下一个来源（`ANTHROPIC_AUTH_TOKEN` → `~/.claude/settings.json` → `~/.claude/.credentials.json`）。
+本 ADR 规定：**值是 `${VAR}` 形状 → 当它不存在**，让 agent 回落到下一个来源（`ANTHROPIC_AUTH_TOKEN` → `~/.claude/settings.json` → `~/.claude/.credentials.json`）。
 
 ---
 
@@ -75,7 +74,7 @@ agent 子进程的环境里可能残留**没展开的 `${VAR}` 占位符**（例
 ### 3.1 剔除，而不是就地展开
 
 在 `mergeAgentEnv`（`src/cli/commands/shared.ts`）里，
-**凡��整串是 `${NAME}` 形状的值，一律从 agent 的 spawn env 里剔掉**。
+**凡是整串是 `${NAME}` 形状的值，一律从 agent 的 spawn env 里剔掉**。
 
 「就地展开」看起来更自然，但**语义不对**：
 
