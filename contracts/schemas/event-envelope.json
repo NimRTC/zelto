@@ -61,6 +61,8 @@
       ]
     },
     "actor": { "type": "string", "description": "Actor that produced this event (hook, cli, system, user)" },
-    "payload": { "type": "object", "description": "Event-specific payload" }
+    "payload": { "type": "object", "description": "Event-specific payload" },
+    "prevHash": { "type": ["string", "null"], "description": "Hash of the previous event in the same slice stream (ADR-100). Null for the genesis event. Optional for backward compatibility with pre-chain events." },
+    "hash": { "type": "string", "description": "SHA-256 hash chaining this event to its predecessor (ADR-100). Optional for backward compatibility with pre-chain events; always present on newly appended events." }
   }
 }
