@@ -242,6 +242,21 @@ export function evaluateWriteSetAgainstPolicy(
     const write = toPosix(raw.trim());
     if (!write) continue;
 
+    // ADR-046 豁免：验收骨架在写集里时，不判策略冲突。
+    //
+    // `deny-acceptance-direct`（tests/acceptance/** → deny）的本意是
+    // 「验收测试随规格冻结，人别绕过规格直接改」（AGENTS.md 禁区-5）。
+    // 但 ADR-046 要求 `zelto spec draft` 生成的骨架必须进本片写集，
+    // 由 agent 把 `test.todo` 换成真断言 —— 否则门禁②永远过不了
+    // （todo 不算验证）。写集本身就是人批准的边界（freeze 钉住），
+    // 「写集里有本片验收文件」正是「对应规格一起改」的已批准形态，
+    // 不是绕过。所以这里跳过该条目的策略交集判定：能写与否归写集预约
+    //（C9 hook 逐写判定 + 事后审计）管，不归这条预检管。
+    // 不放宽其它 deny 规则 —— 保护域等仍照常阻断。
+    if (write === 'tests/acceptance' || write.startsWith('tests/acceptance/')) {
+      continue;
+    }
+
     let allowed = false;
     let deniedBy: string | null = null;
     let askedBy: string | null = null;

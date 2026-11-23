@@ -22,9 +22,9 @@
 // C3: 判定确定性 —— 只读文件、纯计算 + 文件写，不调模型、不触网。
 // C2: 零第三方依赖、不 import adapters/。
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { evaluateFreezeTrace } from '../spec/trace-extract.js';
 import { evaluateWriteSetCoverage } from '../spec/write-set.js';
 import { parseMentionedPaths } from '../spec/scope.js';
@@ -163,18 +163,46 @@ export async function freezeSlice(
   const requiredPaths = mentionedPaths.filter((p) => !referencedPaths.has(p));
   const coverage = evaluateWriteSetCoverage(requiredPaths, effectiveWrites, ctx.repoRoot);
   if (coverage.uncovered.length > 0) {
-    const details = coverage.uncovered.map(
-      (p) => `规格提到「${p}」，但它不在写集里 —— agent 改不了它`,
-    );
+    // ZD-033：报错必须**给出路**，不能只说「你有问题」。
+    //
+    // 病灶（ADR-098 实测）：五片规格阶段共 23.93h，其中 97.8% 是
+    // 「人在改规格与改写集」的往返，而 97% 的闸门失败都是同一句
+    // 「规格提到「X」，但它不在写集里 —— agent 改不了它」。
+    //
+    // 这句话**没告诉人该怎么改**。人得自己判断：
+    //   - X 是本片要改的 → 要加进写集
+    //   - X 只是拿来参考的 → 要在规格里标成只读
+    // 两种修法方向完全相反，人猜错了就是再等几小时被门禁打回。
+    //
+    // 所以每条未覆盖路径都带上**两条出路**（ADR-098 决策五：
+    // 工具**不**自动改写集 —— 写集是人批准的边界，C9）。
+    const details = coverage.uncovered.map((p) => {
+      const exists = existsSync(resolve(ctx.repoRoot, p));
+      return (
+        `规格提到「${p}」，但它不在写集里 —— agent 改不了它` +
+        (exists ? '' : '（该文件当前不存在，可能是本片要新建的）')
+      );
+    });
+    const advisories = [
+      `每个路径都要选一条出路（先想清楚它是「要改的」还是「只读参考的」）：`,
+      `  ① 本片确实要改它 → 加进写集：` +
+        `zelto set ${sliceId} --field writes --value '["${coverage.uncovered[0]}", …]'` +
+        `（写集是本片**允许改动**的边界，加进来的路径 agent 就能改了）`,
+      `  ② 只是拿来参考 / 仿照 → 在规格的「范围」章节写成「只读 <路径>」：` +
+        `把该路径前面加上「只读」两个字（如「- 只读 \`${coverage.uncovered[0]}\` —— 参考它的实现」），` +
+        `再冻结`,
+      `两种改法方向相反，选错会被门禁打回 —— 判据：「这行代码本片会不会改？」会改 → ①；不会 → ②`,
+    ];
     await events.append(sliceId, 'spec.checked', actor, {
       sliceId,
       issues: details.length,
       passed: false,
       details,
+      advisories,
       phase: 'freeze',
       via,
     });
-    return fail('规格与写集不一致，拒绝冻结', details);
+    return fail('规格与写集不一致，拒绝冻结', details, advisories);
   }
 
   // ── 5. 追溯合格判定 ───────────────────────────────────────────────

@@ -306,13 +306,14 @@ export function parseMentionedPaths(content: string): string[] {
   // ZD-024：先把**裸文件名**的段补上同行的目录上下文，
   // 再统一收集路径。
   //
-  // 补齐的判据（四条都要满足，缺一不可）：
+  // 补齐的判据（五条都要满足，缺一不可）：
   //   1. 该段是**裸文件名**（不含 `/`）且扩展名已知；
-  //   2. 同一行内、**在它之前**有一个反引号段，其路径**带目录**，
+  //   2. 在它**之前**有一个反引号段，其路径**带目录**，
   //      且**basename 去掉扩展名后与本段相同**（`x.hpp` ↔ `x.cpp`）；
   //   3. 两个段的扩展名**不同**（同扩展名不是「头/实现」对）；
-  //   4. 补齐后的完整路径确实存在**或**不在写集里 ——
-  //      不在这里判，留给覆盖判据。
+  //   4. 那个前序段与本段在**同一个表格行**里，或在**紧邻的上一行**里
+  //      （见下面的「跨行补齐」）；
+  //   5. 补齐后的完整路径做归一化（去尾部标点、排除 URL / 绝对路径）。
   //
   // 为什么**替换**而不是**追加**裸名：
   //   `evaluateWriteSetCoverage` 要求 mentioned 里的**每一条**都被覆盖。
@@ -320,8 +321,8 @@ export function parseMentionedPaths(content: string): string[] {
   //   所以裸名必须被补齐后的路径**取代**，而不是与之并存 ——
   //   并存的话 uncovered 里仍会有那个裸名，覆盖判据照样报未覆盖。
   //
-  //   替换的**安全性**：补齐的前提是「同一行里有一个带目录的同名兄弟」，
-  //   那是有确切证据的目录，不是猜。猜不出来的（不同名 / 跨行）
+  //   替换的**安全性**：补齐的前提是「前面有一个带目录的同名兄弟」，
+  //   那是有确切证据的目录，不是猜。猜不出来的（不同名 / 离得太远）
   //   保持裸名原样，走 ZD-020 的同名文件判定。
   // 补齐结果按**段的起始位置**索引（不是按文件名）。
   //
@@ -340,11 +341,31 @@ export function parseMentionedPaths(content: string): string[] {
     const ext = seg.text.slice(segDot + 1).toLowerCase();
     if (!KNOWN_EXTENSIONS.includes(ext)) continue;
 
-    // 同一行内的前序段
+    // 前序段：同一行内，或**紧邻的上一行**（ZD-024 跨行补齐）。
     const lineStart = content.lastIndexOf('\n', seg.start) + 1;
+    // 上一行的**起点** —— 跨行补齐的「近邻」判据用。
+    //
+    // 注意别踩 off-by-one：`content[lineStart - 1]` **就是**上一行末尾的
+    // 换行符本身，所以 `lastIndexOf('\n', lineStart - 1)` 会立刻命中它，
+    // 算出来的「上一行起点」会等于 lineStart —— 跨行判据形同虚设。
+    // 必须从 `lineStart - 2` 往前找。
+    const prevLineEnd = lineStart - 1;               // 上一行末尾的 '\n' 位置
+    const prevLineStart = prevLineEnd > 0 ? content.lastIndexOf('\n', prevLineEnd - 1) + 1 : 0;
+
+    // 收集**最近的**合格候选（不是第一个）。
+    //
+    // 为什么取最近而不是第一个：文档顺序里的「第一个」是**最早**的那个。
+    // 跨行时，同名兄弟可能出现在好几行之前 —— 最近的那个才是
+    // 「这一段紧跟着的那个头文件」。
+    let best: { dir: string; end: number } | null = null;
+
     for (const prev of backtickSegments) {
       if (prev.end > seg.start) continue;               // 必须在它之前
-      if (prev.start < lineStart) continue;              // 同一行内
+      // 同一行内 → 直接算候选
+      const sameLine = prev.start >= lineStart;
+      // 跨行 → 只认**紧邻的上一行**（中间不能隔别的行）
+      const adjacentPrevLine = prev.start >= prevLineStart && prev.start < lineStart;
+      if (!sameLine && !adjacentPrevLine) continue;
       if (!prev.text.includes('/')) continue;            // 前序段要带目录
       if (!hasKnownExtension(prev.text)) continue;
 
@@ -358,11 +379,13 @@ export function parseMentionedPaths(content: string): string[] {
       if (prevBase.slice(prevBaseDot + 1).toLowerCase() === ext) continue; // 同扩展名 → 不是「头/实现」对
 
       const dir = prev.text.slice(0, prev.text.lastIndexOf('/'));
-      const full = `${dir}/${seg.text}`;
+      if (!best || prev.end > best.end) best = { dir, end: prev.end };
+    }
+
+    if (best) {
+      const full = `${best.dir}/${seg.text}`;
       const normalized = normalizeMentionedPath(full);
-      if (!normalized) continue;
-      completedByPos.set(seg.start, normalized);
-      break; // 一个候选就够（最近的同名前序段）
+      if (normalized) completedByPos.set(seg.start, normalized);
     }
   }
 
