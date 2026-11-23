@@ -21,11 +21,48 @@ import { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from '../..
 import type { EventEnvelope, EventType } from '../../core/events/index.js';
 import { parseClaudeUsage } from '../usage-parse.js';
 
+/**
+ * ZD-007：运行中累计的 token 数。
+ *
+ * 只记 token，不记金额 —— SDK 的 assistant 消息只给 token，
+ * 金额在 `result` 消息里才有（那是**最终**值）。
+ */
+interface LiveTokenCount {
+  inputTokens: number;
+  outputTokens: number;
+  model?: string;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function firstFiniteNumber(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string') {
+      const parsed = Number.parseFloat(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
 export interface ClaudeAgentSdkAdapterOptions {
   /** Working directory for the agent session (default: process.cwd()) */
   cwd?: string;
   /** Maximum budget in USD (default: no limit) */
   maxBudgetUsd?: number;
+  /**
+   * ZD-007：每 1k token 的单价（USD）—— 用于把运行中的 token 折算成金额。
+   *
+   * 没有它 → `getLiveUsage` 报不出金额（返回 null = 「测不到」）。
+   * 宁可测不到，也不要拿猜的金额去判超支。
+   */
+  pricePerKToken?: { input: number; output: number };
   /** Maximum number of agentic turns (default: no limit) */
   maxTurns?: number;
   /** Model to use (e.g. 'sonnet', 'opus', 'fable') */
@@ -134,6 +171,20 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
    * 长会话里 `result` 消息早就被 shift 掉了。
    */
   private readonly sessionUsage = new Map<string, AdapterUsage>();
+  /**
+   * ZD-007：运行中累计的 token 数（每会话）。
+   *
+   * 只累加 token，不直接累加金额 —— SDK 的 assistant 消息只给 token，
+   * 金额在 `result` 里才有。金额由 `getLiveUsage` 用单价折算。
+   */
+  private readonly sessionLiveTokens = new Map<string, LiveTokenCount>();
+  /**
+   * ZD-007：每 1k token 的单价（USD）。
+   *
+   * 没有单价 → `getLiveUsage` 报不出金额（返回 null）。
+   * 宁可「测不到」也不要猜一个金额去判超支。
+   */
+  private readonly pricePerKToken?: { input: number; output: number };
   /** Resolve functions for waitForExit promises, keyed by sessionId */
   private readonly exitResolvers = new Map<string, (code: number | null) => void>();
   /** Resolvers for "the generator loop has fully unwound", keyed by sessionId */
@@ -144,6 +195,7 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
   constructor(options: ClaudeAgentSdkAdapterOptions = {}) {
     this.cwd = options.cwd ?? process.cwd();
     this.maxBudgetUsd = options.maxBudgetUsd;
+    this.pricePerKToken = options.pricePerKToken;
     this.maxTurns = options.maxTurns;
     this.model = options.model;
     this.claudeCodePath = options.claudeCodePath;
@@ -301,6 +353,25 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
         if (msgType === 'result' || 'total_cost_usd' in msg) {
           const usage = parseClaudeUsage(msg);
           if (usage) this.sessionUsage.set(sessionId, usage);
+        }
+
+        // ZD-007：**运行中**的累计花费。
+        //
+        // SDK 每条 assistant 消息都带 `usage`（token 数），但**不带**累计金额
+        // —— 金额只在 `result` 消息里。所以运行中能报的是**token**，
+        // 金额要靠模型单价折算。
+        //
+        // 为什么值得做：`getUsage` 只有在 agent **退出**后才有值，
+        // 于是「运行中查预算」根本无从下手（ZD-007 的病灶：
+        // 一轮烧 $5.86 没人拦得住）。token 是运行中**唯一**能拿到的信号，
+        // 它足够粗，但够用来**停手**。
+        //
+        // 折算用配置里的 `llm.pricing`（每 1k token 的价）。
+        // 没有配单价 → **报不了金额**（返回 null = 「测不到」）——
+        // 宁可测不到，也不拿一个猜的金额去判「超支」（那会让预算闸门变成假闸门）。
+        const liveTokens = this.accumulateLiveTokens(sessionId, msg);
+        if (liveTokens) {
+          this.sessionLiveTokens.set(sessionId, liveTokens);
         }
 
         // Keep only the last 100 events in memory
@@ -533,6 +604,68 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
    */
   getUsage(sessionId: string): AdapterUsage | null {
     return this.sessionUsage.get(sessionId) ?? null;
+  }
+
+  /**
+   * ZD-007：运行中的累计用量。
+   *
+   * 金额由 token × 单价折算（SDK 的 assistant 消息只给 token，不给金额）。
+   * 没有单价 → 返回 null（「测不到」），不猜金额。
+   */
+  getLiveUsage(sessionId: string): AdapterUsage | null {
+    const tokens = this.sessionLiveTokens.get(sessionId);
+    const price = this.pricePerKToken;
+    if (!tokens || !price) return null;
+
+    const inputCost = (tokens.inputTokens / 1000) * price.input;
+    const outputCost = (tokens.outputTokens / 1000) * price.output;
+    const costUsd = inputCost + outputCost;
+    if (!Number.isFinite(costUsd) || costUsd < 0) return null;
+
+    const usage: AdapterUsage = { costUsd };
+    if (tokens.inputTokens > 0) usage.inputTokens = tokens.inputTokens;
+    if (tokens.outputTokens > 0) usage.outputTokens = tokens.outputTokens;
+    if (tokens.model) usage.model = tokens.model;
+    return usage;
+  }
+
+  /**
+   * ZD-007：从一条 SDK 消息里累加 token。
+   *
+   * SDK 的形状：assistant 消息的 `message.usage` 里带 `input_tokens` /
+   * `output_tokens`；`result` 消息带 `usage`（同样的字段）+
+   * `total_cost_usd`（最终金额）。
+   *
+   * 这里**只认** `message.usage` 与顶层 `usage` 两处 ——
+   * 免得把 `result` 消息里那份最终 usage 与中途累加的重复计入。
+   * 所以 `result` 消息不参与累加（金额由 `getUsage` 单独报）。
+   *
+   * 返回累加后的累计 token；这条消息没带 token 时返回 null（不更新）。
+   */
+  private accumulateLiveTokens(
+    sessionId: string,
+    msg: Record<string, unknown>,
+  ): LiveTokenCount | null {
+    const msgType = typeof msg.type === 'string' ? msg.type : '';
+
+    // `result` 消息的 usage 是**最终**用量（与中途累加重复）—— 不参与累加。
+    if (msgType === 'result') return null;
+
+    const inner = asRecord(msg.message);
+    const usage = inner ? asRecord(inner.usage) : asRecord(msg.usage);
+    if (!usage) return null;
+
+    const inputTokens = firstFiniteNumber(usage.input_tokens, usage.inputTokens);
+    const outputTokens = firstFiniteNumber(usage.output_tokens, usage.outputTokens);
+    if (inputTokens === null && outputTokens === null) return null;
+
+    const prev = this.sessionLiveTokens.get(sessionId);
+    const next: LiveTokenCount = {
+      inputTokens: (prev?.inputTokens ?? 0) + (inputTokens ?? 0),
+      outputTokens: (prev?.outputTokens ?? 0) + (outputTokens ?? 0),
+      model: prev?.model ?? (typeof msg.model === 'string' ? msg.model : undefined),
+    };
+    return next;
   }
 
   async stop(sessionId: string): Promise<void> {

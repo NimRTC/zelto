@@ -29,6 +29,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** 是不是一个普通对象（非 null、非数组）—— 解析 NDJSON 时用。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 取第一个可用的有限数字（snake_case 与 camelCase 都认）。 */
+function firstNumber(...values: unknown[]): number | null {
+  for (const v of values) {
+    const n = typeof v === 'number' ? v : typeof v === 'string' ? Number.parseFloat(v) : Number.NaN;
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 // ─── Session Persistence ─────────────────────────────────────────────────────
 
 const SESSIONS_DIR = '.zelto/sessions';
@@ -118,6 +132,23 @@ interface ClaudeAgentAdapterOptions {
   /** Maximum number of retries on failure (default: 2) */
   maxRetries?: number;
   /**
+   * 用 `--output-format stream-json --verbose` 跑（ZD-007 阶段2）。
+   *
+   * 开着时 stdout 是 **NDJSON**（逐行 JSON 事件），agent **运行中**就会
+   * 逐条吐出 `assistant` 消息（各带 `message.usage`），于是适配器能在
+   * agent 还没退出时累加 token、`getLiveUsage` 报出累计花费 —— 运行中
+   * 预算拦截才对 shell 适配器生效。
+   *
+   * 默认关（保持 `json` 一次性输出）。前提：配了 `pricePerKToken`，
+   * 否则只累加 token、报不出金额（仍然拦不了）。
+   */
+  streamJson?: boolean;
+  /**
+   * 每 1k token 的单价（ZD-007）。用于把运行中累加的 token 折成金额。
+   * 没有它 `getLiveUsage` 报不出金额（返回 null = 「测不到」），不猜。
+   */
+  pricePerKToken?: { input: number; output: number };
+  /**
    * Optional callback for real-time output from the agent.
    * Called with each line of stdout/stderr as it arrives.
    */
@@ -158,13 +189,19 @@ interface SessionState {
  * （ADR-035 §3.2）。代价是 stdout 一次性到达，不再逐块流式回调 ——
  * ADR 已把这条记为「不是缺陷」。
  */
-function claudeCodeFlags(extra: string[] = []): string {
+function claudeCodeFlags(extra: string[] = [], streamJson = false): string {
+  // ZD-007 阶段2：stream-json 让 stdout 变成 NDJSON 逐行事件，
+  // agent 运行中就能报用量；代价是必须同时给 `--verbose`（否则
+  // Claude Code 直接报错退出）。`--include-partial-messages` 不是必需的
+  // （我们只要 `assistant` 消息里的 usage，不要 token 级增量），不加。
+  const outputFlags = streamJson
+    ? ['--output-format', 'stream-json', '--verbose']
+    : ['--output-format', 'json'];
   return [
     '--print',
     '--permission-mode',
     'bypassPermissions',
-    '--output-format',
-    'json',
+    ...outputFlags,
     ...extra,
   ].join(' ');
 }
@@ -197,6 +234,22 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
   private readonly maxRetries: number;
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
+  /** ZD-007 阶段2：用 stream-json 跑（运行中可报用量） */
+  private readonly streamJson: boolean;
+  /** ZD-007：单价，用于把运行中累加的 token 折成金额 */
+  private readonly pricePerKToken?: { input: number; output: number };
+  /**
+   * ZD-007：运行中累计的 token（按会话记）。
+   *
+   * 只累加 `assistant` 消息里的 `message.usage` —— `result` 消息的 usage
+   * 是**最终**用量（与中途累加重复，且它自带 `total_cost_usd`，由
+   * `getUsage` 单独报），所以不参与累加。
+   */
+  private readonly sessionLiveTokens = new Map<string, { input: number; output: number; model?: string }>();
+  /** 每个会话尚未成型的 stdout 尾巴（按行切分用，跨 chunk 拼行）。 */
+  private readonly ndjsonBuffers = new Map<string, string>();
+  /** 已处理到的「stream 模式下已解析的最后一条 result」，用于去重。 */
+  private readonly lastStreamResult = new Map<string, Record<string, unknown>>();
   private readonly sessions = new Map<string, SessionState>();
   /**
    * 尚未落盘的启动噪声（`[claude-code:*]` 行），按会话记。
@@ -216,6 +269,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     this.maxRetries = options.maxRetries ?? 2;
     this.onOutput = options.onOutput;
     this.onProgress = options.onProgress;
+    this.streamJson = options.streamJson ?? false;
+    this.pricePerKToken = options.pricePerKToken;
   }
 
   // ─── Session Recovery ──────────────────────────────────────────────────────
@@ -359,6 +414,7 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
           opts.resumeAgentSessionId
             ? ['--resume', opts.resumeAgentSessionId]
             : ['--session-id', agentSessionId],
+          this.streamJson,
         )
       : '';
 
@@ -408,6 +464,10 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       state.output.push(text);
       sessionData.output.push(text);
       touchActivity();
+      // ZD-007 阶段2：stream-json 模式下逐行解析，累加运行中用量。
+      if (this.streamJson) {
+        this.consumeNdjson(sessionId, text);
+      }
       if (this.onOutput) {
         this.onOutput(sessionId, text);
       }
@@ -897,6 +957,105 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     const json = extractClaudeJson(this.getRawOutput(sessionId));
     if (!json) return null;
     return parseClaudeUsage(json);
+  }
+
+  /**
+   * ZD-007 阶段2：运行中的累计用量。
+   *
+   * 只在 `streamJson` 模式下有值（json 模式中途拿不到）。金额由
+   * 累计 token × 单价折算；没有单价 → 返回 null（「测不到」），不猜。
+   *
+   * 没有 `streamJson` 或还没收到任何 assistant 消息 → null，
+   * 语义是「测不到」而非「零」。
+   */
+  getLiveUsage(sessionId: string): AdapterUsage | null {
+    if (!this.streamJson) return null;
+    const tokens = this.sessionLiveTokens.get(sessionId);
+    if (!tokens) return null;
+
+    // 有最终 result（自带 total_cost_usd）时优先用它 —— 比估算准。
+    const finalResult = this.lastStreamResult.get(sessionId);
+    if (finalResult) {
+      const exact = parseClaudeUsage(finalResult);
+      if (exact) return exact;
+    }
+
+    const price = this.pricePerKToken;
+    if (!price) return null;
+    const costUsd =
+      (tokens.input / 1000) * price.input + (tokens.output / 1000) * price.output;
+    if (!Number.isFinite(costUsd) || costUsd < 0) return null;
+
+    const usage: AdapterUsage = { costUsd };
+    if (tokens.input > 0) usage.inputTokens = tokens.input;
+    if (tokens.output > 0) usage.outputTokens = tokens.output;
+    if (tokens.model) usage.model = tokens.model;
+    return usage;
+  }
+
+  /**
+   * ZD-007 阶段2：消费 stream-json 的一段 stdout（NDJSON，逐行 JSON 事件）。
+   *
+   * 跨 chunk 拼行：一段 chunk 可能把一行 JSON 切成两半，缓冲区里留住
+   * 不完整的尾巴，下次拼上再解析。逐行 parse 成功的：
+   * - `assistant` 消息 → 累加 `message.usage` 的 input/output token；
+   * - `result` 消息 → 存下来（自带 `total_cost_usd`），供 `getLiveUsage`
+   *   在有最终金额时优先用精确值。
+   *
+   * 解析失败的行直接跳过（可能是空行、日志前缀、非 JSON）—— 不抛错，
+   * 也不因此中断 agent。
+   */
+  private consumeNdjson(sessionId: string, chunk: string): void {
+    let buffer = (this.ndjsonBuffers.get(sessionId) ?? '') + chunk;
+    let newlineIdx = buffer.indexOf('\n');
+    while (newlineIdx >= 0) {
+      const line = buffer.slice(0, newlineIdx).trim();
+      buffer = buffer.slice(newlineIdx + 1);
+      if (line.length > 0) this.consumeNdjsonLine(sessionId, line);
+      newlineIdx = buffer.indexOf('\n');
+    }
+    this.ndjsonBuffers.set(sessionId, buffer);
+  }
+
+  /** 解析 NDJSON 的一行：assistant → 累加 token；result → 记最终金额。 */
+  private consumeNdjsonLine(sessionId: string, line: string): void {
+    let msg: Record<string, unknown> | null = null;
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        msg = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return; // 非 JSON 行（日志 / 空行）—— 跳过
+    }
+    if (!msg) return;
+
+    const type = typeof msg.type === 'string' ? msg.type : '';
+
+    if (type === 'result') {
+      // 记录最终 result（含 total_cost_usd），供 getLiveUsage 用精确金额。
+      if ('total_cost_usd' in msg) this.lastStreamResult.set(sessionId, msg);
+      return; // result 的 usage 是最终值，不参与累加
+    }
+
+    if (type !== 'assistant') return;
+
+    // 形状：{ type:'assistant', message: { usage: { input_tokens, output_tokens } }, ... }
+    const inner = isRecord(msg.message) ? msg.message : null;
+    const usage = inner && isRecord(inner.usage) ? inner.usage : isRecord(msg.usage) ? msg.usage : null;
+    if (!usage) return;
+
+    const inputTokens = firstNumber(usage.input_tokens, usage.inputTokens) ?? 0;
+    const outputTokens = firstNumber(usage.output_tokens, usage.outputTokens) ?? 0;
+    if (inputTokens === 0 && outputTokens === 0) return;
+
+    const prev = this.sessionLiveTokens.get(sessionId) ?? { input: 0, output: 0 };
+    const model = prev.model ?? (typeof msg.model === 'string' ? msg.model : undefined);
+    this.sessionLiveTokens.set(sessionId, {
+      input: prev.input + inputTokens,
+      output: prev.output + outputTokens,
+      ...(model ? { model } : {}),
+    });
   }
 
   /** 会话的原始 stdout 文本（内存优先，回落到持久化文件） */

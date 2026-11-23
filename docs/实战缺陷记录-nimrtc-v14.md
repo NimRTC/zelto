@@ -155,11 +155,75 @@
 
 **修复**：本轮先**改配置**（`budgetLimitUsd: 0` = 不限）—— 对探索式开发任务，$1 是假闸门：不是钱的问题，是「agent 需要先摸清 4 个 vendor 库才能动手」的固有成本。
 
-**未做（真正的修法）**：运行中定期查预算并在超限时**停掉 agent**。这需要：
-- agent 进程的可中断点（现在只在进程结束时才拿得到 token 用量）
-- 或者用 `--max-turns` / 输出 token 上限做**事前**约束（比事后判定强）
+**已修（zelto 侧，v0.6.x）**：
 
-**回归测试**：暂无（这条是「设计缺陷记录」，不是行为缺陷）
+1. **可中断点** —— `core/ports/executor.ts` 新增可选能力 `getLiveUsage(sessionId)`：
+   - 与 `getUsage` 的区别是**什么时候**能拿到 —— `getUsage` 通常要等 agent **退出**
+     （Claude Code 的 `--output-format json` 在最后才吐整段 JSON，中途没有）；
+     `getLiveUsage` 是**运行中**就能报出当前累计花费。
+   - 返回 `null` 的语义是「**测不到**」（不是「零」）—— 没数据不等于没花钱。
+
+2. **纯判定层** —— 新增 `core/budget/runtime-guard.ts`：
+   - `RuntimeBudgetGuard.check()` 返回**三态**：`ok` / `exceeded` / `unknown`。
+     `unknown`（测不到）→ **不判定超支**，让 agent 继续跑。
+     把「测不到」当成「没花钱」会让预算闸门变成一道**假闸门** —— 恰恰是本条要修的病。
+   - 上限为「不限」（`budgetLimitUsd: 0` → `Infinity`）→ 闸门**不启用**（没有上限就没有闸门）。
+
+3. **接线层** —— 三条运行路径都在等 agent 的间隙**定期查预算**，超了**当场叫停** agent：
+   - 单片前台路径：`core-slice.ts` 的 `waitForExitWithWatchdog`
+   - 单片后台监督路径：同一函数（同一个等法）
+   - 并行路径：`parallel-executor.ts` 的 `waitForExitOrHalt`
+
+   三处都用 `createRuntimeBudgetGuard` 造闸门：
+   - 适配器没有 `getLiveUsage` → **拦不了** → 退回老口径；
+   - 没有单价 → 折不出金额 → **拦不了**；
+   - shell 适配器默认 `--output-format json` 中途拿不到 → `getLiveUsage` 返回 null → **拦不了**；
+     配置 `agent.streamJson: true` 后改用 `--output-format stream-json`，运行中逐条
+     解析 `assistant` 消息累加 token（见下方「阶段2」）。
+   「拦不了」不等于「放行无阻」—— 起跑前那次检查与跑完后的复判仍在，
+   但运行中**确实**没有第三道闸门 —— 这是事实，不该被含糊过去。
+
+4. **收尾不许进门禁** —— 被预算闸门拦下的一轮，**不跑门禁**：
+   闸门已经判「这一轮花超了」，再跑一遍门禁（编译 + 测试）是**继续烧机器**。
+   而且病灶本身就是「产物做完了但超预算没进门禁，切片卡在 frozen」——
+   让人来判，不是让门禁再跑一遍。
+   处置统一：留痕（`run.aborted` + `stall.classified`）→ 退 `frozen` → **现场保留**。
+
+4. **事前约束** —— `createExecutorAdapter` 把 `budgetLimitUsd` 接进 SDK 适配器的
+   `maxBudgetUsd`（SDK 自己的**事前**约束，比事后查更硬）。
+
+5. **金额折算** —— SDK 的 assistant 消息只给 **token**，不给金额（金额在 `result` 里才有，
+   那是**最终**值）。适配器用配置里的 `llm.pricing` 按模型折算（`resolvePricePerKToken`）。
+   找不到对应档 → **报不出金额**（宁可测不到，也不拿猜的价去判超支）。
+
+6. **措辞** —— `budgetInterceptionMessage` 明说「这不是 agent 跑砸了，是闸门在运行中拦下的」，
+   并提醒「产物可能已经写在 worktree 里，先看现场，别直接重跑」——
+   病灶的另一半就是措辞：说成「跑砸了」，人就会重跑 → 再烧一遍钱。
+
+7. **上限三处同源** —— `budgetLimitUsd` 有三个读者
+   （`BudgetCollector.getLimit` / 配置解析器 / 运行中闸门），
+   必须**同一口径**（`0` = 不限，默认 `1.0`）——
+   漂移的后果是「起跑前按 $1 拦、运行中按 $100 拦」，人看到一个自相矛盾的账。
+
+**回归测试**：`tests/zd007-runtime-budget-guard.test.ts`（25 例，分五层）
+- 纯逻辑层：判定口径（三态、边界、不限、脏数据）
+- 接线层：挂一个**永不自己退出**的假 adapter，验「超预算真的会停下来」
+  （单片路径 + 并行路径各一）
+- 适配器层：shell 适配器默认 json 模式 `getLiveUsage` 返回 null（fail-safe）；
+  `streamJson` 模式能从 NDJSON 累加 token、按单价折成金额（含跨 chunk 拼行、最终金额优先）
+- 配置层：三处读上限必须一致
+- 单价层：拿别的模型的价去折算 = 错的判据 → 不猜
+
+**阶段2（2026-11-23）：shell 适配器的运行中拦截**。原实现里 shell 适配器
+（`npx claude-code`）根本报不出运行中用量 —— 它跑 `--output-format json`，
+stdout 到最后才一次性到达。现在：
+- 配置 `agent.streamJson: true` 时改用 `--output-format stream-json --verbose`
+  （stream-json 强制要求 verbose，否则 Claude Code 直接报错退出）；
+- 适配器逐行解析 NDJSON：`assistant` 消息累加 `message.usage` 的 token，
+  `result` 消息记下最终 `total_cost_usd`（有精确金额时优先用它）；
+- 配了 `llm.pricing` 就能把 token 折成金额 → `getLiveUsage` 在运行中报得出 →
+  运行中预算拦截对 shell 适配器生效。
+- **默认关**（零行为变化），且没有单价时仍报 null（不猜金额）。
 
 ---
 
@@ -179,9 +243,28 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **修法（本轮用的）**：从主仓把已 checkout 的子模块内容同步过去（robocopy 排除 `.git`）+ 给 msquic 补 `git remote`（SourceLink 需要）。
 
-**未做（zelto 侧该修）**：`worktree create` 之后应该自动同步子模块 —— 要么从主仓的 `.git/modules` 本地 clone（`--reference`，不走网络），要么直接复制内容。这是 zelto 的活，不该让人手工做。
+**已修（zelto 侧）**：`worktree create` 之后自动同步子模块 —— 实现见 `core/worktree/manager.ts`
+的 `syncSubmodules`（ADR-044）：
 
-**回归测试**：暂无（需要真 git 仓库 + 子模块，测试成本高）
+- **不触网**（C3）：克隆源指向主仓里已存在的 module git 目录
+  （`<主仓>/<path>/.git` 是目录 → 用它自己；否则用 `<主仓>/.git/modules/<name>/`），
+  本地 objects 复用。
+- **不用 `--recursive`**：嵌套 submodule 由 `syncNestedSubmodules` 从主仓的
+  module git 目录**本地克隆**（`--recursive` 会按 `.gitmodules` 里的 https URL 联网，
+  实测挂起 5 分钟以上，见 D-66 的记录）。
+- **同步失败必须留痕**（D-73）：`submoduleFailures` 记下「是哪个 vendor + 为什么」，
+  否则「worktree 里少了 12 个 vendor」完全不显形，等到门禁报「找不到 googletest」
+  时人看到的是源码缺失，跟「隔离目录没同步 vendor」毫无关系。
+- **本地缺钉死的 commit → 当场抛错**（ADR-095 §3.1）：worktree 建出来是**坏的**，
+  门禁②**必然**失败。让它在建 worktree 的时候失败（早几分钟、错误信息直达），
+  比在门禁的时候失败（信息被几千行编译输出淹没）好得多。
+
+**回归测试**：
+- `tests/d73-submodule-offline-sync.test.ts` —— 离线同步 + 失败留痕
+- `tests/adr095-submodule-missing-commit.test.ts` —— 本地缺 commit 时当场抛错
+- `tests/zd021-submodule-pointer-mismatch.test.ts` —— 指针错位不误拦合并
+- `tests/d72-worktree-submodule-cleanup.test.ts` —— 含 submodule 的 worktree 清理
+- `tests/d52-submodule-dirty-merge.test.ts` —— dirty submodule 的合并
 
 ---
 
@@ -193,7 +276,31 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：同上 —— 门禁失败原因与被验代码无关。
 
-**未做（zelto 侧该修）**：门禁命令序列应该支持「配置 → 编译 → 测试」三段，或者从 CMakeLists 自动推导 configure 命令。
+**已修（zelto 侧）**：门禁命令支持 `phase` 字段，序列按「**配置 → 编译 → 测试**」排序：
+
+- `core/gate/types.ts` 新增 `GatePhase = 'configure' | 'default' | 'build' | 'test'`、
+  `GATE_PHASE_ORDER`、`gatePhaseOf`、`orderGateCommands`。
+- `core/gate/executor.ts` 的 `GateExecutor.execute` 用 `orderGateCommands` 排序选中的命令。
+- 配置里长这样：
+
+  ```yaml
+  gate:
+    commands:
+      - name: configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+        phase: configure
+      - name: build
+        run: cmake --build build --config Debug
+        phase: build
+      - name: test
+        run: ctest --test-dir build -C Debug --output-on-failure
+        phase: test
+  ```
+
+- **不写 `phase` 的命令归 `default`**，排在 configure 之后、build 之前 ——
+  旧配置（只写 build / test）行为不变。
+
+**回归测试**：`tests/zd009-gate-command-phases.test.ts`（11 例，含配置解析）
 
 ---
 
@@ -1040,6 +1147,208 @@ ZD-006 修的）**不进入** `backtickSegments`，所以它们的区间不在�
 
 ---
 
+## ZD-031：需求条目被压成一行 —— 验收口径与测试形态全丢
+
+### 场景
+
+nimrtc v1.4 规格阶段（2026-11-21 ~ 11-22）共花 **23.93h**。
+实测发现：**LLM 调用只占 2.2%（32 分钟）**，其余 97.8% 是人在改规格与改写集。
+
+拆开看根因：`zelto spec draft` 送进模型的 prompt 实测只有 **470~705 token**，
+而需求条目的正文被 `extractCriteria` **压成了一行**。
+
+拿 N2 举例 —— 需求文档里它有 **16 行**不同描述，
+旧口径只装下**其中 1 行**（主体描述）。丢掉的恰恰是：
+
+- 「验收：两个只能通过 TCP 互通的 peer 选出 TCP 候选对，被选中对的 protocol 读作 "tcp"」
+- 「测试形态：环回测试里让 UDP socket 绑到互相不可路由的地址，TCP 是唯一通路」
+- 「N2-1：TCP 在 UDP 失败之后才尝试，不是和 UDP 赛跑」（子条目，整条没进）
+
+**丢的正是规格里「可判定的验收标准」最该照抄的东西。**
+模型看不到验收口径，就只能自己编一条更容易做的 —— 于是人又得回去改。
+
+### 根因
+
+`extractCriteria` 的口径是「同一条目多处出现 → 保留**最长**的那份」。
+「最长」= 信息量最大 ≠ **信息最全** —— 一条需求的多个侧面
+（主体 / 验收口径 / 测试形态 / 子条目）分处不同的行，
+每行单独看都不够长，于是那些行全被丢弃。
+
+子条目（`N2-1`）更彻底：它的 id 不在 `wanted` 里，压根不被收集。
+
+### 后果
+
+- 规格草稿的验收标准是**模型编的**，不是需求要求的；
+- 人必须逐条把验收口径抄回规格 —— 这是几小时的活；
+- 12 次 `spec.drafted` 里绝大多数是**同一个原因**的反复。
+
+### 修复
+
+**已修复（2026-11-23，ADR-099）**：
+
+- `extractCriteria` 的返回值加 `aspects`（`string[]`）——
+  装这条需求在文档里的**全部去重后的侧面**；
+- 去重**只剥排版**（列表标记 / 勾选框 / markdown 强调 / 引号风格），
+  **不动正文** —— 「N2：主体」与「N2 验收：口径」只差三个字，
+  而那正是必须区分的信息；
+- **子条目并入父需求**：`N2-1` 是 `N2` 的约束而非独立需求，
+  必须跟着 `N2` 一起给模型看（它是一条「负向」纪律，
+  模型看不到就一定会实现错）；
+- **父需求没正文但有子条目时**，主体取第一个侧面 ——
+  否则下游会报「找不到这一条的正文」，而明明有内容（假报也是误报）；
+- `text` 字段保持向后兼容（仍是主体描述）。
+
+实测：N2 从 **1 行 → 5 个侧面**（主体 + SDP writer + 验收口径 + 测试形态 + 子条目）。
+
+### 回归测试
+
+`tests/zd031-032-spec-drafting-context.test.ts`（8 个用例）
+
+### 剩余问题
+
+1. **需求文档本身的排版冗余**（101 条验收标准里大量重复）
+   没有被清理 —— 清洗需求文档是**改人的出处**，不在工具的职责里。
+2. **子条目也可能被直接关联**（`trace.requirements = ["N2-1"]`）——
+   两种情况不冲突，但「既关联 N2 又关联 N2-1」时侧面会重复出现在
+   两个需求下。下游按需求 id 逐条渲染，重复可接受。
+
+---
+
+## ZD-032：规格起草不读设计文档 —— 模块事实明明在仓库里
+
+### 场景
+
+`zelto spec draft` 给模型的 prompt 里**没有任何模块与文件路径的事实** ——
+只有切片 id / 标题 / 模块名 / 写集 / 需求的一行正文。
+
+而这些事实**已经在仓库里**：已确认的设计文档
+（`.zelto/design/dsg-*.json`）里写着
+
+```json
+{ "name": "网络适配层 (ice)",
+  "filePatterns": ["src/modules/ice/**"],
+  "dependencies": ["core", "engine"] }
+```
+
+**规格起草这条路根本没去读它。**
+
+### 根因
+
+`buildSpecInput` 只组装了「切片自身的字段 + 需求正文」，
+没有任何一步去读 `.zelto/design/`。
+
+这不是漏了某个字段，是**整条上下文通路没接** ——
+设计 → 切片规格这条链上，设计这一端是断的。
+
+### 后果
+
+模型只能凭空猜目录，或者写出一份空泛的骨架。
+人要写出一份能判定的规格，得**从零查代码**。
+
+### 修复
+
+**已修复（2026-11-23，ADR-099）**：
+
+新增 `src/llm/design-context.ts`，把已确认设计的模块事实喂进 prompt：
+
+- **只取已确认的设计** —— draft 状态的设计是模型草稿，人没批准，
+  拿它当事实就是把「模型的猜测」升级成「输入的真相」；
+- **只取与本片相关的模块**（模块名匹配 / 路径与写集有交集 / **依赖闭包**）；
+- 模块分两种**角色**：
+  - `write` —— 本片所属模块（「归的路径」就是写集该落的位置）；
+  - `readonly` —— 依赖闭包里的模块（本片要**对接 / 仿照**的对象）；
+- **依赖闭包算传递依赖** —— 设计的依赖名可能指向中间模块
+  （`ice → sdp → core`），只取一层的话 `core` 不会出现在只读参考里，
+  而它恰恰是最常被参考的那个；
+- **模块名匹配认括号里的短名** —— 设计的依赖名是短名（`core`），
+  模块名是带括号的标题（`核心基础层 (core)`），两者字面不相等；
+- **降级不阻断** —— 读不到设计就照旧走（信息少一点，不是不能干活）。
+
+实测：prompt 从 **470~705 token** 涨到 **2000~2800 字符**，
+且含真实模块路径与依赖。
+
+### 回归测试
+
+`tests/zd031-032-spec-drafting-context.test.ts`（9 个用例）
+
+### 剩余问题
+
+1. **「本片所属模块」靠版本计划里的模块名与设计里的模块名**字面**匹配** ——
+   写法不一致时匹配不上（此时降级为「按写集交集相关」）。
+   可以改成按路径前缀反查模块，但那是另一个改动。
+2. **设计正文被裁剪过时**（不是设计模板格式），
+   `deriveModules` 退回存的 `modules` 缓存 —— 那份缓存可能是旧口径。
+
+---
+
+## ZD-033：「不在写集里」只说「你有问题」，不给修法
+
+### 场景
+
+冻结被拦时，报错是：
+
+```
+规格提到「X」，但它不在写集里 —— agent 改不了它
+```
+
+人得自己判断 X 是「本片要改的」还是「只读参考的」——
+而两条修法方向**完全相反**：
+
+- 要改 → 加进写集（`zelto set <id> --field writes --value ...`）
+- 只读参考 → 在规格里标成「只读 <路径>」
+
+猜错就是再等几小时被门禁打回。
+
+### 根因
+
+报错只陈述了**事实**，没陈述**出路**。
+ADR-098 实测：五片规格阶段 **97%** 的闸门失败是同一句 ——
+同一句话被反复读，说明它没在帮人做决定。
+
+### 后果
+
+每一次这种往返都是**几小时**的人工时间（实测共 22.23h）。
+这是 23.93h 里最大的一块。
+
+### 修复
+
+**已修复（2026-11-23，ADR-099）**：
+
+改动在**编排层**（`core/lifecycle/freeze.ts`）而不是 CLI 侧 ——
+CLI 与 Web 共用同一份判定（C3），两份说法不一致人更懵：
+
+```
+每个路径都要选一条出路（先想清楚它是「要改的」还是「只读参考的」）：
+  ① 本片确实要改它 → 加进写集：zelto set <id> --field writes --value '["路径", …]'
+  ② 只是拿来参考 / 仿照 → 在规格的「范围」章节写成「只读 <路径>」
+两种改法方向相反，选错会被门禁打回 —— 判据：「这行代码本片会不会改？」
+```
+
+同时：
+
+- 未覆盖路径若是**当前不存在**的文件，报错补一句
+  「（该文件当前不存在，可能是本片要新建的）」——
+  「新建」与「只读」是两种完全不同的意图，这个信息有用；
+- **工具不自动改写集**（ADR-098 决策五）——
+  写集是人批准的边界（C9），工具替人扩边界就是替人批准；
+- CLI 侧**删掉**了重复的「写集」分支（原来说法只有「加进写集」一条，
+  还把「只读」出路漏了）—— 一份说法；
+- `--json` 输出加上 `advisories` 字段（Web 端要显示）。
+
+### 回归测试
+
+`tests/zd033-freeze-write-set-hints.test.ts`（2 个用例）
+
+### 剩余问题
+
+1. **「只读」前缀要人自己写** —— 工具不替人改规格（对的），
+   但人得记住这个约定。ADR-098 的「只读前缀识别」已经能认它，
+   前提是人写对了。
+2. **报错只列了第一条路径进示例命令** —— 多路径时命令里是
+   `["src/b.cpp", …]`，其余路径要人自己补。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
@@ -1298,6 +1607,52 @@ fail fast：前一条失败就不跑后一条 —— 后一条大概率也依赖
   修掉之后本地与 CI 的子模块内容一致，构建期就不再依赖
   「本地缺不缺那两个文件」这件偶然的事。
 
+## ZD-027 门禁失败时，真正失败的用例被截掉了 —— agent 只拿到「2333 个里错了，错哪个不知道」
+
+**场景**：用 nimrtc-v14 的真实事件流做效率复盘时发现，5 个切片、14 次门禁，
+每次全量跑 2316–2387 个用例、250~400 秒。门禁失败时，`gate.result` 事件里
+存下来的 stdout 只有 **500 字符**，而那恰好是**排在最前面、通过了**的用例：
+
+```
+Test project D:/MyOpen/nimrtc-v14/.zelto/worktrees/v1-device-policy/build
+          Start    1: BwePluginSeam.RegisterDefaultPluginsRegistersAimd
+   1/2333 Test    #1: ...  Passed    0.01 sec
+```
+
+真正失败的那个用例在中间段（第 300~2000 号之间），**被截掉了**。
+stderr 只剩一句 `Errors while running CTest`。
+
+**根因**：`executor.ts` 写 `gate.result` 时是 `stdout: r.stdout.slice(0, 500)`
+—— 只存**头部**。测试运行器的失败用例几乎从不排在开头（开头的总是先跑的
+一批普通用例），所以这个截断**系统性地**丢掉了最该被看到的那几行。
+`feedback.ts` 又只能从 stderr 捞，于是 agent 拿到的失败证据是空的。
+
+**后果**：agent 重跑修 bug 时拿不到「上次为什么失败」，只能从头摸一遍；
+人只能自己进 worktree 重跑一遍全量测试去找失败用例 —— 每次 250~400 秒。
+这是 nimrtc 开发「经常停下来」的一个直接来源。
+
+**修复（2026-11-23）**：
+1. 新建 `src/core/gate/diagnostics.ts`（纯计算，C3）：从测试输出里抽
+   `{ test, message, location }[]` 失败用例清单 + 断言尾部，覆盖
+   **CTest / node --test（TAP + spec）/ vitest / jest / gtest**。
+   抽不出时返回空清单 —— 空不等于通过，只表示没抽到。
+2. `GateResult` 增 `failures` / `reportedFailureCount` / `runner` 字段；
+   `executor.ts` 在命令失败时补上诊断，`gate.result` 事件随之带上结构化
+   失败清单；stdout 失败时改存**尾部**（断言通常在末尾）。
+3. `feedback.ts` 优先把失败用例清单作为给 agent 的 `reason`，并渲染完整清单；
+   抽到的条数少于运行器声明的总数时明说「还有 N 条没抽到」。
+4. CLI（`zelto gate`）与 `autoGateAfterRun` 的失败呈现都先列失败用例名与断言。
+5. 新增 `zelto gate <id> --rerun-failed`：读上一次 `gate.result` 的失败 CTest
+   用例名，把 ctest 命令收窄成 `ctest -R "^(?:失败1|失败2)$"`（整名精确匹配、
+   元字符转义），只重跑上次失败的用例。没有历史 / 识别不出 / 非 ctest /
+   已带 `-R` 时**一律退回全量** —— 宁可慢，不漏跑。
+
+**回归测试**：`tests/zd027-gate-failure-diagnostics.test.ts`（28 项）。
+
+**剩余问题**：`--rerun-failed` 依赖上一轮是本版本诊断写出的失败清单（老版本
+二进制写的 `gate.result` 没有 `failures` 字段），首次使用退回全量、后续生效。
+C++ 侧的「只构建受影响的目标」属于增量门禁（阶段 3），需改配置契约、单独写 ADR。
+
 **顺带查清的 nimrtc 环境问题**（不是 zelto 的缺陷，但挡住了验证）：
 
 `build_dtls_cert.py` 一开始直接崩：
@@ -1328,6 +1683,181 @@ dll 打包进去。**
 脚本能跑 —— 如果脚本本身跑不起来，准备阶段会**明确报错**并**不放行**到 agent，
 而不是让 agent 在缺产物的目录里跑一小时再在门禁②炸掉。
 
+
+---
+
+## ZD-028 门禁重试是全量重跑 —— 810 秒花在「再确认同一个失败」上
+
+**场景**：ZD-027 落地后复盘 nimrtc-v14 的事件流，发现门禁的**内部重试**
+（`gate.retry`）跑的是**完全相同的命令** —— 对 `test` 命令而言，
+就是再跑一遍全部 2333 个用例。
+
+实测统计（`.zelto/events` 全量）：
+
+| 门禁命令 | 次数 | 总耗时 | 占比 |
+| --- | --- | --- | --- |
+| `test` | 15 | **4055s** | **90%** |
+| `build` | 15 | 439s | 10% |
+
+门禁墙钟合计 4494s（约 1.25 小时），**九成在 `test` 上**。
+
+重试的明细：
+
+```
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v3-n4-d6-connectivity   cmd=build  attempt=1/1 prevExit=1
+RETRY slice=v3-n4-d6-connectivity   cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v3-n4-d6-connectivity   cmd=test   attempt=1/1 prevExit=8
+```
+
+**根因**：重试的语义本该是「再试一次，看是不是偶发」。但实现上重试跑的是
+**同一条命令**的全量 —— 于是「偶发」这个语义退化成了「再跑一遍，再确认一次
+同样的失败」。
+
+`v1-device-policy` 一片光 `test` 就花了 1254.6s（5 次全量），其中 3 次是
+**纯浪费**（同样的用例、同样的断言，失败是确定性的）。每次约 270s，
+合计约 **810s**。
+
+**顺带查出的三个真 bug**（都在 ZD-027 的 `--rerun-failed` 里，都是
+**在 nimrtc 上不工作**的）：
+
+1. **`isCtestCommand` 认不出被 `cmd /c` 包起来的 ctest**。旧判据
+   `[\s&|;(]` 不含 `"`，于是 nimrtc 的真实命令
+   `cmd /c "ctest --test-dir build ..."` 判为**不是** ctest 命令 ——
+   收窄逻辑恰好在它被开发出来的那个项目上完全失效。
+2. **`-R` 的正则里 `|` 在 Windows cmd 下是管道符**。实测
+   `cmd /c "ctest -R "^(?:A|B)$" ..."` 直接把命令打崩（exit 255，
+   `'B)$' 不是内部或外部命令`）—— 门禁报的是一个与被测代码毫不相干的错。
+3. **`--tests-from-file` 有假绿陷阱**：没匹配到任何用例时 ctest 退出码是
+   **0**（stderr 打印 `No tests were found!!!`）。照搬过来会让「筛选用例名
+   写错」表现成**门禁假绿**。
+
+**修复（2026-11-23，ADR-096）**：
+
+1. 过滤条件改用 **`--tests-from-file`（精确用例名清单文件）**，不用 `-R` 正则 ——
+   用例名本来就是精确串，不需要正则；也就彻底避开了 `|` `(` `)` `.`
+   等元字符的 Windows 引号/管道符陷阱。
+2. 清单文件写在**门禁工作目录**下（固定名 + 切片 id，避免并行切片互相覆盖），
+   跑完即删。命令行里只多一个相对路径，避开 Windows 绝对路径的空格与引号。
+3. **假绿堵死**：收窄那一轮若退出码为 0，但输出里看不到任何被筛选用例名
+   （或出现 `No tests were found`），判为**失败**并说清「收窄条件可能已过期」。
+4. **`isCtestCommand` 放宽**：认 `ctest` **词元**（含扩展名），卡前后边界；
+   路径形态按**扩展名**判是不是可执行工具（`exe`/`cmd`/`bat`/`com`/`sh`
+   算，`cjs`/`js`/`py` 不算 —— 那是别的工具的脚本）。
+5. **门禁内部重试自动收窄**：重试时若上一轮失败且能识别出失败用例，
+   把命令收窄成「只跑那些失败用例」。第一轮已全量跑过，覆盖没丢，
+   只是把重试的边际成本从 O(全量) 降到 O(失败用例数)。
+
+**预计收益**：nimrtc 的 6 次重试从 6 × 270s 降到 6 × ~5s，省约 **1590s（约 26 分钟）**。
+
+**回归测试**：`tests/adr096-gate-rerun-narrowing.test.ts`（21 项）
++ `tests/zd027-gate-failure-diagnostics.test.ts` 新增 3 项（executor 级端到端：
+重试确实只跑失败用例、事件留痕、清单跑完即删）。
+
+**ADR**：`docs/adr-096-gate-rerun-failed-narrowing.md`。
+
+**剩余问题**：「只构建受影响的目标」仍属增量门禁（阶段 3b）——
+推导规则藏在项目的 CMake 宏里，工具猜不得（ADR-051 已就同类问题否决）；
+要推进必须由**项目侧显式声明**「模块 → 用例」的映射。
+
+
+---
+
+## ZD-030 门禁第一轮就跑全量 —— 2387 个用例里 2300 个与本片无关
+
+**场景**：ZD-028 修好了「重试」这一轮，但**第一轮**门禁仍然是全量的。
+复盘 nimrtc-v14 的事件流：
+
+| 切片 | 门禁次数 | 每次用例数 | 每次耗时 |
+| --- | --- | --- | --- |
+| v1-device-policy | 5 | 2333 | ~270s |
+| v3-n4-d6-connectivity | 3 | 2387 | ~290s |
+
+而 `v2-ice` 的**写集**只有：
+
+```
+src/modules/ice/**
+src/modules/sdp/**
+```
+
+`v2-ice` 只碰了 ice 与 sdp 两个模块，却要跑**全部 2387 个用例** ——
+其中 audio、video、webrtc、dtls 的用例**一个都没被这次改动影响**。
+
+**根因**：门禁不知道「这次改动影响哪些用例」。它只有一个「跑哪些命令」
+的抽象，命令是**项目级**的（跑全部用例），与**切片级**的写集之间没有连接。
+
+三条已有的路都走不通（详见 ADR-097 的「背景」段）：
+
+1. **`spec.gateCommands`（ADR-051）** —— 让人**手写**本片的门禁命令。
+   有效，但要求人知道 CMake 目标名（`nimrtc_add_test` 宏会做
+   `string(REPLACE "/tests/" "_test_")` 再拼源文件名，**猜不出来**），
+   而且每片都要写一遍。
+2. **`--rerun-failed`（ADR-096）** —— 只在**已经失败过**之后收窄。
+   救的是「重试的边际成本」，救不了「第一轮就跑全量」。
+3. **CTest `-R` 正则** —— nimrtc 的用例名（`test_ice_test.IceCandidateBuild`）
+   **不含模块路径**（实测），「从用例名反推源目录」这条路根本不成立。
+
+**后果不只是慢，是信号被稀释**：2337 个用例的通过记录里，agent 找不到
+「哪个用例跟我有关」；而且门禁跑全量制造了一个**危险错觉** ——
+「门禁过了 = 整个项目都好了」。收窄后这个错觉消失，
+门禁过了意味着「**我这片的改动是好的**」—— 这才是我们要的。
+
+**修复（2026-11-23，ADR-097）**：
+
+新增配置段 `gate.scope`，由**项目侧显式声明**「写集路径模式 → 作用域标签」：
+
+```yaml
+gate:
+  scope:
+    rules:
+      - match: "src/modules/ice/**"
+        labels: ["ice"]
+      - match: "src/modules/sdp/**"
+        labels: ["sdp"]
+    fallback: full
+```
+
+工具做的：把切片的写集按规则匹配成标签集合 → 用
+`ctest --show-only=json-v1` 枚举出**带这些标签的精确用例名** →
+写清单文件 → 用 `--tests-from-file` 只跑它们。
+**工具不推导目标名、不推断依赖、不猜**（ADR-051 的教训）。
+
+关键安全约束：
+
+- **匹配不到任何用例 → 门禁判失败**（不是「跑 0 个用例判通过」——
+  ctest 在没匹配到时退出码是 **0**，那是假绿）；
+- **写集没命中任何规则 → 退回全量**（`scopeSource: "fallback-full"`）；
+- **没配 `gate.scope` → 跑全量**（老项目零变化）；
+- **收窄跑完验真**：输出里必须看得到被筛选用例名，否则判失败
+  （复用 ADR-096 的 `verifyNarrowedTestsRan`）；
+- **留痕**：`gate.executed` / `gate.result` 记 `scoped` / `scopeLabels` /
+  `scopeTestCount` / `scopeTotalTestCount` / `scopeSource`；
+- **人的出口**：`zelto gate <id> --full` 强制跑全量
+  （规则可能漏 —— 收窄是工具的判断，全量是人的判断）。
+
+**与 ADR-096 的关系**：两者共用同一套机制（`--tests-from-file` 清单文件）、
+同一个坑（Windows 管道符）、同一道假绿防线。ADR-096 治「重试」，
+ADR-097 治「第一轮」。
+
+**预计收益**：`v2-ice` 一类切片门禁从 2387 个用例降到 ~200 个，
+单次省 200~250s；一片 5 次门禁从 1254s 降到 ~400s。
+
+**回归测试**：`tests/adr097-scoped-gate.test.ts`（22 项）
++ `tests/config-loading.test.ts` 新增 2 项（`gate.scope` 必须被解析出来、
+`scope:` 段不能吞掉 `gate:` 的其它键）。
+
+**ADR**：`docs/adr-097-gate-scope-by-write-set.md`。
+
+**剩余问题**：
+1. **nimrtc 当前没有给用例打标签** —— `cmake/NimRTCTest.cmake` 的
+   `nimrtc_add_test` 只调 `add_test(NAME ...)`，没有
+   `set_tests_properties(... LABELS ...)`。要用上这个能力，
+   必须**先在项目侧加标签**。这是「能力是协作出来的」——
+   工具不猜，但会明确告诉你「标签一个都没匹配到」。
+2. **签字判据还没认作用域**（ADR-098）—— 事件里已有足够信息，
+   但签字复查的「验收真跑过本片」一项还看不出这轮跑的是不是本片相关用例。
 
 ---
 
