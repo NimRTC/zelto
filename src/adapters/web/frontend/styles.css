@@ -99,6 +99,9 @@ tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: #161b22; }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
+/* 「服务出过错」的提示行 —— 与「连接断开」是两件事：
+   连接断开 = 服务没了（该重启）；出过错 = 服务还在（不必重启）。 */
+#crash-line.bad { color: var(--bad); }
 .cards { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
 .card {
   border: 1px solid var(--border);

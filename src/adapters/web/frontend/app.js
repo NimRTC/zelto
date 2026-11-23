@@ -12,6 +12,10 @@ const refreshLine = document.getElementById('refresh-line');
 // 连接状态是「独占」语义（一条状态，反复更新）。
 // 混在一个容器里，连接提示的 textContent 赋值会把动作横幅冲掉。
 const conn = document.getElementById('conn');
+// 出过错的提示 —— **独立**于 conn（连接状态）。
+// 两件事必须分开：conn 说「服务没了，该重启」，
+// crashLine 说「服务还在，但出过错，数据可能不新鲜」。
+const crashLine = document.getElementById('crash-line');
 let currentView = 'overview';
 // 当前是否停在**切片详情页**。
 //
@@ -1446,6 +1450,68 @@ async function refreshSummary() {
   // 只更新时间戳不够显眼：配一个绿点 + 秒级时间，人一眼就能看出它在跳。
   // 断连时（noteDisconnected 已设样式）这一行由 markRefresh 覆盖成告警色。
   markRefresh(false);
+  // 服务端自己报一下有没有出过错 —— 见下方 refreshHealth。
+  void refreshHealth();
+}
+
+/**
+ * 问服务端「你出过错没有」。
+ *
+ * ── 为什么需要这个 ──────────────────────────────────────────────────
+ *
+ * 人对着一个不动的页面时，有两种完全不同的处境：
+ *
+ *   ① **服务真的死了** —— 终端窗口被关了 / Ctrl+C 了。
+ *      页面连不上，`noteDisconnected` 会报「连接已断开」。
+ *   ② **服务活着，但出过一次错** —— 崩溃兜底接住了，
+ *      服务继续跑、页面继续刷新，**但数据可能不新鲜**。
+ *
+ * 原来这两者在人眼里是**同一个画面**：一个不动的页面。
+ * 于是人会做同一个动作：关标签页、重新跑 zelto web。
+ * 对 ② 来说这是多余的 —— 而且**可能丢掉正开着的东西**
+ * （比如那个已经起跑的 agent 的监控页面）。
+ *
+ * 所以这里让服务端自己报状态：出过错就把顶栏标黄，
+ * 并说清「最后出错的时刻与原因」。人一眼能分清该重启还是该等等。
+ *
+ * 只在出错时才改 DOM —— 没出错就什么都不做，不打扰人。
+ */
+async function refreshHealth() {
+  try {
+    const h = await apiGet('/api/health');
+    if (!h || !h.crashes) {
+      noteHealthy();
+      return;
+    }
+    const last = h.lastCrash || {};
+    noteUnhealthy(h.crashes, last);
+  } catch (err) {
+    // 健康检查拿不到不算「不健康」—— 概况接口还通着就说明服务活着。
+    // 这里静默即可，别把噪音混进断连判定。
+    void err;
+  }
+}
+
+/** 服务出过错的提示（顶栏独占一行 —— 与「连接断开」分开）。 */
+function noteUnhealthy(count, last) {
+  const key = 'crashes:' + count + ':' + (last.at || '');
+  if (crashLine.dataset.crashKey === key) return;
+  crashLine.dataset.crashKey = key;
+  const when = last.at ? new Date(last.at).toLocaleTimeString() : '未知时刻';
+  crashLine.textContent =
+    '⚠️ 出过错 ' + count + ' 次（最后一次 ' + when + '：' +
+    (last.message || '原因不明') +
+    '）—— 服务仍在运行，数据可能不新鲜。完整栈见终端。';
+  crashLine.className = 'small bad';
+  crashLine.title = '驾驶舱出过错，但服务还活着 —— 不必重启 zelto web';
+}
+
+/** 服务没出错 —— 撤掉提示。 */
+function noteHealthy() {
+  if (!crashLine.dataset.crashKey) return;
+  crashLine.dataset.crashKey = '';
+  crashLine.textContent = '';
+  crashLine.className = 'muted small';
 }
 
 /**

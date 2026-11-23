@@ -48,6 +48,7 @@
 import type { ServerResponse } from 'node:http';
 import { sendJson, validId } from './server.js';
 import type { WebApi } from './api.js';
+import type { CockpitCrashGuard } from './crash-guard.js';
 
 export interface WebContext {
   method: string;
@@ -57,6 +58,13 @@ export interface WebContext {
   repoRoot: string;
   /** POST 的 JSON 请求体（已解析；非 POST 时为 undefined） */
   body?: unknown;
+  /**
+   * 崩溃兜底器（可选）。
+   *
+   * 用来回答一个问题：「服务还活着吗？它有没有出过错？」
+   * —— 人对着一个不再更新的页面时，最想知道的正是这个。
+   */
+  crashGuard?: CockpitCrashGuard | null;
 }
 
 export interface WebRouter {
@@ -74,6 +82,45 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
   // 工程信息（名称 / 根目录）—— 驾驶舱标题用
   if (method === 'GET' && path === '/api/project') {
     sendJson(res, 200, await api.projectInfo());
+    return;
+  }
+
+  // ── GET /api/health ────────────────────────────────────────────────
+  //
+  // 回答一个问题：**「驾驶舱还活着吗？它有没有出过错？」**
+  //
+  // 为什么需要这个端点：
+  //
+  //   驾驶舱是**前台进程**（ADR-072 §10，不是常驻 daemon）。
+  //   进程一没，浏览器里那个页面就停在最后一次轮询的画面上，
+  //   看着像「卡住」，实际上早就没人应答了。
+  //
+  //   而**崩溃兜底**兜住的是另一类消失：一次未捕获异常。
+  //   兜底之后服务还在跑，但人如果只看到「页面不动了」，
+  //   仍然会以为服务死了 —— 于是关标签页、重新跑 zelto web，
+  //   而实际上原来的服务好好的。
+  //
+  //   这个端点把两件事说清楚：
+  //     - 服务确实还在应答（能返回 200 就说明它活着）
+  //     - 它出过错没有、出了几次、最后一次是什么
+  //
+  // **只读**，不暴露栈（栈里有路径，对本机服务不算风险，
+  // 但没必要给人看 —— 人要的是「出没出错」，不是栈）。
+  if (method === 'GET' && path === '/api/health') {
+    const guard = ctx.crashGuard ?? null;
+    sendJson(res, 200, {
+      ok: true,
+      pid: process.pid,
+      uptimeSec: Math.round(process.uptime()),
+      crashes: guard?.count ?? 0,
+      lastCrash: guard?.last
+        ? {
+            at: guard.last.at,
+            kind: guard.last.kind,
+            message: guard.last.message,
+          }
+        : null,
+    });
     return;
   }
 
@@ -308,7 +355,7 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    const body = ctx.body as { only?: unknown; retry?: unknown; dryRun?: unknown } | undefined;
+    const body = ctx.body as { only?: unknown; retry?: unknown; dryRun?: unknown; full?: unknown } | undefined;
     const only = typeof body?.only === 'string' ? body.only : undefined;
     const retry = typeof body?.retry === 'number' && Number.isFinite(body.retry)
       ? Math.max(0, Math.floor(body.retry))
@@ -317,6 +364,7 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       ...(only ? { only } : {}),
       ...(retry !== undefined ? { retry } : {}),
       ...(body?.dryRun === true ? { dryRun: true } : {}),
+      ...(body?.full === true ? { full: true } : {}),
     });
     if (!result.ok) {
       sendLifecycleFailure(res, result);

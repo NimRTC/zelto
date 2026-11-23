@@ -1010,7 +1010,7 @@ export class WebApi {
    */
   async runGate(
     sliceId: string,
-    options: { only?: string; retry?: number; dryRun?: boolean } = {},
+    options: { only?: string; retry?: number; dryRun?: boolean; full?: boolean } = {},
   ): Promise<{
     ok: boolean;
     reason: string;
@@ -1043,6 +1043,9 @@ export class WebApi {
         timeoutSec: config.gate.timeoutSec,
         retryMax: config.gate.retry.max,
         ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
+        // 门禁作用域（ADR-097）—— Web 与 CLI 用同一套规则，
+        // 否则「网页上验过的」与「命令行验过的」口径不一致。
+        ...(config.gate.scope ? { scope: config.gate.scope } : {}),
         ...(config.gate.submoduleCheck !== undefined
           ? { submoduleCheck: config.gate.submoduleCheck }
           : {}),
@@ -1053,6 +1056,8 @@ export class WebApi {
         ...(options.only ? { only: options.only } : {}),
         ...(options.retry !== undefined ? { retry: options.retry } : {}),
         ...(options.dryRun ? { dryRun: true } : {}),
+        // `--full`（ADR-097）—— 人显式要求跑全量，不做作用域收窄。
+        ...(options.full ? { full: true } : {}),
       },
     );
 

@@ -10,3 +10,9 @@ export { WebServer, sendJson, validId, type WebServerOptions } from './server.js
 export { WebApi, type SliceSummary, type SliceDetail } from './api.js';
 export { createWebRouter, type WebContext, type WebRouter } from './router.js';
 export { renderIndexHtml } from './frontend.js';
+export {
+  installCockpitCrashGuard,
+  type CockpitCrashGuard,
+  type CockpitCrashGuardOptions,
+  type CockpitCrashRecord,
+} from './crash-guard.js';

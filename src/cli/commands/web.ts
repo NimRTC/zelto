@@ -13,7 +13,7 @@
 // 那两个动作在 CLI 侧有完整实现，Web 侧再实现一份会分叉判定。
 // 理由见 ADR-072 §4。
 
-import { WebServer } from '../../adapters/web/index.js';
+import { WebServer, installCockpitCrashGuard } from '../../adapters/web/index.js';
 import { register } from './shared.js';
 
 const DEFAULT_PORT = 4321;
@@ -42,19 +42,41 @@ register('web', async (args) => {
 
   const openBrowser = args.includes('--open');
 
-  const server = new WebServer({ port, repoRoot: process.cwd() });
+  // ── 崩溃兜底（先装，再构造服务）────────────────────────────────────
+  //
+  // 为什么必须在服务**启动之前**装：
+  // 服务的整个生命周期里都可能抛出未捕获异常（事件流写入、
+  // 文件读抖了、某个 handler 边界外的异步炸了）。
+  // 没有兜底时，Node 的默认行为是「打印栈 → 退出进程」——
+  // 驾驶舱**瞬间消失**，而浏览器里的页面看着一切正常（只是不再更新）。
+  //
+  // 兜底之后：出错 → 记一笔 + 报给人 + **服务继续跑**。
+  // 页面还在、还在刷新，`/api/health` 会说清「出过错没有」。
+  //
+  // 兜底器要作为 option 传给 WebServer（服务端据此把它暴露给前端），
+  // 所以顺序是「先装兜底 → 再构造服务 → 再启动」。
+  //
+  // 详见 `adapters/web/crash-guard.ts` 的文件头。
+  const guard = installCockpitCrashGuard();
+
+  const server = new WebServer({ port, repoRoot: process.cwd(), crashGuard: guard });
 
   try {
     await server.start();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`❌ Web 驾驶舱启动失败：${message}`);
+    guard.dispose();
     return 1;
   }
 
   console.log(`🌐 zelto 驾驶舱已启动：${server.url}`);
   console.log(`   （能接管：签字 / 拒签 / 回答 / 拉闸 + 冻结 / 门禁 / 开跑 / 续跑）`);
   console.log(`   （签字不等于合并 —— 合入主干请跑 zelto merge <id>）`);
+  // 打出 pid —— 人判断「服务还在不在」的第一手依据。
+  // 之前只有一个 URL：URL 在服务死后依然能复制粘贴，
+  // 于是人拿旧 URL 反复试，得到的全是「连不上」。
+  console.log(`   （pid ${process.pid} —— 服务停了的话这个进程就没了）`);
   console.log('   Ctrl+C 停止');
 
   if (openBrowser) {
@@ -72,6 +94,7 @@ register('web', async (args) => {
   // 保持进程运行 —— 显式的前台进程，不是常驻 daemon（ADR-072 §10）
   await new Promise<void>((resolve) => {
     const stop = () => {
+      guard.dispose();
       void server.stop().then(() => resolve());
     };
     process.on('SIGINT', stop);
