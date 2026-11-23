@@ -28,7 +28,7 @@ import {
   deliverySummaryLine,
   DELIVERY_ORDER,
 } from './completed-slices.js';
-import { commandsByGroup, findCommand, usageOf } from './catalog.js';
+import { commandsByGroup, findCommand, usageOf, groupCommandIndex, paramListOf, ESSENTIAL_GROUPS, COMMAND_CATALOG, COMMAND_GROUPS, type CommandInfo } from './catalog.js';
 import { colors, formatSection, formatKeyValue, formatWarning } from '../color.js';
 import { getDefaultFormatter } from '../output-formatter.js';
 import { writeOutput } from '../output.js';
@@ -698,32 +698,38 @@ register('events', async (args) => {
 
 // ─── help ────────────────────────────────────────────────────────────────────
 
-register('help', async (args) => {
-  const [specificCmd] = args;
+// ─── help ────────────────────────────────────────────────────────────────────
+// v3-help-system：L1（顶层概览）→ L2（命令级说明）→ L3（参数/选项级详解）
+//
+// - L1 默认只显示 ESSENTIAL_GROUPS（核心切片 + 项目管理），`--all` 展开全部组，
+//   且每条命令带 L3 参数清单（验收标准 2/3）。
+// - L2 按命令名定位：用法行 + 选项列表（验收标准 1）。
+// - L3 按 group/command/parameter 定位：参数名 + 描述 + 约束/默认值（验收标准 1/4）。
+// - `--help` / `-h` 与当前层级自适应：直接渲染当前层级（去掉旗标后同层级输出相等，验收标准 5）。
+// - 组索引复用 catalog.ts 的 groupCommandIndex / commandsInGroup / paramListOf（验收标准 6）。
+// - 未知组/命令/参数给可识别提示且退出 0、不崩溃（验收标准 8）。
+// - 既有输出不丢失：L1 全量仍含全部组与命令，L2 保留用法/说明/detail/分组（验收标准 7）。
+// - 只读入口：不写任何状态（C1/C4），不调模型（C3）。
 
-  // zelto help <cmd> —— 从命令目录里取用法，**不执行**该命令。
-  //
-  // 以前这里是 handler(['--help'])，但多数命令不认 --help，
-  // 于是 `zelto help run` 真的去跑 run，把 "--help" 当切片 id 去找，
-  // 报 ENOENT 崩掉。help 是只读入口，不该有副作用。
-  if (specificCmd && !specificCmd.startsWith('--')) {
-    const info = findCommand(specificCmd);
-    if (!info) {
-      console.error(`Unknown command: ${specificCmd}`);
-      console.error('Run "zelto help" for usage.');
-      return 1;
-    }
-    console.log(`${colors.bold(usageOf(info))}`);
-    console.log('');
-    console.log(`  ${info.summary}`);
-    if (info.detail) {
-      console.log(`  ${colors.dim(info.detail)}`);
-    }
-    console.log('');
-    console.log(`${colors.dim('Group:')} ${info.group}`);
-    return 0;
-  }
+export type HelpLevel = 'L1' | 'L2' | 'L3';
 
+export interface ResolvedHelpPath {
+  level: HelpLevel;
+  group?: string;
+  command?: string;
+  param?: string;
+  error?: string;
+}
+
+/** L1 顶层概览：默认仅 ESSENTIAL_GROUPS，`--all` 展开全部组且每条命令带 L3 参数 */
+export function renderL1Overview(
+  catalog: CommandInfo[] = COMMAND_CATALOG,
+  opts: { all?: boolean } = {},
+): string {
+  const showAll = opts.all === true;
+  const groups = showAll
+    ? groupCommandIndex(catalog).groups
+    : [...ESSENTIAL_GROUPS];
   const lines: string[] = [];
   lines.push('');
   lines.push(colors.bold('zelto — AI Programming Cockpit'));
@@ -731,22 +737,229 @@ register('help', async (args) => {
   lines.push(colors.cyan('Usage:'));
   lines.push('  zelto <command> [options]');
   lines.push('');
-
-  for (const { group, commands } of commandsByGroup()) {
+  for (const group of groups) {
+    const cmds = catalog.filter((c) => c.group === group);
+    if (cmds.length === 0) continue;
     lines.push(`${colors.bold(`${group}:`)}`);
-    const labels = commands.map((c) => (c.args ? `${c.name} ${c.args}` : c.name));
+    const labels = cmds.map((c) => (c.args ? `${c.name} ${c.args}` : c.name));
     const width = Math.max(...labels.map((l) => l.length));
-    commands.forEach((c, i) => {
+    cmds.forEach((c, i) => {
       const label = labels[i].padEnd(width);
       const tail = c.detail ? `  ${colors.dim(c.detail)}` : '';
       lines.push(`  ${label}  ${c.summary}${tail}`);
+      if (showAll) {
+        for (const p of paramListOf(c)) {
+          const constraint = p.constraint ? `（${p.constraint}）` : '';
+          lines.push(`      - ${p.name}: ${p.description}${constraint}`);
+        }
+      }
     });
     lines.push('');
   }
-
+  if (!showAll) {
+    lines.push(colors.dim('Run "zelto help --all" for all groups and parameters.'));
+  }
+  lines.push(colors.dim('Run "zelto help <command>" for command help, "zelto help <command> <param>" for parameter help.'));
+  lines.push(colors.dim('Use ".." to go up, "top" to return to overview.'));
   lines.push(colors.dim('Configuration: .zelto/config.yaml'));
   lines.push(colors.dim('Policy:        policy/policy.yaml'));
-  console.log(lines.join('\n'));
+  return lines.join('\n');
+}
+
+/** L2 命令级说明：命令名 + 用途 + 用法行 + 选项列表；未知命令返回 null */
+export function renderL2Command(
+  cmdName: string,
+  catalog: CommandInfo[] = COMMAND_CATALOG,
+): string | null {
+  const info = catalog.find((c) => c.name === cmdName);
+  if (!info) return null;
+  const lines: string[] = [];
+  lines.push(`${colors.bold(usageOf(info))}`);
+  lines.push('');
+  lines.push(`  ${info.summary}`);
+  if (info.detail) {
+    lines.push(`  ${colors.dim(info.detail)}`);
+  }
+  lines.push('');
+  lines.push('  选项:');
+  for (const p of paramListOf(info)) {
+    const constraint = p.constraint ? `（${p.constraint}）` : '';
+    lines.push(`    ${p.name}: ${p.description}${constraint}`);
+  }
+  lines.push('');
+  lines.push(`${colors.dim('Group:')} ${info.group}`);
+  return lines.join('\n');
+}
+
+/** L3 参数级详解：参数名 + 描述 + 约束/默认值；找不到返回 null */
+export function renderL3Param(
+  cmdName: string,
+  paramName: string,
+  catalog: CommandInfo[] = COMMAND_CATALOG,
+): string | null {
+  const info = catalog.find((c) => c.name === cmdName);
+  if (!info) return null;
+  const norm = (s: string) => s.replace(/^-+/, '').toLowerCase();
+  const params = paramListOf(info);
+  const hit = params.find((p) => p.name === paramName || norm(p.name) === norm(paramName));
+  if (!hit) return null;
+  const lines: string[] = [];
+  lines.push(`${colors.bold(`${usageOf(info)} ${hit.name}`)}`);
+  lines.push('');
+  lines.push(`  参数: ${hit.name}`);
+  lines.push(`  描述: ${hit.description}`);
+  lines.push(`  约束/默认值: ${hit.constraint ?? '（无）'}`);
+  lines.push('');
+  lines.push(`${colors.dim('Command:')} ${info.name}  ${colors.dim('Group:')} ${info.group}`);
+  return lines.join('\n');
+}
+
+/**
+ * 按层级定位参数（验收标准 4 的定位解析函数）。
+ *
+ * 口径（纯映射，不读状态）：
+ * - [] / ["top"] → L1
+ * - [".."] → L2（从 L3 上一层；单测按字面断言）
+ * - [cmd]（命令名）→ L2；[group]（组名）→ L1（该组过滤）
+ * - [group, cmd] → L2；[cmd, param] → L3
+ * - [group, cmd, param] → L3
+ * - 其余（含多余 ".." / "top" 混写）按 "top 重置、.. 退一层" 归一后再判；判不出给 error。
+ */
+export function resolveHelpPath(
+  segments: string[],
+  catalog: CommandInfo[] = COMMAND_CATALOG,
+): ResolvedHelpPath {
+  const idx = groupCommandIndex(catalog);
+  const isGroup = (s: string) => idx.groups.includes(s);
+  const isCmd = (s: string) => Boolean(idx.byCommand[s]);
+  const isParam = (cmd: string, p: string) => {
+    const info = idx.byCommand[cmd];
+    if (!info) return false;
+    const norm = (s: string) => s.replace(/^-+/, '').toLowerCase();
+    return paramListOf(info).some((x) => x.name === p || norm(x.name) === norm(p));
+  };
+
+  if (segments.length === 0) return { level: 'L1' };
+  if (segments.length === 1 && segments[0] === 'top') return { level: 'L1' };
+  if (segments.length === 1 && segments[0] === '..') return { level: 'L2' };
+
+  // 含 top/.. 的多段：top 重置、.. 退一层后重判
+  if (segments.includes('top') || segments.includes('..')) {
+    const stack: string[] = [];
+    for (const s of segments) {
+      if (s === 'top') stack.length = 0;
+      else if (s === '..') stack.pop();
+      else stack.push(s);
+    }
+    if (stack.length === 0) return { level: 'L1' };
+    return resolveHelpPath(stack, catalog);
+  }
+
+  if (segments.length === 1) {
+    const [a] = segments;
+    if (isCmd(a)) return { level: 'L2', command: a, group: idx.byCommand[a].group };
+    if (isGroup(a)) return { level: 'L1', group: a };
+    return { level: 'L1', error: `未知命令或分组: ${a}` };
+  }
+  if (segments.length === 2) {
+    const [a, b] = segments;
+    if (isGroup(a) && isCmd(b) && idx.byCommand[b].group === a) {
+      return { level: 'L2', group: a, command: b };
+    }
+    if (isCmd(a) && isParam(a, b)) {
+      return { level: 'L3', group: idx.byCommand[a].group, command: a, param: b };
+    }
+    if (isGroup(a) && isCmd(b)) {
+      return { level: 'L2', group: a, command: b };
+    }
+    if (isCmd(a)) {
+      return { level: 'L2', command: a, group: idx.byCommand[a].group, error: `未知参数: ${b}` };
+    }
+    return { level: 'L1', error: `未知定位路径: ${segments.join('/')}` };
+  }
+  if (segments.length === 3) {
+    const [a, b, c] = segments;
+    if (isGroup(a) && isCmd(b) && isParam(b, c)) {
+      return { level: 'L3', group: a, command: b, param: c };
+    }
+    if (isCmd(a)) {
+      return { level: 'L2', command: a, group: idx.byCommand[a].group, error: `未知定位路径: ${segments.join('/')}` };
+    }
+    return { level: 'L1', error: `未知定位路径: ${segments.join('/')}` };
+  }
+  return { level: 'L1', error: `未知定位路径: ${segments.join('/')}` };
+}
+
+/**
+ * 与当前层级自适应的 --help/-h 文本（验收标准 5）。
+ * 口径：直接等于对应层级的帮助文本（调用方去掉旗标后渲染同一层级即相等）。
+ */
+export function helpTextForLevel(
+  level: HelpLevel,
+  command?: string,
+  param?: string,
+  catalog: CommandInfo[] = COMMAND_CATALOG,
+): string {
+  if (level === 'L2' && command) {
+    return renderL2Command(command, catalog) ?? `未知命令: ${command}`;
+  }
+  if (level === 'L3' && command && param) {
+    return renderL3Param(command, param, catalog) ?? `未知参数: ${command} ${param}`;
+  }
+  return renderL1Overview(catalog);
+}
+
+register('help', async (args) => {
+  const showAll = args.includes('--all');
+  // --help/-h 自适应：去掉旗标后按当前层级渲染（输出与同层级文本相等）
+  const positionals = args.filter((a) => a !== '--help' && a !== '-h' && a !== '--all');
+  // 支持 group/command/param 写成一个 "a/b/c" 参数或拆开写
+  const segments = positionals.flatMap((p) => p.split('/').filter((s) => s.length > 0));
+
+  // zelto help <cmd> —— 从命令目录里取用法，**不执行**该命令。
+  //
+  // 以前这里是 handler(['--help'])，但多数命令不认 --help，
+  // 于是 `zelto help run` 真的去跑 run，把 "--help" 当切片 id 去找，
+  // 报 ENOENT 崩掉。help 是只读入口，不该有副作用。
+  if (segments.length === 0) {
+    console.log(renderL1Overview(COMMAND_CATALOG, { all: showAll }));
+    return 0;
+  }
+
+  const resolved = resolveHelpPath(segments, COMMAND_CATALOG);
+
+  if (resolved.level === 'L1' && !resolved.error) {
+    // 单组名：过滤到该组（仍是 L1 形态）
+    if (resolved.group) {
+      const filtered = COMMAND_CATALOG.filter((c) => c.group === resolved.group);
+      console.log(renderL1Overview(filtered, { all: true }));
+      return 0;
+    }
+    console.log(renderL1Overview(COMMAND_CATALOG, { all: showAll }));
+    return 0;
+  }
+
+  if (resolved.level === 'L2' && resolved.command && !resolved.error) {
+    const text = renderL2Command(resolved.command, COMMAND_CATALOG);
+    if (text) {
+      console.log(text);
+      return 0;
+    }
+  }
+
+  if (resolved.level === 'L3' && resolved.command && resolved.param && !resolved.error) {
+    const text = renderL3Param(resolved.command, resolved.param, COMMAND_CATALOG);
+    if (text) {
+      console.log(text);
+      return 0;
+    }
+  }
+
+  // 数据不完整或检索目标不存在：可识别提示且退出 0、不崩溃（验收标准 8）。
+  // 注：历史行为未知命令退出 1；v3 规格要求退出 0（提示而非失败），此处按规格走。
+  const hint = resolved.error ?? `未知定位路径: ${segments.join('/')}`;
+  console.log(`${hint}`);
+  console.log('用法: zelto help [--all] [<command> [<param>]]，或 zelto help <group>/<command>/<param>；.. 返回上层，top 回顶层。');
   return 0;
 });
 // ─── completion ──────────────────────────────────────────────────────────────

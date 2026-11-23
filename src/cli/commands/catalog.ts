@@ -132,3 +132,98 @@ export function commandsByGroup(): Array<{ group: string; commands: CommandInfo[
     commands: COMMAND_CATALOG.filter((c) => c.group === group),
   })).filter((g) => g.commands.length > 0);
 }
+
+/** L1 顶层概览默认只显示的分组（v3-help-system 验收标准 2） */
+export const ESSENTIAL_GROUPS: string[] = ['核心切片', '项目管理'];
+
+/** 可被帮助系统按组查询的索引结构（v3-help-system 验收标准 6） */
+export interface GroupCommandIndex {
+  /** 分组名（按 COMMAND_GROUPS 顺序） */
+  groups: string[];
+  /** 组名 → 该组命令（与 COMMAND_CATALOG 同一对象引用，不拷贝） */
+  byGroup: Record<string, CommandInfo[]>;
+  /** 命令名 → 命令元信息 */
+  byCommand: Record<string, CommandInfo>;
+}
+
+/**
+ * 按组查询的索引：help 的 L1 概览、`--all` 展开、层级定位都从这里取。
+ *
+ * @param catalog 数据源（默认 COMMAND_CATALOG；单测可传入构造数据）
+ */
+export function groupCommandIndex(catalog: CommandInfo[] = COMMAND_CATALOG): GroupCommandIndex {
+  const order = COMMAND_GROUPS.filter((g) => catalog.some((c) => c.group === g));
+  const extra = [...new Set(catalog.map((c) => c.group))].filter((g) => !order.includes(g));
+  const groups = [...order, ...extra];
+  const byGroup: Record<string, CommandInfo[]> = {};
+  for (const g of groups) {
+    byGroup[g] = catalog.filter((c) => c.group === g);
+  }
+  const byCommand: Record<string, CommandInfo> = {};
+  for (const c of catalog) {
+    byCommand[c.name] = c;
+  }
+  return { groups, byGroup, byCommand };
+}
+
+/** 按组取命令（组索引的薄查询口） */
+export function commandsInGroup(group: string, catalog: CommandInfo[] = COMMAND_CATALOG): CommandInfo[] {
+  return catalog.filter((c) => c.group === group);
+}
+
+/** L3 参数条目：参数名 + 描述 + 约束/默认值（v3-help-system 验收标准 1） */
+export interface ParamInfo {
+  /** 参数名（如 `--json`、`-h`、`<id>`） */
+  name: string;
+  /** 一句话描述 */
+  description: string;
+  /** 约束/默认值（无则为 null） */
+  constraint: string | null;
+}
+
+/**
+ * 从命令的 `args` + `detail` 里抽出 L3 参数清单。
+ *
+ * 口径：
+ * - `detail` 按 `,` 切 token，每个 token 的首个 `--flag` / `-x` 为参数名，
+ *   token 剩余部分为约束（如 `--operation read|write|execute` → 约束 `read|write|execute`）；
+ * - `args` 里的 `<...>` / `[...]` 占位也计入（如 `<id>`）；
+ * - 两者都抽不出时回退到 `--help` / `-h`（每个命令都有 L3 可看，`--all` 不漏项）。
+ */
+export function paramListOf(command: CommandInfo): ParamInfo[] {
+  const out: ParamInfo[] = [];
+  const seen = new Set<string>();
+  const push = (name: string, description: string, constraint: string | null) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push({ name, description, constraint });
+  };
+
+  if (command.detail) {
+    for (const token of command.detail.split(',')) {
+      const t = token.trim();
+      if (!t) continue;
+      const flagMatch = t.match(/--?[a-zA-Z][\w-]*/);
+      if (flagMatch) {
+        const name = flagMatch[0];
+        const rest = t.slice(t.indexOf(name) + name.length).trim();
+        push(name, `命令 ${command.name} 的 ${name} 选项`, rest || null);
+      } else {
+        // detail 里没有旗标形态（如 `list, show, check` 子命令表）→ 整段记一条
+        push(t, `命令 ${command.name} 的子命令/用法：${t}`, null);
+      }
+    }
+  }
+
+  if (command.args) {
+    for (const m of command.args.match(/[<[].+?[>\]]/g) ?? []) {
+      push(m, `命令 ${command.name} 的 ${m} 参数`, null);
+    }
+  }
+
+  if (out.length === 0) {
+    push('--help', `命令 ${command.name} 的 --help 选项`, null);
+    push('-h', `命令 ${command.name} 的 -h 选项（等价于 --help）`, null);
+  }
+  return out;
+}
