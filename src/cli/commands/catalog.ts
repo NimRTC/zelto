@@ -73,6 +73,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'wait', group: '项目管理', args: '<task-id>', summary: '等待后台任务结束' },
 
   // ─── 治理与运行时 ──────────────────────────────────────────────────────
+  { name: 'why', group: '治理与运行时', args: '<path|[slice-id]>', summary: '解释策略判定：结论/规则依据/归属切片/修复建议', detail: '--operation read|write|execute, --as-human, --json' },
   { name: 'policy', group: '治理与运行时', args: '<subcommand>', summary: '策略规则的增删查改与校验', detail: 'list, show, check, validate, add, remove, edit, lock（查看/更新策略哈希锚点）' },
   { name: 'reservation', group: '治理与运行时', args: '<subcommand> [slice-id]', summary: '写集预约的查看与释放', detail: 'list, active, show, release, reap' },
   { name: 'drift', group: '治理与运行时', args: '<slice-id>', summary: '检查切片与冻结基线之间的漂移', detail: '--json' },
