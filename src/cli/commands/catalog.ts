@@ -45,7 +45,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'run', group: '核心切片', args: '<id>', summary: '执行切片', detail: '--dry-run, --agent, --adapter, --hotfix --yes, --json' },
   { name: 'start', group: '核心切片', args: '<id>', summary: '一条命令走完 create → check → freeze → run', detail: '--yes, --agent, --adapter' },
   { name: 'admit', group: '核心切片', args: '<id>', summary: '检查切片准入', detail: '--json' },
-  { name: 'gate', group: '核心切片', args: '<id>', summary: '门禁② 跑验收测试', detail: '--dry-run, --retry, --spec-md, --json' },
+  { name: 'gate', group: '核心切片', args: '<id>', summary: '门禁② 跑验收测试', detail: '--dry-run, --retry, --spec-md, --json, --rerun-failed, --full' },
   { name: 'sign', group: '核心切片', args: '<id>', summary: '批准、拒绝、撤销或退回重跑已完成的切片', detail: '--approve | --reject | --revoke | --revise, --comment' },
   { name: 'inbox', group: '核心切片', args: '', summary: '查看待签字队列' },
   { name: 'abandon', group: '核心切片', args: '<id>', summary: '废弃一个切片' },
@@ -73,11 +73,12 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'wait', group: '项目管理', args: '<task-id>', summary: '等待后台任务结束' },
 
   // ─── 治理与运行时 ──────────────────────────────────────────────────────
+  { name: 'why', group: '治理与运行时', args: '<path|[slice-id]>', summary: '解释策略判定：结论/规则依据/归属切片/修复建议', detail: '--operation read|write|execute, --as-human, --json' },
   { name: 'policy', group: '治理与运行时', args: '<subcommand>', summary: '策略规则的增删查改与校验', detail: 'list, show, check, validate, add, remove, edit, lock（查看/更新策略哈希锚点）' },
   { name: 'reservation', group: '治理与运行时', args: '<subcommand> [slice-id]', summary: '写集预约的查看与释放', detail: 'list, active, show, release, reap' },
   { name: 'drift', group: '治理与运行时', args: '<slice-id>', summary: '检查切片与冻结基线之间的漂移', detail: '--json' },
   { name: 'merge', group: '治理与运行时', args: '[id ...]', summary: '合并已签字的切片（不带 id 则合并全部待合切片；子命令 plan 只出计划）', detail: '--strategy, --target, --plan, --dry-run, --push, --json' },
-  { name: 'audit', group: '治理与运行时', args: '<slice-id>', summary: '查看切片的审计追踪', detail: '--json' },
+  { name: 'audit', group: '治理与运行时', args: '<slice-id> | verify <slice-id>', summary: '查看切片的审计追踪 / 校验事件哈希链', detail: '--json' },
   { name: 'hook', group: '治理与运行时', args: '', summary: '安装 / 卸载 git hooks 与 agent 钩子', detail: '--install, --uninstall, --status, --claude, --cursor, --codex, --all' },
   { name: 'halt', group: '治理与运行时', args: '', summary: '拉闸：暂停正在跑的批次，交回控制权', detail: '--scope, --reason, --rollback, --clear, --list, --json' },
   { name: 'arch', group: '治理与运行时', args: 'check', summary: '架构偏离检查：设计模块图 vs 实际 import 图（只读报告）', detail: '--design, --root, --strict, --json' },
@@ -131,4 +132,99 @@ export function commandsByGroup(): Array<{ group: string; commands: CommandInfo[
     group,
     commands: COMMAND_CATALOG.filter((c) => c.group === group),
   })).filter((g) => g.commands.length > 0);
+}
+
+/** L1 顶层概览默认只显示的分组（v3-help-system 验收标准 2） */
+export const ESSENTIAL_GROUPS: string[] = ['核心切片', '项目管理'];
+
+/** 可被帮助系统按组查询的索引结构（v3-help-system 验收标准 6） */
+export interface GroupCommandIndex {
+  /** 分组名（按 COMMAND_GROUPS 顺序） */
+  groups: string[];
+  /** 组名 → 该组命令（与 COMMAND_CATALOG 同一对象引用，不拷贝） */
+  byGroup: Record<string, CommandInfo[]>;
+  /** 命令名 → 命令元信息 */
+  byCommand: Record<string, CommandInfo>;
+}
+
+/**
+ * 按组查询的索引：help 的 L1 概览、`--all` 展开、层级定位都从这里取。
+ *
+ * @param catalog 数据源（默认 COMMAND_CATALOG；单测可传入构造数据）
+ */
+export function groupCommandIndex(catalog: CommandInfo[] = COMMAND_CATALOG): GroupCommandIndex {
+  const order = COMMAND_GROUPS.filter((g) => catalog.some((c) => c.group === g));
+  const extra = [...new Set(catalog.map((c) => c.group))].filter((g) => !order.includes(g));
+  const groups = [...order, ...extra];
+  const byGroup: Record<string, CommandInfo[]> = {};
+  for (const g of groups) {
+    byGroup[g] = catalog.filter((c) => c.group === g);
+  }
+  const byCommand: Record<string, CommandInfo> = {};
+  for (const c of catalog) {
+    byCommand[c.name] = c;
+  }
+  return { groups, byGroup, byCommand };
+}
+
+/** 按组取命令（组索引的薄查询口） */
+export function commandsInGroup(group: string, catalog: CommandInfo[] = COMMAND_CATALOG): CommandInfo[] {
+  return catalog.filter((c) => c.group === group);
+}
+
+/** L3 参数条目：参数名 + 描述 + 约束/默认值（v3-help-system 验收标准 1） */
+export interface ParamInfo {
+  /** 参数名（如 `--json`、`-h`、`<id>`） */
+  name: string;
+  /** 一句话描述 */
+  description: string;
+  /** 约束/默认值（无则为 null） */
+  constraint: string | null;
+}
+
+/**
+ * 从命令的 `args` + `detail` 里抽出 L3 参数清单。
+ *
+ * 口径：
+ * - `detail` 按 `,` 切 token，每个 token 的首个 `--flag` / `-x` 为参数名，
+ *   token 剩余部分为约束（如 `--operation read|write|execute` → 约束 `read|write|execute`）；
+ * - `args` 里的 `<...>` / `[...]` 占位也计入（如 `<id>`）；
+ * - 两者都抽不出时回退到 `--help` / `-h`（每个命令都有 L3 可看，`--all` 不漏项）。
+ */
+export function paramListOf(command: CommandInfo): ParamInfo[] {
+  const out: ParamInfo[] = [];
+  const seen = new Set<string>();
+  const push = (name: string, description: string, constraint: string | null) => {
+    if (seen.has(name)) return;
+    seen.add(name);
+    out.push({ name, description, constraint });
+  };
+
+  if (command.detail) {
+    for (const token of command.detail.split(',')) {
+      const t = token.trim();
+      if (!t) continue;
+      const flagMatch = t.match(/--?[a-zA-Z][\w-]*/);
+      if (flagMatch) {
+        const name = flagMatch[0];
+        const rest = t.slice(t.indexOf(name) + name.length).trim();
+        push(name, `命令 ${command.name} 的 ${name} 选项`, rest || null);
+      } else {
+        // detail 里没有旗标形态（如 `list, show, check` 子命令表）→ 整段记一条
+        push(t, `命令 ${command.name} 的子命令/用法：${t}`, null);
+      }
+    }
+  }
+
+  if (command.args) {
+    for (const m of command.args.match(/[<[].+?[>\]]/g) ?? []) {
+      push(m, `命令 ${command.name} 的 ${m} 参数`, null);
+    }
+  }
+
+  if (out.length === 0) {
+    push('--help', `命令 ${command.name} 的 --help 选项`, null);
+    push('-h', `命令 ${command.name} 的 -h 选项（等价于 --help）`, null);
+  }
+  return out;
 }

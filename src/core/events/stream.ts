@@ -102,6 +102,71 @@ export interface EventEnvelope {
   type: EventType;
   actor: string;
   payload: Record<string, unknown>;
+  /** 前一个已上链事件的 hash；创世事件为 null；老事件缺省（ADR-100）。 */
+  prevHash?: string | null;
+  /** 本事件的 SHA-256 链哈希；老事件缺省（ADR-100）。新写入必带。 */
+  hash?: string;
+}
+
+/** 链校验逐行结果（ADR-100 §4）。 */
+export interface ChainFailure {
+  index: number;
+  runSeq: number | null;
+  reason: string;
+}
+
+export interface ChainVerdict {
+  ok: boolean;
+  /** 参与哈希校验的事件数（带 hash 的）。 */
+  checked: number;
+  /** 上链前老事件数（不带 hash 的前缀，直接跳过，不判假）。 */
+  unchained: number;
+  failures: ChainFailure[];
+  /** 链尾 hash（无已上链事件时为 null）。 */
+  head: string | null;
+}
+
+/**
+ * 递归稳定序列化：对象键排序，数组保序。
+ *
+ * 为什么必须稳定：同一事件在写入时与 verify 时各算一次 hash，
+ * `JSON.stringify` 的键序若随插入序漂移，同一内容会算出不同 hash，
+ * 链校验必误报。规则固定写死，不随调用方传入序变化（ADR-100 §3）。
+ */
+export function stableStringify(value: unknown): string {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map((v) => stableStringify(v)).join(',')}]`;
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * 事件上链前的规范内容（ADR-100 §3）。
+ *
+ * 固定字段序：ts, runSeq, slice, run, type, actor, payload, prevHash。
+ * `hash` 自身不参与自哈希 —— 否则成循环定义。
+ */
+export function canonicalEventContent(e: Omit<EventEnvelope, 'hash'>): string {
+  return stableStringify({
+    actor: e.actor,
+    payload: e.payload,
+    prevHash: e.prevHash ?? null,
+    run: e.run,
+    runSeq: e.runSeq,
+    slice: e.slice,
+    ts: e.ts,
+    type: e.type,
+  });
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const { createHash } = await import('node:crypto');
+  return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
 /**
@@ -174,7 +239,17 @@ export class EventStream {
     const { join } = await import('node:path');
 
     this.seq++;
-    const event: EventEnvelope = {
+    // 链尾 = 同一切片已持久化的最后一个 hash（若文件不存在则为创世）。
+    // 读链只读本文件，不跨切片 —— 每片一条链（ADR-100 §2）。
+    const prevEvents = await this.read(sliceId);
+    let prevHash: string | null = null;
+    for (let i = prevEvents.length - 1; i >= 0; i -= 1) {
+      if (typeof prevEvents[i].hash === 'string' && prevEvents[i].hash) {
+        prevHash = prevEvents[i].hash as string;
+        break;
+      }
+    }
+    const base: Omit<EventEnvelope, 'hash'> = {
       ts: new Date().toISOString(),
       runSeq: this.seq,
       slice: sliceId,
@@ -182,13 +257,82 @@ export class EventStream {
       type,
       actor,
       payload,
+      prevHash,
     };
+    const hash = await sha256Hex(canonicalEventContent(base));
+    const event: EventEnvelope = { ...base, hash };
 
     const dir = join(this.baseDir, sliceId);
     await mkdir(dir, { recursive: true });
     await appendFile(join(dir, 'events.jsonl'), JSON.stringify(event) + '\n', 'utf-8');
 
     return event;
+  }
+
+  /**
+   * 从持久化存储按写入顺序读回整条链（ADR-100：`loadChain`）。
+   * 就是 `read` —— 保留独立命名，给 `audit verify` 一个只读入口语义。
+   */
+  async loadChain(sliceId: string): Promise<EventEnvelope[]> {
+    return this.read(sliceId);
+  }
+
+  /**
+   * 逐行校验哈希链（ADR-100 §4），只读、不写文件。
+   *
+   * 规则：
+   * - 不带 hash 的老事件前缀直接跳过（`unchained` 计数），不判假；
+   * - 第一个带 hash 的事件 prevHash 必须为 null（创世），否则断链；
+   * - 每个带 hash 事件：复算 hash 必须一致，且 prevHash 必须等于上一个已上链 hash；
+   * - 空 hash / 非法值直接判失败（不允许空串绕过）。
+   */
+  async verifyChain(sliceId: string): Promise<ChainVerdict> {
+    const chain = await this.read(sliceId);
+    const failures: ChainFailure[] = [];
+    let checked = 0;
+    let unchained = 0;
+    let lastHash: string | null = null;
+    let seenChained = false;
+
+    for (let i = 0; i < chain.length; i += 1) {
+      const e = chain[i];
+      if (typeof e.hash !== 'string' || !e.hash) {
+        // 老事件：还没上链。链开始前跳过；链中间出现视为缺失（断链证据）。
+        if (!seenChained) {
+          unchained += 1;
+          continue;
+        }
+        failures.push({ index: i, runSeq: typeof e.runSeq === 'number' ? e.runSeq : null, reason: '事件缺失 hash（链中间出现未上链事件）' });
+        continue;
+      }
+      seenChained = true;
+      checked += 1;
+      const expectedPrev = lastHash;
+      const actualPrev = e.prevHash ?? null;
+      if (actualPrev !== expectedPrev) {
+        failures.push({
+          index: i,
+          runSeq: typeof e.runSeq === 'number' ? e.runSeq : null,
+          reason: `prevHash 对不上：期望 ${expectedPrev ?? 'null'}，实际 ${actualPrev ?? 'null'}`,
+        });
+        // 断链后仍继续复算，让报告一次说清所有断点。
+        lastHash = e.hash;
+        continue;
+      }
+      const { hash, ...rest } = e;
+      void hash;
+      const recomputed = await sha256Hex(canonicalEventContent(rest as Omit<EventEnvelope, 'hash'>));
+      if (recomputed !== e.hash) {
+        failures.push({
+          index: i,
+          runSeq: typeof e.runSeq === 'number' ? e.runSeq : null,
+          reason: `hash 对不上：文件记 ${e.hash}，复算 ${recomputed}`,
+        });
+      }
+      lastHash = e.hash;
+    }
+
+    return { ok: failures.length === 0, checked, unchained, failures, head: lastHash };
   }
 
   async read(sliceId: string): Promise<EventEnvelope[]> {
