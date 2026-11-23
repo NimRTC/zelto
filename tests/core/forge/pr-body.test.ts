@@ -227,4 +227,81 @@ describe('renderPrBody', () => {
     assert.equal(a.body, b.body);
     assert.equal(a.title, b.title);
   });
+
+  // ─── 回归：验收过了却被写成「门禁② ❌ 未通过」─────────────────────────
+  //
+  // 病灶（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-23）：
+  //   追溯块里写着「门禁② ❌ 未通过」，而事实是**验收确实过了**
+  //   （gate.result 的 acceptance.status = 'passed'，exitCode = 0）。
+  //
+  // 根因：`buildTraceBlock` 用了 `passCount > 0 && acceptancePassed`。
+  // 而**门禁根本没把验收 stdout 存进事件** ——
+  // `AcceptanceOutcome` 只留 status / exitCode / durationMs / reason。
+  // 于是 `passCount` 对所有走「显式验收配置」路径的片**恒为 0**，
+  // `passCount > 0` 这个条件**永远不成立**。
+  //
+  // 后果：追溯链说假话。PR body 是给远端 reviewer 看的追溯凭据，
+  // 它说「门禁没过」，远端就会以为这片有问题而拒绝 ——
+  // **追溯链说假话，比没有追溯链更糟。**
+  describe('验收通过了但用例数拿不到', () => {
+    const factsWithoutCounts = () =>
+      makeFacts({
+        review: makeReview({
+          gate: { acceptanceRan: true, acceptancePassed: true, passCount: 0, totalCount: 0 },
+        }),
+      });
+
+    it('追溯块必须说门禁通过了', () => {
+      const block = buildTraceBlock(factsWithoutCounts(), '2026-11-22T02:00:00.000Z');
+      assert.equal(
+        block.gate.passed,
+        true,
+        '验收跑过且通过了 —— 门禁就该是通过，哪怕用例数拿不到',
+      );
+    });
+
+    it('摘要表必须说「门禁② ✅ 通过」', () => {
+      const rendered = renderPrBody(factsWithoutCounts(), '2026-11-22T02:00:00.000Z');
+      assert.ok(
+        rendered.body.includes('| 门禁② | ✅ 通过 |'),
+        `body 必须说门禁通过了，实际：\n${rendered.body}`,
+      );
+      assert.ok(
+        !rendered.body.includes('门禁② | ❌'),
+        `body 不得说门禁没通过，实际：\n${rendered.body}`,
+      );
+    });
+
+    it('不得显示「✅ 0/0」这种自相矛盾的说法', () => {
+      const rendered = renderPrBody(factsWithoutCounts(), '2026-11-22T02:00:00.000Z');
+      assert.ok(
+        !rendered.body.includes('0/0'),
+        `用例数拿不到就不该显示数字，实际：\n${rendered.body}`,
+      );
+      assert.ok(
+        rendered.body.includes('用例数未记录'),
+        `要说清「没记录」而不是假装有数字，实际：\n${rendered.body}`,
+      );
+    });
+  });
+
+  it('验收没通过时仍然要报未通过', () => {
+    const facts = makeFacts({
+      review: makeReview({
+        gate: { acceptanceRan: true, acceptancePassed: false, passCount: 0, totalCount: 0 },
+      }),
+    });
+    const block = buildTraceBlock(facts, '2026-11-22T02:00:00.000Z');
+    assert.equal(block.gate.passed, false);
+  });
+
+  it('验收没跑过时不能算门禁通过', () => {
+    const facts = makeFacts({
+      review: makeReview({
+        gate: { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 },
+      }),
+    });
+    const block = buildTraceBlock(facts, '2026-11-22T02:00:00.000Z');
+    assert.equal(block.gate.passed, false);
+  });
 });

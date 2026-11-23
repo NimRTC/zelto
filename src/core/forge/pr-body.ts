@@ -103,13 +103,7 @@ export function renderPrBody(facts: ForgeTraceFacts, now: string): RenderedPr {
     `| 追溯项 | 需求 ${trace.trace.requirements} / 契约 ${trace.trace.contracts} / 测试 ${trace.trace.tests} |`,
   );
   lines.push(`| 门禁② | ${trace.gate.passed ? '✅ 通过' : '❌ 未通过'} |`);
-  lines.push(
-    `| 验收 | ${
-      trace.gate.acceptanceRan
-        ? `${trace.gate.acceptancePassed ? '✅' : '❌'} ${trace.gate.passCount}/${trace.gate.totalCount}`
-        : '⏭️ 未跑'
-    } |`,
-  );
+  lines.push(`| 验收 | ${acceptanceLabel(trace.gate)} |`);
   lines.push(
     `| 写集越界 | ${trace.writeSetViolations.length === 0 ? '无' : `⚠️ ${trace.writeSetViolations.length} 处`} |`,
   );
@@ -177,7 +171,20 @@ export function buildTraceBlock(facts: ForgeTraceFacts, now: string): TraceBlock
     approvedBy: facts.approvedBy,
     approvedAt: facts.approvedAt,
     gate: {
-      passed: review.gate.passCount > 0 && review.gate.acceptancePassed,
+      // 判据与 `core/sign-review/evaluate.ts` 的「② 验收真跑过本片」**一致**：
+      // 「跑过」且「通过」。
+      //
+      // **不能**额外要求 `passCount > 0` ——
+      // 用例数是从验收 stdout 里解析出来的，而门禁**没有把 stdout 存进事件**
+      // （`AcceptanceOutcome` 只留 status/exitCode/durationMs/reason）。
+      // 于是 `passCount` 对所有走「显式验收配置」路径的片**恒为 0**。
+      // 加上 `passCount > 0` 这个条件，会把一片**验收确实过了**的片
+      // 在 PR body 里写成「门禁② ❌ 未通过」——
+      // 追溯链说假话，比没有追溯链更糟（远端 reviewer 会据此拒绝一片好片）。
+      //
+      // 用例数拿不到就**拿不到**（ADR-059：不冒充数字），
+      // 但不能因为拿不到就推翻「验收通过」这个**明确记录在案**的结论。
+      passed: review.gate.acceptanceRan && review.gate.acceptancePassed,
       acceptanceRan: review.gate.acceptanceRan,
       acceptancePassed: review.gate.acceptancePassed,
       passCount: review.gate.passCount,
@@ -209,4 +216,30 @@ function artifactLabel(status: string): string {
     default:
       return '未知（HEAD 读不到）';
   }
+}
+
+/**
+ * 验收结论 → 人话。
+ *
+ * **用例数拿不到时不显示数字** —— 门禁没把验收 stdout 存进事件
+ * （`AcceptanceOutcome` 只留 status/exitCode/durationMs/reason），
+ * 所以 `passCount`/`totalCount` 对走「显式验收配置」路径的片恒为 0。
+ *
+ * 显示成「✅ 0/0」是**自相矛盾**：0 个用例通过了？0 个用例里通过了几个？
+ * 人读到只会困惑，不会更信任这块追溯链。
+ *
+ * 所以分三态（与 `cli/sign-review/render.ts` 的 `formatAcceptance` 同一套）：
+ *   - 没跑 → 「⏭️ 未跑」
+ *   - 跑了但用例数拿不到 → 「✅ 通过（用例数未记录）」
+ *   - 拿得到 → 「✅ 5/5」
+ *
+ * **不拿 0/0 冒充数字**（ADR-059：查不到就是查不到，绝不冒充）。
+ */
+function acceptanceLabel(gate: TraceBlock['gate']): string {
+  if (!gate.acceptanceRan) return '⏭️ 未跑';
+  if (!gate.acceptancePassed) {
+    return gate.totalCount > 0 ? `❌ ${gate.passCount}/${gate.totalCount}` : '❌ 未通过';
+  }
+  if (gate.totalCount > 0) return `✅ ${gate.passCount}/${gate.totalCount}`;
+  return '✅ 通过（用例数未记录）';
 }
