@@ -2,6 +2,228 @@
 
 ## [Unreleased]
 
+### Added
+- **Events are now a hash chain — tampering is verifiable from the outside**
+  (ADR-100). The event stream was append-only (C4), but "append-only" only
+  meant *zelto* wouldn't rewrite it; an external reader had no way to tell
+  whether the file had been edited between two runs. `EventEnvelope` gained
+  optional `prevHash`/`hash` fields: `append` finds the chain tail for the
+  slice, computes `hash = SHA-256(prevHash + canonical content)` and writes
+  it; `loadChain` reads the chain back; `verifyChain` recomputes each hash
+  and checks the `prevHash` links. New writes always carry the chain;
+  pre-chain events are counted as `unchained` rather than reported as
+  tampered (see ADR-105 below for what `verify` concludes about them).
+  No signing, no concurrency locks, no backfill of history — this covers
+  new writes only.
+- **`zelto audit verify <slice>` — a read-only tamper check** (ADR-100).
+  The whole path calls `EventStream.verifyChain` (read files, pure
+  computation) and modifies no audit log, no state, and no file at all
+  (C1/C4). It prints the chain conclusion, `Checked`/`Unchained`/`Head`
+  counts, and the exact line of every break (line number + runSeq + reason).
+  Exit code 0 = chain intact or nothing to verify, 1 = chain broken.
+- **`zelto why <path>` — the decision, explained** (M2 of the 0.7.0 plan).
+  For any path it answers: allow / deny / ask, the rule id and the basis
+  that decided it, the owning slice and its reserved write-set, and what to
+  do about it. It **assembles existing capabilities** rather than adding a
+  new judgement: `core/policy/engine.ts#evaluatePolicy` + `ReservationStore`
+  + the managed-spec exception + the protected domain (ADR-100's plan,
+  `docs/plan-0.7.0-verifiability.md`). It only explains judgements, it
+  never makes them (C3); it reads, it never writes. `--json` is there for
+  the web cockpit and for scripts. Guide: `docs/guide-zelto-why.md`.
+- **Help is now layered in three levels** (M4 of the 0.7.0 plan). L1 is the
+  top level (`zelto help` shows two essential groups, `zelto help --all`
+  shows all seven); L2 is a command (`zelto help <command>` — usage line
+  plus options); L3 is a sub-command or parameter (`zelto help <command>
+  <param>` — name, description, constraints/defaults). `..` goes up one
+  level, `top` goes back to the top, and `--help`/`-h` adapt to the level
+  you're at. The single source of truth is `COMMAND_CATALOG` in
+  `catalog.ts`; an unknown group/command/parameter gets a recognisable
+  hint and exit code 0 — it never crashes. Guide:
+  `docs/guide-help-layers.md`.
+- **The gate can be scoped by write-set, and re-run failures can be narrowed**
+  (ADR-096 / ADR-097). A gate re-run used to be a full re-run: on the
+  nimrtc-v14 battlefield the gate wall was 4494s (1.25 hours), 90% of it
+  in the `test` command. Now `zelto gate` builds and runs only what the
+  slice's write-set actually touches (measured: `v2-ice` went from 2387
+  cases to ~200), and `--rerun-failed` re-runs only the cases that failed
+  the last time. The scope is recorded in the event stream (`scoped`,
+  `scopeLabels`, `scopeTestCount`, `scopeTotalTestCount`) — and ADR-104
+  makes the **sign-off judgement** read those fields, so the person
+  signing can see that the gate really ran this slice's tests.
+- **The cockpit can act, not just look** (ADR-086 / ADR-094).
+  The cockpit now has the brakes, never the accelerator: `freeze` / `gate`
+  / `run` / `resume` stay CLI-only, but the sign card gained a **reject**
+  button, the slice detail page gained an answer box, and the top bar
+  carries a permanent **halt** button. All four actions call the same
+  core implementations the CLI uses — no re-implementation, no forked
+  verdicts. Writing to the cockpit's endpoints now requires
+  `Content-Type: application/json`, because `fetch(mode:'no-cors')` can
+  send a `text/plain` body that a token + Origin check alone will not
+  stop.
+- **The cockpit survives a crash, and the runtime budget is guarded**
+  (ADR-092). A crashed cockpit used to take the running batch's state with
+  it. There is now a crash guard and a runtime budget guard, both with
+  recovery paths.
+- **Specs are drafted from the real repository, not from guesses** (ADR-012 /
+  ADR-098 / ADR-099). The spec generator now scans the real repo before
+  designing, so module paths are not guessed; it gets the *body* of the
+  requirement items and auto-links them; and the drafting context is
+  density-controlled with read-only references plus an overflow fallback
+  instead of dumping everything into the prompt.
+- **Specification conformance is now judged, and there is a glossary**
+  (ADR-057 / ADR-098). `zelto spec-check` judges whether the slice
+  actually implements what the spec says, and a domain glossary
+  (`zelto glossary`) keeps the same word meaning the same thing across
+  specs and code.
+- **The human gate has three actions, and PRs are traceable**
+  (ADR-094 / ADR-095). A person can now say something about a slice
+  (reject / ask / answer) instead of only approving; `zelto forge` opens a
+  PR whose traceability block points back at the slice, and the PR block
+  no longer writes "验收过了" where gate② has not passed — **saying
+  something false is worse than having no traceability chain at all**.
+
+### Fixed
+- **`audit verify` now distinguishes three states, not two**
+  (ADR-105, ADR-100 §3). `verifyChain` returned a single boolean `ok`, so
+  "the chain is intact and I checked every line" and "there is no chain
+  to check at all" (the stream doesn't exist / is empty / is entirely
+  pre-chain events) both came back as `ok: true`. For a command whose job
+  is to prove *the evidence was not touched*, that is a real bug: an
+  external reader takes `ok: true` to mean "it was verified", when it
+  actually means "there was nothing to verify". The verdict now carries
+  `status: 'ok' | 'broken' | 'no-chain'`, and the CLI prints `Chain: OK` /
+  `Chain: BROKEN` / `Chain: NO CHAIN` (with a line saying there is no
+  chained event to verify). The boolean `ok` is kept for existing callers
+  but its meaning is narrowed to `status !== 'broken'` — so `no-chain`
+  still exits 0 (it does not falsely report tampering, per ADR-100 §3),
+  but it no longer claims to be a verification. **New code reads
+  `status`.**
+- **`audit verify` on a stream that does not exist no longer reports a
+  green "verified"** — the companion fix to the one above, and the reason
+  the acceptance suite for it could only pass on the author's machine: it
+  asserted against the repo's local `.zelto` event stream, which is
+  gitignored and therefore absent on a clean checkout and on CI. The
+  acceptance test now **builds its own chain** in a temporary directory,
+  so it verifies the same thing on every machine, and covers all three
+  states.
+- **A spec file inside the write-set is no longer judged as a tampered
+  managed file** (ADR-106). ADR-014 §3.3 says the worktree's *copy* of a
+  spec is a file zelto put there, so changing it is tampering — but when
+  the spec is **in the write-set**, zelto itself told the agent "You may
+  only modify these paths" and that path is on the list. The result was
+  **zelto asking the agent to change the spec and then blocking the whole
+  run for changing it**: the agent's work was complete (state machine,
+  wiring, 17 unit tests, acceptance file, ADR, docs, CHANGELOG — all on
+  the tree), yet the slice rolled back to `frozen` and gate never ran.
+  "Changing the spec is automatically changing the spec" does not hold
+  when the spec is in the write-set: the spec is then *human-approved
+  work*, not zelto's managed copy. The exemption is **not** unconditional:
+  the changed spec must still contain every requirement materialised at
+  freeze time (ADR-032 §3.3) — **text included**, not just the count,
+  because keeping the count while swapping the content is the standard
+  way to weaken an acceptance criterion. A missing or rewritten
+  criterion is judged tampering, at the same severity as "managed file
+  changed". The judgement is a pure function, read-only, no network (C3).
+- **The write-set judgement now converges on the one matcher C9 uses**
+  (ADR-106 §5). Whether a spec is in the write-set is decided in **two**
+  places — `zeltoOwnedPaths()` (does it need protecting?) and
+  `buildSpecIntegrity()` (does it get an anchor?) — and both used strict
+  equality, while the runtime guard uses `pathInWriteSet`, which
+  understands **globs** (`specs/slices/*.md`) and **directory prefixes**
+  (`specs/`, `specs/slices/`, `specs`). So when a person wrote the
+  write-set any of those four ways, C9 said "in the write-set" while the
+  audit said "not in the write-set". The two sides disagreed, and the
+  outcome was one of two bad results, depending on which side ran first:
+  either **zelto asks the agent to change the spec and then blocks it for
+  changing it** (the exact contradiction ADR-106 fixes — just with a
+  different spelling it didn't fix), or the anchor side says "not in the
+  write-set", gives no anchor, the "frozen requirements are still there"
+  check never fires, and **the agent can delete acceptance criteria
+  without being stopped** — a miss. Fixing one side only turns the
+  contradiction into the miss. **Both sides must use the same matcher.**
+  The same hole in ADR-046's acceptance-directory exemption is fixed too:
+  `tests/acceptance/**/*.cjs` as a write-set entry now works.
+- **The 14 `.cjs` acceptance suites that had never run now run**
+  (D-59). They existed on the tree but the test runner collected `.ts`
+  unit tests only, so they were dead weight: a suite that never runs is
+  not a verification. They now execute, and the one that asserted against
+  the repo's local `.zelto` state was rewritten to be hermetic.
+- **`.cjs` acceptance suites are now collected by branch, not by directory**
+  (ZD-036). The runner collected every `.test.cjs` under
+  `tests/acceptance/**` in the **working tree**, regardless of whether it
+  belonged to the current branch. So acceptance suites from another
+  branch (untracked, asserting a version number and a lock file that
+  cannot exist on this branch) were pulled into this branch's CI — and
+  they were **red for a reason that had nothing to do with the code**:
+  the red was not "the code is broken", it was "the scope was wrong". The
+  criterion is now `git ls-files`: **an acceptance test that is not in the
+  repository is not part of this repository's contract.** (Without git
+  available it falls back to collecting them all.)
+- **The gate's CTest fixtures now work on Linux as well as Windows**
+  (the Windows CI job was green while the Linux one was red). The fixture
+  built a `cmd /c "<path>\ctest.cmd"` batch file, so on Linux the command
+  did not exist. The fixture is now platform-aware: a `ctest.cmd` on
+  Windows, an executable `ctest.sh` (mode 0755) on POSIX. Three test files
+  were affected (`adr096`, `adr097`, `zd027`).
+- **The runtime-budget guard test no longer hangs the event loop on Node 22**
+  (the same Linux red). The fake adapter had no child process, so nothing
+  kept the event loop alive; the watchdog timer is `unref()`'d, so the loop
+  drained and the test ended before the thing it was testing. The fake
+  adapter now holds a ref'd keep-alive handle and releases it on `stop()`.
+- **The gate failure diagnostics no longer depend on Windows-only
+  semantics** (the same Linux red).
+- **The version base point can now be pinned explicitly**, instead of only
+  being derivable from the preceding version or from `HEAD` (ZD-009), and
+  the design generator's module names now accept the bracketed short name
+  (ZD-010 / ZD-011), with a missing module section in the design filled in.
+- **A submodule pointer mismatch no longer blocks an unrelated merge.**
+- **The gate re-run now feeds the previous round's failure evidence back to
+  the agent** (ZD-013).
+- **The placeholder check stops reading API names as placeholders**
+  (ZD-019).
+- **The frozen-admission checks no longer have three false positives** —
+  backticked commands, `basename` counting as coverage, and `install` not
+  being a file (ZD-006).
+- **The spec coverage check no longer misses a new file when a bare
+  filename borrows the directory of the neighbouring "header/implementation"**
+  (ZD-024).
+- **The halt request now has a 30-minute TTL**, so a stale brake no longer
+  blocks every subsequent slice (ZD-023), and the admission refusal of
+  `zelto run` no longer starts a run while a pause is in effect (ZD-023).
+- **The submodule sync does not touch the network, does not hang, and its
+  failure must be sayable** (ZD-073 / ADR-103) — including the case of a
+  submodule that is missing two files (ZD-026).
+- **The git baseline snapshot retries on a transient timeout** (so a
+  momentary hiccup no longer fails a slice), and **the `zelto set` array
+  fields now accept JSON arrays** (ZD-022).
+- **The Cockpit's frontend script was a syntax error** — the page rendered
+  nothing but "加载中…" (ADR-093).
+- **The frontend script moved from template strings into standalone
+  files** (ADR-093).
+- **The `run` command's wait limit went from 30 seconds to 2 minutes**,
+  because the preparation phase has to build the worktree and sync
+  submodules.
+
+### Infrastructure
+- **CI now runs on two platforms.** Linux (`ubuntu-latest`) runs the full
+  `pnpm test` and is the main gate; Windows (`windows-latest`, Node 22,
+  explicit `shell: bash`) runs `build + test:quick + lint` from the same
+  scripts. The historical Windows-only traps (a newline eating a commit
+  trailer, path separators, leftover locks, `cmd` pipe characters, a BOM
+  header) only ever surface on Windows, so both platforms have to be in
+  CI for them to surface at all.
+- **A no-model "out-of-bounds write gets blocked" end-to-end test**
+  (`tests/guard-deny-e2e.test.ts`). It builds a temporary project and
+  worktree, drives the `PreToolUse` judgement with a synthetic
+  `contracts/schemas/hook-io.json` payload for all three harness
+  envelopes (Claude / Cursor / Codex), and asserts: an out-of-bounds
+  write is denied per-write; an unreserved path is denied as
+  `reservation:missing`; the git-audit backstop reports non-empty
+  `violations` (including `other/evil.ts`); the conclusion lands on disk
+  as a `policy.violation` event; and a path that is both in the write-set
+  and allowed by the policy is let through — the counter-example that
+  proves the denial is not a blanket "deny everything".
+
 ## [0.6.0] — 2026-11-18
 
 ### Published
