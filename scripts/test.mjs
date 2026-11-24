@@ -43,7 +43,6 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-
 import { withBuildLock } from './build-lock.mjs';
 import { buildDist, copyAssets } from './build-dist.mjs';
 
@@ -58,6 +57,24 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
  *
  * 为什么原地跑（而不是复制到 `dist-test/`）：它们用 `__dirname` 定位
  * `dist/` 与仓库根，搬了位置相对路径就全错。
+ *
+ * ── 只收 git 已跟踪的（2026-11-24，v1-version-align 事故）───────────────
+ *
+ * 收「工作区里所有 `.cjs`」看起来更全，实际会**把不属于当前分支的验收
+ * 契约拉进 CI**。
+ *
+ * 实测（v1-version-align）：该切片已合并进 `version/v1` 分支（不是 main），
+ * 它的验收文件在 main 的工作区里是**未跟踪**状态 ——
+ * 而它断言的是 `package.json` 版本为 `0.7.1`、且存在 `package-lock.json`。
+ * 在 main 上这两条都不成立（main 是 `0.6.0`，用 pnpm 没有 lockfile），
+ * 于是 `pnpm test` 必红 —— **红的原因不是代码坏了，是收窄错了范围**。
+ *
+ * 判据：**验收测试没进仓库，就不属于这个仓库的契约。**
+ * 所以只收 `git ls-files` 认得的那些 —— 它们随分支走，在哪个分支就在
+ * 那个分支的契约里。
+ *
+ * 拿不到 git（比如从 npm tarball 里跑）时**退回全收**：
+ * 那时没有分支概念，「工作区里有什么就验什么」是对的。
  */
 function collectCjsAcceptanceTests(repoRoot) {
   const results = [];
@@ -78,7 +95,35 @@ function collectCjsAcceptanceTests(repoRoot) {
     }
   };
   walk(join(repoRoot, 'tests', 'acceptance'));
-  return results.sort();
+
+  const all = results.sort();
+  const tracked = trackedAcceptanceTests(repoRoot);
+  if (tracked === null) return all; // 拿不到 git → 全收
+  return all.filter((f) => tracked.has(f));
+}
+
+/**
+ * 仓库里 git 已跟踪的 `.cjs` 验收测试（绝对路径集合）。
+ *
+ * 拿不到 git 时返回 `null` —— 调用方据此退回「全收」。
+ */
+function trackedAcceptanceTests(repoRoot) {
+  try {
+    const out = execFileSync('git', ['ls-files', '--', 'tests/acceptance'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const set = new Set();
+    for (const line of out.split('\n')) {
+      const rel = line.trim();
+      if (!rel.endsWith('.test.cjs')) continue;
+      set.add(join(repoRoot, ...rel.split('/')));
+    }
+    return set;
+  } catch {
+    return null;
+  }
 }
 
 // 与 `build.mjs` 同理：**不要在这里 `process.exit()`** ——
@@ -154,6 +199,15 @@ try {
   //   它要快。Linux CI 跑的是 `pnpm test`（全量），会跑到。
   //   这是刻意的：Windows job 的定位是「快 + 跨平台坑」，
   //   不是「全量验收」。
+  //
+  // ── 收窄到 git 已跟踪的（2026-11-24，v1-version-align 事故）──────────
+  //
+  //   收「工作区里所有 `.cjs`」会**把不属于当前分支的验收契约拉进 CI**：
+  //   已合并进 `version/v1` 的切片的验收文件，在 main 的工作区里是未跟踪的，
+  //   而它断言的 `0.7.1` + `package-lock.json` 在 main 上都不成立 → 必红。
+  //
+  //   判据：**验收测试没进仓库，就不属于这个仓库的契约。**
+  //   详见 `collectCjsAcceptanceTests()` 的说明。
   const cjsAcceptance = collectCjsAcceptanceTests(root);
   if (cjsAcceptance.length > 0) {
     console.log(
