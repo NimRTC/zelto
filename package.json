@@ -30,7 +30,7 @@
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
     "clean": "node scripts/clean.mjs",
-    "prepublishOnly": "node scripts/version-check.mjs"
+    "prepublishOnly": "pnpm clean && pnpm build && pnpm test && node scripts/version-check.mjs"
   },
   "engines": {
     "node": ">=22.0.0"
