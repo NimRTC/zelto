@@ -165,6 +165,25 @@
   did not exist. The fixture is now platform-aware: a `ctest.cmd` on
   Windows, an executable `ctest.sh` (mode 0755) on POSIX. Three test files
   were affected (`adr096`, `adr097`, `zd027`).
+- **The gate's narrowing parameters are no longer inserted inside the
+  path's quotes** (the same Linux red, and the one that survived the
+  fixture fix). The narrowing argument (`--tests-from-file` /
+  `--show-only=json-v1`) landed **inside** the quoted path:
+  `"/tmp/gate/ctest.sh --tests-from-file m.txt" --test-dir build`. In a
+  POSIX shell the quotes are the shell's — everything inside is **one
+  token**, so the whole "path + narrowing argument" became a **file
+  name**: `No such file or directory`, and the gate reported an error
+  that had nothing to do with the code under test. On Windows this is
+  not a problem: `cmd /c "..."` has cmd do the quote pairing, so an
+  argument inside the quotes is still a separate argument (verified in
+  ADR-096). So it was never "the Windows form is right and the POSIX
+  form is wrong" — it was **one form behaving differently under two
+  quote semantics**, and the insertion point has to make both work.
+  The insertion point now steps over the closing quote. While there, the
+  **duplicated** ctest-token logic in `scope.ts` (a verbatim copy of the
+  copy in `diagnostics.ts`) was **collapsed into one implementation** —
+  the copy had the same hole, so both sides broke together (ADR-106 §5:
+  two judgements of one thing will drift apart).
 - **The runtime-budget guard test no longer hangs the event loop on Node 22**
   (the same Linux red). The fake adapter had no child process, so nothing
   kept the event loop alive; the watchdog timer is `unref()`'d, so the loop
