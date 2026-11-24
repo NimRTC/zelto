@@ -49,7 +49,22 @@ function makeReview(overrides: Partial<SignReviewFacts> = {}): SignReviewFacts {
     sliceId: 'v1-demo',
     sliceState: 'completed',
     trace: { requirements: ['r1', 'r2', 'r3'], contracts: ['c1'], tests: ['t1'] },
-    gate: { acceptanceRan: true, acceptancePassed: true, passCount: 5, totalCount: 5 },
+    gate: {
+      acceptanceRan: true,
+      acceptancePassed: true,
+      passCount: 5,
+      totalCount: 5,
+      // ADR-104 决策一：门禁作用域事实。老事件没有这个字段，
+      // 按「没收窄」降级（老事件必然是全量跑的）。
+      scope: {
+        scoped: false,
+        labels: [],
+        testCount: null,
+        totalTestCount: null,
+        source: 'no-config',
+        reason: '',
+      },
+    },
     diff: { filesChanged: 3, addedLines: 100, deletedLines: 10 },
     cost: { totalUsd: 0.12 },
     stall: { stalled: false, stallClass: null },
@@ -247,7 +262,20 @@ describe('renderPrBody', () => {
     const factsWithoutCounts = () =>
       makeFacts({
         review: makeReview({
-          gate: { acceptanceRan: true, acceptancePassed: true, passCount: 0, totalCount: 0 },
+          gate: {
+            acceptanceRan: true,
+            acceptancePassed: true,
+            passCount: 0,
+            totalCount: 0,
+            scope: {
+              scoped: false,
+              labels: [],
+              testCount: null,
+              totalTestCount: null,
+              source: 'no-config',
+              reason: '',
+            },
+          },
         }),
       });
 
@@ -288,7 +316,20 @@ describe('renderPrBody', () => {
   it('验收没通过时仍然要报未通过', () => {
     const facts = makeFacts({
       review: makeReview({
-        gate: { acceptanceRan: true, acceptancePassed: false, passCount: 0, totalCount: 0 },
+        gate: {
+          acceptanceRan: true,
+          acceptancePassed: false,
+          passCount: 0,
+          totalCount: 0,
+          scope: {
+            scoped: false,
+            labels: [],
+            testCount: null,
+            totalTestCount: null,
+            source: 'no-config',
+            reason: '',
+          },
+        },
       }),
     });
     const block = buildTraceBlock(facts, '2026-11-22T02:00:00.000Z');
@@ -298,7 +339,20 @@ describe('renderPrBody', () => {
   it('验收没跑过时不能算门禁通过', () => {
     const facts = makeFacts({
       review: makeReview({
-        gate: { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 },
+        gate: {
+          acceptanceRan: false,
+          acceptancePassed: false,
+          passCount: 0,
+          totalCount: 0,
+          scope: {
+            scoped: false,
+            labels: [],
+            testCount: null,
+            totalTestCount: null,
+            source: 'no-config',
+            reason: '',
+          },
+        },
       }),
     });
     const block = buildTraceBlock(facts, '2026-11-22T02:00:00.000Z');
