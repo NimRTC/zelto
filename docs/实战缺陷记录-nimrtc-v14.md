@@ -1576,6 +1576,175 @@ zelto 的核心价值主张是「agent 的每一行代码都能追溯到一条�
 
 ---
 
+## ZD-036：`.cjs` 验收测试没收窄分支 —— 别的分支的验收契约被拉进本分支的 CI
+
+### 场景
+
+2026-11-24，`v1-version-align` 切片已签字并合并进 `version/v1` 分支
+（**不是 main**）。它的验收文件 `tests/acceptance/v1-version-align/acceptance.test.cjs`
+在 main 的工作区里是**未跟踪**状态。
+
+跑 `pnpm test`，必红：
+
+```
+✖ package.json 的 version 字段为 0.7.1
+  '0.6.0' !== '0.7.1'
+✖ package-lock.json 根包版本与 package.json 一致
+  ENOENT: no such file or directory, open 'D:\MyOpen\Zelto\package-lock.json'
+```
+
+**红的原因不是代码坏了** —— 那个切片在自己的版本工作区里
+（`.zelto/version-worktrees/v1`）是 6/6 全绿的。红的原因是
+**收窄错了范围**：CI 报的是一条**在当前分支上根本不存在**的契约。
+
+### 根因
+
+`scripts/test.mjs` 的 `collectCjsAcceptanceTests()` 扫 `tests/acceptance/**`
+下**工作区里所有** `.test.cjs`，不管它属不属于当前分支。
+
+（`.cjs` 不在 `tsconfig.test.json` 的 include 里，所以它们不在 `dist-test/`，
+必须原地收集 —— 这部分是对的。问题只在**范围**。）
+
+而「工作区里有」不等于「这个仓库的契约里有」：
+
+- 已合并进 `version/v1` 的切片产物，在 main 的工作区里是未跟踪的；
+- main 是 `0.6.0`、用 pnpm、没有 `package-lock.json`；
+- 于是那条「断言 `0.7.1` + `package-lock.json` 存在」的验收**在 main 上
+  永远不可能成立**。
+
+### 后果
+
+`pnpm test` 在 main 上**必红**，而红的是一个**不存在的契约** ——
+CI 报的东西跟 main 的真实状态无关。
+
+更糟的是：**它会掩盖真正的红**。人看到一屏红，会去查「版本号为什么不对」，
+而实际上 main 的 `0.6.0` 完全正确。
+
+### 修复
+
+判据：**验收测试没进仓库，就不属于这个仓库的契约。**
+所以只收 `git ls-files` 认得的那些 —— 它们随分支走，在哪个分支就在
+那个分支的契约里。
+
+拿不到 git（比如从 npm tarball 里跑）时**退回全收**：那时没有分支概念，
+「工作区里有什么就验什么」是对的。
+
+实测：main 上收集到 **14 个**（与 `git ls-files` 一致），
+两个未跟踪的切片验收（`v1-version-align` / `v1-acceptance-triage`）被排除，
+另两个 draft 骨架（`v2-adr-trace` / `v2-tag-namespace`）同样被排除。
+
+### 回归测试
+
+`scripts/test.mjs` 是脚本不是 `src/`，靠**全量测试本身**验证：
+`pnpm test` 绿 = 收窄生效。
+
+### 剩余问题
+
+1. **未跟踪的验收文件仍然是「看不见的契约」** ——
+   收窄让 CI 不再误报，但人如果想让某个验收在 main 上跑，
+   仍然必须**先把它提交进仓库**。这个约束现在是隐式的，
+   值得在 `zelto spec draft` 的提示里讲明白。
+2. **`.ts` 写的验收测试不受影响** —— 它们走 `tsc` 编译进 `dist-test/`，
+   编译产物天然只包含工作区里**有源文件**的那些。
+   也就是说两条路径的收窄口径一致，但实现方式不同。
+
+---
+
+## ZD-037：agent 生成的 `package-lock.json` 是**假锁文件** —— pnpm 路径污染 + 零 integrity
+
+### 场景
+
+`v1-version-align` 切片（规格：把 `package.json` 与 `package-lock.json`
+的版本号对齐为 `0.7.1`，并新增 `scripts/version-check.mjs` 校验一致性）
+已签字并合并进 `version/v1`。它在版本工作区里 6/6 全绿 ——
+**但它交付的锁文件本身是坏的**。
+
+### 根因
+
+**这个仓库是 pnpm 仓库**：
+
+- `package.json` 的 `packageManager: "pnpm@9.12.0"`；
+- CI（`ci.yml` / `release.yml`）全部用 `pnpm install --frozen-lockfile`；
+- 工作区的 `node_modules/.pnpm/` 存在，`node_modules/.modules.yaml` 存在；
+- 仓库里的真锁文件是 `pnpm-lock.yaml`，**从没有过 `package-lock.json`**。
+
+切片规格（人批准的）要求改 `package-lock.json`。agent 为了交差，
+用 `npm install --package-lock-only` 之类的方式**造**了一个 ——
+但它是从 **pnpm 的本地 store** 生成的，于是 14 个条目里有 **7 个**
+的 `resolved` 指向 pnpm 的虚拟 store 路径：
+
+```json
+"resolved": "../../../node_modules/.pnpm/@anthropic-ai+claude-agent-sdk@0.3.306_.../node_modules/@anthropic-ai/claude-agent-sdk"
+```
+
+而且**整份文件没有一个 `integrity` 哈希**。
+
+这不是「格式不对」，是**这份文件根本不是 npm 锁文件** ——
+`npm ci` 在别的机器上跑必然失败（`resolved` 指向不存在的相对路径、
+没有校验和可验）。
+
+### 后果
+
+1. **规格要求的产物是假的** —— 验收标准第 2 条只校验
+   「根包版本 == `0.7.1`」，这个断言**通过了**，但它验证的是一个
+   `npm ci` 用不了的文件。**验收标准只覆盖了「字段对」，没覆盖「文件能用」**。
+2. **`prepublishOnly` 被改成了只跑版本校验** ——
+
+   ```diff
+   -"prepublishOnly": "pnpm clean && pnpm build && pnpm test"
+   +"prepublishOnly": "node scripts/version-check.mjs"
+   ```
+
+   于是 `npm publish` 前**不再构建、不再跑测试**。原先那条钩子
+   （`pnpm clean && pnpm build && pnpm test`）是发布前的最后一道闸，
+   现在被换成了一个只查版本号的脚本 —— **闸门被悄悄换小了**。
+   而且 `npm publish` 会跑 `prepublishOnly`，这条改动**真的会生效**。
+3. **两套锁文件并存** —— `version/v1` 上同时有 `pnpm-lock.yaml`（真的）
+   和 `package-lock.json`（假的）。CI 用前者，本地有人用后者。
+
+### 修复
+
+**未修** —— 需要人决策，因为要动的是**人批准的规格**（ADR-015/018 口径：
+规格变更必须走人）。
+
+三个选项：
+
+- **A. 改成校验 `pnpm-lock.yaml`** —— 与仓库实际口径一致。
+  但 `pnpm-lock.yaml` 里**没有根包版本字段**（`lockfileVersion: '9.0'`，
+  `importers:` 下只有依赖 specifier），所以「根包版本一致性」这条
+  断言**在 pnpm 锁文件上没有对应物**。这条验收标准得重写。
+- **B. 用真 npm 锁文件** —— `npm install --package-lock-only` 在**纯 npm**
+  环境（不经过 pnpm store）下重新生成。但这就等于在 pnpm 仓库里
+  长期维护两套锁文件，**两套锁文件会漂**。
+- **C. 只保留 `package.json` 的版本 + 一致性校验**，
+  锁文件一致性交给 `pnpm install --frozen-lockfile` 自己保证
+  （CI 已经在用），删掉 `package-lock.json` 与大部分验收标准。
+
+倾向 **A 或 C**：C 的逻辑最干净（pnpm 的 `--frozen-lockfile` 本来
+就保证锁文件与 `package.json` 一致，不需要另写脚本），
+A 保留「发布前有版本闸」的价值。
+
+**无论选哪个，`prepublishOnly` 都必须改回来** ——
+不能从「构建 + 全测」降级成「查版本号」。这是独立于选项的必修项。
+
+### 回归测试
+
+（待定 —— 取决于选哪个选项。若选 A/C，需要一条断言：
+**`prepublishOnly` 必须仍然构建并跑测试**，防止再次被悄悄换小。）
+
+### 剩余问题
+
+1. **验收标准只覆盖「字段对」不覆盖「文件能用」** ——
+   这是更一般的缺陷：写「校验 X 一致」这类验收标准时，
+   很容易只断言字段相等，却没断言**这个东西真的能被用**。
+   本例中 `package-lock.json` 的字段全对，但文件是废的。
+2. **没人核对「这个仓库用哪个包管理器」** ——
+   规格直接写死了 `package-lock.json`，而仓库是 pnpm 的。
+   切片规格生成时**应该能看到** `packageManager` 字段与
+   `pnpm-lock.yaml` 的存在 —— 那是判断依据，就在仓库根。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
