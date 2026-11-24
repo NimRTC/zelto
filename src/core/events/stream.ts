@@ -115,8 +115,40 @@ export interface ChainFailure {
   reason: string;
 }
 
+/**
+ * 链校验的**三态**结论（ADR-105）。
+ *
+ * 为什么不是布尔：布尔把「链完好」和「压根没有链可验」压成同一个 `true`。
+ * 一个用来证明「证据没被动过」的命令，分不清「验过了」和「没东西可验」——
+ * 外部读者据此判断就会踩空：把「无链」读成「验过了」。
+ *
+ * - `ok`：链完整（至少有一个已上链事件，且逐行校验通过）。
+ * - `broken`：断链（哈希对不上 / 链中间出现未上链事件 / 链尾链接断裂）。
+ * - `no-chain`：**没有已上链事件**（流不存在、流为空、或全是上链前的老格式事件）。
+ *   —— 按 ADR-100 §3「不误报被篡改」，它**不是**失败，但它也**不是**「验过了」。
+ */
+export type ChainStatus = 'ok' | 'broken' | 'no-chain';
+
 export interface ChainVerdict {
+  /**
+   * 是否「链完好」。
+   *
+   * **注意这是 `status !== 'broken'` 的便捷视图，不是三态本身** ——
+   * `no-chain` 时它也是 `true`（不判假），但它**不表示「验过了」**。
+   * 要区分「验过了」与「没东西可验」，必须读 `status`。
+   *
+   * 保留这个字段是为了不破坏既有调用方（`audit.ts` 的退出码、
+   * 验收断言），但**新代码一律读 `status`**。
+   */
   ok: boolean;
+  /**
+   * 三态结论（ADR-105）。`ok` 字段由它派生：`status !== 'broken'`。
+   *
+   * `no-chain` 表示「没有已上链事件可验」—— 流不存在 / 流为空 /
+   * 全是上链前的老格式事件。按 ADR-100 §3 不判假（不是 `broken`），
+   * 但**不等于「验过了」**。
+   */
+  status: ChainStatus;
   /** 参与哈希校验的事件数（带 hash 的）。 */
   checked: number;
   /** 上链前老事件数（不带 hash 的前缀，直接跳过，不判假）。 */
@@ -285,6 +317,11 @@ export class EventStream {
    * - 第一个带 hash 的事件 prevHash 必须为 null（创世），否则断链；
    * - 每个带 hash 事件：复算 hash 必须一致，且 prevHash 必须等于上一个已上链 hash；
    * - 空 hash / 非法值直接判失败（不允许空串绕过）。
+   *
+   * **结论是三态**（ADR-105）：`ok` / `broken` / `no-chain`。
+   * `no-chain` = 压根没有已上链事件可验（流不存在 / 流为空 / 全是老格式事件）。
+   * 它**不是** `broken`（不误报被篡改），但也**不是**「验过了」——
+   * 布尔 `ok` 会把这两者压平，所以额外给了 `status`。
    */
   async verifyChain(sliceId: string): Promise<ChainVerdict> {
     const chain = await this.read(sliceId);
@@ -332,7 +369,25 @@ export class EventStream {
       lastHash = e.hash;
     }
 
-    return { ok: failures.length === 0, checked, unchained, failures, head: lastHash };
+    // 三态结论（ADR-105）：
+    //   broken  —— 有断点（哈希对不上 / 链中间出现未上链事件）
+    //   no-chain —— 一个已上链事件都没有（流不存在 / 流为空 / 全是老格式事件）
+    //   ok      —— 有已上链事件且逐行校验通过
+    //
+    // `ok` 字段保持向后兼容：它等于 `status !== 'broken'`，
+    // 所以「无链」仍然是「不判假」（ADR-100 §3），但**读 `status` 才分得清
+    // 「验过了」与「没东西可验」**。
+    const status: ChainStatus =
+      failures.length > 0 ? 'broken' : checked === 0 ? 'no-chain' : 'ok';
+
+    return {
+      ok: status !== 'broken',
+      status,
+      checked,
+      unchained,
+      failures,
+      head: lastHash,
+    };
   }
 
   async read(sliceId: string): Promise<EventEnvelope[]> {

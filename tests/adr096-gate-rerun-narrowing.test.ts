@@ -33,6 +33,7 @@ import { runGate } from '../src/core/lifecycle/gate.js';
 import { SliceStore } from '../src/core/slice/store.js';
 import { EventStream } from '../src/core/events/stream.js';
 import type { GateConfig } from '../src/core/gate/types.js';
+import { createCtestFixture, type CtestFixture } from './helpers/ctest-fixture.js';
 
 describe('ADR-096 · isCtestCommand 认得出被 cmd /c 包起来的 ctest', () => {
   it('识破 nimrtc-v14 的真实命令形态', () => {
@@ -220,14 +221,19 @@ describe('ADR-096 · 清单文件实写实读（端到端）', () => {
 //
 // 这里复刻 nimrtc-v14 的真实命令形态：
 //   cmd /c "ctest --test-dir build --output-on-failure -C Debug"
+//
+// **跨平台**：Windows 上是 `cmd /c "..."`，POSIX 上是直接执行 `ctest.sh` ——
+// `cmd` 在 Linux 上不存在，硬套 Windows 形态会让这条用例在 Linux CI 上
+// 永远走不到断言（命令跑不起来 → runner 认不出 ctest → 判 'unknown'）。
+// 详见 tests/helpers/ctest-fixture.ts 的说明。
 describe('ADR-096 · --rerun-failed 端到端收窄', () => {
   const DIR = join(tmpdir(), `zelto-adr096-e2e-${Date.now()}`);
   const SLICES = join(DIR, '.zelto', 'slices');
   const EVENTS = join(DIR, '.zelto', 'events');
-  // ctest 的替身：Windows 上真实的 ctest 是 .exe，用 .cmd 形态最接近。
-  const CTEST = join(DIR, 'ctest.cmd');
   const WORKER = join(DIR, 'worker.cjs');
-  const REAL_CMD = `cmd /c "${CTEST} --test-dir build --output-on-failure -C Debug"`;
+  // ctest 的替身：按平台给出真实的可执行形态与命令形态。
+  let fixture: CtestFixture;
+  let REAL_CMD: string;
 
   before(async () => {
     await mkdir(SLICES, { recursive: true });
@@ -256,7 +262,12 @@ describe('ADR-096 · --rerun-failed 端到端收窄', () => {
       ].join('\n'),
       'utf-8',
     );
-    await writeFile(CTEST, ['@echo off', `node "${WORKER}" %*`, ''].join('\r\n'), 'utf-8');
+    fixture = createCtestFixture(
+      DIR,
+      'worker.cjs',
+      '--test-dir build --output-on-failure -C Debug',
+    );
+    REAL_CMD = fixture.command;
   });
 
   after(async () => {
@@ -309,15 +320,9 @@ describe('ADR-096 · --rerun-failed 端到端收窄', () => {
     const cmds = out.facts?.commands as Array<{ name: string; run: string }>;
     assert.ok(cmds && cmds.length === 1);
     const run2 = cmds[0].run;
-    assert.ok(
-      run2.includes('--tests-from-file'),
-      `命令应被收窄，实际：${run2}`,
-    );
-    // 收窄参数必须在 `cmd /c "..."` 的引号**内**
-    assert.ok(
-      run2.indexOf('--tests-from-file') > run2.indexOf('"'),
-      `收窄参数必须落在 cmd /c 的引号内，实际：${run2}`,
-    );
+    // 收窄参数必须插在**正确的位置** —— 各平台的「正确位置」不同，
+    // 但判据的严格程度相同（见 helpers/ctest-fixture.ts）。
+    fixture.assertNarrowedInPlace(run2);
   });
 
   it('dry-run 之后不留残留清单文件', async () => {

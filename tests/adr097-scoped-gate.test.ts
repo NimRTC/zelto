@@ -38,6 +38,7 @@ import { runGate } from '../src/core/lifecycle/gate.js';
 import { SliceStore } from '../src/core/slice/store.js';
 import { EventStream } from '../src/core/events/stream.js';
 import type { GateConfig } from '../src/core/gate/types.js';
+import { createCtestFixture, type CtestFixture } from './helpers/ctest-fixture.js';
 
 // ─── 规则解析 ───────────────────────────────────────────────────────────────
 
@@ -202,13 +203,17 @@ describe('ADR-097 · 作用域清单文件', () => {
 //
 // 复刻 nimrtc-v14 的真实命令形态：
 //   cmd /c "ctest --test-dir build --output-on-failure -C Debug"
+//
+// **跨平台**：Windows 上是 `cmd /c "..."`，POSIX 上直接执行 `ctest.sh` ——
+// `cmd` 在 Linux 上不存在，硬套 Windows 形态会让这条用例在 Linux CI 上
+// 永远走不到断言。详见 tests/helpers/ctest-fixture.ts。
 describe('ADR-097 · 作用域收窄端到端', () => {
   const DIR = join(tmpdir(), `zelto-adr097-e2e-${Date.now()}`);
   const SLICES = join(DIR, '.zelto', 'slices');
   const EVENTS = join(DIR, '.zelto', 'events');
-  const CTEST = join(DIR, 'ctest.cmd');
   const WORKER = join(DIR, 'worker.cjs');
-  const REAL_CMD = `cmd /c "${CTEST} --test-dir build --output-on-failure -C Debug"`;
+  let fixture: CtestFixture;
+  let REAL_CMD: string;
 
   before(async () => {
     await mkdir(SLICES, { recursive: true });
@@ -246,7 +251,12 @@ describe('ADR-097 · 作用域收窄端到端', () => {
       ].join('\n'),
       'utf-8',
     );
-    await writeFile(CTEST, ['@echo off', `node "${WORKER}" %*`, ''].join('\r\n'), 'utf-8');
+    fixture = createCtestFixture(
+      DIR,
+      'worker.cjs',
+      '--test-dir build --output-on-failure -C Debug',
+    );
+    REAL_CMD = fixture.command;
   });
 
   after(async () => {

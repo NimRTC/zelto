@@ -30,7 +30,15 @@ register('audit', async (args) => {
       return verdict.ok ? 0 : 1;
     }
     console.log(`Audit verify: ${sliceId}`);
-    console.log(`Chain: ${verdict.ok ? 'OK' : 'BROKEN'}`);
+    // **三态**（ADR-105），不是布尔：
+    //   OK       —— 链完整
+    //   BROKEN   —— 断链
+    //   NO CHAIN —— 没有已上链事件可验（不判假，但也不是「验过了」）
+    //
+    // 为什么不能只打 OK/BROKEN：`no-chain` 与 `ok` 的布尔值都是 true，
+    // 合成一个「OK」就等于宣称「证据没被动过」—— 而实际上**什么都没验**。
+    // 外部读者据此判断就会踩空。
+    console.log(`Chain: ${verdict.status === 'ok' ? 'OK' : verdict.status === 'broken' ? 'BROKEN' : 'NO CHAIN'}`);
     console.log(`Checked: ${verdict.checked}  Unchained(老事件): ${verdict.unchained}  Head: ${verdict.head ?? '(none)'}`);
     if (verdict.failures.length > 0) {
       console.log('Failures:');
@@ -39,8 +47,10 @@ register('audit', async (args) => {
       }
       return 1;
     }
-    if (verdict.checked === 0) {
-      console.log('ℹ️  该流没有已上链事件（全是老格式或空流）——无链可验，不判假。');
+    if (verdict.status === 'no-chain') {
+      // 明确说清「没东西可验」，而不是让人以为「验过了」。
+      console.log('ℹ️  该流没有已上链事件（流不存在、为空，或全是上链前的老格式事件）——无链可验，不判假。');
+      console.log('    ⚠️  这**不是**「证据没被动过」的结论：本次没有验到任何链。');
     }
     return 0;
   }

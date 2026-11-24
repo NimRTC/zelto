@@ -137,6 +137,20 @@ describe('ZD-007 拦截措辞', () => {
  * 为什么需要它：要验「运行中预算闸门真的会让等待方停下来」，
  * 就得有一个「正在跑、且不自己结束」的会话。
  * 真实适配器做不到这一点（要么秒退，要么要花钱）。
+ *
+ * **必须持有一个真实的句柄**（`setInterval`）：
+ * `waitForExitWithWatchdog` 里的看门狗定时器是 `unref()` 过的 ——
+ * 它的存在只是为了让「进程能退出」，不是让事件循环活着。
+ * 于是**事件循环的存活完全取决于有没有别的句柄**。
+ *
+ * 真实适配器里那个句柄是 agent 的**子进程**（`child_process.spawn`）；
+ * 假适配器没有子进程，如果不自己造一个句柄，事件循环会在 agent
+ * 「还活着」期间就空掉 —— Node 报
+ * `Promise resolution is still pending but the event loop has already resolved`。
+ *
+ * 这个坑只在 **Linux + Node 22** 上暴露：Windows 上测试文件里其它
+ * 未 await 的定时器恰好撑住了循环，于是本地全绿、CI 全红。
+ * （同样的坑已在 `tests/d74-halt-single-slice-path.test.ts` 踩过并修好。）
  */
 class HangingAdapter implements ExecutorAdapter {
   readonly name = 'hanging-test-adapter';
@@ -146,6 +160,12 @@ class HangingAdapter implements ExecutorAdapter {
   /** 当前累计花费（可被测试改） */
   liveCostUsd = 0;
   private resolvers = new Map<string, (code: number | null) => void>();
+  /**
+   * 代替子进程的「存活句柄」—— 见上面的说明。
+   * agent 退出（stop() 被调用）之后清掉它，多留一个定时器无害
+   * （但留着会让测试进程退不出去，所以这里清）。
+   */
+  private keepAlive = setInterval(() => {}, 1000);
 
   async start(): Promise<{ sessionId: string }> {
     return { sessionId: 'sess-1' };
@@ -178,6 +198,7 @@ class HangingAdapter implements ExecutorAdapter {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    clearInterval(this.keepAlive);
     const r = this.resolvers.get('sess-1');
     if (r) r(null);
   }
