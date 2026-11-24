@@ -1704,33 +1704,85 @@ CI 报的东西跟 main 的真实状态无关。
 
 ### 修复
 
-**未修** —— 需要人决策，因为要动的是**人批准的规格**（ADR-015/018 口径：
-规格变更必须走人）。
+**已修**（2026-11-25，人已批准）—— 见 `docs/adr-107-version-check-pnpm-lockfile.md`
+与 `specs/slices/v1-version-align.md` 的「修订记录」。
+提交：`version/v1` 的 `2e064a7`。
 
-三个选项：
+三个选项的取舍：**取 A 的方向（校验 pnpm 锁文件）+ C 的保留（脚本留着）**，
+**同时恢复**被降级的闸门。
 
-- **A. 改成校验 `pnpm-lock.yaml`** —— 与仓库实际口径一致。
-  但 `pnpm-lock.yaml` 里**没有根包版本字段**（`lockfileVersion: '9.0'`，
-  `importers:` 下只有依赖 specifier），所以「根包版本一致性」这条
-  断言**在 pnpm 锁文件上没有对应物**。这条验收标准得重写。
-- **B. 用真 npm 锁文件** —— `npm install --package-lock-only` 在**纯 npm**
-  环境（不经过 pnpm store）下重新生成。但这就等于在 pnpm 仓库里
-  长期维护两套锁文件，**两套锁文件会漂**。
-- **C. 只保留 `package.json` 的版本 + 一致性校验**，
-  锁文件一致性交给 `pnpm install --frozen-lockfile` 自己保证
-  （CI 已经在用），删掉 `package-lock.json` 与大部分验收标准。
+**B 方案（用真 npm 锁文件）被否决** —— 等于在 pnpm 仓库里长期维护两套锁文件。
+两套锁文件会漂，而「版本一致性校验脚本」的存在意义就是防漂；
+用一个需要防漂的机制去引入新的漂移源，方向是反的。
+（且 npm 锁文件不含 pnpm 的 peer dependency 解析结果，
+`pnpm install --frozen-lockfile` 与 `npm ci` 会装出**不同的依赖树**。）
 
-倾向 **A 或 C**：C 的逻辑最干净（pnpm 的 `--frozen-lockfile` 本来
-就保证锁文件与 `package.json` 一致，不需要另写脚本），
-A 保留「发布前有版本闸」的价值。
+**关键实测（推翻了原先的假设）**：
+「A 方案只要把文件名换成 `pnpm-lock.yaml` 就行」——**不成立**。
+实测 `pnpm install --lockfile-only` 生成一份 `lockfileVersion: '9.0'` 的锁文件：
 
-**无论选哪个，`prepublishOnly` 都必须改回来** ——
-不能从「构建 + 全测」降级成「查版本号」。这是独立于选项的必修项。
+```yaml
+importers:
+  .:
+    dependencies:
+      js-yaml:
+        specifier: ^5.5.0
+        version: 5.5.0
+```
+
+`importers` 段里**只有依赖的 specifier 与解析后的版本，没有根包版本字段**。
+所以「根包版本一致性」这条断言在 pnpm 锁文件上**没有对应物** ——
+必须**重写断言**，而不是换个文件名。
+
+新的判据（比原来那条更强）：`package.json` 的依赖声明 ↔
+`pnpm-lock.yaml` 的 `importers['.']` **逐条一致** ——
+存在性 + `specifier` 逐字相同 + 反向漂移（锁文件里多出来的也要报）。
+而且它比 `pnpm install --frozen-lockfile` **更早**发现漂移：
+后者是安装时才发现（那时已经装了半个依赖树），本脚本是发布前、
+装任何东西之前。
+
+实际改了什么：
+
+1. **删掉假的 `package-lock.json`** —— `pnpm install --frozen-lockfile` 通过
+   （这是对「真锁文件是完整的」的独立验证）。
+2. **加反向断言** —— `package-lock.json` / `npm-shrinkwrap.json` 存在即失败。
+   **只写正向断言，下一个 agent 还能再造一个。**
+3. **`prepublishOnly` 恢复**成
+   `pnpm clean && pnpm build && pnpm test && node scripts/version-check.mjs`。
+   闸门只能加，不能换小。版本校验放**最后** —— 这样失败时其它检查都已经过了，
+   人看到的是「前面都绿了，卡在版本一致性」。
+4. **版本校验脚本改用动态 `import()` 加载 `js-yaml`** ——
+   装不上时输出可读错误（「跑一次 pnpm install 再试」），
+   而不是抛 Node 的 `ERR_MODULE_NOT_FOUND` 堆栈。
+   **它自己就是「发布前把话说清楚」的脚本，不能自己先崩在堆栈里。**
+5. 验收标准从 6 条扩到 **9 条**（含反向断言、闸门完整性、README 一致性）。
 
 ### 回归测试
 
-（待定 —— 取决于选哪个选项。若选 A/C，需要一条断言：
-**`prepublishOnly` 必须仍然构建并跑测试**，防止再次被悄悄换小。）
+已加（`tests/acceptance/v1-version-align/acceptance.test.cjs`，8/8 绿）：
+
+- **反向断言**：`package-lock.json` / `npm-shrinkwrap.json` **不存在**，
+  而 `pnpm-lock.yaml` 必须存在；
+- **闸门完整性**：`prepublishOnly` 逐字等于
+  `pnpm clean && pnpm build && pnpm test && node scripts/version-check.mjs`，
+  并额外断言三步一步不少、`version-check.mjs` 排在 `pnpm test` **之后**；
+- **漂移检测**：版本范围变了 / 多出一条依赖 → 非零退出且报错点明依赖名；
+- **沙箱里出现 npm 锁文件** → 非零退出。
+
+### 连带发现：第三个病灶（修 README 时才暴露）
+
+修 ZD-037 时发现 `version/v1` 上还有**第三个**同源缺陷 ——
+**版本号提到 `0.7.1`，但中英文 README 都还写 `v0.6.0`**，
+`tests/package-availability.test.ts` 因此红（4 条）。
+
+而 `release-status.json` 的 `published: true` + `npmVersion: 0.6.0`
+说的也是**另一个版本**的事 —— `0.7.1` 根本没发到 npm（`npm view zelto versions`
+只有 `0.6.0`）。这是 ADR-085 那个坑的**同一个形状**：
+**声明与现实不一致，而文档是错的那个。**
+
+已一并修：中英文 README 同步到 `v0.7.1` 并改发布措辞、
+`release-status.json` 改 `published: false`、CHANGELOG 补 `0.7.1` 条目。
+`package-availability` 现在 **9/9 绿**（此前 4 红）。
 
 ### 剩余问题
 
@@ -1738,10 +1790,18 @@ A 保留「发布前有版本闸」的价值。
    这是更一般的缺陷：写「校验 X 一致」这类验收标准时，
    很容易只断言字段相等，却没断言**这个东西真的能被用**。
    本例中 `package-lock.json` 的字段全对，但文件是废的。
+   **本次修订的应对是把「文件能用」写成显式的反向断言。**
 2. **没人核对「这个仓库用哪个包管理器」** ——
    规格直接写死了 `package-lock.json`，而仓库是 pnpm 的。
    切片规格生成时**应该能看到** `packageManager` 字段与
    `pnpm-lock.yaml` 的存在 —— 那是判断依据，就在仓库根。
+3. **验收通过 ≠ 产物可用**（这条是本条与 §ZD-036 的共同教训）——
+   §ZD-036 是「测试范围没收窄，跑到了别人的契约」，
+   ZD-037 是「断言只查字段，没查文件能不能用」。
+   两者都指向同一个根源：
+   **验收标准只断言了「看起来对的东西」，没断言「东西真的能用」。**
+   修 ZD-037 时新增的**反向断言**（假锁文件存在即失败）
+   是对这条教训的直接落地。
 
 ---
 
