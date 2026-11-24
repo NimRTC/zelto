@@ -22,10 +22,34 @@ import { resolve } from 'node:path';
 import { HaltStore, findStuckRunningSlices, rollbackHaltedSlices } from '../../core/halt/index.js';
 import type { HaltRollbackResult } from '../../core/halt/index.js';
 import { ReservationStore } from '../../core/sched/index.js';
+import { loadConfig } from '../../core/config/loader.js';
+import { DEFAULT_HALT_TTL_MS } from '../../core/halt/store.js';
 import { events, register, store, ZELTO_DIR, existingWorktreePath } from './shared.js';
 
-function haltStore(): HaltStore {
-  return new HaltStore(ZELTO_DIR);
+/**
+ * 这个 halt store 用哪个默认 TTL。
+ *
+ * 优先级：`--ttl`（本次拉闸）> `config.yaml` 的 `haltTtlSec` > 30 分钟。
+ *
+ * 为什么要有配置项（ZD-023 剩余问题）：TTL 硬编码时，
+ * 有人想「我这一轮暂停要留 2 小时」没有出口 ——
+ * `HaltStore.request()` 支持传 TTL 参数，但 CLI 从来没暴露过。
+ */
+function defaultTtlMs(): number {
+  try {
+    const cfg = loadConfig();
+    if (cfg.haltTtlSec !== undefined) {
+      // `0` = 永不过期（人显式要的）
+      return cfg.haltTtlSec === 0 ? 0 : cfg.haltTtlSec * 1000;
+    }
+  } catch {
+    // 配置读不出来 → 退回默认（不因为配置坏了就拉不了闸）
+  }
+  return DEFAULT_HALT_TTL_MS;
+}
+
+function haltStore(ttlMs?: number): HaltStore {
+  return new HaltStore(ZELTO_DIR, ttlMs ?? defaultTtlMs());
 }
 
 /** 打印现场：哪些切片在跑、预约还在谁手上、worktree 在哪 */
@@ -94,7 +118,7 @@ register('halt', async (args) => {
   // 不拦住的话 `--help` 会被当成一次真的拉闸 —— 拉闸是副作用动作，
   // 不能被一个只是想看说明的参数触发。
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: zelto halt [--scope <scope>] [--reason <text>]');
+    console.log('Usage: zelto halt [--scope <scope>] [--reason <text>] [--ttl <sec>]');
     console.log('       zelto halt --list                       查看当前暂停请求');
     console.log('       zelto halt --clear [--scope <scope>]    解除暂停（不带 scope 时解除全部）');
     console.log('       zelto halt --rollback [--reason <text>] 回退卡在 running 的切片（批次已崩时用）');
@@ -103,6 +127,9 @@ register('halt', async (args) => {
     console.log('');
     console.log('有效期：默认 30 分钟。过期后不再拦住新工作（但仍会停下当时正在跑的活）。');
     console.log('过期不等于解除 —— 请求仍在盘上，要彻底清掉请用 --clear。');
+    console.log('');
+    console.log('--ttl <sec>：本次拉闸的有效期（秒）。0 = 永不过期。');
+    console.log('            不给时用 config.yaml 的 haltTtlSec，都没有则 30 分钟。');
     return 0;
   }
 
@@ -110,7 +137,7 @@ register('halt', async (args) => {
   // 拉闸是状态型副作用（写 .zelto/halts/ + batch.halted 事件）。
   // 未识别的参数（拼写错误、多余的位置参数、缺值的 --scope/--reason）
   // 必须返回非零退出码且不产生任何副作用，而不是按 scope=all 执行。
-  const KNOWN_VALUE_FLAGS = new Set(['--scope', '--reason']);
+  const KNOWN_VALUE_FLAGS = new Set(['--scope', '--reason', '--ttl']);
   const KNOWN_BOOL_FLAGS = new Set(['--list', '--clear', '--rollback', '--json']);
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -118,7 +145,7 @@ register('halt', async (args) => {
       const v = args[i + 1];
       if (v === undefined || v.startsWith('--')) {
         console.error(`halt: ${a} 缺少取值`);
-        console.error('Usage: zelto halt [--scope <scope>] [--reason <text>] [--json]');
+        console.error('Usage: zelto halt [--scope <scope>] [--reason <text>] [--ttl <sec>] [--json]');
         return 1;
       }
       i++;
@@ -258,13 +285,38 @@ register('halt', async (args) => {
   const reasonIdx = args.indexOf('--reason');
   const reason = reasonIdx >= 0 ? args[reasonIdx + 1] : '人工拉闸';
 
-  const req = await halts.request(scope, 'human', reason);
+  // ── --ttl：本次拉闸的有效期（秒）───────────────────────────────────
+  //
+  // ZD-023 剩余问题：TTL 硬编码 30 分钟，CLI 从来没暴露过出口。
+  // 现在有三级来源：`--ttl` > `config.yaml` 的 `haltTtlSec` > 30 分钟。
+  //
+  // 判据：**必须是**一个非负整数秒。
+  // - 负数 → 报错（那不是「更短的 TTL」，是笔误）
+  // - 非数字 → 报错
+  // - `0` → 永不过期（人显式要的）
+  const ttlIdx = args.indexOf('--ttl');
+  let ttlMs: number | undefined;
+  if (ttlIdx >= 0) {
+    const raw = args[ttlIdx + 1];
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 0 || String(parsed) !== raw.trim()) {
+      console.error(`halt: --ttl 需要一个非负整数秒，收到 "${raw}"`);
+      console.error('  0 = 永不过期');
+      return 1;
+    }
+    ttlMs = parsed === 0 ? 0 : parsed * 1000;
+  }
+
+  const req = await halts.request(scope, 'human', reason, ttlMs);
 
   await events.append('batch', 'batch.halted', 'human', {
     scope,
     reason,
     haltId: req.id,
     requestedAt: req.requestedAt,
+    // 把有效期一起记进事件 —— 事后回看时能一眼看出「这次拉闸打算管多久」
+    //（ZD-023 剩余问题 1：事件流里分不清「人真的喊停」与「读到陈旧请求」）。
+    expiresAt: req.expiresAt,
   });
 
   if (isJson) {

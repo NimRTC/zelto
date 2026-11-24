@@ -5,6 +5,7 @@ import type { DesignDoc } from '../../core/design/types.js';
 import { parseDesignModules } from '../../core/design/parse.js';
 import { DESIGN_PROMPT } from '../prompts/design.js';
 import { REFINE_DESIGN_PROMPT } from '../prompts/refine-design.js';
+import { chatWithOverflowFallback } from '../overflow-fallback.js';
 import { isPlaceholderTitle, fallbackTitleFrom } from './placeholder-title.js';
 
 /**
@@ -21,18 +22,36 @@ export async function generateDesign(
   existingId: string,
   projectStructure?: string,
 ): Promise<Pick<DesignDoc, 'title' | 'body' | 'modules'>> {
-  const prompt = DESIGN_PROMPT
-    .replace('{{PROJECT_STRUCTURE}}', projectStructure && projectStructure.trim() ? projectStructure : '（本次没有提供项目扫描结果 —— 若需求没有写明目录结构，模块路径只写「沿用现有模块」而不要虚构。）')
-    .replace('{{REQUIREMENT_SPEC}}', requirementSpec);
+  const injectable = projectStructure && projectStructure.trim() ? projectStructure : '（本次没有提供项目扫描结果 —— 若需求没有写明目录结构，模块路径只写「沿用现有模块」而不要虚构。）';
 
-  const response = await llm.chat({
-    messages: [
-      { role: 'system', content: '你是一个高级软件架构师。请严格按用户要求生成设计文档。' },
-      { role: 'user', content: prompt },
-    ],
-    temperature: 0.7,
-    maxTokens: 4096,
-  });
+  // ZD-002：装不下就缩摘要重试一次。
+  //
+  // 摘要**已经有**字符预算（`MAX_SUMMARY_CHARS`），但那个预算猜不出
+  // 模型端的 token 上限 —— 12k 字符在 DeepSeek 上是安全的（163840 token），
+  // 在上下文更小的模型上就未必。实测踩到的是：摘要 1.1MB（预算加之前）
+  // 直接 400「number of input tokens (373385) has exceeded max_seq_len」。
+  //
+  // 缩的是**注入的仓库摘要**，不是需求正文 —— 缩需求正文就等于丢需求。
+  // 重试仍失败 → 抛原始错误（不静默降级成「空摘要」，
+  // 那会让模型拿残缺上下文编路径，而人看不出来）。
+  const response = await chatWithOverflowFallback(
+    llm,
+    (structure) =>
+      DESIGN_PROMPT
+        .replace('{{PROJECT_STRUCTURE}}', structure)
+        .replace('{{REQUIREMENT_SPEC}}', requirementSpec),
+    injectable,
+    {
+      maxRetries: 1,
+      request: {
+        messages: [
+          { role: 'system', content: '你是一个高级软件架构师。请严格按用户要求生成设计文档。' },
+        ],
+        temperature: 0.7,
+        maxTokens: 4096,
+      },
+    },
+  );
 
   return parseDesignResponse(response.content, existingId);
 }

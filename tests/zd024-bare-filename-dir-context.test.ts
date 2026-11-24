@@ -71,6 +71,19 @@ describe('ZD-024 裸文件名带上行内目录上下文', () => {
     );
   });
 
+  it('D-4 覆盖判据：跨行写法也不再误报（新建文件）', () => {
+    const spec = [
+      '| `src/modules/ice/src/tcp_socket.hpp` | 头 |',
+      '| `tcp_socket.cpp` | 实现 |',
+    ].join('\n');
+    const coverage = evaluateWriteSetCoverage(parseMentionedPaths(spec), WRITES, root);
+    assert.deepEqual(
+      coverage.uncovered,
+      [],
+      `跨行误报未覆盖：${JSON.stringify(coverage.uncovered)}`,
+    );
+  });
+
   it('反向：不同名的裸文件名不借目录（那是另一个文件，规格没说它在哪）', () => {
     const spec = [
       '| `src/modules/ice/src/tcp_socket.hpp` + `other.cpp` | 别的文件 |',
@@ -82,15 +95,37 @@ describe('ZD-024 裸文件名带上行内目录上下文', () => {
     );
   });
 
-  it('反向：跨行的裸文件名不借目录', () => {
+  it('跨行的裸文件名**借紧邻上一行**的目录（ZD-024 剩余问题 1）', () => {
+    // 剩余问题 1：「补齐只认同一行。跨行写法（头文件在上一行、
+    // 实现文件在下一行）仍然不补 —— 那是规格排版的问题，不补是安全的。」
+    //
+    // 修法：允许**紧邻的上一行**提供目录上下文。
+    // 「紧邻」是硬约束 —— 中间隔别的行就不借（见下面的反向用例）。
     const spec = [
       '| `src/modules/ice/src/tcp_socket.hpp` | 头 |',
       '| `tcp_socket.cpp` | 实现 |',
     ].join('\n');
     const mentioned = parseMentionedPaths(spec);
     assert.ok(
+      mentioned.includes('src/modules/ice/src/tcp_socket.cpp'),
+      `跨行（紧邻）应补齐目录：${JSON.stringify(mentioned)}`,
+    );
+    assert.ok(
+      !mentioned.includes('tcp_socket.cpp'),
+      `补齐后的裸名不应再残留：${JSON.stringify(mentioned)}`,
+    );
+  });
+
+  it('反向：中间隔了别的行 → 不借目录（离得远就没有确切证据）', () => {
+    const spec = [
+      '| `src/modules/ice/src/tcp_socket.hpp` | 头 |',
+      '| —— | 别的内容 |',
+      '| `tcp_socket.cpp` | 实现 |',
+    ].join('\n');
+    const mentioned = parseMentionedPaths(spec);
+    assert.ok(
       !mentioned.includes('src/modules/ice/src/tcp_socket.cpp'),
-      `跨行不得借目录：${JSON.stringify(mentioned)}`,
+      `隔行的不得借目录：${JSON.stringify(mentioned)}`,
     );
   });
 

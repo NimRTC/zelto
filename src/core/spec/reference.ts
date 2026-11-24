@@ -184,6 +184,146 @@ function hasLeadingPhrase(textBefore: string, phrases: string[]): boolean {
 }
 
 /**
+ * 「只读作用域」的**边界字符** —— 遇到它，只读标记就不再往后绑定了。
+ *
+ * 为什么是句号而不是逗号（ADR-098 决策一 + 实现要点 1）：
+ *
+ *   「只读 `a.cpp`，`b.cpp`」  → 两个**都**是只读（逗号只是并列连接）
+ *   「只读 `a.cpp`。但要改 `b.cpp`」 → 只有 `a.cpp` 是只读
+ *
+ * 逗号是**并列**的连接符（人写「只读 A、B」就是两个都只读），
+ * 句号才是**句子的**分界（句号后面是新的一句话，新句子里的话不再受
+ * 前面那个「只读」管辖）。
+ *
+ * 分号同理 —— 「只读 `a.cpp`；`b.cpp` 照它的样子写」里 `b.cpp`
+ * 其实是**要照着写**的（是参照物，也是只读），但「只读 `a.cpp`；
+ * 要改 `b.cpp`」里 `b.cpp` 是要改的 —— 分号两侧语义不定，
+ * 所以**不把分号当边界**（宁可漏认，让它走「紧邻」判据）。
+ */
+const SCOPE_BOUNDARY = /[。！？]/;
+
+/**
+ * 「只读作用域」的**反转措辞** —— 遇到它，只读作用域就**结束**。
+ *
+ * 为什么需要它（ZD-034 回归实测）：
+ *
+ *   「只读 `ice.c`，**但要改** `udp_socket.cpp`」
+ *
+ *   这句里 `udp_socket.cpp` 是**要改的** —— 人用「但要改」明确反转了
+ *   「只读」的适用范围。如果没有反转判据，「只读」作用域会一路延伸到
+ *   句末 → `udp_socket.cpp` 被豁免 → **D-4 漏报**
+ *   （真正要改、却没被写集授权的文件被放过，agent 撞写集守卫时才炸）。
+ *
+ *   漏报比误报更糟（AGENTS.md），所以这条必须有。
+ *
+ * 措辞清单分两组：
+ *   - 明确反转：「要改」「要修改」「需要改」「将要改」「改为」「修改为」
+ *   - 引入新话题的连接词：「但」「但是」「然而」「不过」「而」
+ *
+ * 英文：'but', 'however', 'instead', 'to modify', 'must change'。
+ *
+ * **为什么「但 / 而」这类连接词也算反转**：
+ *   「只读 `a.cpp`，**但** `b.cpp` 是要改的」—— 人用「但」起头新分句，
+ *   语义上已经离开了「只读」的管辖范围。保守起见**宁可多认反转**
+ *   （多认 = 漏豁免 = 报出来让人补一句「只读」，代价是几分钟；
+ *   少认 = 漏报 = agent 撞守卫，代价是几小时）。
+ */
+const SCOPE_RESET = /但要改|但需改|但需要改|要修改|需要修改|需要改|要改|将要改|改为|修改为|但|但是|然而|不过|而是|但要|\bbut\b|\bhowever\b|\binstead\b/i;
+
+/**
+ * 一行里的某个位置之前，**同一个列表条目内**有没有只读标记。
+ *
+ * 「同一个列表条目」的含义：从行首（或上一个列表符号）到当前位置之间。
+ * 列表项之间的只读标记**不互相传染** ——
+ * `- 只读 \`a.cpp\`` 这一项的只读，不该影响下一项 `- \`b.cpp\``。
+ *
+ * 为什么要「条目内」而不是「行内」：
+ *   规格的「范围」章节常写成一行多个列表项（表格化写法）：
+ *   `- 只读 \`a.cpp\` —— 说明     - \`b.cpp\` —— 要改的`
+ *   行内判据会把 `b.cpp` 也豁免 → 真正要改的文件被放过 → D-4 漏报。
+ *
+ * @param line 整行
+ * @param index 候选路径在行内的起始位置
+ */
+function hasReadonlyScopeInItem(line: string, index: number): boolean {
+  const before = line.slice(0, index);
+
+  // 只看**当前列表条目**的部分：截到上一个列表符号（`-` / `*` / `数字.`）之前。
+  const itemStart = findItemStart(before);
+  const scoped = before.slice(itemStart);
+
+  // 条目内出现句号 → 只读作用域到此为止
+  if (SCOPE_BOUNDARY.test(scoped)) return false;
+
+  // 条目内出现反转措辞 → 只读作用域到此为止（ZD-034）
+  //
+  // 取**最后**一次反转措辞的位置：只读标记必须在反转措辞**之后**才生效。
+  // 「但要改 `b.cpp`，只读 `a.cpp`」—— 只读标记在反转之后 → 生效。
+  const resetMatch = lastResetIndex(scoped);
+  if (resetMatch >= 0) {
+    const afterReset = scoped.slice(resetMatch);
+    // 反转措辞之后还有只读标记 → 作用域重新开始
+    if (!mentionsReadonlyPhrase(afterReset)) return false;
+  }
+
+  // 条目内有没有只读标记（不限扩展名，语义更强）
+  return mentionsReadonlyPhrase(scoped);
+}
+
+/**
+ * 找最后一个反转措辞的位置（-1 = 没有）。
+ *
+ * 为什么要「最后一个」而不是「第一个」：
+ *   「只读 `a.cpp`，但 `b.cpp` 要改，只读 `c.cpp`」
+ *   —— 作用域在「但」处结束，在第二个「只读」处重新开始。
+ *   取「第一个」会把第二个「只读」也吃掉 → `c.cpp` 被当只读（这倒对）
+ *   但更重要的是取「最后一个」能让「但」之后的普通路径（如 `b.cpp`）不被豁免。
+ */
+function lastResetIndex(text: string): number {
+  let last = -1;
+  const re = new RegExp(SCOPE_RESET.source, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    last = m.index;
+  }
+  return last;
+}
+
+/**
+ * 找出「当前列表条目」的起点。
+ *
+ * 判据：往前找最近的列表符号（`- ` / `* ` / `+ ` / `1. `）。
+ * 找不到就用行首。
+ */
+function findItemStart(textBefore: string): number {
+  const listItem = /(?:^|\s)(?:[-*+]\s+|\d+[.)]\s+)/g;
+  let last = -1;
+  let m: RegExpExecArray | null;
+  while ((m = listItem.exec(textBefore)) !== null) {
+    last = m.index;
+  }
+  return last === -1 ? 0 : last + 1;
+}
+
+/**
+ * 一段文字里有没有只读标记。
+ *
+ * 与 `hasLeadingPhrase` 的区别：那个判「**紧邻**」（标记必须贴着路径），
+ * 这个判「**这一段里出现过**」—— 用于只读作用域的延续判定。
+ *
+ * 标记本身不需要紧贴任何东西，所以只需要**出现过**。
+ */
+function mentionsReadonlyPhrase(text: string): boolean {
+  const lower = text.toLowerCase();
+  for (const phrase of READONLY_PHRASES) {
+    const p = phrase.toLowerCase().trimEnd();
+    if (!p) continue;
+    if (lower.includes(p)) return true;
+  }
+  return false;
+}
+
+/**
  * 找出规格里**只是被引用**（不是被要求修改）的路径。
  *
  * @param content 规格文件全文
@@ -203,10 +343,26 @@ export function parseReferencedPaths(content: string): string[] {
 
     // A. 参考章节里的路径 —— 整段都是「拿来读的」
     if (inReferenceSection) {
-      for (const { candidate } of candidatesWithIndex(line)) {
+      for (const { candidate, index } of candidatesWithIndex(line)) {
         // 参考章节也只豁免**文档**：源码出现在参考章节里，
         // 往往正是「顺便看一眼这个实现」，而不是「只读不改」。
         // 把源码也豁免 = D-4 漏报（该授权的文件被放过）。
+        //
+        // ZD-034：但**条目级「只读」前缀**优先于章节规则 ——
+        // 「- 只读 \`src/x/ice.c\`」在参考章节里也是**明确不许改**的，
+        // 而章节规则只豁免文档 → 源码被漏豁免 → D-4 误报。
+        // 显式的只读标记语义比章节的默认语义强。
+        //
+        // 注意：这里**不**查只读作用域（跨路径延续）——
+        // 参考章节里的源码要豁免，得靠**紧邻**的只读标记
+        // （`- 只读 \`src/x/ice.c\`` —— 路径就是紧挨着标记的那个）。
+        // 作用域延续留给正文通道处理。
+        const before = line.slice(0, index);
+        if (hasLeadingPhrase(before, READONLY_PHRASES)) {
+          const p = asAnyPath(candidate);
+          if (p) referenced.add(p);
+          continue;
+        }
         const p = asDocPath(candidate);
         if (p) referenced.add(p);
       }
@@ -216,6 +372,19 @@ export function parseReferencedPaths(content: string): string[] {
     // B/C. 正文：指路措辞 / 只读标记后面跟着的路径
     for (const { candidate, index } of candidatesWithIndex(line)) {
       const before = line.slice(0, index);
+
+      // 只读作用域内（同一列表条目内、句号之前）→ 整条都只读。
+      //
+      // ZD-034：原先只认「紧邻」的只读标记，于是
+      // 「只读 \`a.cpp\` 与 \`b.cpp\`」只豁免了 `a.cpp` ——
+      // 而人写这句话时，`b.cpp` 同样是**只读参考**。
+      // 漏豁免 = D-4 误报 = 人回去改写集 = 几小时的往返（ADR-098 实测）。
+      if (hasReadonlyScopeInItem(line, index)) {
+        const p = asAnyPath(candidate);
+        if (p) referenced.add(p);
+        continue;
+      }
+
       if (hasLeadingPhrase(before, READONLY_PHRASES)) {
         // 只读标记：不限扩展名
         const p = asAnyPath(candidate);

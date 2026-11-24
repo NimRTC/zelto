@@ -305,18 +305,33 @@ describe('WorktreeManager — submodules (ADR-044)', () => {
     }
   });
 
-  it('skips submodules that are not populated in the main repo (no network fetch)', async () => {
-    const { repo } = makeRepoWithSubmodule();
+  it('populates submodules offline from local objects even when the main repo working tree is gone', async () => {
+    const { repo, subPath } = makeRepoWithSubmodule();
     try {
-      // 删掉主仓里的 submodule 工作树 —— 它不再是「本地已有 objects」
+      // 删掉主仓里的 submodule **工作树** —— 但 objects 还在
+      // （`.git/modules/vendor/lib/objects/` 里）。
+      //
+      // 老判据是「主仓工作树没了 = 本地没有 objects」→ 跳过，
+      // 留下一个**空 vendor 目录**，门禁②的 build 阶段才炸
+      // （报错是「找不到头文件」，跟真正的原因毫无关系 —— ADR-095 §2.3）。
+      //
+      // 实测（2026-11-23）：**objects 一直都在** —— 删掉工作树不动对象库。
+      // 真正会「本地没有 objects」的情形是 objects 也没了
+      // （见下一个用例）。
+      //
+      // 所以这里改成：**本地有 objects 就离线同步**（不触网）。
       rmSync(join(repo, 'vendor', 'lib'), { recursive: true, force: true });
 
       const manager = new WorktreeManager(repo);
-      const info = await manager.create('skip-sub');
+      const info = await manager.create('offline-sub');
       const result = manager.syncSubmodules(info.path);
 
-      assert.deepEqual(result.initialized, []);
-      assert.deepEqual(result.skipped, ['vendor/lib']);
+      assert.deepEqual(result.skipped, [], '本地有 objects 就该同步，不该跳过');
+      assert.deepEqual(result.initialized, [subPath]);
+      assert.ok(
+        existsSync(join(info.path, subPath, 'lib.txt')),
+        '离线同步后 vendor 内容必须在 —— 空 vendor 目录会让 build 阶段炸',
+      );
     } finally {
       rmSync(join(repo, '..'), { recursive: true, force: true });
     }
@@ -370,6 +385,31 @@ describe('WorktreeManager — submodules (ADR-044)', () => {
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a submodule whose local objects are genuinely gone (never touches the network)', async () => {
+    const { repo } = makeRepoWithSubmodule();
+    try {
+      // 这次连**对象库**一起删掉 —— 才是真正的「本地没有 objects」。
+      // （只删工作树的话 objects 还在，见上面那个用例。）
+      rmSync(join(repo, 'vendor', 'lib'), { recursive: true, force: true });
+      rmSync(join(repo, '.git', 'modules', 'vendor', 'lib'), { recursive: true, force: true });
+
+      const manager = new WorktreeManager(repo);
+      const info = await manager.create('no-objects-sub');
+      const result = manager.syncSubmodules(info.path);
+
+      // 本地真的什么都没有 → 跳过，**不联网**（C3）。
+      // 失败原因要留痕（D-73），人才能知道缺什么。
+      assert.deepEqual(result.initialized, []);
+      assert.deepEqual(result.skipped, ['vendor/lib']);
+      assert.ok(
+        manager.submoduleFailures.length > 0,
+        '同步失败必须留痕 —— 否则「vendor 没同步上」完全不显形（D-73）',
+      );
+    } finally {
+      rmSync(join(repo, '..'), { recursive: true, force: true });
     }
   });
 

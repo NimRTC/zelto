@@ -19,7 +19,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { summarizeProjectStructure, renderStructureSection } from '../src/llm/project-context.js';
+import { summarizeProjectStructure, renderStructureSection, extractVendorLibraries } from '../src/llm/project-context.js';
 import type { ProjectMap, ProjectModule } from '../src/core/project/types.js';
 
 function mod(name: string, files: string[], testFiles: string[] = [], submodules: ProjectModule[] = []): ProjectModule {
@@ -108,6 +108,102 @@ describe('项目结构摘要（design 的真实仓库上下文）', () => {
     const m = map([mod('src/a', ['src/a/1.cpp', 'src/a/2.cpp'])]);
     assert.deepEqual(summarizeProjectStructure(m), summarizeProjectStructure(m));
     assert.equal(summarizeProjectStructure(m).modulesMarkdown, summarizeProjectStructure(m).modulesMarkdown);
+  });
+});
+
+// ZD-003：项目结构摘要缺 third_party / vendor 库清单。
+//
+// 病灶（nimrtc v1.4，2026-11-20）：摘要里只有
+// `src/third_party/libjuice/src/Makefile` 这样的**文件路径**，模型得自己推
+// 「libjuice 是个库」—— 它推错了：写 libnice（实际 libjuice）、
+// 写 OpenSSL（实际是 vendored wolfSSL）。
+//
+// 修法：把 vendor 目录下的**子目录名**单独抽成「第三方库清单」，
+// 并在 prompt 里明说「只能用这些名字」。库名是**事实**，不该靠模型猜。
+describe('ZD-003 · 第三方库清单', () => {
+  /**
+   * 复刻 nimrtc 的 vendor 布局。
+   *
+   * 注意：模块名**本身就是**相对仓库根的完整路径
+   * （`src/third_party/libjuice`），不是路径片段 —— 见 `scanProject`
+   * 的 `buildModuleTree`。这里照抄真实形状，否则测的是另一种树。
+   */
+  function nimrtcMap(): ProjectMap {
+    return map([
+      mod('src', [], [], [
+        mod('src/modules', [], [], [
+          mod('src/modules/ice', ['src/modules/ice/src/ice.cpp']),
+        ]),
+        mod('src/third_party', [], [], [
+          mod('src/third_party/libjuice', ['src/third_party/libjuice/src/Makefile']),
+          mod('src/third_party/wolfssl', ['src/third_party/wolfssl/src/Makefile']),
+          mod('src/third_party/opus', ['src/third_party/opus/src/Makefile']),
+        ]),
+      ]),
+    ]);
+  }
+
+  it('认出 vendor 目录下的库名', () => {
+    const libs = extractVendorLibraries(nimrtcMap());
+    assert.ok(libs.includes('libjuice'), `应认出 libjuice，实际 ${JSON.stringify(libs)}`);
+    assert.ok(libs.includes('wolfssl'), '应认出 wolfssl');
+    assert.ok(libs.includes('opus'), '应认出 opus');
+  });
+
+  it('库目录**下面**的子模块是库内部结构，不被当成新库', () => {
+    const m = map([
+      mod('src', [], [], [
+        mod('src/third_party', [], [], [
+          mod('src/third_party/libjuice', [], [], [
+            mod('src/third_party/libjuice/src', ['src/third_party/libjuice/src/a.c']),
+          ]),
+        ]),
+      ]),
+    ]);
+    const libs = extractVendorLibraries(m);
+    assert.deepEqual(libs, ['libjuice'], `不该把 src 认成库，实际 ${JSON.stringify(libs)}`);
+  });
+
+  it('vendor 目录名之后没有下一段 → 认不出库名（不硬凑）', () => {
+    const m = map([mod('src', [], [], [mod('src/third_party', ['src/third_party/x.c'])])]);
+    assert.deepEqual(extractVendorLibraries(m), []);
+  });
+
+  it('普通业务模块不算第三方库', () => {
+    const m = map([
+      mod('src', [], [], [
+        mod('src/modules', [], [], [mod('src/modules/ice', ['src/modules/ice/a.cpp'])]),
+        mod('src/engine', ['src/engine/a.cpp']),
+      ]),
+    ]);
+    assert.deepEqual(extractVendorLibraries(m), []);
+  });
+
+  it('渲染出的 prompt 有独立的「第三方库」一节，且明说只能用这些名字', () => {
+    const text = renderStructureSection(summarizeProjectStructure(nimrtcMap()));
+    assert.match(text, /### 项目已依赖的第三方库/);
+    assert.match(text, /libjuice/);
+    assert.match(text, /wolfssl/);
+    // 明说「只能用这里列出来的名字」—— 少了这句，模型仍会凭印象编
+    assert.match(text, /只能用这里列出来的名字/);
+  });
+
+  it('没有第三方库时**不出现**那一节（不制造噪声）', () => {
+    const text = renderStructureSection(summarizeProjectStructure(map([mod('src/a', ['src/a/1.cpp'])])));
+    assert.doesNotMatch(text, /### 项目已依赖的第三方库/);
+  });
+
+  it('库清单**不占**模块清单的字符预算（它是独立的一节）', () => {
+    const big = mod('src/third_party', Array.from({ length: 14256 }, (_, i) => `src/third_party/x/f${i}.c`), [], [
+      mod('src/third_party/wolfssl', Array.from({ length: 5000 }, (_, i) => `src/third_party/wolfssl/f${i}.c`)),
+    ]);
+    const s = summarizeProjectStructure(map([big]));
+    assert.ok(
+      s.modulesMarkdown.length <= 12000 + 400,
+      `模块清单 ${s.modulesMarkdown.length} 字符，超过预算`,
+    );
+    // 库名照样认得出来（它不在 modulesMarkdown 里）
+    assert.deepEqual(s.vendorLibraries, ['wolfssl']);
   });
 });
 

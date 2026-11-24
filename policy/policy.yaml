@@ -8,6 +8,11 @@ rules:
     action: allow
     basis: "policy.yaml#allow-src-ts"
 
+  - id: allow-ci-workflow
+    match: { path: ".github/**", operation: "write" }
+    action: allow
+    basis: "policy.yaml#allow-ci-workflow"
+
   # Allow writing to test files
   - id: allow-tests
     match: { path: "tests/**/*.ts", operation: "write" }
@@ -33,6 +38,12 @@ rules:
     match: { path: "docs/**", operation: "write" }
     action: allow
     basis: "policy.yaml#allow-docs"
+
+  # Allow contract schema edits (ADR-100: event-envelope hash chain fields)
+  - id: allow-contracts
+    match: { path: "contracts/**", operation: "write" }
+    action: allow
+    basis: "policy.yaml#allow-contracts"
 
   # Allow config edits (with human oversight)
   - id: allow-config

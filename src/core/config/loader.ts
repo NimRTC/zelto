@@ -17,20 +17,51 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { GateAcceptanceConfig } from '../gate/types.js';
+import type { GateAcceptanceConfig, GatePhase } from '../gate/types.js';
+import { parseScopeConfig, type ScopeConfig } from '../gate/scope.js';
 import { stripSurroundingQuotes } from '../policy/yaml.js';
 import { parseBlockScalarHeader, readBlockScalar } from './blocks.js';
 
 /** `.zelto` 目录名 —— 与 CLI 的 ZELTO_DIR 同值。 */
 export const ZELTO_DIR_NAME = '.zelto';
 
+/**
+ * 门禁命令的合法阶段（ZD-009）。
+ *
+ * 白名单 —— 不认识的阶段名**报错**，不静默当默认值。
+ * 写错了阶段名而没人发现，比直接报错难查得多。
+ *
+ * 不含 `'default'`：那是**没写 phase 时的内部落点**，不是人能写的值 ——
+ * 人写 `phase: default` 会被当成「没写」，那不如直接报错让人知道
+ * 这个词没有意义。
+ */
+const GATE_PHASES: readonly string[] = ['configure', 'build', 'test'];
+
+/** 一条门禁命令的形状（config.yaml 里的写法）。 */
+export interface GateCommandConfig {
+  name: string;
+  run: string;
+  timeoutSec?: number;
+  /** 阶段（ZD-009）。没写 = 老行为（按配置顺序）。 */
+  phase?: GatePhase;
+}
+
 
 export interface ZeltoConfig {
   gate: {
-    commands: Array<{ name: string; run: string; timeoutSec?: number }>;
-    profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
+    commands: Array<GateCommandConfig>;
+    profiles?: Record<string, Array<GateCommandConfig>>;
     /** 切片级验收配置（ADR-033）。没配就退回到「跑该片的验收目录」。 */
     acceptance?: GateAcceptanceConfig;
+    /**
+     * 门禁作用域（ADR-097）—— 按切片的**写集**收窄「跑哪些用例」。
+     *
+     * 没配 = 门禁跑全量（老行为，零变化）。
+     *
+     * 配了之后，写集命中规则的切片会**只跑**带对应 CTest 标签的用例。
+     * 规则由**项目侧显式声明** —— 工具不推导目标名（ADR-051 已否决）。
+     */
+    scope?: ScopeConfig;
     timeoutSec: number;
     /** 子模块预检开关（默认 true）；`false` = 不跑 `submodule-check` 这道预检 */
     submoduleCheck?: boolean;
@@ -41,6 +72,34 @@ export interface ZeltoConfig {
     adapter?: string;
     timeout?: number;
     maxRetries?: number;
+    /**
+     * **agent 用的模型**（不是规格起草用的那个）。
+     *
+     * 为什么必须有这一节（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+     *   `claude-agent-sdk` 适配器原先拿 `llm.model` 当 agent 的模型 ——
+     *   而 `llm.model` 是**规格起草**用的模型（nimrtc 那边配的是
+     *   `deepseek-ai/DeepSeek-V3`，走自建网关）。
+     *
+     *   Claude Code 不认识那个模型名 → agent **秒退**（exit 0、无输出、
+     *   零改动）。症状极像「agent 干了活但没改文件」，而真正原因是
+     *   「模型名不认，agent 根本没跑起来」。
+     *
+     *   代价是**整轮**（agent 跑 10 秒 → 门禁报「vendor 缺失」→
+     *   人以为是自己代码的问题）。这种错误必须当场显形。
+     *
+     * 所以：agent 的模型**单独配**，不与 `llm.model` 混用。
+     * 不配 = 用 Claude Code 自己的默认（不传 model）。
+     */
+    model?: string;
+    /**
+     * Claude Code 用 `--output-format stream-json` 跑（ZD-007 阶段2，默认 false）。
+     *
+     * 为什么默认关：`json` 模式是一次性输出（既有行为），切成 `stream-json`
+     * 会改变 stdout 的形态（NDJSON 逐行），影响 `getOutput` 的读取方式。
+     * 开了之后 agent **运行中**就能报出累计用量，运行中预算拦截才对
+     * shell 适配器生效 —— 但前提是配了 `llm.pricing`（否则报不出金额，仍然拦不了）。
+     */
+    streamJson?: boolean;
     /**
      * 透传给 agent 子进程的额外环境变量（ADR-090）。
      *
@@ -114,6 +173,40 @@ export interface ZeltoConfig {
       commands: Array<{ run: string; timeoutSec?: number }>;
     };
   };
+  /**
+   * 「拉闸」请求的**默认有效期**（秒）。
+   *
+   * 为什么要有（ZD-023 剩余问题）：TTL 原本硬编码 30 分钟，
+   * 有人想「我这一轮暂停要留 2 小时」时没有出口 ——
+   * `HaltStore.request()` 支持传 TTL，但 CLI 没暴露。
+   *
+   * 语义：
+   * - 未配置 / 配不出数 → 用 `DEFAULT_HALT_TTL_MS`（30 分钟）；
+   * - `0` → **永不过期**（人显式要的）；
+   * - 其它正数 → 这个秒数就是默认 TTL。
+   *
+   * 注意：过期只影响「拦不拦新工作」，**不影响「停不停在跑的活」**
+   * （见 `core/halt/store.ts` 的 `HaltRequest.expiresAt`）。
+   */
+  haltTtlSec?: number;
+  /**
+   * 预算上限（美元）—— **运行中预算闸门**的上限（ZD-007）。
+   *
+   * 语义（与 `core/budget/collector.ts` 的 `getLimit` 完全一致）：
+   * - 未配置 / 配不出数 → 默认 `1.0`；
+   * - `0` → **不限**（`Infinity`）—— 没有上限就没有闸门；
+   * - 其它正数 → 这个数就是上限。
+   *
+   * 为什么要有这个字段：原先上限只有 `BudgetCollector` 从 config.yaml
+   * **直接读文件**得到，CLI 侧（`createExecutorAdapter`）拿不到 ——
+   * 于是「事前约束」（SDK 的 `maxBudgetUsd`）接不上，
+   * 运行中拦截（ZD-007）也没有上限可用。
+   *
+   * **同一口径两处读**（这里 + collector）是硬要求：
+   * 两份实现漂移的后果是「起跑前那道闸门按 $1 判、运行中那道按 $100 判」，
+   * 人会看到一个自相矛盾的账。
+   */
+  budgetLimitUsd?: number;
   /** External project configuration for cross-repo workflows.
    *  When set, `zelto gate` and `zelto slice create` operate in the
    *  target project directory instead of the current working directory. */
@@ -123,8 +216,8 @@ export interface ZeltoConfig {
     /** Optional gate overrides for the target project. Falls back to
      *  the root gate.commands when not specified. */
     gate?: {
-      commands: Array<{ name: string; run: string; timeoutSec?: number }>;
-      profiles?: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>>;
+      commands: Array<GateCommandConfig>;
+      profiles?: Record<string, Array<GateCommandConfig>>;
     };
     /** Spec directory relative to target project root. Default = "specs/slices". */
     specDir?: string;
@@ -245,6 +338,10 @@ export function loadConfigAt(repoRoot: string): ZeltoConfig {
         ...(parsed.web ? { web: parsed.web } : {}),
         // 生成物清单（ADR-095 §3.2）—— 不配就没有这一节（= 不做准备）。
         ...(parsed.worktree ? { worktree: parsed.worktree } : {}),
+        // 拉闸默认 TTL（秒）—— 不配就没有这个字段（= 用默认 30 分钟）。
+        ...(parsed.haltTtlSec !== undefined ? { haltTtlSec: parsed.haltTtlSec } : {}),
+        // 预算上限（美元）—— 不配就没有这个字段（= 用默认 1.0）。
+        ...(parsed.budgetLimitUsd !== undefined ? { budgetLimitUsd: parsed.budgetLimitUsd } : {}),
         llm: parsed.llm,
         targetProject: parsed.targetProject,
       };
@@ -314,14 +411,16 @@ function validateConfig(config: ZeltoConfig): void {
  * policy parsing share one definition of "surrounding quotes".
  */
 export function parseConfigYaml(content: string): ZeltoConfig | null {
-  const commands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
-  const profiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
+  const commands: Array<GateCommandConfig> = [];
+  const profiles: Record<string, Array<GateCommandConfig>> = {};
   let timeoutSec = 120;
   let retryMax = 2;
   let agentCommand = 'npx claude-code';
   let agentAdapter = '';
   let agentTimeout: number | undefined;
   let agentMaxRetries: number | undefined;
+  let agentStreamJson = false;
+  let agentModel: string | undefined;
   // agent 段的嵌套节（ADR-090）—— 需要跟缩进，否则会把 agent 顶层的
   // timeout: / maxRetries: 误吞成 env 的键
   let inAgentEnvSection = false;
@@ -331,7 +430,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentCursorIndent = 0;
   let agentCursorEndpoint: string | undefined;
   let agentCursorApiKeyEnv: string | undefined;
-  let currentCommand: { name: string; run: string; timeoutSec?: number } | null = null;
+  let currentCommand: GateCommandConfig | null = null;
   /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
   let currentCommandIndent = 0;
   let inGateSection = false;
@@ -348,6 +447,11 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let acceptanceRequired = true;
   let acceptanceTimeoutSec: number | undefined;
   let acceptanceBuildDir: string | undefined;
+  // scope: 段（ADR-097）—— 门禁作用域规则
+  let inScopeSection = false;
+  let scopeIndent = 0;
+  let scopeBlockLines: string[] = [];
+  let gateScope: ScopeConfig | undefined;
   /** 子模块预检开关（缺省 = 不写字段 = 预检开启） */
   let submoduleCheck: boolean | undefined;
   let llmProvider = '';
@@ -360,6 +464,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let inWebSection = false;
   let webMaxConcurrentRuns: number | undefined;
   let webLaunchTimeoutMs: number | undefined;
+  /** 拉闸默认 TTL（秒）。`0` = 永不过期；undefined = 用默认 30 分钟。 */
+  let haltTtlSec: number | undefined;
+  /** 预算上限（美元）。`0` = 不限；undefined = 用默认 1.0。 */
+  let budgetLimitUsd: number | undefined;
   // worktree: 段（ADR-095 §3.2）—— 生成物清单
   let inWorktreeSection = false;
   let inWorktreePrepareSection = false;
@@ -372,15 +480,33 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let targetProjectPath = '';
   let targetProjectSpecDir = '';
   let targetProjectDepth = 0;
-  const targetProjectCommands: Array<{ name: string; run: string; timeoutSec?: number }> = [];
-  const targetProjectProfiles: Record<string, Array<{ name: string; run: string; timeoutSec?: number }>> = {};
-  let currentTpCommand: { name: string; run: string; timeoutSec?: number } | null = null;
+  const targetProjectCommands: Array<GateCommandConfig> = [];
+  const targetProjectProfiles: Record<string, Array<GateCommandConfig>> = {};
+  let currentTpCommand: GateCommandConfig | null = null;
   /** 缩进层级：区分命令自身的 timeoutSec 与上层配置 */
   let currentTpCommandIndent = 0;
   let inTpProfileSection = false;
   let currentTpProfile: string | null = null;
 
   const lines = content.split('\n');
+
+  /**
+   * 把正在攒的 command 落袋（进 profile 或进 commands）。
+   *
+   * 抽成函数是因为「收尾」这件事在解析器里有**五处**要做
+   * （遇到新段头时、遇到新命令项时、循环结束时…）—— 抄五遍迟早漏一处，
+   * 而漏掉的后果是**一条门禁命令静默消失**（门禁少跑一条，却报「通过」）。
+   */
+  const flushPendingCommand = (): void => {
+    if (!currentCommand) return;
+    if (currentProfile) {
+      (profiles[currentProfile] ??= []).push(currentCommand);
+    } else {
+      commands.push(currentCommand);
+    }
+    currentCommand = null;
+  };
+
   // 索引式循环：块标量（run: > / command: |）要一次吃掉若干行，
   // 需要能把游标推进到块之后的下一行（见 config-blocks.ts）。
   for (let i = 0; i < lines.length; i++) {
@@ -482,6 +608,39 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         acceptanceTimeoutSec = undefined;
         acceptanceBuildDir = undefined;
         continue;
+      }
+
+      // scope: 门禁作用域段（ADR-097）。
+      //
+      // 它是 gate 的兄弟节点，不是 command —— 与 acceptance 一样要另开
+      // 一个状态机（不能借用 currentCommand 那套）。
+      //
+      // 位置要紧：必须在「profile 名匹配」之前判。否则 `scope:` 之后的
+      // 规则项会被当成 profile 名 / command 吃掉，作用域规则静默丢失
+      // —— 门禁于是「配了却按全量跑」（而且没人知道）。
+      if (trimmed === 'scope:') {
+        flushPendingCommand();
+        inScopeSection = true;
+        scopeIndent = indent;
+        scopeBlockLines = [];
+        continue;
+      }
+
+      if (inScopeSection) {
+        // 只认比 `scope:` 更深缩进的行 —— 缩进回到 `scope:` 那一层
+        // 或更浅，就是 scope 段结束（回到 gate 的其它键）。
+        if (indent > scopeIndent) {
+          // 用外层的 `line`（原始行，保留缩进）——
+          // 里面的 `raw` 是 acceptance 段自己的局部变量。
+          scopeBlockLines.push(line);
+          continue;
+        }
+        // scope 段结束 —— 结算并回到 gate 段。
+        inScopeSection = false;
+        const scopeCfg = parseScopeConfig(scopeBlockLines.join('\n'));
+        if (scopeCfg) gateScope = scopeCfg;
+        scopeBlockLines = [];
+        // 落到这里说明这一行是 gate 的其它键 —— 继续往下走（不 continue）。
       }
 
       // Detect profile name (indented under profiles:, e.g. "  docs:")
@@ -590,6 +749,27 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
+      // phase：门禁命令的阶段（ZD-009）—— configure / build / test。
+      //
+      // 缩进比命令项更深 → 该命令专属。没写 = `default`（老行为）。
+      //
+      // 认不出的值**不猜**（不静默当 default）—— 写错了阶段名会让人以为
+      // 「配了但没生效」，那比直接报错更难查。判据是白名单。
+      if (trimmed.startsWith('phase:')) {
+        const raw = trimmed.slice(6).trim().toLowerCase();
+        const isPerCommand = currentCommand !== null && indent > currentCommandIndent;
+        if (isPerCommand && currentCommand) {
+          if (!GATE_PHASES.includes(raw)) {
+            throw new Error(
+              `gate 命令 "${currentCommand.name}" 的 phase: "${raw}" 不认识。` +
+              `可用值：${GATE_PHASES.join(' / ')}`,
+            );
+          }
+          currentCommand.phase = raw as GatePhase;
+        }
+        continue;
+      }
+
       // submoduleCheck：子模块预检开关（默认 true）。`false` 显式关掉。
       if (trimmed.startsWith('submoduleCheck:')) {
         submoduleCheck = trimmed.slice(15).trim().toLowerCase() !== 'false';
@@ -682,6 +862,22 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         continue;
       }
 
+      // agent 段的 `model:` —— agent 执行用的模型，**与 `llm.model`（规格起草）
+      // 是两回事**。混用会让 Claude Code 认不出模型名而秒退（ADR-101 附注）。
+      if (trimmed.startsWith('model:')) {
+        agentModel = stripSurroundingQuotes(trimmed.slice(6).trim());
+        continue;
+      }
+
+      // ZD-007 阶段2：Claude Code 用 `--output-format stream-json` 跑。
+      // 默认关（保持 `json` 一次性输出的既有行为）；开了之后 agent 运行中
+      // 就能报出累计用量，运行中预算拦截才对 shell 适配器生效。
+      if (trimmed.startsWith('streamJson:')) {
+        const raw = stripSurroundingQuotes(trimmed.slice(11).trim()).toLowerCase();
+        agentStreamJson = raw === 'true' || raw === 'yes' || raw === '1';
+        continue;
+      }
+
       // 认不出的 agent 子键：结束嵌套节，交回其它段处理。
       inAgentEnvSection = false;
       inAgentCursorSection = false;
@@ -699,6 +895,36 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       const raw = Number.parseInt(trimmed.slice(16).trim(), 10);
       // 小于 1000 视为无效 —— 太短的开跑预算必然误报超时。
       webLaunchTimeoutMs = Number.isFinite(raw) && raw >= 1000 ? raw : undefined;
+      continue;
+    }
+
+    // ── haltTtlSec：拉闸请求的默认有效期（秒）────────────────────────
+    //
+    // ZD-023 剩余问题：TTL 硬编码 30 分钟，没有配置项。
+    // 有人想「这一轮暂停留 2 小时」时没有出口。
+    //
+    // 顶层标量键 —— 不在任何段里，所以要放在段的判断**之前**判，
+    // 否则它会被某个段的兜底分支吃掉。
+    if (trimmed.startsWith('haltTtlSec:')) {
+      const raw = Number.parseInt(trimmed.slice(11).trim(), 10);
+      // 负数无效（那不是「更短的 TTL」，是笔误）；0 = 永不过期（合法）。
+      haltTtlSec = Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+      continue;
+    }
+
+    // ── budgetLimitUsd：预算上限（美元）──────────────────────────────
+    //
+    // ZD-007：运行中预算闸门需要上限。
+    //
+    // 顶层标量键 —— 与 haltTtlSec 同理，要放在段的判断之前。
+    //
+    // 语义与 `core/budget/collector.ts` 的 `getLimit` **必须一致**：
+    // - `0` → 不限（Infinity）
+    // - 正数 → 这个数就是上限
+    // - 负数 / 解析不出数 → 无效（当作没配）
+    if (trimmed.startsWith('budgetLimitUsd:')) {
+      const raw = Number.parseFloat(trimmed.slice(15).trim());
+      budgetLimitUsd = Number.isFinite(raw) && raw >= 0 ? raw : undefined;
       continue;
     }
 
@@ -889,6 +1115,21 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
           }
           continue;
         }
+
+        // phase：门禁命令的阶段（ZD-009）—— 与主 gate 段同一口径。
+        if (trimmed.startsWith('phase:')) {
+          const raw = trimmed.slice(6).trim().toLowerCase();
+          if (currentTpCommand && indent > currentTpCommandIndent) {
+            if (!GATE_PHASES.includes(raw)) {
+              throw new Error(
+                `targetProject.gate 的命令 "${currentTpCommand.name}" 的 phase: "${raw}" 不认识。` +
+                `可用值：${GATE_PHASES.join(' / ')}`,
+              );
+            }
+            currentTpCommand.phase = raw as GatePhase;
+          }
+          continue;
+        }
       }
     }
   }
@@ -899,6 +1140,15 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
     } else {
       commands.push(currentCommand);
     }
+  }
+
+  // scope: 段如果到文件末尾还没结算，在这里补一次 ——
+  // 漏结算的后果是「配了作用域却按全量跑」（配置静默失效）。
+  if (inScopeSection) {
+    inScopeSection = false;
+    const scopeCfg = parseScopeConfig(scopeBlockLines.join('\n'));
+    if (scopeCfg) gateScope = scopeCfg;
+    scopeBlockLines = [];
   }
 
   // Flush pending targetProject command
@@ -942,11 +1192,18 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         commands,
         ...(Object.keys(profiles).length > 0 ? { profiles } : {}),
         ...(acceptance ? { acceptance } : {}),
+        ...(gateScope ? { scope: gateScope } : {}),
         timeoutSec,
         ...(submoduleCheck !== undefined ? { submoduleCheck } : {}),
         retry: { max: retryMax },
       }
-    : { commands: [], ...(acceptance ? { acceptance } : {}), timeoutSec: 120, retry: { max: 2 } };
+    : {
+        commands: [],
+        ...(acceptance ? { acceptance } : {}),
+        ...(gateScope ? { scope: gateScope } : {}),
+        timeoutSec: 120,
+        retry: { max: 2 },
+      };
 
   const targetProject = targetProjectPath
     ? {
@@ -980,7 +1237,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       ? { prepare: { commands: worktreePrepareCommands } }
       : undefined;
 
-  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web || worktree
+  return commands.length > 0 || Object.keys(profiles).length > 0 || acceptance || llm || targetProject || web || worktree || haltTtlSec !== undefined || budgetLimitUsd !== undefined
     ? {
         gate,
         agent: {
@@ -988,6 +1245,8 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
           ...(agentAdapter ? { adapter: agentAdapter } : {}),
           ...(agentTimeout ? { timeout: agentTimeout } : {}),
           ...(agentMaxRetries !== undefined ? { maxRetries: agentMaxRetries } : {}),
+          ...(agentStreamJson ? { streamJson: true } : {}),
+          ...(agentModel ? { model: agentModel } : {}),
           ...(Object.keys(agentEnv).length > 0 ? { env: { ...agentEnv } } : {}),
           ...(agentCursorEndpoint || agentCursorApiKeyEnv
             ? {
@@ -1000,6 +1259,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         },
         ...(web ? { web } : {}),
         ...(worktree ? { worktree } : {}),
+        // 拉闸默认 TTL（秒）。`0` = 永不过期。
+        ...(haltTtlSec !== undefined ? { haltTtlSec } : {}),
+        // 预算上限（美元）。`0` = 不限。
+        ...(budgetLimitUsd !== undefined ? { budgetLimitUsd } : {}),
         llm,
         ...(targetProject ? { targetProject } : {}),
       }

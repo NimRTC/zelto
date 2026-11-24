@@ -33,7 +33,8 @@ import {
   harnessForAdapter,
   resolveAgentCommand,
 } from './shared.js';
-import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, markSliceStalled, revertRunAbortedBeforeStart } from './run-support.js';
+import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, gateScopeForSlice, markSliceStalled, revertRunAbortedBeforeStart, createRuntimeBudgetGuard, readBudgetLimit } from './run-support.js';
+import { RuntimeBudgetGuard } from '../../core/budget/index.js';
 import {
   type RuntimeGuard,
   enforceWriteSet,
@@ -202,6 +203,12 @@ export interface ExitOrHalt {
   exitCode: number | null;
   halted: boolean;
   reason?: string;
+  /** ZD-007：预算闸门在运行中拦下 */
+  budgetExceeded?: boolean;
+  /** 拦截时的已花费（美元） */
+  spentUsd?: number;
+  /** 拦截时的上限（美元） */
+  limitUsd?: number;
 }
 
 /**
@@ -242,16 +249,28 @@ export async function waitForExitOrHalt(
     stop(id: string): Promise<void>;
     /** D-66：报告「这一轮有进展」—— 可选能力，没实现不受影响 */
     markProgress?(id: string): void;
+    /** ZD-007：运行中累计用量 —— 可选能力，没有就拦不了 */
+    getLiveUsage?(id: string): { costUsd: number } | null;
   },
   sessionId: string,
   haltStore: HaltStore,
   scope: string,
   /** D-66：进展探针（读切片事件流大小） */
   progressProbe?: SliceProgressProbe,
+  /**
+   * ZD-007：运行中预算闸门。
+   *
+   * 不传 → 不拦（并行路径的旧行为）。
+   * 传了就每轮询查一次，超了当场叫停 agent。
+   */
+  budgetGuard?: RuntimeBudgetGuard,
 ): Promise<ExitOrHalt> {
   let finished = false;
   let halted = false;
   let reason: string | undefined;
+  let budgetExceeded = false;
+  let spentUsd: number | undefined;
+  let limitUsd: number | undefined;
 
   // 轮询器：看到暂停请求就停掉 agent；agent 先退出就自己收摊
   const watcher = (async () => {
@@ -266,6 +285,25 @@ export async function waitForExitOrHalt(
         try {
           if (progressProbe.poll()) adapter.markProgress?.(sessionId);
         } catch { /* 探针失败不影响拉闸判定 */ }
+      }
+
+      // ── ZD-007：运行中预算闸门 ─────────────────────────────────────
+      //
+      // 与单片路径同一口径：测不到 → 不判定超支（继续跑）；
+      // 超了 → 叫停 agent，且**与拉闸分开记**（原因不同，处置不同）。
+      if (budgetGuard?.enabled) {
+        const verdict = budgetGuard.check();
+        if (verdict.status === 'exceeded') {
+          budgetExceeded = true;
+          spentUsd = verdict.spentUsd;
+          limitUsd = verdict.limitUsd;
+          try {
+            await adapter.stop(sessionId);
+          } catch {
+            // agent 已经退出了 —— 停不到也没关系
+          }
+          return;
+        }
       }
 
       const req = await haltStore.isHalted(scope);
@@ -285,7 +323,7 @@ export async function waitForExitOrHalt(
   finished = true;
   await watcher;
 
-  return { exitCode, halted, reason };
+  return { exitCode, halted, reason, budgetExceeded, spentUsd, limitUsd };
 }
 
 // ─── 内部状态 ────────────────────────────────────────────────────────────────
@@ -370,6 +408,28 @@ export async function executeSlicesParallel(
 
   /** 被拉闸打断、没能跑起来的切片 */
   const haltedIds = new Set<string>();
+
+  /**
+   * 被**预算闸门**拦下的切片（ZD-007）。
+   *
+   * 与 `haltedIds` **分开记** —— 两者处置相似（都交回人）但**原因不同**：
+   * - `haltedIds` = 人喊停 → 走 `rollbackHaltedSlice`（人工介入）；
+   * - `budgetExhaustedIds` = 闸门拦下 → 走预算停机路径（`stall.classified`
+   *   记 `budget_exhausted`）。
+   *
+   * 混在一起的后果：人看到「halted」会以为是自己喊停的，
+   * 于是去 `zelto halt --clear` 找原因 —— 而真相是「钱烧完了」。
+   */
+  const budgetExhaustedIds = new Set<string>();
+
+  /**
+   * 被预算闸门拦下的切片的花费明细（ZD-007）。
+   *
+   * 为什么要单独存：`SliceState` 里没有这两个字段，
+   * 而事后打印时需要它们（「花了多少 / 上限多少」）——
+   * 现场被交回给人时，人第一件事就是想看这个数。
+   */
+  const budgetSpent = new Map<string, { spentUsd: number; limitUsd: number }>();
 
   /** 拉闸原因（人写的）—— 写进事件与 stall 记录，给人自己看 */
   let haltReason: string | undefined;
@@ -479,6 +539,7 @@ export async function executeSlicesParallel(
       gateCommandsForSlice(slice),
       await scheduler.readFeedbackFor(st.id),
       await scheduler.readHumanFeedbackFor(st.id),
+      gateScopeForSlice(slice) ?? undefined,
     );
     const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
     writeFileSync(bundlePath, JSON.stringify(bundle, null, 2), 'utf-8');
@@ -645,6 +706,12 @@ export async function executeSlicesParallel(
   const config = loadConfig();
   const maxRetries = config.agent.maxRetries ?? 2;
 
+  // ZD-007：预算上限（美元）。`0` = 不限 → 没有闸门。
+  //
+  // 与单片路径**同一口径**（同一个 `BudgetCollector.getLimit`）——
+  // 两处漂移的后果是「单片按 $1 拦、并行按 $100 拦」。
+  const budgetLimitUsd = await readBudgetLimit();
+
   const results = await Promise.allSettled(
     states.map(async (st, i) => {
       if (haltedIds.has(st.id)) {
@@ -655,12 +722,23 @@ export async function executeSlicesParallel(
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         // 安全点 ②：等 agent 的时候也在听拉闸
         // 喊停 → 停掉这个 agent → 现场保留（worktree / 预约都还在）
+        //
+        // ZD-007：同一处也在听**预算闸门** —— 并行路径同样会烧钱，
+        // 而且并行时烧得更快（一批 agent 同时跑）。
+        const budgetGuard = budgetLimitUsd !== null
+          ? createRuntimeBudgetGuard({
+              adapter: adapters[i],
+              sessionId: st.sessionId,
+              limitUsd: budgetLimitUsd,
+            })
+          : null;
         const exitCode = await waitForExitOrHalt(
           adapters[i],
           st.sessionId,
           haltStore,
           haltScope,
           progressProbes.get(st.id),
+          budgetGuard ?? undefined,
         );
         st.exitCode = exitCode.exitCode;
         st.elapsedSec = Math.floor((Date.now() - startTime) / 1000);
@@ -674,6 +752,33 @@ export async function executeSlicesParallel(
           phase: 'parallel',
           attempt: attempt + 1,
         });
+
+        if (exitCode.budgetExceeded) {
+          // 与「拉闸」**分开**处理（ZD-007）：
+          // 不是人喊停，是闸门拦下的 —— 记成 failed 会让人以为「跑砸了」，
+          // 于是重跑 → 再烧一遍钱。
+          st.status = 'failed';
+          budgetExhaustedIds.add(st.id);
+          budgetSpent.set(st.id, {
+            spentUsd: exitCode.spentUsd ?? 0,
+            limitUsd: exitCode.limitUsd ?? 0,
+          });
+          await events.append(st.id, 'run.aborted', 'zelto', {
+            sliceId: st.id,
+            exitCode: null,
+            reason: 'budget_exhausted',
+            budgetExceeded: true,
+            spentUsd: exitCode.spentUsd,
+            limitUsd: exitCode.limitUsd,
+          });
+          await events.append(st.id, 'stall.classified', 'zelto', {
+            sliceId: st.id,
+            class: 'budget_exhausted',
+            spent: exitCode.spentUsd,
+            limit: exitCode.limitUsd,
+          });
+          return { ...st, exitCode: null, status: 'halted' as const };
+        }
 
         if (exitCode.halted) {
           st.status = 'failed';
@@ -787,6 +892,49 @@ export async function executeSlicesParallel(
     }
 
     const st = result.value;
+
+    // ── 被**预算闸门**拦下的切片（ZD-007）─────────────────────────────
+    //
+    // 与「被拉闸打断」**分开处置** —— 两者原因不同：
+    // - 拉闸 = 人喊停 → `stall.class = human_halt`；
+    // - 预算 = 闸门拦下 → `stall.class = budget_exhausted`。
+    //
+    // 混为一谈的后果：人看到「halted」会去 `zelto halt --clear` 找原因，
+    // 而真相是「钱烧完了」—— 找错了地方，还以为闸门坏了。
+    //
+    // 共同点：**现场保留**（worktree / 预约都不动）——
+    // 产物可能已经写好了，人要先看现场再决定是放行还是重来。
+    if (budgetExhaustedIds.has(st.id)) {
+      // 回退：running → frozen。准入只认 frozen/completed，
+      // 不退回去切片会永远卡在 running（ADR-020 §3.2 同理）。
+      let reverted = false;
+      try {
+        await store.transit(st.id, 'RUN_FINISH');
+        reverted = true;
+      } catch {
+        // 状态被别处改过 —— 事件照样留
+      }
+
+      outcomes.push({
+        id: st.id,
+        status: 'failed',
+        exitCode: null,
+        elapsedSec: st.elapsedSec,
+        gatePassed: null,
+        signRequested: false,
+      });
+      const spent = budgetSpent.get(st.id);
+      console.log(
+        `⛔  ${st.id}: 预算闸门拦下（$${spent?.spentUsd.toFixed(4) ?? '?'} / ` +
+          `上限 $${spent?.limitUsd.toFixed(4) ?? '?'}）—— 现场保留，等人处理`,
+      );
+      console.log('   注意：这不是「agent 跑砸了」，是「闸门在运行中拦下的」。产物可能已经写好了 —— 先看现场，别直接重跑。');
+      if (reverted) {
+        console.log(`   状态: → frozen（stall: budget_exhausted）`);
+        console.log(`   继续: 调高 budgetLimitUsd 后 zelto resume ${st.id} → zelto run ${st.id}`);
+      }
+      continue;
+    }
 
     // 被拉闸打断的切片：不进门禁、不发签名请求 —— 现场交回给人
     if (st.status === 'halted' || haltedIds.has(st.id)) {
@@ -921,9 +1069,13 @@ export async function executeSlicesParallel(
 
   // 被拉闸的切片保留预约与钩子 —— 现场交回给人（ADR-020 §3.5）。
   // 释放预约会让仍在跑（或没死透）的 agent 失去写集约束（C9）。
+  //
+  // ZD-007：被**预算闸门**拦下的切片**同样保留** ——
+  // agent 是被 stop() 叫停的，可能没死透（进程还在收尾），
+  // 释放了预约它就失去写集约束了。
   const keptGuards: string[] = [];
   for (const [id, guard] of guards) {
-    if (haltedIds.has(id)) {
+    if (haltedIds.has(id) || budgetExhaustedIds.has(id)) {
       keptGuards.push(id);
       continue;
     }

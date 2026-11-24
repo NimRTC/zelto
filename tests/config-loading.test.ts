@@ -81,6 +81,64 @@ gate:
     assert.ok(stdout.includes('echo-test'), `Should use custom command: ${stdout}`);
   });
 
+  it('reads gate.scope from config.yaml (ADR-097)', async () => {
+    // 静默失效防线：配了 gate.scope 却没被解析器吃进去 →
+    // 门禁「配了却按全量跑」，而且没人知道。
+    // 所以这里断言解析结果**确实带上了 scope**。
+    await mkdir(join(TEST_DIR, '.zelto'), { recursive: true });
+    await writeFile(join(TEST_DIR, '.zelto', 'config.yaml'), `
+gate:
+  commands:
+    - name: echo-test
+      run: echo hello
+  timeoutSec: 30
+  retry:
+    max: 1
+  scope:
+    rules:
+      - match: "src/modules/ice/**"
+        labels: ["ice"]
+      - match: "src/modules/sdp/**"
+        labels: ["sdp"]
+    fallback: full
+`, 'utf-8');
+
+    const { loadConfigAt } = await import('../src/core/config/loader.js');
+    const cfg = loadConfigAt(TEST_DIR);
+    assert.ok(cfg.gate.scope, 'gate.scope 必须被解析出来');
+    assert.equal(cfg.gate.scope.rules.length, 2);
+    assert.deepEqual(cfg.gate.scope.rules[0], { match: 'src/modules/ice/**', labels: ['ice'] });
+    assert.deepEqual(cfg.gate.scope.rules[1], { match: 'src/modules/sdp/**', labels: ['sdp'] });
+    assert.equal(cfg.gate.scope.fallback, 'full');
+  });
+
+  it('scope: 段在 gate 段里不吞掉 gate 的其它键 (ADR-097)', async () => {
+    // scope: 是 gate 的兄弟节点，不是 command。
+    // 位置错了的话，acceptance: / timeoutSec 会被 scope 段吃掉
+    // —— 配置静默失效。
+    await writeFile(join(TEST_DIR, '.zelto', 'config.yaml'), `
+gate:
+  commands:
+    - name: echo-test
+      run: echo hello
+  scope:
+    rules:
+      - match: "src/**"
+        labels: ["all"]
+  timeoutSec: 77
+  retry:
+    max: 3
+`, 'utf-8');
+
+    const { loadConfigAt } = await import('../src/core/config/loader.js');
+    const cfg = loadConfigAt(TEST_DIR);
+    assert.ok(cfg.gate.scope);
+    assert.equal(cfg.gate.scope.rules.length, 1);
+    assert.equal(cfg.gate.timeoutSec, 77, 'timeoutSec 不能被 scope 段吞掉');
+    assert.equal(cfg.gate.retry.max, 3);
+    assert.equal(cfg.gate.commands.length, 1);
+  });
+
   it('falls back to defaults when policy.yaml is missing', async () => {
     // Remove policy dir
     await rm(join(TEST_DIR, 'policy'), { recursive: true, force: true });

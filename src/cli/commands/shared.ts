@@ -238,7 +238,7 @@ export {
 
 // shared.ts 自己也要用 loadConfig —— re-export 不产生本地绑定，
 // 所以这里单独 import 一次（同一份实现，不会分叉）。
-import { loadConfig } from '../../core/config/loader.js';
+import { loadConfig, parseEnvRef } from '../../core/config/loader.js';
 
 /**
  * Resolve the target project directory if configured.
@@ -708,13 +708,89 @@ export function resolveAgentCommand(
  *
  * 优先级：`process.env` < `agent.env`。
  * 空对象直接返回 `process.env`，避免无谓的拷贝。
+ *
+ * ## 未展开的 `${VAR}` 占位符必须剔除（实测 nimrtc-v14，2026-11-23）
+ *
+ * 进程环境里可能残留**没展开的占位符**——比如有人（或某个脚本）把
+ * `ANTHROPIC_API_KEY` 设成了字面量 `"${NIMRTC_LLM_API_KEY}"`。
+ *
+ * Claude Code 的取凭据顺序是 `ANTHROPIC_API_KEY` **优先于**
+ * `ANTHROPIC_AUTH_TOKEN`（后者在 `~/.claude/settings.json` 的 `env` 块里，
+ * 本来是好的）。于是这个占位符**顶掉了**一个能用的 token →
+ * 上游返回 401 → agent 秒退（exit 1、`api_error_status: 401`、零改动）。
+ *
+ * 症状极像「agent 干了活但没改文件」，真正原因却是「模型/凭据没生效」。
+ * 代价是**整轮**：agent 跑 3 分钟 → 门禁报 vendor 缺失 → 人怀疑自己的代码。
+ *
+ * 所以：**值是 `${VAR}` 形状就当它不存在**，让它回落到下一个来源
+ * （`ANTHROPIC_AUTH_TOKEN` → `~/.claude/settings.json` → `~/.claude/.credentials.json`）。
+ *
+ * 为什么只剔除、不就地展开：就地展开需要知道「展开成什么」，
+ * 而引用源（`NIMRTC_LLM_API_KEY`）**不一定**是 agent 该用的那个凭据
+ * ——规格起草的模型和 agent 执行的模型本就该分开（`agent.model` vs `llm.model`）。
+ * 剔除 = 让 Claude Code 自己按它的优先级去找，语义更对。
  */
 export function mergeAgentEnv(
   agentEnv: Record<string, string> | undefined,
   base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  if (!agentEnv || Object.keys(agentEnv).length === 0) return base;
-  return { ...base, ...agentEnv };
+  if (!agentEnv || Object.keys(agentEnv).length === 0) {
+    // 没有 agent.env：base 原样返回 —— 但**得先看有没有占位符**。
+    // 有占位符才拷贝（把占位符剔掉），没有就保持「原样返回 base」
+    // 的既有契约（不无谓地拷贝一份）。
+    const stripped = stripUnexpandedEnvRefs(base);
+    return stripped === base ? base : stripped;
+  }
+  return stripUnexpandedEnvRefs({ ...base, ...agentEnv });
+}
+
+/**
+ * 剔除环境变量里**未展开的 `${VAR}` 占位符**。
+ *
+ * 判据：整串就是 `${NAME}`（`parseEnvRef` 的口径）——
+ * `prefix-${NAME}` **不算**占位符（那可能是刻意拼的字符串）。
+ *
+ * 只剔除**引用目标在本进程环境里确实存在且非空**的情况之外的？不 ——
+ * 两种都要剔除：
+ *   - 引用目标存在 → 值本该是展开后的真值，现在是没展开的占位符 → 剔除
+ *   - 引用目标不存在 → 值是死的占位符 → 剔除
+ * 两种情况下这个值对 agent 都**没有用**，留着只会顶掉别的来源。
+ */
+export function stripUnexpandedEnvRefs(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  // 先扫一遍找占位符 —— **没有就原样返回入参**，
+  // 保持「不无谓拷贝」的既有契约（调用方可能拿它跟 base 做引用比较）。
+  let hasPlaceholder = false;
+  for (const value of Object.values(env)) {
+    if (isEnvRefPlaceholder(value)) {
+      hasPlaceholder = true;
+      break;
+    }
+  }
+  if (!hasPlaceholder) return env;
+
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    // 整串是 `${VAR}` 形状 → 是没展开的占位符，不给 agent。
+    if (isEnvRefPlaceholder(value)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * 这个值是不是「没展开的 `${VAR}` 占位符」。
+ *
+ * **带引号也算** —— 实测（nimrtc-v14，2026-11-23）进程环境里残留的是
+ * `"${NIMRTC_LLM_API_KEY}"`（**连引号一起**）：
+ * 有人用 `set VAR="${OTHER}"` 赋值，而 `OTHER` 在那个 shell 里没展开。
+ * 于是字面量连同引号一起留在了环境里。
+ *
+ * 判据用 `parseEnvRef`（**剥掉**成对引号后的整串匹配）——
+ * 只认「剥引号后整串就是 `${NAME}`」，不认部分引用（`prefix-${NAME}`）。
+ */
+function isEnvRefPlaceholder(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  return parseEnvRef(stripSurroundingQuotes(value.trim())) !== null;
 }
 
 /**
@@ -761,6 +837,67 @@ export function resolveCursorGateway(
  * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
  * @param cwd — Optional working directory (e.g. an isolated worktree). Defaults to process.cwd().
  */
+/**
+ * 取出「每 1k token 的单价」（ZD-007）。
+ *
+ * 配置里的 `llm.pricing` 是**按模型**分档的：
+ *
+ * ```yaml
+ * llm:
+ *   model: deepseek-chat
+ *   pricing:
+ *     deepseek-chat:
+ *       inputPer1k: 0.00027
+ *       outputPer1k: 0.0011
+ * ```
+ *
+ * 要翻成金额，先得知道**用哪个模型**的那一档。
+ *
+ * 找不到对应档 → 返回 null（= 报不出金额 → 运行中闸门拦不了）。
+ * 宁可「拦不了」也不要拿别的模型的价去折算 ——
+ * 折错了会让闸门**提前**或**延后**开火，两种都是错的判据。
+ *
+ * 兜底：**恰好一档**时用它（不猜模型名，但价格唯一，没得选错）。
+ * 两档以上且模型对不上 → 不猜 → null。
+ */
+export function resolvePricePerKToken(
+  model: string | undefined,
+  pricing: Record<string, { inputPer1k: number; outputPer1k: number }> | undefined,
+): { input: number; output: number } | null {
+  if (!pricing) return null;
+
+  const entries = Object.entries(pricing);
+  if (entries.length === 0) return null;
+
+  if (model) {
+    // 模型名可能带前缀（`deepseek/deepseek-chat`）—— 后缀匹配。
+    const exact = pricing[model];
+    if (exact) {
+      return { input: exact.inputPer1k, output: exact.outputPer1k };
+    }
+    const suffixMatch = entries.find(([key]) => model.endsWith(key));
+    if (suffixMatch) {
+      const entry = suffixMatch[1];
+      return { input: entry.inputPer1k, output: entry.outputPer1k };
+    }
+  }
+
+  // 恰好一档 → 用它（没得选错）
+  if (entries.length === 1) {
+    const entry = entries[0][1];
+    return { input: entry.inputPer1k, output: entry.outputPer1k };
+  }
+
+  return null;
+}
+
+/**
+ * Create executor adapter based on config and optional override.
+ * @param overrideType — Optional override from CLI --adapter flag
+ * @param agentCommand — Agent command string (for claude-agent adapter)
+ * @param timeoutSec — Optional agent timeout in seconds (from slice or config)
+ * @param cwd — Optional working directory (e.g. an isolated worktree). Defaults to process.cwd().
+ */
 export function createExecutorAdapter(
   overrideType?: string,
   agentCommand?: string,
@@ -786,21 +923,43 @@ export function createExecutorAdapter(
   }
 
   if (type === 'claude-agent-sdk') {
+    const pricePerKToken = resolvePricePerKToken(cfg.llm?.model, cfg.llm?.pricing);
     return new ClaudeAgentSdkAdapter({
       cwd: workDir,
-      model: cfg.llm?.model,
+      // agent 的模型走 `agent.model`，**不**用 `llm.model` ——
+      // `llm.model` 是规格起草用的模型（实测 nimrtc-v14：配的是
+      // `deepseek-ai/DeepSeek-V3`，走自建网关）。拿它当 agent 的模型，
+      // Claude Code 认不出模型名 → agent **秒退**（exit 0、零改动），
+      // 症状看起来像「agent 干了活却没改文件」。
+      // 没配 `agent.model` 就不传 model，用 Claude Code 自己的默认。
+      ...(cfg.agent.model ? { model: cfg.agent.model } : {}),
       // ADR-090：`agent.env` 对所有适配器生效 —— 这样「把凭证放配置里」
       // 这条规则不会变成「只有 Cursor 能这么干」的特例。
       env: mergeAgentEnv(cfg.agent.env) as Record<string, string>,
+      // ZD-007：把**运行中**预算拦截需要的能力接上 ——
+      // ① `maxBudgetUsd` 是 SDK 的**事前**约束（比事后查更硬：它让 SDK 自己停）；
+      // ② `pricePerKToken` 让适配器能把运行中的 token 折成金额，
+      //    于是 zelto 的运行中闸门才拦得住（没有单价 = 拦不了）。
+      ...(cfg.budgetLimitUsd && cfg.budgetLimitUsd > 0
+        ? { maxBudgetUsd: cfg.budgetLimitUsd }
+        : {}),
+      ...(pricePerKToken ? { pricePerKToken } : {}),
     });
   }
 
   // Default: claude-agent (shell spawn)
+  //
+  // ZD-007 阶段2：`agent.streamJson: true` 时用 stream-json 跑，
+  // 让运行中预算拦截对 shell 适配器生效 —— 前提是配了 `llm.pricing`
+  // （否则只累加 token、报不出金额，仍然拦不了）。
+  const shellPrice = resolvePricePerKToken(cfg.llm?.model, cfg.llm?.pricing);
   return new ClaudeAgentAdapter({
     cwd: workDir,
     agentCommand: resolveAgentCommand(type, agentCommand, cfg),
     timeoutMs,
     env: mergeAgentEnv(cfg.agent.env),
+    ...(cfg.agent.streamJson ? { streamJson: true } : {}),
+    ...(cfg.agent.streamJson && shellPrice ? { pricePerKToken: shellPrice } : {}),
   });
 }
 

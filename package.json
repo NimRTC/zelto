@@ -1,6 +1,6 @@
 {
   "name": "zelto",
-  "version": "0.6.0",
+  "version": "0.7.1",
   "description": "AI Programming Cockpit — let machines watch the machines",
   "license": "MIT",
   "author": "Runshine",
@@ -30,7 +30,7 @@
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
     "clean": "node scripts/clean.mjs",
-    "prepublishOnly": "pnpm clean && pnpm build && pnpm test"
+    "prepublishOnly": "node scripts/version-check.mjs"
   },
   "engines": {
     "node": ">=22.0.0"

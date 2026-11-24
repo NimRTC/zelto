@@ -107,6 +107,57 @@ function git(args: string[], cwd: string): string {
   });
 }
 
+/**
+ * 跑一条 git 命令，超时就**重试**。
+ *
+ * ── 为什么超时值得重试 ──────────────────────────────────────────────────
+ *
+ * 60 秒超时撞上的是**冷缓存**，不是「git 坏了」：
+ * 刚建出来的 worktree 上，索引/对象库都还没热起来，
+ * `git diff --name-only` 要把整个工作树 stat 一遍，冷缓存下能跑到几百秒
+ * （实测 nimrtc-v14，2026-11-23：worktree 刚建好时三条 git 命令合计 >60s，
+ * 热起来之后同样的命令只要 0.3~0.4 秒）。
+ *
+ * 超时是**瞬时**状态，不是「读不出来」。D-61 要求的是
+ * 「判不出来要 fail closed」—— 但「第一次读超时、第二次能读出来」
+ * 并不是判不出来，是**抖动**。直接抛错会让一个完全正常的工程
+ * 因为冷缓存而拒绝开工（D-61 的教训本意是防「假装干净」，
+ * 不是防「抖动」）。
+ *
+ * 所以这里重试；**重试仍然失败才抛**。fail closed 的语义没变：
+ * 最终读不出来 → 抛错 → 基线不明 → 拒绝开工。
+ */
+function gitWithRetry(args: string[], cwd: string, attempts = 3): string {
+  return runWithTimeoutRetry(() => git(args, cwd), attempts);
+}
+
+/**
+ * 重试「瞬时失败」的通用包装。
+ *
+ * 只对**超时/资源类**错误重试：git 自己报错（比如「不是 git 仓库」）
+ * 重试再多次也是同样的结果，重试只是浪费时间。
+ *
+ * 重试全部失败后把最后一个错误抛出去 —— fail closed 的语义没变。
+ *
+ * @param run 实际要跑的动作
+ * @param attempts 最多尝试次数（含第一次）
+ */
+export function runWithTimeoutRetry<T>(run: () => T, attempts = 3): T {
+  let lastError: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return run();
+    } catch (err) {
+      lastError = err;
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'ETIMEDOUT' && code !== 'ENOBUFS' && code !== 'EAGAIN') {
+        throw err;
+      }
+    }
+  }
+  throw lastError;
+}
+
 /** git 的 C 风格转义与字节值。 */
 const GIT_ESCAPES: Record<string, number> = {
   a: 0x07,
@@ -644,9 +695,9 @@ export function listChangedPaths(repoRoot: string): string[] {
   //
   // 「不是 git 仓库」这种整体失败会在这里冒出来，
   // 上层据此把这一轮判成「审计失败」而不是「没有越界」。
-  add(git(['diff', '--name-only'], repoRoot));
-  add(git(['diff', '--cached', '--name-only'], repoRoot));
-  add(git(['ls-files', '--others', '--exclude-standard'], repoRoot));
+  add(gitWithRetry(['diff', '--name-only'], repoRoot));
+  add(gitWithRetry(['diff', '--cached', '--name-only'], repoRoot));
+  add(gitWithRetry(['ls-files', '--others', '--exclude-standard'], repoRoot));
 
   return [...paths].sort();
 }

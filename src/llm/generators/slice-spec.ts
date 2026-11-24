@@ -17,6 +17,7 @@
 
 import type { LlmAdapter } from '../../core/ports/llm.js';
 import { SLICE_SPEC_PROMPT } from '../prompts/slice-spec.js';
+import { renderDesignContext, type DesignContext } from '../design-context.js';
 
 /** 生成一份切片规格所需要的已知信息 */
 export interface SliceSpecInput {
@@ -40,6 +41,29 @@ export interface SliceSpecInput {
    * 方向都反了。判定追溯链是否成立，需要知道这条需求**要求了什么**。
    */
   requirementDetails?: Array<{ id: string; text: string }>;
+  /**
+   * 需求条目的**全部侧面**（ZD-031）。
+   *
+   * 一条需求在需求文档里往往散落多行 —— 主体、验收口径、测试形态、
+   * 子条目（`N2-1`）。只给主体那一行，模型就看不到**验收口径**
+   * （「被选中对的 protocol 读作 "tcp"」）与**测试形态**
+   * （「环回测试里让 UDP socket 绑到互相不可路由的地址」）。
+   *
+   * 实测（nimrtc v1.4 的 N2）：需求文档里有 16 行不同描述，
+   * 旧口径只装下 1 行 —— 丢的恰恰是规格里最该照抄的部分。
+   */
+  requirementAspects?: Array<{ id: string; aspects: string[] }>;
+  /**
+   * 设计上下文（ZD-032）—— 本片所属模块的**事实**。
+   *
+   * 为什么需要：实测 `zelto spec draft` 给模型的输入只有 **470~705 token**，
+   * 只有切片 id / 写集 / 需求的一行正文 —— **没有任何模块与文件路径的事实**。
+   * 于是模型只能凭空猜路径或写空泛骨架，人得从零查代码写规格。
+   *
+   * 而这些事实**已经在已确认的设计文档里**
+   * （`modules[].filePatterns` / `dependencies`）—— 只是这条路没去读。
+   */
+  designContext?: DesignContext | null;
   /** 所属版本的前置切片 */
   prerequisites?: string[];
 }
@@ -55,11 +79,34 @@ export const TBD_PLACEHOLDER = 'TBD（需人确认）';
  */
 export function renderRequirementDetails(input: SliceSpecInput): string {
   const details = input.requirementDetails ?? [];
+  const aspectsById = new Map(
+    (input.requirementAspects ?? []).map((a) => [a.id, a.aspects]),
+  );
   if (details.length === 0) {
     return '（本片没有关联的需求条目 —— 规格的「需求」章节写「无」，验收标准需人补齐后再确认规格）';
   }
   return details
-    .map((d) => (d.text ? `- ${d.id}：${d.text}` : `- ${d.id}：（需求文档里找不到这一条的正文 —— 不要凭空推测它要什么，规格里如实标注「需人补齐」）`))
+    .map((d) => {
+      if (!d.text) {
+        return `- ${d.id}：（需求文档里找不到这一条的正文 —— 不要凭空推测它要什么，规格里如实标注「需人补齐」）`;
+      }
+      // ZD-031：这一条有多个侧面 → 主体一行，其余侧面逐条列出。
+      //
+      // 为什么要全给：需求文档里一条需求往往散落多行 —— 主体说「做什么」，
+      // 「验收：……」说「做完什么样」，「测试形态：……」说「怎么验证」。
+      // 后两者正是规格里「可判定的验收标准」要照抄的东西，
+      // 漏掉它们模型就自己编一条，于是人又要回去改。
+      const aspects = aspectsById.get(d.id);
+      if (!aspects || aspects.length <= 1) {
+        return `- ${d.id}：${d.text}`;
+      }
+      const [first, ...rest] = aspects;
+      const lines = [`- ${d.id}：${first}`];
+      for (const aspect of rest) {
+        lines.push(`  - ${aspect}`);
+      }
+      return lines.join('\n');
+    })
     .join('\n');
 }
 
@@ -91,6 +138,7 @@ export async function generateSliceSpec(
     .replace('{{WRITES_JSON}}', JSON.stringify(input.writes, null, 2))
     .replace('{{REQUIREMENTS_JSON}}', JSON.stringify(input.requirements ?? [], null, 2))
     .replace('{{REQUIREMENT_DETAILS}}', renderRequirementDetails(input))
+    .replace('{{DESIGN_CONTEXT}}', renderDesignContext(input.designContext ?? null))
     .replace('{{PREREQUISITES_JSON}}', JSON.stringify(input.prerequisites ?? [], null, 2));
 
   const response = await llm.chat({
@@ -154,9 +202,29 @@ export function buildDeterministicSliceSpec(input: SliceSpecInput): string {
 
   if (requirements.length > 0) {
     // 验收标准来自人批准的需求条目 —— 物化出来的追溯出处仍然是人的话，不是工具的话
-    requirements.forEach((req, i) => {
-      lines.push(`${i + 1}. 满足需求「${req}」；验证方式：有对应测试或可核对的产出`);
-    });
+    //
+    // ZD-031：一条需求有多个侧面时，**每个侧面一条**验收标准。
+    //
+    // 为什么不能只写一条「满足需求 X」：需求文档里一条需求往往带着
+    // 「验收口径」与「测试形态」两个侧面 —— 那正是「怎么验证」的答案。
+    // 合成一条「满足需求 X；验证方式：有对应测试」等于把答案丢了，
+    // 人还是得自己回去把口径抄成验收标准。
+    const aspectsById = new Map(
+      (input.requirementAspects ?? []).map((a) => [a.id, a.aspects]),
+    );
+    let n = 0;
+    for (const req of requirements) {
+      const aspects = aspectsById.get(req);
+      if (aspects && aspects.length > 1) {
+        for (const aspect of aspects) {
+          n += 1;
+          lines.push(`${n}. ${aspect}`);
+        }
+      } else {
+        n += 1;
+        lines.push(`${n}. 满足需求「${req}」；验证方式：有对应测试或可核对的产出`);
+      }
+    }
   } else {
     lines.push(NO_CRITERIA_PLACEHOLDER);
   }

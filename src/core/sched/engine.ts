@@ -5,7 +5,7 @@
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../policy/types.js';
-import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateFeedback, HumanFeedback } from './types.js';
+import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateScopeSummary, GateFeedback, HumanFeedback } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
 import { pathMatches, writeSetsOverlap } from './paths.js';
@@ -196,6 +196,7 @@ export class Scheduler {
     gateCommands?: GateCommandSummary[],
     gateFeedback?: GateFeedback[],
     humanFeedback?: HumanFeedback[],
+    gateScope?: GateScopeSummary,
   ): ConstraintBundle {
     // Collect relevant policy rules (exclude deny-all defaults, include specific rules)
     const relevantRules = this.policy.rules.filter((r) => {
@@ -217,9 +218,10 @@ export class Scheduler {
         '.cursor/rules/**',
       ],
       policyRules: relevantRules,
-      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands, gateFeedback, humanFeedback),
+      instructions: this.buildInstructions(slice, affinity ?? null, gateCommands, gateFeedback, humanFeedback, gateScope),
       affinity: affinity ?? null,
       ...(gateCommands && gateCommands.length > 0 ? { gateCommands } : {}),
+      ...(gateScope ? { gateScope } : {}),
       ...(gateFeedback && gateFeedback.length > 0 ? { gateFeedback } : {}),
       ...(humanFeedback && humanFeedback.length > 0 ? { humanFeedback } : {}),
     };
@@ -500,6 +502,7 @@ export class Scheduler {
     gateCommands?: GateCommandSummary[],
     gateFeedback?: GateFeedback[],
     humanFeedback?: HumanFeedback[],
+    gateScope?: GateScopeSummary,
   ): string {
     const lines = [
       `You are implementing slice "${slice.id}": ${slice.title}`,
@@ -574,6 +577,37 @@ export class Scheduler {
         `makes the gate fail for reasons that have nothing to do with your code.`,
         '',
       );
+    }
+
+    // 门禁作用域（ADR-097）—— 门禁会验**哪些用例**。
+    //
+    // 放在门禁命令**之后**：先说「跑哪条命令」，再说「这条命令验哪些用例」。
+    //
+    // 为什么必须说：门禁按写集**收窄**（ADR-097），而上面的命令原文是
+    // **项目级**的（跑全部用例）。agent 不知道收窄，就会以为「门禁跑全量、
+    // 我跑 3 个用例就行」—— 两边口径不一致，追溯链就断了。
+    if (gateScope) {
+      if (gateScope.scoped) {
+        lines.push(
+          `## Which tests the gate will run`,
+          `The gate narrows its test run to the ones related to your write-set.`,
+          `Labels: ${gateScope.labels.map((l) => `\`${l}\``).join(', ')}.`,
+          `Reason: ${gateScope.reason}`,
+          '',
+          `Verify against **the same scope**. Running only a handful of tests and`,
+          `assuming the rest are fine is exactly what the gate would not accept.`,
+          `Running the whole suite is allowed (it is strictly more than the gate does),`,
+          `but it is slower — prefer the scoped set when you can.`,
+          '',
+        );
+      } else {
+        lines.push(
+          `## Which tests the gate will run`,
+          `The gate runs the **full** test suite this time (${gateScope.reason}).`,
+          `Verify against the full suite.`,
+          '',
+        );
+      }
     }
 
     // 上一轮的失败证据（ZD-013）—— 放在门禁命令**之后**：

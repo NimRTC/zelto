@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { parseTestRunnerStats } from '../gate/acceptance.js';
 import type { EventEnvelope } from '../events/stream.js';
 import type { SliceData } from '../slice/store.js';
-import type { ArtifactEvidence, SignReviewFacts } from './types.js';
+import type { ArtifactEvidence, GateScopeFacts, ScopeSource, SignReviewFacts } from './types.js';
 
 /**
  * 事实收集需要的外部依赖。
@@ -119,6 +119,58 @@ interface GateResultPayloadLike {
     passed?: boolean;
     stdout?: string;
   }>;
+  /**
+   * 门禁作用域的留痕（ADR-097 决策五）。
+   *
+   * **全部可选** —— 老事件的 payload 没有这些字段。
+   */
+  scoped?: boolean;
+  scopeLabels?: string[];
+  scopeSource?: string;
+  scopeReason?: string;
+  scopeTestCount?: number;
+  scopeTotalTestCount?: number;
+}
+
+/**
+ * 采集门禁作用域事实（ADR-104 决策一）。
+ *
+ * **来源是 `gate.result` 事件的 payload** —— 字段**已经在那里**
+ * （ADR-097 决策五「留痕」），这里只是**读出来**。
+ *
+ * **老事件降级**：payload 没有作用域字段 → 按「没收窄」处理
+ * （`scoped: false` / `source: 'no-config'`）。
+ *
+ * **为什么这个降级是安全的**：老事件是**收窄功能上线之前**写的，
+ * 那时的门禁**必然跑的是全量** —— 全量永远覆盖本片，
+ * 所以「没收窄」这个描述对老事件是**准确**的，不是「查不到」。
+ *
+ * **标签排序**（ADR-104 实现要点 4）：`scopeLabels` 的顺序来自
+ * 规则匹配顺序，而**规则顺序会变**（人改 `config.yaml`）。
+ * 判据不受影响，但**呈现要稳定** —— 同一组标签两次签字显示成
+ * 同一个字符串，否则「事件里记的和这次显示的不一样」会让人以为出了 bug。
+ */
+function collectScopeFacts(payload: GateResultPayloadLike): GateScopeFacts {
+  const scoped = payload.scoped === true;
+  const source: ScopeSource =
+    payload.scopeSource === 'config' || payload.scopeSource === 'fallback-full'
+      ? payload.scopeSource
+      : 'no-config';
+
+  // 标签：去重 + 排序（呈现稳定）
+  const labels = Array.isArray(payload.scopeLabels)
+    ? [...new Set(payload.scopeLabels.filter((l): l is string => typeof l === 'string'))].sort()
+    : [];
+
+  return {
+    scoped,
+    labels,
+    testCount: typeof payload.scopeTestCount === 'number' ? payload.scopeTestCount : null,
+    totalTestCount:
+      typeof payload.scopeTotalTestCount === 'number' ? payload.scopeTotalTestCount : null,
+    source,
+    reason: typeof payload.scopeReason === 'string' ? payload.scopeReason : '',
+  };
 }
 
 /**
@@ -140,11 +192,18 @@ interface GateResultPayloadLike {
 function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['gate'] {
   const latest = gateResultEvents.length > 0 ? gateResultEvents[gateResultEvents.length - 1] : null;
   if (!latest) {
-    return { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 };
+    return {
+      acceptanceRan: false,
+      acceptancePassed: false,
+      passCount: 0,
+      totalCount: 0,
+      scope: collectScopeFacts({}),
+    };
   }
 
   const payload = latest.payload as GateResultPayloadLike;
   const status = payload.acceptance?.status;
+  const scope = collectScopeFacts(payload);
 
   // 主路径：显式验收配置给出了结论（passed / failed）
   if (status === 'passed' || status === 'failed') {
@@ -164,11 +223,11 @@ function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['g
       }
     }
 
-    return { acceptanceRan: ran, acceptancePassed: passed, passCount, totalCount };
+    return { acceptanceRan: ran, acceptancePassed: passed, passCount, totalCount, scope };
   }
 
   // 回退路径：acceptance 缺失或 skipped —— 扫描 spec.gateCommands 的验收命令
-  return collectAcceptanceFromResults(payload.results);
+  return { ...collectAcceptanceFromResults(payload.results), scope };
 }
 
 /**
@@ -186,7 +245,7 @@ function collectGateFacts(gateResultEvents: EventEnvelope[]): SignReviewFacts['g
  */
 function collectAcceptanceFromResults(
   results: GateResultPayloadLike['results'],
-): SignReviewFacts['gate'] {
+): Omit<SignReviewFacts['gate'], 'scope'> {
   if (!Array.isArray(results)) {
     return { acceptanceRan: false, acceptancePassed: false, passCount: 0, totalCount: 0 };
   }

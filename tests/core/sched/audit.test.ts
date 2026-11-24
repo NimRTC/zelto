@@ -10,6 +10,7 @@ import {
   auditWorktreeWrites,
   parsePorcelainStatus,
   hashFile,
+  runWithTimeoutRetry,
 } from '../../../src/core/sched/audit.js';
 
 function makeRepo(): string {
@@ -174,5 +175,55 @@ describe('auditWorktreeWrites', () => {
       baselineChanged: ['vendor/x.txt'],
     });
     assert.deepEqual(result.violations, ['stray.ts']);
+  });
+});
+
+describe('runWithTimeoutRetry', () => {
+  it('retries a timeout and returns the eventual success', () => {
+    // 冷缓存的抖动：第一次读超时，第二次就好了（实测 nimrtc-v14，
+    // 2026-11-23：worktree 刚建好时 git 命令合计 >60s，热起来只要 0.04s）。
+    let calls = 0;
+    const result = runWithTimeoutRetry(() => {
+      calls++;
+      if (calls < 3) {
+        const err = new Error('spawnSync git ETIMEDOUT') as NodeJS.ErrnoException;
+        err.code = 'ETIMEDOUT';
+        throw err;
+      }
+      return 'ok';
+    });
+    assert.equal(result, 'ok');
+    assert.equal(calls, 3);
+  });
+
+  it('throws after exhausting the retries (fail closed)', () => {
+    let calls = 0;
+    assert.throws(
+      () =>
+        runWithTimeoutRetry(() => {
+          calls++;
+          const err = new Error('spawnSync git ETIMEDOUT') as NodeJS.ErrnoException;
+          err.code = 'ETIMEDOUT';
+          throw err;
+        }),
+      /ETIMEDOUT/,
+    );
+    assert.equal(calls, 3);
+  });
+
+  it('does not retry a genuine git failure', () => {
+    let calls = 0;
+    assert.throws(
+      () =>
+        runWithTimeoutRetry(() => {
+          calls++;
+          const err = new Error('not a git repository') as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          throw err;
+        }),
+      /not a git repository/,
+    );
+    // 「不是仓库」重试也没用 —— 只试一次。
+    assert.equal(calls, 1);
   });
 });

@@ -523,6 +523,20 @@ export function judgeWriteTargets(
   for (const rel of relativeTargets) {
     const result = evaluateRules(ctx.rules, rel, 'write');
     if (result.action === 'deny') {
+      // ADR-046 豁免：本片验收文件在写集里时，`deny-acceptance-direct`
+      // 不拦 —— 写集是人批准的边界（freeze 钉住），「写集里有本片验收文件」
+      // 正是「对应规格一起改」的已批准形态（AGENTS.md 禁区-5 的例外分支）。
+      // 写集预约（第 3 步）已先判过：不在写集里的验收文件照样被拦。
+      // 不放宽其它 deny 规则。
+      if (
+        result.ruleId === 'deny-acceptance-direct' &&
+        ctx.sliceId !== null &&
+        ctx.writes !== null &&
+        pathInWriteSet(rel, ctx.writes) &&
+        (rel === 'tests/acceptance' || rel.startsWith('tests/acceptance/'))
+      ) {
+        continue;
+      }
       return {
         decision: 'deny',
         reason: result.guidance ?? `策略拒绝写入 "${rel}"（规则 ${result.ruleId}）。`,

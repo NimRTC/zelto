@@ -62,12 +62,38 @@ const DEMO_SLICE = {
 const DEMO_EVENTS = [
   { ts: '2026-01-01T00:00:00.000Z', runSeq: 1, slice: 'demo-slice', run: null, type: 'budget.spent', actor: 'cli', payload: { amount: 0.0012 } },
   { ts: '2026-01-01T00:00:00.001Z', runSeq: 2, slice: 'demo-slice', run: null, type: 'stall.classified', actor: 'human', payload: { sliceId: 'demo-slice', class: 'human_halt', reason: 'needs human' } },
-  { ts: '2026-01-01T00:00:00.002Z', runSeq: 3, slice: 'demo-slice', run: null, type: 'policy.violation', actor: 'zelto', payload: { sliceId: 'demo-slice', kind: 'write-outside-write-set', violations: ['src/out-of-writeset.ts'] } },
-  { ts: '2026-01-01T00:00:00.003Z', runSeq: 4, slice: 'demo-slice', run: null, type: 'gate.result', actor: 'zelto', payload: { sliceId: 'demo-slice', passed: true, results: [{ command: 'acceptance', passed: true, exitCode: 0, stdout: '# pass 5\n# fail 0\n# todo 0\n# skipped 0\n' }], acceptance: { status: 'passed', path: 'tests/acceptance/demo-slice/', command: 'node --test tests/acceptance/demo-slice/' } } },
+  { ts: '2026-01-01T00:00:00.002Z', runSeq: 3, slice: 'demo-slice', run: null, type: 'gate.result', actor: 'zelto', payload: { sliceId: 'demo-slice', passed: true, results: [{ command: 'acceptance', passed: true, exitCode: 0, stdout: '# pass 5\n# fail 0\n# todo 0\n# skipped 0\n' }], acceptance: { status: 'passed', path: 'tests/acceptance/demo-slice/', command: 'node --test tests/acceptance/demo-slice/' } } },
+  // 越界记录放在**门禁通过之后** ——
+  //
+  // 「陈旧结论消解」（ADR-072，2026-11-16 加入）判据：
+  // 最新一条 passed=true 的 gate.result **晚于**最新一条 policy.violation
+  // → 越界已被「扩写集/重跑门禁」解决 → violations 清空。
+  //
+  // 原夹具把 violation 放在 gate.result **之前**（runSeq 3 / ts .002，
+  // gate.result 是 runSeq 4 / ts .003）—— 那正是「越界已被解决」的样子，
+  // 于是 violations 被清空，「改动在写集内」判过。
+  //
+  // 但这个夹具的**意图**是「有一处越界写入」—— 所以越界必须是**最新**的结论。
+  // 把 violation 挪到门禁之后，夹具才真的表达它的意图。
+  { ts: '2026-01-01T00:00:00.004Z', runSeq: 5, slice: 'demo-slice', run: null, type: 'policy.violation', actor: 'zelto', payload: { sliceId: 'demo-slice', kind: 'write-outside-write-set', violations: ['src/out-of-writeset.ts'] } },
 ];
 
 // approve-slice：给 `--approve` 回归用的独立切片 —— 不跟 demo-slice 抢事件流，
 // 免得只读性快照（见下方用例）被签字动作污染。
+//
+// ── 追溯与验收记录为什么必须有 ──────────────────────────────────────────
+//
+// `--approve` 现在要过**签字前确认闸门**（D-48，2026-11-17 接进）。
+// 四项确认：追溯链未断 / 验收真跑过本片 / 改动在写集内 / 产物真落地。
+//
+// 闸门是**对的** —— 它拦的是「什么都没验证过就签字」。
+// 所以这个夹具必须**长得像一片真的通过了闸门的切片**，
+// 否则 `--approve` 被拦是**闸门正常工作**，不是被测功能坏了。
+//
+// （这个夹具写于 2026-11-14，闸门是 11-17 才接进的 ——
+//  夹具落后于产品，闸门一上线它就必然红。
+//  「测试夹具落后于产品」与「产品有缺陷」要分清：
+//  这里**产品是对的**，该改的是夹具。）
 const APPROVE_SLICE = {
   id: 'approve-slice',
   title: 'Approve slice',
@@ -76,7 +102,8 @@ const APPROVE_SLICE = {
   acceptance: { dir: 'tests/acceptance/approve-slice/', frozenHash: null, oracleSrc: null },
   baseCommit: null,
   drift: { detected: false, reason: null, at: null },
-  trace: { requirements: [], contracts: [], tests: [] },
+  // 追溯三条都要非空 —— 否则「追溯链未断」这项必然不过
+  trace: { requirements: ['req-approve-1'], contracts: ['contract-approve-1'], tests: ['test-approve-1'] },
   traceWaiver: null,
   baseline: false,
   writes: [],
@@ -86,6 +113,14 @@ const APPROVE_SLICE = {
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-01-01T00:00:00.000Z',
 };
+
+// approve-slice 的事件流 —— 只放让四项确认过得去的最小集：
+// 一条 gate.result（带 acceptance 记录）。
+// 「产物真落地」默认被签字路径豁免（产物要合并后才进主干，属合并阶段的确认），
+// 所以这里不需要产物证据。
+const APPROVE_EVENTS = [
+  { ts: '2026-01-01T00:00:01.000Z', runSeq: 1, slice: 'approve-slice', run: null, type: 'gate.result', actor: 'zelto', payload: { sliceId: 'approve-slice', passed: true, results: [{ command: 'acceptance', passed: true, exitCode: 0, stdout: '# pass 3\n# fail 0\n' }], acceptance: { status: 'passed', path: 'tests/acceptance/approve-slice/', command: 'node --test tests/acceptance/approve-slice/' } } },
+];
 
 function writeSlice(slice) {
   writeFileSync(join(sandbox, '.zelto', 'slices', `${slice.id}.json`), JSON.stringify(slice, null, 2), 'utf-8');
@@ -104,6 +139,7 @@ before(() => {
   writeSlice(DEMO_SLICE);
   writeEvents('demo-slice', DEMO_EVENTS);
   writeSlice(APPROVE_SLICE);
+  writeEvents('approve-slice', APPROVE_EVENTS);
 });
 
 after(() => {

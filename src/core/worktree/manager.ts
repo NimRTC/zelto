@@ -5,8 +5,8 @@
 // C3: 全部为本地确定性操作，不调模型、不触网
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, cpSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
-import { join, relative, isAbsolute } from 'node:path';
+import { existsSync, cpSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
+import { join, relative, isAbsolute, dirname, resolve } from 'node:path';
 import { resolveWithin } from '../io/path-safe.js';
 
 /** worktree 根目录（相对仓库根） */
@@ -143,6 +143,30 @@ export class WorktreeManager {
   private readonly repoRoot: string;
 
   /**
+   * 缓存的 git **common dir**（共享的那个 `.git`）。
+   *
+   * 为什么要缓存：`.git` 在**主仓**里是目录，在 **worktree** 里是**文件**
+   * （内容形如 `gitdir: D:/repo/.git/worktrees/<name>`）。zelto 的
+   * `run` 常常是在**版本工作目录**（`.zelto/version-worktrees/<label>/`）
+   * 里跑的 —— 那里的 `.git` 是文件，于是 `<repoRoot>/.git/modules/...`
+   * 这个路径**根本不存在**。
+   *
+   * 病灶（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+   *   `zelto run v1-ice-recovery` 在版本工作目录里跑 →
+   *   `syncSubmodules` 找不到任何 module git 目录 → 14 个 submodule 全部
+   *   `skipped`（worktree 里 vendor 全空）→
+   *   `alignSubmodulesToMainRepo` 去问「commit 在不在」时问错了仓库
+   *   （空目录没有 `.git`，git 向上找到**顶层仓库**而不是 submodule）→
+   *   回答「没有 ac01707f」→ 抛错「无法创建隔离 worktree」。
+   *
+   *   而那个 commit **确实存在**（在 `.git/worktrees/v3/modules/...` 里）。
+   *
+   * 所以这里必须用 `git rev-parse --git-common-dir` 问 git 自己
+   * 「共享的 git 目录在哪」，而不是假设 `.git` 是目录。
+   */
+  private commonDirCache: string | null = null;
+
+  /**
    * 移除 worktree 时的重试间隔（毫秒）。
    *
    * 可被测试改小 —— 生产值 3s 是为了让 Windows 上的文件句柄有时间释放。
@@ -175,6 +199,135 @@ export class WorktreeManager {
   /** 这次同步用哪个超时。 */
   private submoduleTimeoutMs(): number {
     return this.submoduleTimeoutMsOverride ?? DEFAULT_SUBMODULE_TIMEOUT_MS;
+  }
+
+  /**
+   * 这个仓库的 **git common dir** —— 所有 worktree 共享的那个 `.git`。
+   *
+   * 为什么必须问 git 而不是自己拼（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+   *   `.git` 在主仓里是**目录**，在 worktree 里是**文件**（内容是
+   *   `gitdir: D:/repo/.git/worktrees/<name>`）。zelto 的 `run` 常常跑在
+   *   **版本工作目录**里，那里的 `.git` 是文件 ——
+   *   于是 `<repoRoot>/.git/modules/...` 这种拼法**根本不存在**。
+   *
+   * `git rev-parse --git-common-dir` 回答的正是「共享的 git 目录在哪」，
+   * 主仓与 worktree 都能给出正确答案（worktree 返回主仓的 `.git`）。
+   *
+   * 拿不到时（不在 git 仓库里 / git 不可用）→ 返回 null，
+   * 调用方退回「`<repoRoot>/.git` 是目录」的老假设。
+   */
+  private gitCommonDir(): string | null {
+    if (this.commonDirCache !== null) return this.commonDirCache || null;
+    try {
+      const out = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+        cwd: this.repoRoot,
+        encoding: 'utf-8',
+        timeout: 30_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      this.commonDirCache = out || null;
+      return this.commonDirCache;
+    } catch {
+      this.commonDirCache = '';
+      return null;
+    }
+  }
+
+  /**
+   * 某个 submodule 的 **module git 目录**（git 内部存放它对象库的地方）。
+   *
+   * 候选按优先级：
+   *   1. `<repoRoot>/<sub.path>/.git` 是**目录** → 独立嵌套克隆，就用它自己
+   *   2. `<repoRoot>/<sub.path>/.git` 是**文件** → 读它写的 `gitdir:` 指针
+   *      （这才是**这个工作区里那个 submodule 真正指向的对象库**）
+   *   3. `<commonDir>/modules/<name>/` → git 的标准布局（按 name）
+   *   4. `<commonDir>/modules/<path>/` → 兜底（历史上有工具按 path 放）
+   *   5. `<gitDir>/modules/<name|path>/` → worktree 自己的 git 目录下的 modules/
+   *
+   * 候选 2/3/5 是修掉「版本工作目录里跑 run 就全军覆没」的关键：
+   *   `.git` 在主仓里是**目录**，在 worktree 里是**文件**。zelto 的 `run`
+   *   常常跑在**版本工作目录**里 —— 那里的 `.git` 是文件，于是
+   *   `<repoRoot>/.git/modules/...` 这种拼法**根本不存在**。
+   *
+   *   而 worktree 里那个 submodule 的 `.git` 指针指向的是
+   *   `.git/worktrees/<name>/modules/...`（**这个 worktree 专属**的对象库），
+   *   与主仓那份**不是同一个** —— 里面钉住的 commit 也可能不同。
+   *
+   * 找不到 → null（调用方记成 skipped，不静默）。
+   */
+  private moduleGitDirFor(sub: { name: string; path: string }, gitLink: string): string | null {
+    // 1. `.git` 是目录 → 独立嵌套克隆
+    if (this.isDirectory(gitLink)) return gitLink;
+
+    // 2. `.git` 是文件 → 读它指向的 gitdir
+    if (existsSync(gitLink)) {
+      const pointed = this.resolveGitLinkPointer(gitLink);
+      if (pointed) return pointed;
+    }
+
+    // 3/4/5. 共享的 common dir 与 worktree 自己的 git 目录
+    const bases: string[] = [];
+    const commonDir = this.gitCommonDir();
+    if (commonDir) bases.push(join(commonDir, 'modules'));
+    // 兜底：`<repoRoot>/.git` 是目录时的老路径（git 不可用时）
+    bases.push(join(this.repoRoot, '.git', 'modules'));
+    // worktree 自己的 git 目录下的 modules/
+    const gitDir = this.gitDirOf(this.repoRoot);
+    if (gitDir) bases.push(join(gitDir, 'modules'));
+
+    for (const base of bases) {
+      for (const key of [sub.name, sub.path]) {
+        const dir = join(base, ...key.split('/'));
+        if (existsSync(dir)) return dir;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 读 submodule 工作区里那个 `.git` **文件**，解析出它指向的 git 目录。
+   *
+   * `.git` 文件的内容形如 `gitdir: <path>`，路径可以是**相对**的
+   * （相对于 `.git` 文件所在目录）。
+   *
+   * 为什么要读它（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+   *   版本工作目录里那个 submodule 的 `.git` 指向
+   *   `.git/worktrees/v3/modules/src/third_party/wolfssl/src` ——
+   *   那是**这个 worktree 专属**的对象库，钉住的 commit 与主仓那份不同。
+   *   靠猜路径猜不到，只能**问那个指针本身**。
+   */
+  private resolveGitLinkPointer(gitLink: string): string | null {
+    try {
+      const raw = readFileSync(gitLink, 'utf-8').trim();
+      const m = raw.match(/^gitdir:\s*(.+)$/m);
+      if (!m) return null;
+      const target = m[1].trim();
+      if (!target) return null;
+      const abs = isAbsolute(target) ? target : resolve(join(dirname(gitLink), target));
+      return existsSync(abs) ? abs : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 这个工作区的 **git dir**（worktree 自己那个，不是共享的 common dir）。
+   *
+   * worktree 的 git 目录在主仓里：`.git/worktrees/<name>`。
+   * 它的 `modules/` 下住着**这个 worktree 专属**的 submodule 对象库。
+   */
+  private gitDirOf(worktreePath: string): string | null {
+    try {
+      const out = execFileSync('git', ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], {
+        cwd: worktreePath,
+        encoding: 'utf-8',
+        timeout: 30_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      return out || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -539,36 +692,88 @@ export class WorktreeManager {
       const hasGitLink = existsSync(gitLink);
       const hasContent = this.hasDirectoryContent(mainSubPath);
 
-      if (!hasGitLink) {
-        if (hasContent) {
-          // c) 主仓里已经有源码 → 直接复制过去（离线、且保留内容一致）
-          this.copyDirectory(mainSubPath, join(worktreePath, sub.path));
-          initialized.push(sub.path);
-        } else {
-          // 主仓里既没有 .git 也没有内容 → 没本地 objects，跳过（不触网拉）
+      if (!hasGitLink && !hasContent) {
+        // 主仓里既没有 .git 也没有内容 → 本地没有副本。
+        //
+        // **但先问一次 module git 目录**（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+        //   在**版本工作目录**里跑时，那个 submodule 可能压根没初始化过
+        //   （目录存在但是空的，没有 `.git` 指针）——
+        //   它的对象库却**已经在** `.git/worktrees/<name>/modules/...` 里了
+        //   （那是被 `git submodule update` 初始化过的版本工作目录留下的）。
+        //
+        //   早先这里直接 `skipped` → worktree 里 vendor 全空 →
+        //   门禁②的 build 阶段才炸，报错是「找不到头文件」（ADR-095 §2.3）。
+        //
+        //   所以：**先找 module git 目录，找得到就照样同步**（不触网，
+        //   用本地 objects）；真找不到才跳过。
+        const fallbackDir = this.moduleGitDirFor(sub, gitLink);
+        if (!fallbackDir) {
+          // 真的什么都没有（既没有工作树，也没有对象库）→ 跳过（不触网拉）。
+          //
+          // **但必须留痕**（D-73）：「少了哪个 vendor、为什么少」
+          // 是人唯一能据此修好环境的线索。不留痕的话，
+          // 「vendor 没同步上」这件事直到门禁报「找不到头文件」才显形。
           skipped.push(sub.path);
+          this.submoduleFailures.push({
+            path: sub.path,
+            reason: '本地既没有 submodule 工作树，也没有 module git 目录（对象库）—— 无副本可同步',
+          });
+          continue;
         }
+        // 有 module git 目录 → 走下面的同步路径（`hasGitLink` 为 false，
+        // 但对象库在 → 能检出到钉死的 commit）。
+        this.syncOneSubmodule(sub, fallbackDir, mainSubPath, worktreePath, initialized, skipped);
         continue;
       }
 
-      // submodule 自己的 git 目录。按优先级找三处：
-      //   1. `<主仓>/<path>/.git` 是**目录** → 独立嵌套克隆，就用它自己
-      //   2. `<主仓>/.git/modules/<name>/` → git 的标准布局（按 name）
-      //   3. `<主仓>/.git/modules/<path>/` → 兜底（历史上有工具按 path 放）
-      //
-      // 1 和 2/3 是**互斥**的两种布局：`.git` 指向 module git 目录时，
-      // module git 目录就在 `.git/modules/` 下；`.git` 本身就是目录时，
-      // `.git/modules/` 下**没有**对应目录。
-      const nestedGitDir = this.isDirectory(gitLink) ? gitLink : null;
-      const moduleGitDir = nestedGitDir ?? [
-        join(this.repoRoot, '.git', 'modules', ...sub.name.split('/')),
-        join(this.repoRoot, '.git', 'modules', ...sub.path.split('/')),
-      ].find((dir) => existsSync(dir));
+      if (!hasGitLink) {
+        // c) 主仓里已经有源码 → 直接复制过去（离线、且保留内容一致）
+        this.copyDirectory(mainSubPath, join(worktreePath, sub.path));
+        initialized.push(sub.path);
+        continue;
+      }
+
+      // submodule 自己的 git 目录。按优先级找几处 —— 见
+      // `moduleGitDirFor()` 的说明（关键是**不能**假设 `<repoRoot>/.git` 是目录：
+      // 在版本工作目录里它是文件）。
+      const moduleGitDir = this.moduleGitDirFor(sub, gitLink);
       if (!moduleGitDir) {
+        // 工作树在，但找不到它的 git 目录 → 没法离线同步。
+        // 同样要留痕（D-73）。
         skipped.push(sub.path);
+        this.submoduleFailures.push({
+          path: sub.path,
+          reason: 'submodule 工作树存在，但找不到它的 git 目录（.git 指针与 module git 目录都不在）',
+        });
         continue;
       }
 
+      this.syncOneSubmodule(sub, moduleGitDir, mainSubPath, worktreePath, initialized, skipped);
+    }
+
+    // 嵌套 submodule：主仓的 module git 目录做本地克隆源，不联网。
+    this.syncNestedSubmodules(worktreePath, submodules.map((s) => s.path));
+
+    return { initialized, skipped };
+  }
+
+  /**
+   * 把一个 submodule 同步进 worktree（本地 objects，不触网）。
+   *
+   * 抽出来是因为两条路径汇到同一处：
+   *   - 主仓里那个 submodule 有 `.git` 指针（正常初始化的）
+   *   - 主仓里那个 submodule **没有** `.git`，但 module git 目录**存在**
+   *     （版本工作目录里没初始化过的 submodule —— 见 `syncSubmodules` 的说明）
+   */
+  private syncOneSubmodule(
+    sub: { name: string; path: string },
+    moduleGitDir: string,
+    mainSubPath: string,
+    worktreePath: string,
+    initialized: string[],
+    skipped: string[],
+  ): void {
+    {
       // ── 钉死的 commit 本地有没有？先查，再动 ──────────────────────
       //
       // 病灶（实测 nimrtc-v14 v3-n4-d6-connectivity，2026-11-22）：
@@ -602,8 +807,23 @@ export class WorktreeManager {
       //
       //   共享 module git 目录（`.git/modules/...`）没有这个问题，
       //   但从工作树问同样是对的 —— 所以统一问工作树。
+      //
+      // **主仓工作区里那个 submodule 是个空目录时**（版本工作目录里
+      // 没初始化过 submodule 的那种情况）→ **问 module git 目录本身**。
+      //
+      // 为什么（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+      //   空目录里没有 `.git`，git 会**向上**找到**顶层仓库**（版本工作目录
+      //   自己那个 git dir），于是回答的是顶层仓库的答案 ——
+      //   顶层仓库里当然没有那个 submodule 的 commit → **误判为缺失**。
+      //   实测就是这么误报的：报「没有 ac01707f」，而那个 commit
+      //   **确实存在**在 module git 目录里。
+      //
+      // 判据：那个目录里**有没有 `.git`**（有 = 真 submodule 工作区，
+      // 问它；没有 = 空壳，问 module git 目录）。
       const pinned = this.pinnedCommitOf(sub.path);
-      if (pinned && !this.commitAvailable(mainSubPath, pinned)) {
+      const mainSubIsReal = existsSync(join(mainSubPath, '.git'));
+      const probePath = mainSubIsReal ? mainSubPath : moduleGitDir;
+      if (pinned && !this.commitAvailable(probePath, pinned)) {
         // 本地缺这个 commit → **记下来并抛错**，不继续建一个空 vendor 的 worktree。
         //
         // 为什么是抛错而不是警告（ADR-095 §3.1）：worktree 建出来是**坏的**，
@@ -679,11 +899,6 @@ export class WorktreeManager {
         });
       }
     }
-
-    // 嵌套 submodule：主仓的 module git 目录做本地克隆源，不联网。
-    this.syncNestedSubmodules(worktreePath, submodules.map((s) => s.path));
-
-    return { initialized, skipped };
   }
 
   /**
@@ -755,10 +970,23 @@ export class WorktreeManager {
         // `msquic`，剩下的是 `modules/` + 嵌套的 path。
         // 早先这里拼成了 `.../modules/submodules/<name>`（多一层），
         // 两个候选都找不到 → 静默跳过 → worktree 里嵌套层仍是空目录。
-        const moduleGitDir = [
-          join(this.repoRoot, '.git', 'modules', ...topPath.split('/'), 'modules', ...sub.path.split('/')),
-          join(this.repoRoot, '.git', 'modules', ...topPath.split('/'), 'modules', ...sub.name.split('/')),
-        ].find((dir) => existsSync(dir));
+        //
+        // 候选按「共享 common dir」与「本 worktree 自己的 git dir」两处都试 ——
+        // 在**版本工作目录**里跑时，`.git` 是文件，`<repoRoot>/.git/modules` 不存在
+        // （同 `moduleGitDirFor()` 的病灶说明）。
+        const nestedBases = [
+          ...(this.gitCommonDir() ? [join(this.gitCommonDir() as string, 'modules')] : []),
+          join(this.repoRoot, '.git', 'modules'),
+          ...(this.gitDirOf(this.repoRoot)
+            ? [join(this.gitDirOf(this.repoRoot) as string, 'modules')]
+            : []),
+        ];
+        const moduleGitDir = nestedBases
+          .flatMap((base) => [
+            join(base, ...topPath.split('/'), 'modules', ...sub.path.split('/')),
+            join(base, ...topPath.split('/'), 'modules', ...sub.name.split('/')),
+          ])
+          .find((dir) => existsSync(dir));
         if (!moduleGitDir) continue;
 
         // 顶层 submodule 在 worktree 里的位置 —— 嵌套层要挂在它下面
@@ -848,6 +1076,22 @@ export class WorktreeManager {
       if (!existsSync(join(mainSub, '.git'))) continue;
       if (!existsSync(wtSub)) continue;
 
+      // worktree 里这个 submodule **有没有被初始化出来**。
+      //
+      // 为什么必须单独判（实测 nimrtc-v14 v1-ice-recovery，2026-11-23）：
+      //   worktree 里的 submodule 目录存在但**是空的**（没有 `.git`）——
+      //   那说明同步那一步没成功。
+      //   此时在 `wtSub` 里跑任何 git 命令，git 会**向上**找到顶层仓库，
+      //   于是回答的是**顶层仓库**的答案：
+      //     - `rev-parse HEAD` → 顶层仓库的 HEAD（毫无意义）
+      //     - `cat-file -e <sha>` → 顶层仓库里没有那个 commit → **误判为缺失**
+      //   实测就是这么误报的：报「没有 ac01707f」，而那个 commit
+      //   **确实存在**在 submodule 自己的对象库里。
+      //
+      // 所以：目录里没有 `.git` → 不问它，改问**主仓**里那个 submodule
+      // （它的 `.git` 指向真正的 module git 目录）。
+      const wtHasGit = existsSync(join(wtSub, '.git'));
+
       // 目标 commit：**worktree 自己的 index** 里记录的 gitlink。
       // worktree 是从主仓同一个 commit 建出来的，所以它 index 里记的
       // 就是主仓要的那一个 —— 这比「主仓工作区当前在哪个 commit」更准
@@ -863,7 +1107,7 @@ export class WorktreeManager {
       if (!target) continue;
 
       // worktree 里那个 submodule 当前实际在哪个 commit
-      const wtHead = this.submoduleHead(wtSub);
+      const wtHead = wtHasGit ? this.submoduleHead(wtSub) : null;
       if (wtHead === target) continue;
 
       // ── 钉死的 commit 本地根本没有？→ 明确报错，别静默 ────────────
@@ -882,7 +1126,19 @@ export class WorktreeManager {
       // 判据用 `cat-file -e`：只读本地对象库，不触网（C3），且是确定性的。
       // 「commit 不存在」与「checkout 因别的原因失败」必须分开 ——
       // 前者必须拦（worktree 建出来就是坏的），后者不该拦（可能只是一次占用）。
-      if (!this.commitAvailable(wtSub, target)) {
+      //
+      // **问哪个目录**：worktree 里那个 submodule 初始化成功时问它；
+      // 没初始化成功时问**主仓**里那个 —— 但主仓里那个若也是**空壳**
+      // （版本工作目录里没初始化过 submodule），问它等于问**顶层仓库**
+      // → 误判「缺失」（见上面的病灶说明）。
+      //
+      // 兜底：module git 目录本身就是那个对象库 —— 它一定答得对。
+      const probePath = wtHasGit
+        ? wtSub
+        : existsSync(join(mainSub, '.git'))
+          ? mainSub
+          : this.moduleGitDirFor(sub, join(mainSub, '.git')) ?? mainSub;
+      if (!this.commitAvailable(probePath, target)) {
         throw new WorktreeError(
           missingSubmoduleCommitMessage(sub.path, target, this.repoRoot),
           `checkout ${target}`,

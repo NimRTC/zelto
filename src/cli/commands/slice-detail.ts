@@ -182,7 +182,11 @@ function parseArrayField(rawValue: string, field: string): string[] {
     } catch (err) {
       throw new Error(
         `${field} 的值看起来是 JSON 数组，但解析失败：` +
-        `${err instanceof Error ? err.message : String(err)}`,
+        `${err instanceof Error ? err.message : String(err)}\n` +
+        `  数组字段收两种格式：JSON 数组（推荐，如 ["src/a/**","src/b/**"]）` +
+        `或逗号分隔（src/a/**,src/b/**）。\n` +
+        `  以 "[" 开头一律按 JSON 解析，解析失败**不会**退回逗号分隔 —— ` +
+        `那样会把「JSON 写错了」变成「写集里多了几个奇怪条目」（同一个病）。`,
       );
     }
     if (!Array.isArray(parsed)) {
@@ -214,6 +218,20 @@ register('set', async (args) => {
     for (const field of [...SLICE_SETTABLE_FIELDS].sort()) {
       f.out(`  ${field}`);
     }
+    f.out('');
+    // ZD-022 剩余问题：数组字段的格式**必须**写在 help 里。
+    //
+    // 为什么：数组字段收两种格式（JSON 数组 / 逗号分隔），
+    // 而 help 里只列字段名的话，下一个人还是会猜 ——
+    // 猜错的那一次，zelto 会**静默**把写集写坏（带方括号的垃圾条目，
+    // 覆盖不到任何路径，也不报错）。「不说 = 让人猜」在这里是有代价的。
+    f.out('Array fields (writes, trace.requirements, trace.contracts, trace.tests, spec.gateCommands)');
+    f.out('  accept TWO formats:');
+    f.out('    JSON array     --value \'["src/a/**","src/b/**"]\'   (preferred — unambiguous)');
+    f.out('    comma-separated --value "src/a/**,src/b/**"            (legacy, still supported)');
+    f.out('  A value starting with "[" is parsed as JSON; if it fails to parse,');
+    f.out('  zelto reports the error and leaves the field UNCHANGED');
+    f.out('  (it never silently falls back to comma-splitting).');
     return 1;
   }
 

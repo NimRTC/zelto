@@ -11,11 +11,14 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { BudgetCollector } from '../../core/budget/collector.js';
+import { RuntimeBudgetGuard } from '../../core/budget/runtime-guard.js';
 import { GateExecutor } from '../../core/gate/executor.js';
 import { SignManager } from '../../core/gate/sign.js';
 import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
-import type { GateCommandSummary } from '../../core/sched/types.js';
+import type { GateCommandSummary, GateScopeSummary } from '../../core/sched/types.js';
+import { resolveScope } from '../../core/gate/scope.js';
+import { pathMatches } from '../../core/sched/paths.js';
 import { classifyStall, isAutoResolvable, type StallClass } from '../../core/stall/classifier.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
@@ -53,6 +56,26 @@ export function gateCommandsForSlice(slice: { writes: string[]; spec?: { gateCom
     return specific.map((c) => ({ name: c.name, run: c.run }));
   }
   return resolveGateCommands(detectSliceType(slice.writes));
+}
+
+/**
+ * 求本片这轮门禁的**作用域**（ADR-097）。
+ *
+ * 与门禁执行器同一口径（同一个 `resolveScope`）—— agent 必须知道
+ * 「门禁会验哪些用例」，否则它会以为门禁跑全量、自己跑几个用例就行
+ * （ADR-045 的教训：口径不一致 = 追溯链断）。
+ *
+ * 没配 `gate.scope` → 返回 null（包里不带这一段 = 老行为，零变化）。
+ */
+export function gateScopeForSlice(slice: { writes: string[] }): GateScopeSummary | null {
+  const config = loadConfig();
+  if (!config.gate.scope || config.gate.scope.rules.length === 0) return null;
+  const match = resolveScope(slice.writes, config.gate.scope, pathMatches);
+  return {
+    scoped: match.source === 'config',
+    labels: match.labels,
+    reason: match.reason,
+  };
 }
 
 /**
@@ -363,6 +386,9 @@ export async function autoGateAfterRun(id: string): Promise<void> {
     commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
     profiles: config.gate.profiles,
     ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
+    // 门禁作用域（ADR-097）—— 自动门禁与手动门禁**同一套**规则，
+    // 否则「agent 验过的东西」与「门禁验的东西」口径不一致（ADR-045）。
+    ...(config.gate.scope ? { scope: config.gate.scope } : {}),
     timeoutSec: config.gate.timeoutSec,
     ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
     retry: { max: config.gate.retry.max, budgetStepUsd: 0.05 },
@@ -397,13 +423,43 @@ export async function autoGateAfterRun(id: string): Promise<void> {
   const report = await executor.execute(id);
 
   console.log(`  Gate commands: ${report.results.length}`);
+  // 门禁作用域（ADR-097）：自动门禁也必须说清楚「这次跑的是全量还是收窄」。
+  if (report.scope) {
+    if (report.scope.scoped) {
+      console.log(
+        `  Scope: 🎯 收窄（标签：${report.scope.labels.join('、')}）—— 跑了 ${report.scope.testCount ?? '?'} / ${report.scope.totalTestCount ?? '?'} 个用例`,
+      );
+    } else {
+      console.log(`  Scope: 全量（${report.scope.reason}）`);
+    }
+  }
   for (const r of report.results) {
     const icon = r.passed ? '✅' : '❌';
     console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
-    if (!r.passed && r.stderr) {
-      const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
-      for (const line of stderrLines) {
-        console.log(`       ${line.slice(0, 200)}`);
+    if (!r.passed) {
+      // ZD-027：先给结构化失败用例清单，再退回裸 stderr。
+      const failures = r.failures ?? [];
+      if (failures.length > 0) {
+        const runner = r.runner && r.runner !== 'unknown' ? ` · ${r.runner}` : '';
+        console.log(`       ✗ 失败用例${runner}：${failures.length} 个`);
+        for (const f of failures.slice(0, 8)) {
+          const name = f.test?.trim() || '(未命名用例)';
+          const loc = f.location ? `  ${f.location}` : '';
+          console.log(`         ✗ ${name}${loc}`);
+          if (f.message) {
+            for (const ml of f.message.split('\n').slice(0, 4)) {
+              console.log(`             ${ml.slice(0, 200)}`);
+            }
+          }
+        }
+        if (failures.length > 8) {
+          console.log(`         … 另有 ${failures.length - 8} 个（见 gate.result 事件）`);
+        }
+      } else if (r.stderr) {
+        const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
+        for (const line of stderrLines) {
+          console.log(`       ${line.slice(0, 200)}`);
+        }
       }
     }
   }
@@ -733,4 +789,59 @@ export async function handleWriteSetViolation(
     tampered,
     ...extra,
   });
+}
+
+/**
+ * 读预算上限（ZD-007）。
+ *
+ * 与 `BudgetCollector.getLimit` **同一口径**（同一份配置、同一条语义）：
+ * - `budgetLimitUsd > 0` → 这个数就是上限
+ * - `budgetLimitUsd: 0` → 不限（`Infinity`）
+ * - 没有这一项 / 解析不出数 → 默认 `1.0`
+ *
+ * 这里**直接复用** collector 的读法而不是自己再解析一遍 config.yaml ——
+ * 两份实现漂移的后果是「起跑前那道闸门按 $1 判、运行中那道按 $100 判」，
+ * 人会看到一个自相矛盾的账。
+ *
+ * 返回 null 表示「读不到上限」→ 不设运行中闸门（退回老口径）。
+ */
+export async function readBudgetLimit(): Promise<number | null> {
+  try {
+    const budget = new BudgetCollector(events, ZELTO_DIR);
+    return await budget.getLimit('');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 造一个**运行中**的预算闸门（ZD-007）。
+ *
+ * 为什么这里造：`RuntimeBudgetGuard` 是纯计算（core/），
+ * 而「上限从哪来」「运行中用量从哪读」是**接线**（CLI/）。
+ * 分开是为了让 core 不认识适配器（C2）。
+ *
+ * 三种情况返回 null（= 不拦）：
+ * 1. 上限是「不限」（`budgetLimitUsd: 0` → Infinity）—— 没有上限就没有闸门；
+ * 2. 适配器**没有** `getLiveUsage` —— 跑不到运行中用量，拦不了
+ *    （Claude Code 的 shell 适配器就属于这种：json 输出中途拿不到）；
+ * 3. 配置里没有单价 —— 折不出金额，同样拦不了。
+ *
+ * 第 2、3 条尤其要说清楚：**拦不了不等于放行无阻**，
+ * 起跑前那次检查与跑完后的复判仍在（那是老的两道闸门）。
+ * 但运行中**确实**没有第三道闸门 —— 这是事实，不该被含糊过去。
+ */
+export function createRuntimeBudgetGuard(opts: {
+  adapter: ExecutorAdapter;
+  sessionId: string;
+  limitUsd: number;
+}): RuntimeBudgetGuard | null {
+  if (!Number.isFinite(opts.limitUsd)) return null;
+  if (typeof opts.adapter.getLiveUsage !== 'function') return null;
+
+  const guard = new RuntimeBudgetGuard(opts.limitUsd, () => {
+    const usage = opts.adapter.getLiveUsage?.(opts.sessionId);
+    return usage ? { costUsd: usage.costUsd } : null;
+  });
+  return guard.enabled ? guard : null;
 }

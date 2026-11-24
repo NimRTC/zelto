@@ -61,3 +61,45 @@ jobs:
       - run: pnpm test
 
       - run: pnpm lint
+
+  build-and-test-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+        shell: bash
+
+      - name: Credential scan
+        env:
+          ZELTO_CREDENTIAL_PATTERNS: ${{ secrets.ZELTO_CREDENTIAL_PATTERNS }}
+        shell: bash
+        run: |
+          if [ -n "$ZELTO_CREDENTIAL_PATTERNS" ]; then
+            mkdir -p .zelto
+            printf '%s' "$ZELTO_CREDENTIAL_PATTERNS" > .zelto/credential-patterns.local.json
+          fi
+          pnpm check:credentials
+
+      - run: pnpm build
+        shell: bash
+
+      - run: pnpm test:quick
+        shell: bash
+
+      - run: pnpm lint
+        shell: bash

@@ -8,6 +8,7 @@
 import { colors } from '../color.js';
 import type { SignCheck } from '../../core/sign-review/types.js';
 import type { SignReviewFacts } from '../../core/sign-review/types.js';
+import { describeScope } from '../../core/sign-review/evaluate.js';
 
 /** 渲染视口。宽度控制每行截断，高度由结构固定行数保证不超。 */
 export interface SignReviewViewport {
@@ -66,7 +67,7 @@ export function renderSignReview(
   // ⑥ 四项确认项
   lines.push(sectionTitle('签字前请确认四件事'));
   for (const check of checks) {
-    lines.push(`  ${check.ok ? colors.green('✓') : colors.red('✗')} ${checkLabel(check.label)}${truncate(check.evidence, width - 18)}`);
+    lines.push(`  ${check.ok ? colors.green('✓') : colors.red('✗')} ${checkLabel(check.label)}${formatEvidence(check.evidence, width - 18)}`);
   }
   lines.push(divider(width));
 
@@ -77,6 +78,27 @@ export function renderSignReview(
 }
 
 // ─── 小工具 ──────────────────────────────────────────────────────────────────
+
+/**
+ * 佐证文案的呈现 —— 正常截断（ADR-104 决策三）。
+ *
+ * **为什么佐证里已经有作用域，还要在这里再处理一次**：
+ * 佐证文案是「结论 · 作用域说明」两段，作用域说明正是这次要让人看见的东西。
+ * 但**这一行的宽度本来就不够**（标签占 14 列 + 前缀），
+ * 统一截断会把它切掉 —— 人看到「…· 按写集收窄跑的（标签…」这样一个断句，
+ * **等于没看见**（比不显示更糟：看起来像显示过了）。
+ *
+ * 所以做法是：**作用域说明在「验收（门禁②）」段已经完整显示**
+ * （那一段是整行，宽度充足），这里的确认项行只是**结论的复述**，
+ * 截断到「按写集收窄」这几个字就够人认出了 ——
+ * 真正要核对数字时，看上面那一段。
+ *
+ * **为什么不换行**：渲染的验收标准是「单屏铺开、不分页」（ADR-070 §5.3），
+ * 多一行就可能超屏。所以**放在同一行末尾**。
+ */
+function formatEvidence(evidence: string, width: number): string {
+  return truncate(evidence, width);
+}
 
 /** 一行的水平分隔线 —— 全宽。 */
 function divider(width: number): string {
@@ -100,19 +122,54 @@ function traceLine(kind: string, label: string, items: string[], width: number):
   return truncate(`  ${kind}  ${label}：${value}  ${marker}`, width);
 }
 
-/** 验收段内容 —— 说清跑没跑、跑没跑过、结论是什么（ADR-033）。 */
+/**
+ * 验收段内容 —— 说清跑没跑、跑没跑过、结论是什么（ADR-033）。
+ *
+ * **作用域**（ADR-104 决策三）：收窄发生时要在**紧邻结论**处说明
+ * 「这轮跑的是不是全量」——
+ *
+ * 为什么放在这里而不是单独开一段：人签字前需要知道「门禁跑的是不是全量」。
+ * 收窄是**工具的判断**（规则是人配的），人签字时看不到它
+ * = 人在**不知情**的情况下批准。
+ *
+ * 与 ADR-097 决策五的 `--full`（人的出口）是同一件事的两面：
+ * **看得见收窄 → 才有「按全量重跑」这个动作**。
+ */
 function formatAcceptance(facts: SignReviewFacts): string {
   const g = facts.gate;
   if (!g.acceptanceRan) {
-    return colors.red('✗') + ' gate.result 事件没有 acceptance 记录 —— 本片没有真正被验收过';
+    return (
+      colors.red('✗') +
+      ' gate.result 事件没有 acceptance 记录 —— 本片没有真正被验收过' +
+      scopeSuffix(g.scope)
+    );
   }
   if (!g.acceptancePassed) {
-    return colors.red('✗') + ` acceptance 跑过但未通过（${g.passCount}/${g.totalCount}）`;
+    return (
+      colors.red('✗') +
+      ` acceptance 跑过但未通过（${g.passCount}/${g.totalCount}）` +
+      scopeSuffix(g.scope)
+    );
   }
   if (g.totalCount > 0) {
-    return colors.green('✓') + ` ${g.passCount}/${g.totalCount} passed · 跑的是本片验收文件`;
+    return (
+      colors.green('✓') +
+      ` ${g.passCount}/${g.totalCount} passed · 跑的是本片验收文件` +
+      scopeSuffix(g.scope)
+    );
   }
-  return colors.green('✓') + ' acceptance 通过（本片验收文件）';
+  return colors.green('✓') + ' acceptance 通过（本片验收文件）' + scopeSuffix(g.scope);
+}
+
+/**
+ * 作用域说明后缀 —— 复用 core 的同一份措辞（ADR-104 决策六）。
+ *
+ * **判据与事实必须共用**（D-11 教训：两处各判一套会漂移）；
+ * 呈现可以各有一份（CLI 是文本，Web 是 HTML），但**内容必须同源**。
+ */
+function scopeSuffix(scope: SignReviewFacts['gate']['scope'] | undefined): string {
+  const note = describeScope(scope);
+  return note ? ` · ${note}` : '';
 }
 
 /** 成本 —— 美元金额，两位小数。 */

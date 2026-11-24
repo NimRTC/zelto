@@ -37,13 +37,17 @@ register('gate', async (args) => {
       // --spec-md without slice-id is handled above
       return 0;
     }
-    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run] [--spec-md] [--only <name>]');
+    console.error('Usage: zelto gate <slice-id> [--retry <N>] [--dry-run] [--spec-md] [--only <name>] [--rerun-failed] [--full]');
     console.error('       zelto gate --spec-md                    (validate all specs)');
+    console.error('       --full                                  强制跑全量（不做作用域收窄，ADR-097）');
     return 1;
   }
 
   const isJson = args.includes('--json');
   const isDryRun = args.includes('--dry-run');
+  const rerunFailed = args.includes('--rerun-failed');
+  // `--full` = 人显式要求跑全量（怀疑作用域规则漏了某个模块时的出口）。
+  const forceFull = args.includes('--full');
   const retryFlag = args.indexOf('--retry');
   const forceRetry = retryFlag >= 0 && args[retryFlag + 1] ? Math.max(0, parseInt(args[retryFlag + 1], 10) || 0) : -1;
   const onlyFlag = args.indexOf('--only');
@@ -137,6 +141,7 @@ register('gate', async (args) => {
         timeoutSec: config.gate.timeoutSec,
         retryMax: forceRetry >= 0 ? forceRetry : config.gate.retry.max,
         ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
+        ...(config.gate.scope ? { scope: config.gate.scope } : {}),
         ...(config.gate.submoduleCheck !== undefined ? { submoduleCheck: config.gate.submoduleCheck } : {}),
         ...(gateRoot ? { gateRoot } : {}),
         requestSign: true,
@@ -145,6 +150,8 @@ register('gate', async (args) => {
         ...(onlyCommand ? { only: onlyCommand } : {}),
         ...(forceRetry >= 0 ? { retry: forceRetry } : {}),
         ...(isDryRun ? { dryRun: true } : {}),
+        ...(rerunFailed ? { rerunFailed: true } : {}),
+        ...(forceFull ? { full: true } : {}),
       },
     );
 
@@ -181,13 +188,28 @@ register('gate', async (args) => {
 
     const facts = (outcome.facts ?? {}) as {
       passed?: boolean;
-      results?: Array<{ command: string; passed: boolean; exitCode: number | null; durationMs: number; stderr?: string | null }>;
+      results?: Array<{
+        command: string; passed: boolean; exitCode: number | null; durationMs: number;
+        stderr?: string | null;
+        failures?: Array<{ test?: string; message?: string; location?: string }>;
+        reportedFailureCount?: number | null;
+        runner?: string;
+      }>;
       acceptance?: { status: string; path: string | null; command: string | null; reason: string | null } | null;
       retryCount?: number;
       totalDurationMs?: number;
       signRequestId?: string;
       code?: string;
       designId?: string;
+      // 作用域事实（ADR-097）—— 「门禁过了意味着什么」要说清楚。
+      scope?: {
+        scoped: boolean;
+        labels: string[];
+        source: string;
+        reason: string;
+        testCount: number | null;
+        totalTestCount: number | null;
+      };
     };
 
     // 架构护栏拦截 —— 它在跑门禁命令**之前**就拦下了。
@@ -241,6 +263,7 @@ register('gate', async (args) => {
         ...(facts.acceptance ? { acceptance: facts.acceptance } : {}),
         retryCount: facts.retryCount,
         totalDurationMs: facts.totalDurationMs,
+        ...(facts.scope ? { scope: facts.scope } : {}),
       }));
       // JSON 模式的退出码跟着**结论**走（重构前既有契约）：
       // 门禁没通过 = 结论为否 = 退出码 1。
@@ -248,14 +271,54 @@ register('gate', async (args) => {
     }
 
     console.log(`  Commands: ${facts.results?.length ?? 0}`);
+
+    // 作用域（ADR-097 决策五）—— 门禁过了意味着什么，必须说清楚。
+    //
+    // 收窄跑的门禁过了 = 「本片相关用例全过」，不是「整个项目都好了」。
+    // 不说清楚，收窄就成了「悄悄降级的门禁」。
+    const scope = facts.scope;
+    if (scope) {
+      if (scope.scoped) {
+        const total = scope.totalTestCount ?? '?';
+        const ran = scope.testCount ?? '?';
+        console.log(`  Scope:    🎯 收窄（标签：${scope.labels.join('、')}）—— 跑了 ${ran} / ${total} 个用例`);
+      } else {
+        console.log(`  Scope:    全量（${scope.reason}）`);
+      }
+    }
+
     for (const r of facts.results ?? []) {
       const icon = r.passed ? '✅' : '❌';
       console.log(`    ${icon} ${r.command} (${r.durationMs.toFixed(0)}ms, exit ${r.exitCode ?? 'signal'})`);
-      if (!r.passed && r.stderr) {
-        // Show truncated stderr for failure debugging
-        const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
-        for (const line of stderrLines) {
-          console.log(`       ${line.slice(0, 200)}`);
+      if (!r.passed) {
+        // ZD-027：先给结构化失败用例清单（哪个用例挂了、断言说了什么），
+        // 再退回裸 stderr —— 后者往往只有一句「Errors while running CTest」。
+        const failures = r.failures ?? [];
+        if (failures.length > 0) {
+          const runner = r.runner && r.runner !== 'unknown' ? ` · ${r.runner}` : '';
+          console.log(`       ✗ 失败用例${runner}：${failures.length} 个`);
+          for (const f of failures.slice(0, 8)) {
+            const name = f.test?.trim() || '(未命名用例)';
+            const loc = f.location ? `  ${f.location}` : '';
+            console.log(`         ✗ ${name}${loc}`);
+            if (f.message) {
+              for (const ml of f.message.split('\n').slice(0, 4)) {
+                console.log(`             ${ml.slice(0, 200)}`);
+              }
+            }
+          }
+          if (failures.length > 8) {
+            console.log(`         … 另有 ${failures.length - 8} 个失败用例（见 gate.result 事件）`);
+          }
+          const reported = r.reportedFailureCount;
+          if (typeof reported === 'number' && reported > failures.length) {
+            console.log(`         （运行器共报 ${reported} 个失败）`);
+          }
+        } else if (r.stderr) {
+          const stderrLines = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 5);
+          for (const line of stderrLines) {
+            console.log(`       ${line.slice(0, 200)}`);
+          }
         }
       }
     }
@@ -279,6 +342,11 @@ register('gate', async (args) => {
 
     if ((facts.retryCount ?? 0) > 0) {
       console.log(`  Retries:  ${facts.retryCount}`);
+    }
+
+    // 非失败类提示（例如 --rerun-failed 收窄了哪些命令）—— 无论过没过都说。
+    if (facts.passed && outcome.advisories.length > 0) {
+      for (const a of outcome.advisories) console.log(`  ⚠ ${a}`);
     }
 
     if (facts.passed) {

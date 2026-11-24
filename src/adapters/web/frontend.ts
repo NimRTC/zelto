@@ -33,6 +33,13 @@ ${renderStyles()}
     <h1><span id="project-name" class="project-name">…</span> <span class="h1-sep">·</span> <span class="h1-sub">zelto 驾驶舱</span> <small id="summary-line">加载中…</small></h1>
     <div class="head-meta">
       <span id="refresh-line" class="muted small">正在连接…</span>
+      <!-- 崩溃提示的**独立**容器 ——
+           它与「连接断开」是两件事：
+             - 连接断开 = 服务**没了**（该重新跑 zelto web）
+             - 出过错   = 服务**还在**（别重启，页面可能不新鲜而已）
+           混一个容器会互相覆盖：先断连后出错会把「该重启」的提示顶掉，
+           反之亦然 —— 人看到的永远不是当下最要紧的那件事。 -->
+      <span id="crash-line" class="muted small"></span>
       <span id="project-root" class="muted small"></span>
     </div>
     <nav>

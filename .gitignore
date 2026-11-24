@@ -29,6 +29,9 @@ zelto-dashboard.html
 # 本地排障产物（不入库）
 stderr.txt
 stdout.txt
+# 本地基线比对产物（不入库）
+_baseline-out.txt
+_baseline-out.log
 test_out.txt
 test_err.txt
 test-out.txt
