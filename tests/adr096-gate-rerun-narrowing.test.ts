@@ -89,6 +89,58 @@ describe('ADR-096 · 收窄用 --tests-from-file（避开 Windows 正则陷阱�
     assert.ok(out.includes('--tests-from-file m.txt'));
   });
 
+  // ── 引号边界（2026-11-25，Linux CI 红了才暴露出来）────────────────────
+  //
+  // 路径形态带引号时，插入点必须落在引号**外面**。
+  //
+  // POSIX shell 里引号是 shell 的 —— 引号内是**一个 token**。
+  // 插在引号内会得到：
+  //
+  //   "/tmp/x/ctest.sh --tests-from-file m.txt" --test-dir build
+  //
+  // 整个「路径+参数」成了**文件名** —— 命令跑不起来，
+  // 门禁报的是一个与被测代码毫不相干的错。
+  //
+  // Windows 上 `cmd /c "..."` 的引号由 cmd 自己配对，参数落在引号内也照样是
+  // 独立参数 —— 所以**同样的形态在两个平台上结果不同**，
+  // 而插入点必须让两边都对。
+  //
+  // 这条用例在 Windows 上也跑（断言与平台无关）——
+  // 本地全绿、只有 Linux CI 红，说明这个洞**没有平台无关的回归护栏**。
+  // 补上它，下次再动插入点时本地就会红。
+  it('路径带引号时，参数插在引号**外面**（POSIX shell 语义）', () => {
+    const cmd = '"/tmp/gate/ctest.sh" --test-dir build --output-on-failure -C Debug';
+    const out = narrowCtestCommandByFile(cmd, '.zelto-gate-tests-v1.txt');
+    assert.ok(out);
+
+    // 参数必须在闭合引号**之后** —— 不能落进引号内。
+    const closeQuote = out.indexOf('"', out.indexOf('ctest.sh'));
+    const argIdx = out.indexOf('--tests-from-file');
+    assert.ok(closeQuote >= 0, `命令里应有闭合引号：${out}`);
+    assert.ok(
+      argIdx > closeQuote,
+      `参数必须落在引号外（POSIX 引号内是一个 token），实际：${out}`,
+    );
+
+    // 路径本身必须完好 —— 不能被参数插坏。
+    assert.ok(out.startsWith('"/tmp/gate/ctest.sh" '), `路径引号必须配对，实际：${out}`);
+    // 原参数原样保留。
+    assert.ok(out.includes('--test-dir build'));
+    assert.ok(out.includes('--output-on-failure'));
+    assert.ok(out.includes('-C Debug'));
+  });
+
+  it('单引号路径同样处理', () => {
+    const cmd = "'/tmp/gate/ctest.sh' --test-dir build";
+    const out = narrowCtestCommandByFile(cmd, 'm.txt');
+    assert.ok(out);
+    const closeQuote = out.indexOf("'", out.indexOf('ctest.sh'));
+    assert.ok(
+      out.indexOf('--tests-from-file') > closeQuote,
+      `参数必须落在单引号外，实际：${out}`,
+    );
+  });
+
   it('人已经写了过滤参数 → 不叠加', () => {
     for (const cmd of [
       'ctest -R foo',

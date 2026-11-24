@@ -31,6 +31,8 @@
 // `No tests were found!!!`）—— 那就是**门禁假绿**，最危险的失败模式。
 // 「抽不出」永远不等于「没有」。
 
+import { ctestInsertPoint, sanitizeForFilename } from './diagnostics.js';
+
 /**
  * 一条作用域规则。
  *
@@ -386,52 +388,22 @@ export function resolveScope(
 // ─── ctest 枚举命令 ──────────────────────────────────────────────────────────
 
 /**
- * CTest 工具在命令行里的**完整词元**（与 diagnostics.ts 同口径）。
+ * 「ctest 词元在哪结束」这件事**只有一份实现** —— `diagnostics.ts` 的
+ * `ctestInsertPoint()`。
  *
- * 捕获组 1 是要插入参数的**位置** —— 必须是整个词元（含扩展名），
- * 不能只匹配 `ctest` 三个字母，否则 `ctest.exe` 会被插成
- * `ctest --show-only=json-v1.exe`（把文件名劈开了）。
- */
-const CTEST_TOKEN = /(\bctest(?:\.[A-Za-z0-9]+)?)(?=["'\s&|)]|$)/;
-
-/** 词元**前面**的合法分隔符（不含路径分隔符 —— 路径形态另走一套判定）。 */
-const CTEST_PREFIX = /[\s"'=;&|(]/;
-
-/** 当 ctest 以**路径**形态出现时，允许的扩展名（与 diagnostics.ts 同口径）。 */
-const CTEST_EXEC_EXTENSIONS = new Set(['exe', 'cmd', 'bat', 'com', 'sh']);
-
-/**
- * 判断一个**路径形态**的词元指向的是不是 ctest 工具。
+ * **为什么这里不再自己写一份**（2026-11-25，Linux CI 红了才暴露出来）：
+ * 本文件原来有一份**逐字复制**的 `CTEST_TOKEN` / `CTEST_PREFIX` /
+ * `CTEST_EXEC_EXTENSIONS` / `findCtestTokenEnd`。复制的那份**漏了引号边界** ——
+ * 参数被插进路径引号**内部**，POSIX shell 把「路径+参数」当成一个 token，
+ * 命令根本跑不起来（门禁报的是一个与被测代码毫不相干的错）。
  *
- * 真正的判据是**扩展名**：`ctest.exe` / `ctest.cmd` 是工具，
- * `ctest.cjs` / `ctest.py` 是脚本 —— 后者是**别的工具的参数**。
- */
-function isPathToCtestTool(prefix: string, token: string): boolean {
-  const dot = token.indexOf('.');
-  if (dot < 0) return true; // 无扩展名 —— POSIX 的 ctest
-  const ext = token.slice(dot + 1).toLowerCase();
-  return CTEST_EXEC_EXTENSIONS.has(ext);
-}
-
-/**
- * 找出命令里 ctest 词元的**结束位置**（插入点）。找不到合法词元时返回 null。
+ * 诊断侧那份当时**恰好**也漏了同一个洞，所以两边一起坏、一起红 ——
+ * 这就是 ADR-106 §5 说的那条老教训：
+ * **同一个问题两处判定，必然走偏。** 修法不是「把两处都补上」，
+ * 而是**收敛到一处**，让下一次没有第二处可漏。
  *
- * 判定分两步（与 diagnostics.ts 的 `findCtestTokenEnd` 同口径）：
- * 1. `CTEST_TOKEN` 匹配出词元（含扩展名），并确认其后是分隔符或串尾；
- * 2. 确认词元**前面**是命令分隔符，或（路径形态）整条路径指向 ctest 工具。
+ * 两个模块同在 `core/gate/`，互相 import 不违反依赖方向（C2）。
  */
-function findCtestTokenEnd(run: string): number | null {
-  const m = CTEST_TOKEN.exec(run);
-  if (!m) return null;
-  const before = run.slice(0, m.index);
-  if (before.length === 0) return m.index + m[1].length;
-  const lastChar = before[before.length - 1];
-  if (CTEST_PREFIX.test(lastChar)) return m.index + m[1].length;
-  if (lastChar === '/' || lastChar === '\\') {
-    return isPathToCtestTool(before, m[1]) ? m.index + m[1].length : null;
-  }
-  return null;
-}
 
 /**
  * 在一条 ctest 命令里**追加** `--show-only=json-v1`，用来枚举用例。
@@ -448,9 +420,12 @@ export function buildCtestEnumerateCommand(run: string): string | null {
   if (!run) return null;
   // 已经带了 --show-only → 不叠加（会互相覆盖）。
   if (/(?:^|\s)--show-only(?:\s|=)/.test(run)) return null;
-  const end = findCtestTokenEnd(run);
-  if (end === null) return null;
-  return `${run.slice(0, end)} --show-only=json-v1${run.slice(end)}`;
+  // 插入点由 diagnostics.ts 统一给（见上面「只有一份实现」的说明）：
+  // 它会跳过词元后面紧跟的闭合引号 —— POSIX shell 里引号内是一个 token，
+  // 参数插进引号内会把「路径+参数」变成文件名。
+  const insertAt = ctestInsertPoint(run);
+  if (insertAt === null) return null;
+  return `${run.slice(0, insertAt)} --show-only=json-v1${run.slice(insertAt)}`;
 }
 
 // ─── ctest JSON → 精确用例名清单 ────────────────────────────────────────────
@@ -576,17 +551,21 @@ export function scopeManifestFile(sliceId: string, index: number): string {
 /**
  * 把切片 id 变成能安全当文件名的串。
  *
- * 与 ADR-096 的 `sanitizeForFilename` 同口径（杜绝路径穿越 ——
+ * 与 ADR-096 的 `sanitizeForFilename` **同口径**（杜绝路径穿越 ——
  * 切片 id 若含 `../` 就能写到工作目录外面去）。
  *
- * 这里**独立定义**而不是从 diagnostics.ts 导入 —— 免得两处各改一处
- * 漏一处导致文件名对不上。代价是两份小函数，收益是两个模块的
- * 清单前缀不会被人误当成同一套。
+ * **这里直接用 diagnostics.ts 那份**（2026-11-25 改）：
+ * 原来本文件**独立复制**了一份，注释写的是「免得两处各改一处漏一处」——
+ * 但那句话本身就把 ADR-106 §5 的老教训又犯了一遍：
+ * **靠「小心别改漏」来保证一致，不是保证一致。**
+ * 两份同名同逻辑的函数放在同一个依赖域里，下一次改一处就必然漂移。
+ * 既然 scope.ts 已经从 diagnostics.ts 取插入点了，
+ * 这个函数没理由再留一份。
+ *
+ * 清单**前缀**（`GATE_SCOPE_MANIFEST_PREFIX`）仍然各自不同 ——
+ * 那是有意的：两个模块的清单文件不撞名。
  */
-export function sanitizeForFilename(id: string): string {
-  const safe = id.replace(/[^A-Za-z0-9_-]/g, '_');
-  return safe.length > 0 ? safe : 'slice';
-}
+export { sanitizeForFilename };
 
 /**
  * 清单文件的内容。

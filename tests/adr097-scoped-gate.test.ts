@@ -144,6 +144,34 @@ describe('ADR-097 · ctest 枚举命令与用例筛选', () => {
     assert.equal(buildCtestEnumerateCommand('npm test'), null);
   });
 
+  // ── 引号边界（2026-11-25，Linux CI 红了才暴露出来）────────────────────
+  //
+  // 路径形态带引号时，插入点必须落在引号**外面**：
+  //
+  //   "/tmp/x/ctest.sh" --show-only=json-v1 --test-dir build   ✓
+  //   "/tmp/x/ctest.sh --show-only=json-v1" --test-dir build   ✗
+  //
+  // 后者里 POSIX shell 把「路径+参数」当成**一个 token**（一个文件名）——
+  // 命令跑不起来，门禁报的是一个与被测代码毫不相干的错。
+  //
+  // **这条用例存在的意义是「本地能抓到」**：修复前本地全绿、只有 Linux CI 红。
+  // 断言与平台无关，所以 Windows 上也该绿 —— 现在绿了，说明洞补上了。
+  it('路径带引号时，枚举参数插在引号**外面**（POSIX shell 语义）', () => {
+    const out = buildCtestEnumerateCommand(
+      '"/tmp/gate/ctest.sh" --test-dir build --output-on-failure -C Debug',
+    );
+    assert.ok(out);
+    const closeQuote = out.indexOf('"', out.indexOf('ctest.sh'));
+    assert.ok(closeQuote >= 0, `命令里应有闭合引号：${out}`);
+    assert.ok(
+      out.indexOf('--show-only=json-v1') > closeQuote,
+      `枚举参数必须落在引号外，实际：${out}`,
+    );
+    assert.ok(out.startsWith('"/tmp/gate/ctest.sh" '), `路径引号必须配对，实际：${out}`);
+    assert.ok(out.includes('--test-dir build'));
+    assert.ok(out.includes('-C Debug'));
+  });
+
   it('已经带了 --show-only → 不叠加', () => {
     assert.equal(buildCtestEnumerateCommand('ctest --show-only=json-v1'), null);
   });

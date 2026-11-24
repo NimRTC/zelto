@@ -797,6 +797,28 @@ export function narrowCtestCommandByFile(run: string, manifestFile: string): str
 }
 
 /**
+ * 在一条 ctest 命令里，**词元之后**的插入点（跳过紧跟的闭合引号）。
+ *
+ * 供 `scope.ts` 的 `buildCtestEnumerateCommand` 复用 ——
+ * 「ctest 词元在哪结束」这件事**只能有一份实现**：
+ * 两处各写一份，早晚有一处漏掉引号边界（ADR-106 §5 的教训：
+ * 同一个问题两处判定，必然走偏）。2026-11-25 的 Linux CI 红就是
+ * scope.ts 那份漏了。
+ *
+ * 返回 null 表示「找不到合法 ctest 词元」。
+ */
+export function ctestInsertPoint(run: string): number | null {
+  const end = findCtestTokenEnd(run);
+  if (end === null) return null;
+  // 词元后面紧跟的引号是**路径引号的闭合** —— 插入点要落到它外面。
+  let insertAt = end;
+  while (insertAt < run.length && (run[insertAt] === '"' || run[insertAt] === "'")) {
+    insertAt++;
+  }
+  return insertAt;
+}
+
+/**
  * 在命令里 ctest 词元的**后面**插入一段参数。
  *
  * 为什么不能直接 `run.replace(/(\bctest\b)/, ...)`：
@@ -806,12 +828,34 @@ export function narrowCtestCommandByFile(run: string, manifestFile: string): str
  * 所以这里用 `CTEST_TOKEN` 匹配**完整词元**（含扩展名），
  * 并确认词元前面不是路径分隔符，再在词元末尾插入。
  *
+ * ── 引号边界（2026-11-25，Linux CI 红了才暴露出来）────────────────────
+ *
+ * 词元后面**紧跟**引号时，插入点必须落在引号**外面**：
+ *
+ * ```text
+ * "/tmp/x/ctest.sh" --test-dir build
+ * ```
+ *
+ * POSIX shell 里引号是 shell 的 —— 引号内是**一个 token**。
+ * 把参数插进引号内（`"/tmp/x/ctest.sh --tests-from-file m.txt"`），
+ * 整个「路径+参数」就变成了**文件名** —— 命令跑不起来，
+ * 门禁报的是一个与被测代码毫不相干的错。
+ *
+ * Windows 上不是这个问题：`cmd /c "..."` 的引号由 cmd 自己配对，
+ * 参数落在引号内也照样是独立参数（ADR-096 实测可用）。
+ * 所以这**不是**「Windows 形态对、POSIX 形态错」——
+ * 是**同一个形态在两套引号语义下的不同结果**，
+ * 而插入点必须让两边的结果都对。
+ *
+ * 修法：插入点跳过紧跟的闭合引号（可能连续多个）。
+ * `"/tmp/x/ctest.sh"` → `"/tmp/x/ctest.sh" --tests-from-file m.txt`。
+ *
  * 找不到合法词元时返回 null（调用方保留原命令）。
  */
 function insertAfterCtestToken(run: string, args: string): string | null {
-  const end = findCtestTokenEnd(run);
-  if (end === null) return null;
-  return `${run.slice(0, end)} ${args}${run.slice(end)}`;
+  const insertAt = ctestInsertPoint(run);
+  if (insertAt === null) return null;
+  return `${run.slice(0, insertAt)} ${args}${run.slice(insertAt)}`;
 }
 
 /**
