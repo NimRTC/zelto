@@ -36,6 +36,7 @@ import { join } from 'node:path';
 
 import { auditWorktreeWrites } from '../src/core/sched/audit.js';
 import { zeltoOwnedPaths } from '../src/cli/commands/parallel-executor.js';
+import { buildSpecIntegrity } from '../src/cli/commands/shared.js';
 import type { SliceData } from '../src/core/slice/store.js';
 
 const SPEC_REL = 'specs/slices/v3-weaknet-verdict.md';
@@ -130,6 +131,52 @@ describe('ADR-106 托管文件清单：规格按写集判（与验收目录同�
     assert.ok(
       owned.includes(SPEC_REL),
       `规格不在写集里时必须继续被托管 —— 那是 zelto 的副本，实际：${JSON.stringify(owned)}`,
+    );
+  });
+
+  // ─── 回归：写集判据必须与 C9 运行时一致 ──────────────────────────────
+  //
+  // 病灶（2026-11-24 复核 ADR-106 时发现）：
+  //
+  //   ADR-106 的豁免判据用**严格相等**（`writeSet.has(specRel)`），
+  //   而 C9 运行时守卫用 `pathInWriteSet` —— 后者认 **glob 与目录前缀**。
+  //
+  //   于是人用这些写法把规格放进写集时：
+  //     - `specs/slices/*.md`（glob）
+  //     - `specs/`（目录前缀）
+  //     - `specs`（裸目录）
+  //     - `specs/slices/`（父目录前缀）
+  //
+  //   C9 说「这个文件在写集里，你可以改」，
+  //   而托管清单说「不在写集」→ 登记成托管 → agent 一改就判篡改
+  //   → **zelto 一边让 agent 改、一边因它改而拦下** ——
+  //   正是 ADR-106 要修的那个矛盾，只是换了种写法没修掉。
+  //
+  // **同一件事两套判据**是 D-11 的老教训（合并的两条路径判据不一致）。
+  for (const writeForm of [
+    'specs/slices/*.md',
+    'specs/',
+    'specs',
+    'specs/slices/',
+  ]) {
+    it(`写集用「${writeForm}」覆盖规格 → 不进托管清单（与 C9 口径一致）`, () => {
+      const slice = makeSlice({ writes: [...WRITE_SET, writeForm] });
+      const owned = zeltoOwnedPaths('D:/wt', slice);
+      assert.ok(
+        !owned.includes(SPEC_REL),
+        `C9 认「${writeForm}」覆盖这个规格，托管清单也必须认 —— ` +
+          `否则又回到「一边让 agent 改、一边因它改而拦下」。` +
+          `实际：${JSON.stringify(owned)}`,
+      );
+    });
+  }
+
+  it('验收文件同样用写集判据（ADR-046 口径一致，glob 也认）', () => {
+    const slice = makeSlice({ writes: [...WRITE_SET, 'tests/acceptance/**/*.cjs'] });
+    const owned = zeltoOwnedPaths('D:/wt', slice);
+    assert.ok(
+      !owned.includes('tests/acceptance/v3-weaknet-verdict/acceptance.test.cjs'),
+      'glob 覆盖的验收文件也不能被托管 —— C9 允许 agent 改它',
     );
   });
 });
@@ -401,8 +448,7 @@ describe('D-60 写集审计：托管文件不算越界，但被改算篡改', ()
   });
 });
 
-describe('D-60 监督进程路径：managedPaths 必须传（源码级锁定）', () => {
-  it('supervisor.ts 的 installRuntimeGuard 调用带 managedPaths', () => {
+describe('D-60 监督进程路径：managedPaths 必须传（源码级锁定）', () => {  it('supervisor.ts 的 installRuntimeGuard 调用带 managedPaths', () => {
     // 源码在仓库里，不在 dist-test 里 —— 从仓库根找。
     const repoRoot = process.cwd();
     const srcPath = join(repoRoot, 'src', 'cli', 'commands', 'supervisor.ts');
@@ -426,5 +472,107 @@ describe('D-60 监督进程路径：managedPaths 必须传（源码级锁定）'
       /zeltoOwnedPaths/,
       '托管清单必须用 zeltoOwnedPaths（与前台路径同源，不能另写一份）',
     );
+  });
+});
+
+// ─── ADR-106 §2：规格完整性锚的写集判据 ───────────────────────────────────
+//
+// 「冻结需求仍在」这道校验（ADR-106 §2）是规格豁免的**另一半** ——
+// 豁免了「托管」，但没豁免「改验收标准」。
+//
+// 它靠 `buildSpecIntegrity` 产出的**锚**（冻结时物化的需求文本）。
+// 锚从哪来？**起跑前的规格正文**。
+//
+// 病灶（2026-11-24 复核 ADR-106 时发现）：
+//
+//   `buildSpecIntegrity` 的「规格在不在写集里」判据用**严格相等**，
+//   而 C9 运行时用 `pathInWriteSet`（认 glob 与目录前缀）。
+//
+//   后果比托管那一侧更隐蔽 —— **放行与校验会同时走偏**：
+//     托管侧说「不在写集」→ 登记成托管 → agent 改了就判篡改（矛盾）；
+//     锚侧说「不在写集」→ **不给锚** → 「冻结需求仍在」这道校验**不生效**
+//     → agent 删掉验收标准也拦不住。
+//
+//   修好托管侧、放任锚侧，就是「一边放行、一边不校验」—— **漏**。
+//   所以两处必须**同一个判据**（`pathInWriteSet`）。
+describe('ADR-106：规格完整性锚的写集判据与 C9 一致', () => {
+  /** 建一个含「验收标准」的规格文件，返回 worktree 根。 */
+  function makeSpecWorktree(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'zelto-adr106-'));
+    mkdirSync(join(dir, 'specs', 'slices'), { recursive: true });
+    writeFileSync(
+      join(dir, SPEC_REL),
+      [
+        '# Slice: v3-weaknet-verdict',
+        '',
+        '## 验收标准',
+        '',
+        '1. `CallState` 枚举存在，含五个状态。',
+        '2. 同一状态不重复上报。',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    return dir;
+  }
+
+  for (const writeForm of [
+    'specs/slices/*.md',
+    'specs/',
+    'specs',
+    'specs/slices/',
+  ]) {
+    it(`写集用「${writeForm}」覆盖规格 → 要给锚（否则校验形同虚设）`, () => {
+      const dir = makeSpecWorktree();
+      try {
+        const integrity = buildSpecIntegrity(dir, {
+          spec: { path: SPEC_REL },
+          writes: [writeForm],
+        });
+        assert.ok(
+          integrity !== null,
+          `C9 认「${writeForm}」覆盖这个规格，锚也必须给 —— ` +
+            `不给锚 = 「冻结需求仍在」这道校验不生效 = agent 能删掉验收标准`,
+        );
+        assert.equal(integrity?.requirements.length, 2, '两条验收标准都要进锚');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('规格精确在写集里 → 给锚', () => {
+    const dir = makeSpecWorktree();
+    try {
+      const integrity = buildSpecIntegrity(dir, {
+        spec: { path: SPEC_REL },
+        writes: [SPEC_REL],
+      });
+      assert.ok(integrity !== null, '精确命中也要给锚');
+      assert.equal(integrity?.requirements.length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('规格不在写集里 → 不给锚（它受托管哈希保护，不需要这道校验）', () => {
+    const dir = makeSpecWorktree();
+    try {
+      const integrity = buildSpecIntegrity(dir, {
+        spec: { path: SPEC_REL },
+        writes: ['src/core/**'],
+      });
+      assert.equal(integrity, null, '不在写集里 = 不需要锚');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('没有 worktree → 不给锚', () => {
+    const integrity = buildSpecIntegrity(null, {
+      spec: { path: SPEC_REL },
+      writes: [SPEC_REL],
+    });
+    assert.equal(integrity, null);
   });
 });

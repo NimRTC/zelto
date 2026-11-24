@@ -21,6 +21,7 @@ import { SliceStore, checkSliceId } from '../../core/slice/store.js';
 import { hashSpecFile as hashSpecFileCore } from '../../core/lifecycle/freeze.js';
 import { extractRequirementReferences } from '../../core/spec/trace-extract.js';
 import type { SpecIntegrity } from '../../core/sched/audit.js';
+import { pathInWriteSet } from '../../core/sched/paths.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,
@@ -193,8 +194,22 @@ export function buildSpecIntegrity(
   if (!worktreeRoot) return null;
 
   const specRel = slice.spec.path.replace(/\\/g, '/');
-  const inWriteSet = slice.writes.some((w) => w.replace(/\\/g, '/') === specRel);
-  if (!inWriteSet) return null;
+
+  // **判据必须与 C9 运行时一致**（`pathInWriteSet`）。
+  //
+  // 之前用的是严格相等（`w === specRel`），那与 C9 判得不一样：
+  // C9 认 glob（`specs/slices/*.md`）与目录前缀（`specs/`），严格相等不认。
+  //
+  // 后果：人用 `specs/` 写写集 → C9 说「可以改这个规格」
+  // → 这里说「不在写集」→ **不给锚** → 「冻结需求仍在」这道校验不生效
+  // → agent 删掉验收标准也拦不住。
+  //
+  // 而 `zeltoOwnedPaths` 修好之后，规格**确实**被当成「agent 的地盘」放行了
+  // —— 两处口径不一致时，放行与校验会**同时**走偏：
+  // 要么一边让改一边拦（矛盾），要么一边放行一边不校验（漏）。
+  //
+  // 「同一件事两套判据」是 D-11 的老教训。
+  if (!pathInWriteSet(specRel, slice.writes)) return null;
 
   let content: string;
   try {

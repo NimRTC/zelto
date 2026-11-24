@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import { Scheduler } from '../../core/sched/engine.js';
 import { listFilesUnder } from '../../core/sched/audit.js';
+import { pathInWriteSet } from '../../core/sched/paths.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import type { SliceData } from '../../core/slice/store.js';
@@ -151,17 +152,33 @@ export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): 
   if (!worktreePath) return [];
 
   const paths: string[] = [];
-  const writeSet = new Set(slice.writes.map((w) => w.replace(/\\/g, '/')));
 
   // ADR-106：规格在写集里 → agent 的地盘，不登记为托管。
   // 不在写集里 → 照旧托管（内容被改 = 篡改）。
+  //
+  // **判据必须与 C9 运行时一致**（`pathInWriteSet`，与
+  // `auditWorktreeWrites` 用的是同一个匹配器）——
+  //
+  // 之前这里用的是 `writeSet.has(specRel)`（严格相等），那与 C9 的
+  // `pathInWriteSet` **判得不一样**：C9 认 glob（`specs/slices/*.md`）
+  // 与目录前缀（`specs/`），严格相等**不认**。
+  //
+  // 后果（实测四种写法都中招：glob / 目录前缀 / 裸目录 / 父目录前缀）：
+  //   人用 `specs/` 写写集 → C9 允许 agent 改这个规格
+  //   → 但这里判「不在写集」→ 登记成托管 → agent 一改就判篡改
+  //   → **zelto 一边让 agent 改、一边因它改而拦下** ——
+  //   正是 ADR-106 要修的那个矛盾，只是换了种写法没修掉。
+  //
+  // 「同一件事两套判据」是 D-11（合并的两条路径判据不一致）的老教训。
   if (slice.spec.path) {
     const specRel = slice.spec.path.replace(/\\/g, '/');
-    if (!writeSet.has(specRel)) paths.push(specRel);
+    if (!pathInWriteSet(specRel, slice.writes)) paths.push(specRel);
   }
   if (slice.acceptance.dir) {
     for (const file of listFilesUnder(worktreePath, slice.acceptance.dir)) {
-      if (writeSet.has(file)) continue; // agent 要改它（ADR-046）
+      // ADR-046：写集里的验收文件是 agent 该改的（骨架里的 `test.todo`
+      // 必须被换成真断言）。**同样用 `pathInWriteSet`**（理由同上）。
+      if (pathInWriteSet(file, slice.writes)) continue;
       paths.push(file);
     }
   }
