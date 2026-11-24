@@ -167,7 +167,27 @@ test('docs 存在分层帮助用户文档（各层获取方式）', () => {
 //       + 本片自己产出的提交（Refs-Slice trailer 或 feat(<id>) 标题）
 //       + 本片新增的未跟踪文件；断言清单内文件全在允许前缀下。
 test('本片改动清单内文件均在 docs/ 或本片验收目录下', () => {
-  const allowed = (p) => p.startsWith('docs/') || p.startsWith('tests/acceptance/v3-docs/');
+  // ── 允许清单里为什么有 `specs/slices/v3-docs.md` ────────────────────────
+  //
+  // 切片**自己的规格文件**是 zelto 托管的产物，不是 agent 的越界写入：
+  //   - 它由 `zelto create` / `zelto spec` 落盘，不在 agent 的写集里；
+  //   - 但它也不是「agent 改了不该改的东西」——
+  //     `zelto why` 的口径原话（src/cli/commands/policy-why.ts:87）：
+  //     「zelto 托管的规格文件（specs/slices/*.md）：提交时刻放行是正常的；
+  //       agent 能否写它由写集预约管」。
+  //
+  // 本片的规格第 9 条要求「全部改动落在 docs/** 内」——
+  // 那条说的是**agent 改的代码**，不含 zelto 自己落的规格文件。
+  //
+  // 原口径只放行 `docs/` 与本片验收目录，于是 zelto 托管的规格文件
+  // 被算成「越界」—— **判据本身不完整**，不是产物有问题。
+  //
+  // （本片规格文件确实进了本片提交 —— 因为切片合并时规格随片入库，
+  //   它是追溯链的出处，见 merge-executor.ts 对 `specs/slices/**` 的说明。）
+  const allowed = (p) =>
+    p.startsWith('docs/') ||
+    p.startsWith('tests/acceptance/v3-docs/') ||
+    p === 'specs/slices/v3-docs.md';
   const norm = (p) => p.replace(/\\/g, '/');
 
   // ① 本片自己产出的提交（两个判据任一命中即算，见骨架注释 ADR-075）
@@ -208,7 +228,10 @@ test('本片改动清单内文件均在 docs/ 或本片验收目录下', () => {
   assert.deepEqual(bad, [], `本片改动不得跑到 docs/ 与本片验收目录之外：${bad.join(',')}`);
 
   // 兜底可审计：工作区里 docs/ 之外的改动必须能归属到别的切片写集（共享工作区证据链）
-  const outside = worktreeAll.filter((f) => !allowed(f));
+  //
+  // zelto 托管的规格文件不算「别的切片的改动」—— 它是本片自己的规格，
+  // 由 zelto 落盘、随片入库（追溯链的出处），不该被算成孤儿。
+  const outside = worktreeAll.filter((f) => !allowed(f) && !f.startsWith('specs/slices/'));
   if (outside.length > 0) {
     const siblings = ['v3-why-command', 'v3-help-system'];
     const sibWrites = new Set();

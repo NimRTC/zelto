@@ -40,6 +40,7 @@
 // 所以整个测试跑在锁内最简单。
 
 import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,6 +48,38 @@ import { withBuildLock } from './build-lock.mjs';
 import { buildDist, copyAssets } from './build-dist.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 收集 `tests/acceptance/**` 下用 `.cjs` 写的验收测试。
+ *
+ * 为什么单独收集：`.cjs` 不在 `tsconfig.test.json` 的 include 里，
+ * 所以它们**不在 `dist-test/`** —— 而 `npm test` 的 glob 只扫 `dist-test/`。
+ * 结果：这些验收测试**从来没被跑过**。
+ *
+ * 为什么原地跑（而不是复制到 `dist-test/`）：它们用 `__dirname` 定位
+ * `dist/` 与仓库根，搬了位置相对路径就全错。
+ */
+function collectCjsAcceptanceTests(repoRoot) {
+  const results = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.name.endsWith('.test.cjs')) {
+        results.push(full);
+      }
+    }
+  };
+  walk(join(repoRoot, 'tests', 'acceptance'));
+  return results.sort();
+}
 
 // 与 `build.mjs` 同理：**不要在这里 `process.exit()`** ——
 // 那会跳过 `withBuildLock` 的 `finally`，把锁留在磁盘上。
@@ -83,6 +116,54 @@ try {
     ['--test', 'dist-test/tests/**/*.test.js'],
     { cwd: root, stdio: 'inherit' },
   );
+
+  // 4.5 跑 `.cjs` 写的验收测试（**原来一个都没跑过**）
+  //
+  // ── 病灶 ──────────────────────────────────────────────────────────
+  //
+  //   验收测试分两种写法：
+  //     - `.ts` 写的 → `tsc` 编译进 `dist-test/tests/**` → 被上面那条 glob 覆盖
+  //     - `.cjs` 写的 → **不在 `dist-test/` 里** → **从来没被跑过**
+  //
+  //   实测（2026-11-24）：源目录 41 个验收测试，`dist-test` 里只有 29 个。
+  //   缺席的 14 个全在 `v1-*` / `v2-*` / `v3-*` 目录里 ——
+  //   包含哈希链、audit verify、写保护 e2e、CI pipeline、help 系统。
+  //
+  //   为什么没被编译：`tsconfig.test.json` 的 include 是 `tests/**/*.ts`，
+  //   `.cjs` 不在其中；而 `copyAssets` 只复制前端资源，不复制 `.cjs`。
+  //
+  //   后果：「CI 绿灯」这件事**没覆盖到这些验收标准**。
+  //   14 个里有 4 条是坏的（从没跑过，所以坏了没人知道）——
+  //   **绿灯不代表验过，只代表没被验。**
+  //
+  // ── 为什么原地跑而不是复制进 dist-test ────────────────────────────
+  //
+  //   这些 `.cjs` 用 `require` + `__dirname` 定位 `dist/` 与仓库根，
+  //   **设计就是原地运行**（`__dirname` 变了，相对路径就全错）。
+  //   所以正确做法是**在源目录跑它们**，而不是搬到 `dist-test/`。
+  //
+  // ── 为什么不是「全部搬进 dist-test」─────────────────────────────
+  //
+  //   `.ts` 写的验收测试**需要**编译（它们 import `src/` 的 TS 模块）。
+  //   `.cjs` 写的**不需要**（它们 require `dist/` 的 JS 产物）。
+  //   两种写法各有各的定位方式，混在一起搬会破坏其中一种。
+  //
+  // ── 与 `test:quick` 的关系 ────────────────────────────────────────
+  //
+  //   `test:quick`（Windows CI 跑的那个）**仍然不跑这 14 个** ——
+  //   它要快。Linux CI 跑的是 `pnpm test`（全量），会跑到。
+  //   这是刻意的：Windows job 的定位是「快 + 跨平台坑」，
+  //   不是「全量验收」。
+  const cjsAcceptance = collectCjsAcceptanceTests(root);
+  if (cjsAcceptance.length > 0) {
+    console.log(
+      `[zelto] 跑 ${cjsAcceptance.length} 个 .cjs 验收测试（源目录，原地运行）`,
+    );
+    execFileSync(process.execPath, ['--test', ...cjsAcceptance], {
+      cwd: root,
+      stdio: 'inherit',
+    });
+  }
   });
 } catch (err) {
   console.error(err instanceof Error ? err.message : String(err));
