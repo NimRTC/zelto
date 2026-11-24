@@ -39,9 +39,11 @@ export {
 export {
   type ManagedFile,
   type AuditOptions,
+  type SpecIntegrity,
   type WriteAuditResult,
   type SliceCommits,
   auditWorktreeWrites,
+  missingFrozenRequirements,
   parsePorcelainStatus,
   hashFile,
   listFilesUnder,

@@ -311,6 +311,7 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     // 一直有效，而释放它的是这个进程 —— 谁装谁放，才不会漏。
     const { installRuntimeGuard } = await import('./runtime-guard.js');
     const { zeltoOwnedPaths } = await import('./parallel-executor.js');
+    const { buildSpecIntegrity } = await import('./shared.js');
     const slice = await store.read(args.sliceId).catch(() => null);
     const bundlePath = join(args.projectRoot, '.zelto', `${args.sliceId}-bundle.json`);
     const worktreePath = args.workDir === args.projectRoot ? null : args.workDir;
@@ -333,6 +334,10 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       // 自己的规格副本拦下」。
       managedPaths:
         slice && worktreePath ? zeltoOwnedPaths(worktreePath, slice) : undefined,
+      // ADR-106 §2：规格在写集里 → 不托管，但「冻结需求仍在」是硬约束。
+      // 后台路径必须与前台同源 —— 否则后台跑就没有这道校验。
+      specIntegrity:
+        slice && worktreePath ? buildSpecIntegrity(worktreePath, slice) : null,
       // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
       harness: harnessForAdapter(args.adapterType),
     });

@@ -19,6 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import {
   type ManagedFile,
+  type SpecIntegrity,
   type WriteAuditResult,
   type WriteReservation,
   ReservationStore,
@@ -143,6 +144,20 @@ export interface RuntimeGuardOptions {
    * —— 改了规格副本等于自动改规格，改了钩子设置等于关掉门禁。
    */
   managedPaths?: string[];
+  /**
+   * 规格完整性锚（ADR-106 §2）。
+   *
+   * 规格文件在写集里时，它不再受「托管文件哈希」保护 ——
+   * 但它受**「冻结需求仍在」**保护：agent 可以改规格的措辞，
+   * 不能删掉/改写验收标准本身。
+   *
+   * 这里给的是**锚本身**（冻结时提取到的需求文本），
+   * 由调用方在 agent 开工前从**冻结版规格**里提取好。
+   * 审计时再从 worktree 里被改过的规格重新提取、逐条比对。
+   *
+   * 不给 → 不做这道校验（没有锚就没有判据）。
+   */
+  specIntegrity?: SpecIntegrity | null;
   /**
    * 装哪种 harness 的钩子。
    *
@@ -329,6 +344,8 @@ export async function installRuntimeGuard(
         baseCommit: options.baseCommit ?? null,
         managed,
         baselineChanged,
+        // ADR-106 §2：规格在写集里 → 不托管，但「冻结需求仍在」是硬约束。
+        specIntegrity: options.specIntegrity ?? null,
         // ADR-067 D3：只把本片自己产出的提交算进审计范围。
         // 分支上别的提交（基点错位带进来的、运行期间被人合进来的）
         // 不是本片 agent 写的，不该算成「本片的越界写入」。

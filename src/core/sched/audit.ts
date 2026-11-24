@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { pathInWriteSet } from './paths.js';
+import { extractRequirementReferences } from '../spec/trace-extract.js';
 
 /**
  * zelto 自己写进 worktree 的文件。
@@ -34,6 +35,23 @@ export interface AuditOptions {
   baseCommit?: string | null;
   /** zelto 托管的文件：路径不计入越界，但内容被改动即视为篡改 */
   managed?: ManagedFile[];
+  /**
+   * 规格完整性锚（ADR-106 §2）。
+   *
+   * 规格文件**在写集里**时，它不再是「zelto 托管的副本」——
+   * 人把它列进写集，就是说「这片要改它」。豁免不是无条件放行：
+   * 被改过的规格必须**仍然包含**冻结时物化的每一条需求。
+   *
+   * 少一条、或某条的**文本变了** → 判篡改（拦下）。
+   *
+   * 为什么比对文本而不只是条数：条数不变但内容被换掉，是最常见的
+   * 「削弱验收标准」手法。只比条数等于没比。
+   *
+   * 需求来自 `slice.trace.requirements`（ADR-032 §3.3 冻结时物化的
+   * 「人批准的出处」）。没有它（null / 空）→ 不做这道校验
+   * （没有锚就没有判据，不能凭空判篡改）。
+   */
+  specIntegrity?: SpecIntegrity | null;
   /**
    * 运行开始时 worktree 就已经脏的路径（相对 worktree，正斜杠）。
    *
@@ -60,6 +78,19 @@ export interface AuditOptions {
    * 却会被算成「本片的越界写入」（实测 D-28）。
    */
   sliceId?: string | null;
+}
+
+/**
+ * 规格完整性锚（ADR-106 §2）。
+ *
+ * `specPath` 是规格在仓库里的相对路径（正斜杠）；
+ * `requirements` 是冻结时物化的需求条目文本（`slice.trace.requirements`）。
+ */
+export interface SpecIntegrity {
+  /** 规格文件的相对路径（正斜杠），相对 worktree 根 */
+  specPath: string;
+  /** 冻结时物化的需求条目文本，逐条比对 */
+  requirements: string[];
 }
 
 export interface WriteAuditResult {
@@ -382,6 +413,51 @@ export function hashFile(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 找出「冻结时物化的需求」里，现在规格正文里**已经不在**的那些（ADR-106 §2）。
+ *
+ * 判据：从当前规格正文重新提取需求（与锚点**同一套**提取器 ——
+ * `extractRequirementReferences`），然后逐条比对锚点里的需求文本。
+ *
+ * **比对文本，不只比条数**：条数不变但内容被换掉，是最常见的
+ * 「削弱验收标准」手法（把「判据 5：X」改成「判据 5：Y」）。
+ * 只比条数等于没比。
+ *
+ * 语义是**子集**：锚点里的每一条都必须在当前正文里**逐字**出现。
+ * 多出来的新条目**不拦** —— 新增验收标准只会更严，不会削弱。
+ *
+ * 返回值：缺失/被改写的需求文本列表。空数组 = 锚点全在 = 放行。
+ *
+ * 纯函数、只读文件、不调模型、不触网（C3）。
+ *
+ * @param root 规格所在目录（worktree 根）
+ * @param integrity 锚点：规格路径 + 冻结时提取到的需求文本
+ */
+export function missingFrozenRequirements(
+  root: string,
+  integrity: SpecIntegrity,
+): string[] {
+  const specPath = integrity.specPath.replace(/\\/g, '/');
+  let content: string;
+  try {
+    content = readFileSync(join(root, specPath), 'utf-8');
+  } catch {
+    // 规格读不出来 —— 判据判不了。
+    //
+    // 这里**不**判篡改（读不到规格 ≠ 规格被削弱），但也**不能**当成
+    // 「校验通过」—— 上游只拿「缺失列表非空」当篡改依据。
+    //
+    // 所以把「全部锚点」当成缺失报回去（fail closed）：
+    // 规格读不出来 = 判据判不了 = 不能放行。
+    // 这与 D-69「看不见不等于没有」是同一个方向。
+    return [...integrity.requirements];
+  }
+
+  const current = new Set(extractRequirementReferences(content).map((r) => r.text));
+
+  return integrity.requirements.filter((req) => !current.has(req));
 }
 
 /**
@@ -812,6 +888,21 @@ export function auditWorktreeWrites(
     const rel = file.path.replace(/\\/g, '/');
     const actual = hashFile(join(worktreeRoot, rel));
     if (actual !== file.hash) tampered.push(rel);
+  }
+
+  // ADR-106 §2：规格在写集里 → 不托管，但「冻结需求仍在」是硬约束。
+  //
+  // 豁免的是「托管」这道（agent 有权改规格），不是「改规格随便改」。
+  // 少一条冻结时物化的需求、或某条文本被换掉 → 判篡改，
+  // 与「托管文件被改」同档（拦下、退回 frozen）。
+  //
+  // 只在规格**确实被改过**时才判 —— 没改就不用比（比了也只是白比）。
+  const integrity = options.specIntegrity ?? null;
+  if (integrity && integrity.requirements.length > 0 && changed.has(integrity.specPath)) {
+    const missing = missingFrozenRequirements(worktreeRoot, integrity);
+    if (missing.length > 0) {
+      tampered.push(integrity.specPath);
+    }
   }
 
   // 预置脏（D-29）：运行开始时 worktree 就已经脏的路径不算越界，

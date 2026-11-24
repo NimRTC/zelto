@@ -32,6 +32,7 @@ import {
   worktreeManager,
   harnessForAdapter,
   resolveAgentCommand,
+  buildSpecIntegrity,
 } from './shared.js';
 import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, gateScopeForSlice, markSliceStalled, revertRunAbortedBeforeStart, createRuntimeBudgetGuard, readBudgetLimit } from './run-support.js';
 import { RuntimeBudgetGuard } from '../../core/budget/index.js';
@@ -129,16 +130,36 @@ export interface ParallelExecutionResult {
  * —— 它们是 agent 该改的东西（验收骨架里的 `test.todo` 必须被换成真断言）。
  * 把它们同时登记成托管文件，等于一边叫 agent 改、一边拦它改。
  *
- * 判据是**写集**：写集里有的 → agent 的地盘；没在写集里的验收文件 →
+ * **例外（ADR-106）**：**规格文件**同样按写集判 —— 写集里有 → agent 的
+ * 地盘（不托管）；写集里没有 → zelto 的地盘（托管，内容被改 = 篡改）。
+ *
+ * 为什么规格也要按写集判（ADR-046 只给验收目录开了这个口子）：
+ * 人把规格列进写集，就是说「这片要改它」。zelto 一边在约束包里告诉
+ * agent「You may only modify these paths」，一边在运行结束时因为它改了
+ * 规格而把整轮判成篡改 —— 那是**自相矛盾**（实测 nimrtc-v14
+ * `v1-call-state-surface`，2026-11-24：agent 把规格里 ADR 状态从
+ * `Proposed` 改成 `Accepted`，整轮运行被拦，gate 都没跑）。
+ *
+ * 豁免不是无条件放行：审计时另有一道「冻结需求仍在」的校验
+ * （`auditWorktreeWrites` 的 `specIntegrity`），少了任何一条冻结时
+ * 物化的需求 → 仍然判篡改。详见 ADR-106 §2。
+ *
+ * 判据是**写集**：写集里有的 → agent 的地盘；没在写集里的 →
  * zelto 的地盘，agent 不该动。
  */
 export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): string[] {
   if (!worktreePath) return [];
 
   const paths: string[] = [];
-  if (slice.spec.path) paths.push(slice.spec.path);
+  const writeSet = new Set(slice.writes.map((w) => w.replace(/\\/g, '/')));
+
+  // ADR-106：规格在写集里 → agent 的地盘，不登记为托管。
+  // 不在写集里 → 照旧托管（内容被改 = 篡改）。
+  if (slice.spec.path) {
+    const specRel = slice.spec.path.replace(/\\/g, '/');
+    if (!writeSet.has(specRel)) paths.push(specRel);
+  }
   if (slice.acceptance.dir) {
-    const writeSet = new Set(slice.writes.map((w) => w.replace(/\\/g, '/')));
     for (const file of listFilesUnder(worktreePath, slice.acceptance.dir)) {
       if (writeSet.has(file)) continue; // agent 要改它（ADR-046）
       paths.push(file);
@@ -580,6 +601,8 @@ export async function executeSlicesParallel(
         projectRoot: process.cwd(),
         baseCommit,
         managedPaths: zeltoOwnedPaths(st.worktreePath, slice),
+        // ADR-106 §2：规格在写集里 → 不托管，但「冻结需求仍在」是硬约束。
+        specIntegrity: buildSpecIntegrity(st.worktreePath, slice),
         // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
         harness: harnessForAdapter(options.adapterType),
       });

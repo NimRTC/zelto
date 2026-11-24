@@ -103,6 +103,223 @@ describe('D-60 托管文件清单：规格副本归 zelto，不归 agent', () =>
   });
 });
 
+// ─── ADR-106：写集里的规格文件不是「托管文件」─────────────────────────────
+//
+// 病灶（实测于 nimrtc-v14 v1-call-state-surface，2026-11-24）：
+//
+//   规格在写集里（人批准的边界）→ zelto 告诉 agent「You may only modify
+//   these paths」，而这条路径就在名单上。agent 改了它（把 ADR 状态从
+//   `Proposed` 改成 `Accepted`）→ 写集审计判 `tampered` → 整轮运行作废，
+//   gate 都没跑。agent 的活全做完了。
+//
+//   规格文件**无条件**登记为托管，而验收目录**按写集豁免**（ADR-046）——
+//   同一个语义，两套判据。ADR-106 把规格也统一到「写集」这条判据。
+describe('ADR-106 托管文件清单：规格按写集判（与验收目录同源）', () => {
+  it('规格在写集里 → **不**进托管清单（agent 有权改它）', () => {
+    const slice = makeSlice({ writes: [...WRITE_SET, SPEC_REL] });
+    const owned = zeltoOwnedPaths('D:/wt', slice);
+    assert.ok(
+      !owned.includes(SPEC_REL),
+      `写集里的规格文件不能被托管 —— 那等于一边叫 agent 改、一边拦它改。` +
+        `实际：${JSON.stringify(owned)}`,
+    );
+  });
+
+  it('规格不在写集里 → 照旧进托管清单（保护没放松）', () => {
+    const owned = zeltoOwnedPaths('D:/wt', makeSlice());
+    assert.ok(
+      owned.includes(SPEC_REL),
+      `规格不在写集里时必须继续被托管 —— 那是 zelto 的副本，实际：${JSON.stringify(owned)}`,
+    );
+  });
+});
+
+describe('ADR-106 规格完整性锚：豁免「托管」，不豁免「改验收标准」', () => {
+  const SPEC_WITH_CRITERIA = [
+    '# Slice: v1-call-state-surface',
+    '',
+    '## Summary',
+    '状态面。',
+    '',
+    '## 验收标准',
+    '',
+    '1. `CallState` 枚举存在，含五个状态。',
+    '2. 同一状态不重复上报。',
+    '3. `kFailed` 是吸收态。',
+    '',
+  ].join('\n');
+
+  /** 建一个仓库并写一份带验收标准的规格（相对 worktree 根）。 */
+  function makeSpecRepo(specContent: string): string {
+    const dir = makeRepo();
+    mkdirSync(join(dir, 'specs', 'slices'), { recursive: true });
+    writeFileSync(join(dir, SPEC_REL), specContent, 'utf-8');
+    return dir;
+  }
+
+  it('规格被改了，但冻结需求全在 → **不**判篡改（豁免生效）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      // agent 改了一行非验收标准的内容（ADR 状态行）
+      const changed = SPEC_WITH_CRITERIA.replace('状态面。', '状态面。（ADR 已接受）');
+      writeFileSync(join(dir, SPEC_REL), changed, 'utf-8');
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: {
+          specPath: SPEC_REL,
+          requirements: [
+            '`CallState` 枚举存在，含五个状态。',
+            '同一状态不重复上报。',
+            '`kFailed` 是吸收态。',
+          ],
+        },
+      });
+
+      assert.equal(result.error, null, `git 状态读取失败：${result.error}`);
+      assert.ok(
+        !result.tampered.includes(SPEC_REL),
+        `冻结需求全在就不该判篡改 —— 篡改清单：${JSON.stringify(result.tampered)}`,
+      );
+      assert.ok(
+        !result.violations.includes(SPEC_REL),
+        '规格在写集里 → 也不算越界',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('规格被改了，且**少了一条**冻结需求 → 判篡改（拦住自动改验收标准）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      // agent 删掉了「kFailed 是吸收态」这条 —— 条数从 3 变 2
+      const weakened = SPEC_WITH_CRITERIA.replace('3. `kFailed` 是吸收态。\n', '');
+      writeFileSync(join(dir, SPEC_REL), weakened, 'utf-8');
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: {
+          specPath: SPEC_REL,
+          requirements: [
+            '`CallState` 枚举存在，含五个状态。',
+            '同一状态不重复上报。',
+            '`kFailed` 是吸收态。',
+          ],
+        },
+      });
+
+      assert.ok(
+        result.tampered.includes(SPEC_REL),
+        '删掉一条验收标准必须判篡改 —— 那就是自动改规格',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('条数不变但**内容被换掉** → 判篡改（只比条数等于没比）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      // 把「kFailed 是吸收态」换成「kFailed 是终态」—— 条数不变，判据被削弱
+      const weakened = SPEC_WITH_CRITERIA.replace(
+        '3. `kFailed` 是吸收态。',
+        '3. `kFailed` 是终态。',
+      );
+      writeFileSync(join(dir, SPEC_REL), weakened, 'utf-8');
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: {
+          specPath: SPEC_REL,
+          requirements: [
+            '`CallState` 枚举存在，含五个状态。',
+            '同一状态不重复上报。',
+            '`kFailed` 是吸收态。',
+          ],
+        },
+      });
+
+      assert.ok(
+        result.tampered.includes(SPEC_REL),
+        '改写验收标准的文本必须判篡改 —— 条数不变不等于没改',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('规格被改但**新增**了一条验收标准 → 不判篡改（新增只会更严）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      const stricter = SPEC_WITH_CRITERIA.replace(
+        '## 验收标准',
+        '## 验收标准\n\n0. 前提条款。',
+      );
+      writeFileSync(join(dir, SPEC_REL), stricter, 'utf-8');
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: {
+          specPath: SPEC_REL,
+          requirements: [
+            '`CallState` 枚举存在，含五个状态。',
+            '同一状态不重复上报。',
+            '`kFailed` 是吸收态。',
+          ],
+        },
+      });
+
+      assert.ok(
+        !result.tampered.includes(SPEC_REL),
+        '新增验收标准不削弱判据，不该拦',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('没有锚（锚为空）→ 不做这道校验（没有判据不能凭空判篡改）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      writeFileSync(join(dir, SPEC_REL), '改完了，什么都没了\n', 'utf-8');
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: { specPath: SPEC_REL, requirements: [] },
+      });
+
+      assert.ok(
+        !result.tampered.includes(SPEC_REL),
+        '锚为空 = 没有判据 = 不判篡改',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('规格被删了（读不出来）→ 判篡改（fail closed：判据判不了就不能放行）', () => {
+    const dir = makeSpecRepo(SPEC_WITH_CRITERIA);
+    try {
+      // 先提交（规格本来就在版本控制里 —— 它是 zelto 复制进 worktree 的真源），
+      // 再删掉 —— 这才是「agent 把规格删了」的真实场景。
+      execFileSync('git', ['add', SPEC_REL], { cwd: dir, stdio: 'ignore' });
+      execFileSync('git', ['-c', 'user.email=t@t.z', '-c', 'user.name=t', 'commit', '-q', '-m', 'spec'],
+        { cwd: dir, stdio: 'ignore' });
+      rmSync(join(dir, SPEC_REL), { force: true });
+
+      const result = auditWorktreeWrites(dir, [SPEC_REL], {
+        specIntegrity: {
+          specPath: SPEC_REL,
+          requirements: ['`CallState` 枚举存在，含五个状态。'],
+        },
+      });
+
+      assert.ok(
+        result.tampered.includes(SPEC_REL),
+        '规格读不出来 = 判据判不了 = 不能放行（fail closed）',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('D-60 写集审计：托管文件不算越界，但被改算篡改', () => {
   it('规格副本（zelto 放的）不被判成越界', () => {
     const dir = makeRepo();

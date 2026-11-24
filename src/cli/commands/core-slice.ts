@@ -84,7 +84,7 @@ import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { RuntimeBudgetGuard } from '../../core/budget/index.js';
 import { budgetInterceptionMessage } from '../../core/budget/runtime-guard.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict, buildSpecIntegrity } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -1821,6 +1821,9 @@ register('run', async (args) => {
         projectRoot: process.cwd(),
         baseCommit: worktree?.baseCommit ?? null,
         managedPaths: zeltoOwnedPaths(worktree?.path ?? null, slice),
+        // ADR-106 §2：规格在写集里 → 不托管，但「冻结需求仍在」是硬约束。
+        // 锚取自起跑前的规格正文（agent 还没开工）。
+        specIntegrity: buildSpecIntegrity(worktree?.path ?? null, slice),
         // 装哪种 harness 的钩子 —— adapter 决定跑的是谁，
         // harness 决定钩子的信封格式（ADR-083）。
         // 配错 = hook 读不懂载荷 = 判定静默失效。

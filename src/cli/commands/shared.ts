@@ -19,6 +19,8 @@ import { SliceStore, checkSliceId } from '../../core/slice/store.js';
 // ADR-086：规格哈希的**唯一实源**在 core —— CLI 与 Web 调同一份。
 // 两份实现哪怕只差一个 `sha256:` 前缀，就会表现为「刚冻结完就报 hash mismatch」。
 import { hashSpecFile as hashSpecFileCore } from '../../core/lifecycle/freeze.js';
+import { extractRequirementReferences } from '../../core/spec/trace-extract.js';
+import type { SpecIntegrity } from '../../core/sched/audit.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,
@@ -162,6 +164,49 @@ export function loadPolicyConfig(root?: string): LoadedPolicy {
  */
 export function hashSpecFile(specPath: string): string | null {
   return hashSpecFileCore(specPath);
+}
+
+// ─── 规格完整性锚（ADR-106）─────────────────────────────────────────────────
+
+/**
+ * 从**冻结版规格**里提取需求条目，作为「规格完整性锚」（ADR-106 §2）。
+ *
+ * 规格文件在写集里时，它不再受「托管文件哈希」保护（agent 有权改它），
+ * 但受**「冻结需求仍在」**保护：agent 可以改措辞，不能删掉/改写验收标准。
+ *
+ * 锚取自**起跑前**的规格正文（那时 agent 还没开工），存进预约/审计参数里；
+ * 审计时再从 worktree 里被改过的规格重新提取、逐条比对。
+ *
+ * **为什么锚取自规格正文，而不是 `slice.trace.requirements`**：
+ * 追溯字段可能是人**显式声明**的引用（不一定是规格正文里的原文），
+ * 也可能被人在冻结后改过。规格正文里的「验收标准」才是
+ * 「这片要做成什么样」的那份真源（ADR-032 §3.3 的物化来源）。
+ *
+ * 返回 null 表示「没有锚」—— 调用方据此不做这道校验
+ * （没有锚就没有判据，不能凭空判篡改）。
+ */
+export function buildSpecIntegrity(
+  worktreeRoot: string | null,
+  slice: { spec: { path: string }; writes: string[] },
+): SpecIntegrity | null {
+  // 规格不在写集里 → 它受「托管文件哈希」保护，不需要这道锚。
+  if (!worktreeRoot) return null;
+
+  const specRel = slice.spec.path.replace(/\\/g, '/');
+  const inWriteSet = slice.writes.some((w) => w.replace(/\\/g, '/') === specRel);
+  if (!inWriteSet) return null;
+
+  let content: string;
+  try {
+    content = readFileSync(join(worktreeRoot, specRel), 'utf-8');
+  } catch {
+    return null;
+  }
+
+  const requirements = extractRequirementReferences(content).map((r) => r.text);
+  if (requirements.length === 0) return null;
+
+  return { specPath: specRel, requirements };
 }
 
 // ─── Option Parsing ──────────────────────────────────────────────────────────

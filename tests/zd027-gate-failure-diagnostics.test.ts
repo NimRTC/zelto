@@ -18,6 +18,7 @@ import { GateExecutor } from '../src/core/gate/executor.js';
 import { SliceStore } from '../src/core/slice/store.js';
 import { EventStream } from '../src/core/events/stream.js';
 import type { GateConfig } from '../src/core/gate/types.js';
+import { createCtestFixture, type CtestFixture } from './helpers/ctest-fixture.js';
 
 import {
   extractGateFailures,
@@ -443,15 +444,21 @@ describe('GateExecutor — 内部重试自动收窄（ADR-096）', () => {
   //   第二轮（带 --tests-from-file）：只跑清单里的用例，仍失败。
   // 它把每一轮的实际命令行写进 run.log，测试据此断言「第二轮确实收窄了」。
   //
-  // **为什么分两个文件**：`ctest.cmd` 是「ctest 可执行文件」的替身
-  // （扩展名 `.cmd` 是 Windows 上真实的可执行形态），
-  // `ctest-worker.cjs` 是它背后的实现。
+  // **为什么分两个文件**：工具文件（`ctest.cmd` / `ctest.sh`）是
+  // 「ctest 可执行文件」的替身（`.cmd` 是 Windows 上真实的可执行形态，
+  // `.sh` 是 POSIX 上的），`ctest-worker.cjs` 是它背后的实现。
   //
   // 收窄逻辑认的是**词元** `ctest` + 可执行扩展名 ——
-  // 所以 `ctest.cmd` 认得出，`ctest-worker.cjs`（扩展名 `.cjs`）认不出。
-  const FIXTURE = join(DIR, 'ctest.cmd');
+  // 所以 `ctest.cmd` / `ctest.sh` 认得出，
+  // `ctest-worker.cjs`（扩展名 `.cjs`）认不出。
+  //
+  // **跨平台**：Windows 上是 `cmd /c "..."`，POSIX 上直接执行 `ctest.sh` ——
+  // `cmd` 在 Linux 上不存在，硬套 Windows 形态会让这条用例在 Linux CI 上
+  // 永远走不到断言。详见 tests/helpers/ctest-fixture.ts。
   const WORKER = join(DIR, 'ctest-worker.cjs');
   const RUN_LOG = join(DIR, 'run.log');
+  let fixture: CtestFixture;
+  let FIXTURE: string;
 
   before(async () => {
     await mkdir(SLICES, { recursive: true });
@@ -463,7 +470,15 @@ describe('GateExecutor — 内部重试自动收窄（ADR-096）', () => {
         `const LOG = ${JSON.stringify(RUN_LOG)};`,
         'const args = process.argv.slice(2);',
         // 清单文件参数
-        "const mf = args[args.indexOf('--tests-from-file') + 1];",
+        //
+        // **必须先确认 flag 真的在**：`indexOf` 找不到时返回 -1，
+        // `+ 1` 就变成 0 → `args[0]`（`--test-dir`）被当成清单路径
+        // → 第一轮（本来就该跑全量）直接 ENOENT 崩掉。
+        //
+        // 第一轮的输出必须长得像 ctest 的失败输出 —— 否则收窄逻辑
+        // 认不出「这是 ctest 失败」，窄化压根不触发，用例走不到断言。
+        "const mfIdx = args.indexOf('--tests-from-file');",
+        'const mf = mfIdx >= 0 ? args[mfIdx + 1] : null;',
         'let names;',
         'if (mf) {',
         "  names = fs.readFileSync(mf, 'utf8').split('\\n').map(s => s.trim()).filter(Boolean);",
@@ -492,13 +507,14 @@ describe('GateExecutor — 内部重试自动收窄（ADR-096）', () => {
       ].join('\n'),
       'utf-8',
     );
-    await writeFile(
-      FIXTURE,
-      ['@echo off', `node "${WORKER}" %*`, ''].join('\r\n'),
-      'utf-8',
+    // ctest 替身（工具文件 + 背后的实现文件），按平台适配。
+    fixture = createCtestFixture(
+      DIR,
+      'ctest-worker.cjs',
+      '--test-dir build --output-on-failure -C Debug',
     );
+    FIXTURE = fixture.command;
   });
-
   after(async () => {
     await rm(DIR, { recursive: true, force: true });
   });
