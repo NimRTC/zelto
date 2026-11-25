@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { VersionPlan } from '../../core/version/types.js';
+import type { NewVersionSlice } from '../../core/version/create.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { collectCriterionIds, extractCriterionIds } from '../../core/requirements/criteria.js';
 import { DesignStore } from '../../core/design/store.js';
@@ -637,6 +638,156 @@ register('design', async (args) => {
   return 0;
 });
 
+// ─── plan version（确定性建版本，不经 LLM）──────────────────────────────────
+
+/** 把 `--slice` 后面的选项切成一个个切片段（与 plan-patch 同一套解析法）。 */
+function parseNewVersionSlices(args: string[]): NewVersionSlice[] {
+  const out: NewVersionSlice[] = [];
+  let current: NewVersionSlice | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const value = (n: number): string | undefined => {
+      const v = args[n + 1];
+      return v === undefined || v.startsWith('--') ? undefined : v;
+    };
+    if (arg === '--slice') {
+      const id = value(i);
+      if (!id) continue;
+      // 未给标题时用 id 本身 —— 不编造标题（标题是给人看的，编了等于猜）
+      current = { id, title: id, module: '未指定模块', writes: [] };
+      out.push(current);
+      i++;
+      continue;
+    }
+    if (!current) continue;
+    if (arg === '--slice-title') {
+      const v = value(i);
+      if (v) {
+        current.title = v;
+        i++;
+      }
+      continue;
+    }
+    if (arg === '--slice-module') {
+      const v = value(i);
+      if (v) {
+        current.module = v;
+        i++;
+      }
+      continue;
+    }
+    if (arg === '--slice-spec') {
+      const v = value(i);
+      if (v) {
+        current.specPath = v;
+        i++;
+      }
+      continue;
+    }
+    if (arg === '--write') {
+      const v = value(i);
+      if (v) {
+        current.writes.push(...v.split(',').map((s) => s.trim()).filter(Boolean));
+        i++;
+      }
+      continue;
+    }
+  }
+  return out;
+}
+
+/**
+ * `zelto plan version <plan-id> <v> --description <text> [--depends-on <v>...] [--slice <id> ...]`
+ *
+ * 为什么与 `plan add-version` 并存：`add-version` 走 LLM **生成**一版，
+ * 适合「计划里还没有这一版」的探索；本命令的切片清单是**人钉死的**
+ * —— 写集从 git 现场核实出来、逐条可核对，不需要模型再创作一遍。
+ * 实测 nimrtc v1.4.x 补齐的 13 个项，分波规则由「写哪个文件」决定，
+ * 让 LLM 重新生成只会引入漂移。
+ *
+ * 与 plan-patch 的分工：plan-patch **只改已存在的**切片/字段；
+ * 本命令**只加整版**（新版本 + 它的切片清单）。
+ *
+ * C4：加版本必须留痕 —— 写 `draft.revised` 事件，带每个切片的写集，
+ * 事后能一眼看出「这一版的边界是谁、在什么时候、按什么钉下的」。
+ */
+async function planAddVersionDeterministic(args: string[]): Promise<number> {
+  const f = getDefaultFormatter();
+  const id = args[0];
+  const versionLabel = args[1];
+  if (!id || id.startsWith('--') || !versionLabel || versionLabel.startsWith('--')) {
+    f.error('USAGE', 'Usage: zelto plan version <plan-id> <v> --description <text> [--depends-on <v>] [--slice <id> --slice-title <t> --slice-module <m> --write <p>...]');
+    return 1;
+  }
+
+  const optionValues = (name: string): string[] => {
+    const values: string[] = [];
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== name) continue;
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith('--')) continue;
+      values.push(next);
+    }
+    return values;
+  };
+  const description = optionValues('--description')
+    .join(' ')
+    .trim();
+  if (!description) {
+    f.error('USAGE', '缺 --description（这一版做什么、为什么这样分波）。');
+    return 1;
+  }
+
+  const versionStore = new VersionStore(ZELTO_DIR);
+  if (!(await versionStore.exists(id))) {
+    f.error('NOT_FOUND', `Version plan "${id}" not found.`);
+    return 1;
+  }
+  const plan = await versionStore.read(id);
+  if (plan.status !== 'confirmed') {
+    f.error('INVALID_STATE', `计划 "${id}" 还是 ${plan.status} —— 先 zelto plan confirm ${id}，或用 zelto plan patch 改草稿。`);
+    return 1;
+  }
+
+  const { createVersion } = await import('../../core/version/create.js');
+  const { plan: next, version, problems } = createVersion(plan, {
+    version: versionLabel,
+    dependsOn: optionValues('--depends-on').flatMap((v) => v.split(',')).map((s) => s.trim()).filter(Boolean),
+    description,
+    slices: parseNewVersionSlices(args),
+  });
+
+  if (!version) {
+    f.error('INVALID', `不能把版本 "${versionLabel}" 加进计划 "${id}"：`);
+    for (const p of problems) f.out(`   - ${p.message}`);
+    return 1;
+  }
+
+  // ADR-082：原子写入 + 写完读回验证
+  await versionStore.save(next);
+
+  // C4：留痕 —— 这一版是谁、什么时候、按什么切片清单钉下来的
+  await events.append(draftEventKey('plan', id), 'draft.revised', 'zelto', {
+    kind: 'plan',
+    id,
+    title: next.title,
+    addedVersion: version.version,
+    dependsOn: version.dependsOn,
+    slices: version.slices.map((s) => ({ id: s.id, writes: s.writes, specPath: s.specPath })),
+  });
+
+  f.success(`版本 ${version.version} 已加入计划 "${id}"（${version.slices.length} 片）`);
+  f.out(`   依赖：${version.dependsOn.join(', ') || '（无）'}`);
+  for (const s of version.slices) {
+    f.out(`   - ${s.id}  ${s.title}`);
+    f.out(`     写集：${s.writes.join(', ')}`);
+  }
+  f.out('下一步：给每片确认规格，再启动：');
+  for (const s of version.slices) f.out(`   zelto spec draft ${s.id}   →   zelto spec confirm ${s.id}`);
+  f.out(`   zelto version start ${version.version} --plan ${id}`);
+  return 0;
+}
+
 // ─── plan ────────────────────────────────────────────────────────────────────
 
 register('plan', async (args) => {
@@ -649,8 +800,13 @@ register('plan', async (args) => {
     f.out('       zelto plan show <id>   摘要 + 决策点 + 差异');
     f.out('       zelto plan confirm <id>');
     f.out('       zelto plan add-version <id> <description>');
+    f.out('       zelto plan version <id> <v> --description <text> [--depends-on <v>] [--slice <id>...]');
     f.out('       zelto plan patch <id> --version <v> [--add-slice <id> | --remove-slice <id> | --slice <id> --write <p>...]');
     return 1;
+  }
+
+  if (subcmd === 'version') {
+    return planAddVersionDeterministic(args.slice(1));
   }
 
   if (subcmd === 'list') {
@@ -828,7 +984,7 @@ register('plan', async (args) => {
   // zelto plan <design-id>
   const designId = subcmd;
   if (!designId || designId.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan <design-id> | zelto plan list | zelto plan confirm <id> | zelto plan add-version <id> <desc>');
+    f.error('USAGE', 'Usage: zelto plan <design-id> | zelto plan list | zelto plan confirm <id> | zelto plan add-version <id> <desc> | zelto plan version <id> <v> --description <text> --slice <id> ...');
     return 1;
   }
 
