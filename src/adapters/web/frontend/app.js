@@ -217,6 +217,49 @@ function stateBadge(state) {
 }
 
 /**
+ * 分支证据徽标（ADR-114）—— 「完成」是在盘上完成，还是在版本分支里完成。
+ *
+ * 为什么必须有这一列：实测 nimrtc-v14 的 v3 目录 15 片全 completed，
+ * 而 `version/v3` 分支只跟踪了 3 片基线 —— 另外 12 片的「完成」
+ * 只存在于那台机器的磁盘上（`.zelto/` 在 .gitignore 里）。
+ * 只显示盘上状态，页面就在说一句**没有分支依据**的话。
+ *
+ * 三态（与 API 同口径）：
+ * - true：状态文件已进所属根的 git 跟踪（提交里的 state 一并给出）
+ * - false：只在盘上 —— 换台机器就查不到
+ * - null：拿不到 git 证据（目录不是 git 仓库）—— 说「未知」，不说「没有」
+ */
+function branchCell(s) {
+  if (s.onBranch === true) {
+    var b = el('span', 'badge live-active', '✔ 在分支');
+    if (s.committedState && s.committedState !== s.state) {
+      b.appendChild(el('span', 'muted small', ' (提交里: ' + s.committedState + ')'));
+    }
+    return b;
+  }
+  if (s.onBranch === false) {
+    var b2 = el('span', 'badge live-stale', '⚠ 仅在盘上');
+    b2.title = '状态文件没有提交进所属分支（.zelto/ 在 .gitignore 里）—— 换台机器或换 worktree 就查不到';
+    return b2;
+  }
+  return el('span', 'muted', '未知');
+}
+
+/**
+ * 一个切片的「计划对照」单元格（ADR-114）—— 计划里的状态 vs 盘上。
+ *
+ * 数据来自 `/api/plan-coverage`（按 id 索引后递进来）；不在任何计划里时
+ * 如实显示「不在计划」—— 不在计划里本身是事实，不是错误。
+ */
+function planCell(planIndex, id) {
+  var p = planIndex && planIndex[id];
+  if (!p) return el('span', 'muted', '不在计划');
+  var txt = (p.version || '?') + ' · 计划 ' + (p.plannedState || '?');
+  if (p.status && p.status !== 'planned') txt += '（版本 ' + p.status + '）';
+  return el('span', 'small', txt);
+}
+
+/**
  * 被动活性徽标（D-30）：running 到底活没活，一眼看出来。
  * 非 running 片没有活性概念 —— 显示 muted 的「—」，别误导人。
  */
@@ -281,8 +324,107 @@ function progressCell(s) {
 
 // ── 视图 ───────────────────────────────────────────────────────────────
 
+/**
+ * 把 `/api/plan-coverage` 的结果摊平成「切片 id → 计划位置」的索引（ADR-114）。
+ *
+ * 同一 id 出现在多份计划里时（少见：仓库根与版本目录各有一份计划），
+ * 取**第一份**（服务端顺序：仓库根在前）—— 这是展示，不参与判定；
+ * 真正消歧归 CLI（`resolveSliceOwnership` 命中多个会明确报错）。
+ */
+function buildPlanIndex(coverage) {
+  var idx = {};
+  var plans = (coverage && coverage.plans) || [];
+  for (var i = 0; i < plans.length; i++) {
+    var plan = plans[i];
+    for (var j = 0; j < (plan.versions || []).length; j++) {
+      var v = plan.versions[j];
+      for (var k = 0; k < (v.slices || []).length; k++) {
+        var row = v.slices[k];
+        if (idx[row.id]) continue;
+        idx[row.id] = {
+          planId: plan.id,
+          version: v.version,
+          versionStatus: v.status,
+          plannedState: row.plannedState,
+          onDisk: row.onDisk,
+          actualState: row.actualState,
+          onBranch: row.onBranch
+        };
+      }
+    }
+  }
+  return idx;
+}
+
+/**
+ * 计划对照表（ADR-114）—— 「这一版还差什么」的三个口径并排。
+ *
+ * 为什么每版一行而不是把切片全铺开：版本层面的人问的是「这一版推得怎样」，
+ * 展开到片会让页面淹没；切片级的「计划 vs 盘上」在切片列表的「计划」列里。
+ *
+ * 计数口径（与 API 同口径，**不做合成**）：
+ *   计划 N 片 · 盘上 M 片 · 盘上完成 C 片 · **分支上完成 B 片**
+ *
+ * B 才是「版本分支里有证据的完成」。M/C 很大而 B 很小时，页面必须让人
+ * 一眼看出「完成只在盘上」—— 这正是 nimrtc-v14 实测踩到的坑。
+ */
+function renderPlanCoverage(target, coverage) {
+  var plans = (coverage && coverage.plans) || [];
+  if (plans.length === 0) return;
+
+  target.appendChild(el('h2', null, '版本计划（' + plans.length + ' 份）'));
+  target.appendChild(el('p', 'muted small',
+    '计划 vs 盘上 vs 分支：分开数、不合成。计划里的状态来自 .zelto/versions，' +
+    '盘上是切片状态文件，「分支上完成」是已完成且状态文件已提交进所属分支（ADR-114）。'));
+
+  for (var i = 0; i < plans.length; i++) {
+    var plan = plans[i];
+    var where = plan.scope === 'version' ? '（版本目录 ' + plan.label + '）' : '（仓库根）';
+    target.appendChild(el('h3', null, plan.title + ' ' + where + ' · ' + plan.id));
+
+    var rows = (plan.versions || []).map(function (v) {
+      var c = v.counts || {};
+      var gap = (c.completed || 0) - (c.onBranch || 0);
+      var cells = [
+        v.version,
+        String(v.status || '?'),
+        String(c.planned || 0),
+        String(c.onDisk || 0),
+        String(c.completed || 0),
+        branchCountCell(c.onBranch || 0, gap),
+        (v.dependsOn || []).join(', ') || '—',
+        v.branch || '—'
+      ];
+      return { cells: cells };
+    });
+    target.appendChild(table(
+      ['版本', '版本状态', '计划片数', '盘上有片', '盘上完成', '分支上完成', '依赖', '分支'],
+      rows
+    ));
+  }
+}
+
+/** 「分支上完成」单元格 —— 盘上完成与分支上完成差得多时，直说差多少。 */
+function branchCountCell(onBranch, gap) {
+  var box = el('span', null, String(onBranch));
+  if (gap > 0) {
+    var w = el('span', 'badge live-stale', gap + ' 片仅在盘上');
+    w.title = '这些片在盘上是 completed，但状态文件没有进所属分支（.zelto/ 在 .gitignore 里）—— 换机器就查不到';
+    box.appendChild(document.createTextNode(' '));
+    box.appendChild(w);
+  }
+  return box;
+}
+
 async function viewOverview(target) {
   const s = await apiGet('/api/summary');
+  // ADR-114：计划对照表 —— 拿不到就整节不显示（不编一份计划出来）
+  let coverage = null;
+  try {
+    coverage = await apiGet('/api/plan-coverage');
+  } catch (err) {
+    coverage = null;
+  }
   clear(target);
 
   const cards = el('div', 'cards');
@@ -341,6 +483,15 @@ async function viewOverview(target) {
       })
     ));
   }
+
+  // ── 计划对照（ADR-114）───────────────────────────────────────────
+  //
+  // 「这一版还差什么」必须把三个口径并排：
+  //   计划（.zelto/versions）· 盘上（切片状态文件）· 版本分支（git 跟踪）。
+  // 实测（nimrtc-v14，2026-11-25）三者的差是：计划 16 项全 draft、
+  // 盘上 15 片全 completed、版本分支只跟踪 3 片 —— 只看其中一个都会误判。
+  // 这里只呈现计数，不给「完成度」这种合成结论（合成会抹掉差别）。
+  renderPlanCoverage(target, coverage);
 
   // ── 基线切片的清单 ──
   //
@@ -474,6 +625,13 @@ async function viewOverview(target) {
 
 async function viewSlices(target) {
   const slices = await apiGet('/api/slices');
+  // ADR-114：计划索引（id → {version, plannedState, ...}）—— 拿不到就不出「计划」列
+  var planIndex = null;
+  try {
+    planIndex = buildPlanIndex(await apiGet('/api/plan-coverage'));
+  } catch (err) {
+    planIndex = null;
+  }
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
 
@@ -516,25 +674,33 @@ async function viewSlices(target) {
 
     if (devSlices.length > 0) {
       target.appendChild(el('h3', null, '开发切片（' + devSlices.length + '）'));
+      var devHeaders = ['切片', '标题', '状态'];
+      if (planIndex) devHeaders.push('计划');
+      devHeaders.push('分支证据', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新');
       target.appendChild(table(
-        ['切片', '标题', '状态', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新'],
+        devHeaders,
         devSlices.map(function (s) {
           var wd = '';
           if (s.escalated) wd = ' 🚨已上报';
           else if (s.recoveries > 0) wd = ' 自愈' + s.recoveries + '次';
+          var cells = [
+            s.id,
+            s.title,
+            stateBadge(s.state)
+          ];
+          if (planIndex) cells.push(planCell(planIndex, s.id));
+          cells.push(
+            branchCell(s),
+            livenessCell(s),
+            traceCounts(s.trace),
+            String(s.writeCount),
+            s.runCount === 0 ? '—' : (s.lastRunOk ? '✅ ' + s.runCount : '❌ ' + s.runCount) + wd,
+            costCell(s),
+            new Date(s.updatedAt).toLocaleString()
+          );
           return {
             onClick: function () { showSliceDetail(s.id, false, { scope: s.scope, label: s.label }); },
-            cells: [
-              s.id,
-              s.title,
-              stateBadge(s.state),
-              livenessCell(s),
-              traceCounts(s.trace),
-              String(s.writeCount),
-              s.runCount === 0 ? '—' : (s.lastRunOk ? '✅ ' + s.runCount : '❌ ' + s.runCount) + wd,
-              costCell(s),
-              new Date(s.updatedAt).toLocaleString()
-            ]
+            cells: cells
           };
         })
       ));
@@ -939,6 +1105,18 @@ async function showSliceDetail(id, forSign, loc) {
     main.appendChild(el('p', 'muted small',
       '所在根：' + rootName(d.summary.scope, d.summary.label) +
       (roots ? ' · 这片在以下根有记录：' + roots : '')));
+  }
+
+  // ADR-114：分支证据 —— 「completed」是不是在版本分支里完成的
+  if (d.summary) {
+    var bLine = el('p', 'small');
+    bLine.appendChild(el('span', null, '分支证据：'));
+    bLine.appendChild(branchCell(d.summary));
+    if (d.summary.onBranch === false) {
+      bLine.appendChild(el('span', 'muted small',
+        ' 状态文件 .zelto/slices/' + id + '.json 未提交进所属分支 —— 版本分支上没有这一片的完成证据。'));
+    }
+    main.appendChild(bLine);
   }
 
   // ── ADR-086：油门 ────────────────────────────────────────────────────

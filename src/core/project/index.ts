@@ -16,3 +16,10 @@ export {
   type CockpitRoot,
   type CockpitScope,
 } from './cockpit-roots.js';
+
+// ADR-114：分支可见性 —— 「完成」是在盘上完成，还是在版本分支里完成
+export {
+  annotateBranchEvidence,
+  defaultGitProbe,
+  type GitProbe,
+} from './branch-evidence.js';

@@ -249,6 +249,13 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
     return;
   }
 
+  // ── GET /api/plan-coverage ─────────────────────────────────────────
+  // ADR-114：计划 vs 盘上 vs 版本分支 —— 三个口径并排，只呈现差异
+  if (method === 'GET' && path === '/api/plan-coverage') {
+    sendJson(res, 200, await api.planCoverage());
+    return;
+  }
+
   // ── GET /api/questions ───────────────────────────────────────────────
   // ADR-084：agent 的待答提问 —— 驾驶舱要能「就地回答」
   //

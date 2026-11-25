@@ -37,8 +37,8 @@ import { loadPolicy } from '../../core/policy/data-access.js';
 import { VersionStore } from '../../core/version/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { RequirementStore } from '../../core/requirements/store.js';
-import { resolveSliceOwnership } from '../../core/version/branch.js';
-import type { Version } from '../../core/version/types.js';
+import { resolveSliceOwnership, branchOfVersion, readVersionPlans } from '../../core/version/branch.js';
+import type { Version, VersionPlan } from '../../core/version/types.js';
 import { HaltStore } from '../../core/halt/index.js';
 import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
 // ADR-112：驾驶舱按「根」扫描 —— 版本集成目录里的切片不许看不见
@@ -48,6 +48,8 @@ import {
   type CockpitRoot,
   type CockpitScope,
 } from '../../core/project/cockpit-roots.js';
+// ADR-114：分支可见性 —— 「完成」是在盘上完成，还是在版本分支里完成
+import { annotateBranchEvidence } from '../../core/project/branch-evidence.js';
 // ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
 // run 拉起 CLI 进程。判定不分叉（C3）。
 import {
@@ -180,6 +182,23 @@ export interface SliceSummary {
   label: string | null;
   /** 这一片出现过的所有根（版本 label；仓库根记为 `root`）—— 合并的证据 */
   roots: string[];
+  /**
+   * ── ADR-114：分支可见性 ──
+   *
+   * `true` = 这一片的状态文件已**提交进它所属那个根的 git 跟踪**
+   * （等价地：已合进版本分支 / 主干）。`false` = 只在盘上
+   * （`.zelto/` 在 .gitignore 里，状态文件没进版本分支 —— 换台机器就看不到）。
+   *
+   * 为什么必须说：实测 nimrtc-v14 的 v3 目录里 15 片全是 completed，
+   * 但 `version/v3` 分支只跟踪了 3 片基线 —— 其余 12 片「完成了」
+   * 这件事只存在于那台机器的磁盘上。驾驶舱不说这一点，
+   * 人看到的就是「15 片全完成」，而版本分支里没有证据。
+   *
+   * 判据只读 git（C3：确定性、不触网）。
+   */
+  onBranch: boolean | null;
+  /** 提交形态的状态（与盘上 `state` 对照）—— 不跟踪时 `null` */
+  committedState: string | null;
 }
 
 /** 切片详情 —— 含签字复查的事实与判定。 */
@@ -339,7 +358,7 @@ export class WebApi {
     const perRoot = await Promise.all(
       this.workspaces.map((ws) => this.listSlicesInRoot(ws)),
     );
-    return mergeSliceSummaries(perRoot);
+    return annotateBranchEvidence(this.workspaces, mergeSliceSummaries(perRoot));
   }
 
   /** 单个根的切片总览 —— 分根读，一片坏不挡住其它。 */
@@ -375,12 +394,15 @@ export class WebApi {
     const slice = await ws.store.read(id);
     const facts = await this.collectFacts(ws, id);
     const checks = evaluateSignChecks(facts);
-    return {
-      slice,
-      summary: await withRoot(
+    const [summary] = annotateBranchEvidence(this.workspaces, [
+      withRoot(
         await toSummary(slice, ws.budget, this.repoRoot, () => ws.events.read(id)),
         ws.root,
       ),
+    ]);
+    return {
+      slice,
+      summary,
       facts,
       checks,
       trace: facts.trace,
@@ -902,6 +924,97 @@ export class WebApi {
       /** 超支比例（0~1+）；不限时为 null —— 没有上限就没有比例 */
       spendRatio: unlimited ? null : rawLimit > 0 ? spentUsd / rawLimit : 0,
     };
+  }
+
+  /**
+   * ── ADR-114：计划 vs 实际的对照表 ──
+   *
+   * 人问的是「**这一版**还差什么」，驾驶舱原来只能回答「盘上有多少片
+   * 什么状态」。实测（nimrtc-v14，2026-11-25）两者的差是：版本计划里
+   * 16 项全是 `draft`、盘上 15 片全是 `completed`、而版本分支只跟踪了
+   * 3 片基线 —— 三个口径没有任何一处并排呈现过。
+   *
+   * 这里把三个口径并排：
+   *   - **计划**：`.zelto/versions/<id>.json`（版本目录里有就用版本目录的，
+   *     否则用仓库根的）—— 只读，不判定；
+   *   - **盘上**：合并后的切片行（含 ADR-114 的 `onBranch`）；
+   *   - **版本分支**：`onBranch === true` 的片数。
+   *
+   * 只**呈现差异**，不给结论（「计划过期」「某片没做完」都是人要判的）。
+   */
+  async planCoverage(): Promise<unknown> {
+    const slices = await this.listSlices();
+    const byId = new Map(slices.map((s) => [s.id, s]));
+
+    // 版本计划：仓库根 + 每个版本目录，按计划 id 取「最近更新的那份」。
+    const candidates: Array<{ scope: CockpitScope; label: string | null; plan: VersionPlan }> = [];
+    const seenPlans = new Set<string>();
+    const planDirs: Array<{ scope: CockpitScope; label: string | null; zeltoDir: string }> = [
+      { scope: 'root', label: null, zeltoDir: this.zeltoDir },
+      ...this.workspaces.slice(1).map((ws) => ({ scope: ws.root.scope, label: ws.root.label, zeltoDir: ws.zeltoDir })),
+    ];
+    for (const d of planDirs) {
+      for (const plan of readVersionPlans(join(d.zeltoDir, 'versions'))) {
+        const key = `${plan.id}\n${d.scope}\n${d.label ?? ''}`;
+        if (seenPlans.has(key)) continue;
+        seenPlans.add(key);
+        candidates.push({ scope: d.scope, label: d.label, plan });
+      }
+    }
+
+    const plans = candidates.map(({ scope, label, plan }) => ({
+      id: plan.id,
+      title: plan.title,
+      status: plan.status,
+      scope,
+      label,
+      versions: plan.versions.map((v) => {
+        const rows = v.slices.map((s) => {
+          const actual = byId.get(s.id) ?? null;
+          return {
+            id: s.id,
+            title: s.title,
+            plannedState: s.state ?? 'draft',
+            /** 盘上找不到（计划里有、没有切片文件） */
+            onDisk: actual !== null,
+            actualState: actual?.state ?? null,
+            /** 这一行事实的所在根（ADR-112 路由凭据） */
+            scope: actual?.scope ?? null,
+            label: actual?.label ?? null,
+            /** ADR-114：状态文件是否已进所属根的 git 跟踪 */
+            onBranch: actual?.onBranch ?? null,
+            committedState: actual?.committedState ?? null,
+          };
+        });
+        return {
+          version: v.version,
+          description: v.description,
+          dependsOn: v.dependsOn,
+          status: v.status,
+          branch: branchOfVersion(v),
+          baseCommit: v.baseCommit ?? null,
+          slices: rows,
+          /**
+           * 计数口径（**分开数，不合成一个「完成度」**）：
+           * - planned：计划里这一版的片数
+           * - onDisk：盘上有状态文件的片数
+           * - completed：盘上 completed 的片数
+           * - onBranch：已完成且状态文件已进版本分支的片数
+           *
+           * 「计划 10 片里 7 片在分支上完成」与「盘上 10 片全 completed
+           * 但分支只跟踪 0 片」是两种事实，合成一个百分比会抹掉差别。
+           */
+          counts: {
+            planned: rows.length,
+            onDisk: rows.filter((r) => r.onDisk).length,
+            completed: rows.filter((r) => r.actualState === 'completed').length,
+            onBranch: rows.filter((r) => r.actualState === 'completed' && r.onBranch === true).length,
+          },
+        };
+      }),
+    }));
+
+    return { plans };
   }
 
   /**
@@ -1529,13 +1642,15 @@ function rootLabelOf(root: CockpitRoot): string {
 
 /** 把一条总览行标注上它来自哪个根（以及它出现过的其它根）。 */
 function withRoot(
-  summary: Omit<SliceSummary, 'scope' | 'label' | 'roots'>,
+  summary: Omit<SliceSummary, 'scope' | 'label' | 'roots' | 'onBranch' | 'committedState'>,
   root: CockpitRoot,
   otherRoots: string[] = [],
 ): SliceSummary {
   const here = rootLabelOf(root);
   const roots = [here, ...otherRoots.filter((r) => r !== here)];
-  return { ...summary, scope: root.scope, label: root.label, roots };
+  // onBranch / committedState 由调用方（需要 git 事实的那层）补上 ——
+  // 这里只填占位，保证「单根行」与「合并行」形状一致。
+  return { ...summary, scope: root.scope, label: root.label, roots, onBranch: null, committedState: null };
 }
 
 /**
@@ -1643,7 +1758,7 @@ async function toSummary(
   budget: BudgetCollector,
   repoRoot: string,
   loadEvents: () => Promise<EventEnvelope[]>,
-): Promise<Omit<SliceSummary, 'scope' | 'label' | 'roots'>> {
+): Promise<Omit<SliceSummary, 'scope' | 'label' | 'roots' | 'onBranch' | 'committedState'>> {
   const runs = slice.runs ?? [];
   const lastRun = runs.length > 0 ? runs[runs.length - 1] : null;
 
