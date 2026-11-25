@@ -386,11 +386,109 @@ if (semverTags.length > 0 && currentSemver) {
   }
 }
 
+// ── 6b. 触发的 tag == 当前版本（ADR-113 决策一）──────────────────────
+//
+// **这条是「这次要发的包」对不对的判据 —— 与第 6 段互补，缺一不可。**
+//
+// 第 6 段问的是「仓库版本有没有**落后**于已发布的版本」；
+// 本段问的是「**这次触发发布的这个 tag**，跟 `package.json` 对不对得上」。
+//
+// ── 为什么必须有本段（v4 实施遗留的缺口）──────────────────────────────
+//
+// ADR-110 把 tag 分成两个轴 —— 版本锚点 `plan-<planId>/v<n>` 与
+// 发布锚点 `v<semver>`。ADR-110 **决策二**原文：
+//
+//   ① 命名合法性 → scripts/tag-namespace.mjs（唯一判据，workflow 只调用）
+//   ② 版本一致性 → 只对 `v<semver>` 形态校（发布锚点才有「当前版本」这回事）
+//
+// v4-tag-namespace-adr110 把 `release.yml` 里那段版本号比对**整段删了**
+// （理由是「`plan-<planId>/v<n>` 里没有 semver 可抽」）——
+// **那个理由只对 `plan-*` 形态成立**，发布锚点 `v<semver>` 形态仍有 semver 可抽，
+// 而且**必须**校。
+//
+// 于是决策二的 ② 落空了：缺了本段，打一个 `v0.6.0` 的 tag 就能把
+// `package.json` 的 `0.7.1` 发到 npm —— **发布锚点说谎**
+// （tag 说 0.6.0，npm 上是 0.7.1），而本脚本第 6 段的「已发布版本」代理
+// 正是 git tag，于是后续所有依赖「已发布版本」这个事实的防漂移判据
+// 从此建立在**错的基准**上。
+//
+// ── 判据的精确形状 ─────────────────────────────────────────────────
+//
+//   v<semver>              必须**字面等于** package.json 的 version → 不等就非 0 退出
+//   plan-<planId>/v<n>     **不比**（版本锚点是历史，不该因升版失效）→ 放行
+//   其它（认不出版本号）    报错退出 —— 「认不出这次发的是哪一版」
+//
+// **为什么 `plan-*` 不校**：ADR-110 决策一 —— 版本锚点是**历史**。
+// 校它就会退回 ADR-110 缺陷一（升版当天所有历史 tag 同时变非法，发布闸门自锁）。
+//
+// **为什么只做字面相等、不做 semver 范围比较**：
+// 「仓库版本落后于已发布版本」是第 6 段的事（`pkg >= 最高已发布 tag`）。
+// 本段只管「**这次发的** == 当前版本」—— 两条判据**不重叠**。
+//
+// ── 为什么只在 `--tag` 时才判，不在无参时判 ─────────────────────────
+//
+// 无参跑是「检查仓库状态」，`--tag` 是「检查**这次发布**」。
+// 合成一条就会让本地检查被**历史** tag 污染 ——
+// ADR-110 缺陷一的同一坑，换个方向再踩一遍。
+const tagArgIndex = process.argv.indexOf('--tag');
+const triggeringTag = tagArgIndex >= 0 ? process.argv[tagArgIndex + 1] : null;
+
+if (tagArgIndex >= 0 && !triggeringTag) {
+  fail('--tag 后面必须跟一个 tag 名 —— 认不出这次触发发布的是哪个 tag。');
+}
+
+if (triggeringTag) {
+  // 命名空间 tag（版本锚点）：ADR-110 决策一 —— 不校版本。
+  //
+  // 这里只判**形态**，不判合法性 —— 合法性归 scripts/tag-namespace.mjs
+  // （ADR-106 §5：同一问题只能有一处判定）。
+  // 本段只回答「这次发的包跟 tag 对不对得上」。
+  if (/^plan-\d{13}\/v\d+$/.test(triggeringTag)) {
+    console.log(
+      `[version-check] tag "${triggeringTag}" 是版本锚点（plan-<planId>/v<n>）—— ` +
+        `按 ADR-110 决策一不校版本一致性（版本锚点是历史），放行。`,
+    );
+  } else {
+    // 发布锚点 `v<semver>`：必须**字面等于** package.json 的 version。
+    //
+    // 先判形态 —— 认不出版本号的 tag 说不出「这次发的是哪一版」，
+    // 那就**不能放行**（fail closed）。
+    const m = /^v(\d+\.\d+\.\d+)$/.exec(triggeringTag);
+    if (!m) {
+      fail(
+        `tag "${triggeringTag}" 里认不出版本号 —— 不知道这次发布的是哪一版。` +
+          `发布锚点须是 v<major.minor.patch> 形态` +
+          `（如 v${currentVersion}），版本锚点须是 plan-<planId>/v<n> 形态。`,
+      );
+    }
+
+    const tagVersion = m[1];
+    if (tagVersion !== currentVersion) {
+      fail(
+        `tag "${triggeringTag}" 的版本号 ${tagVersion} 与 package.json 的 version ` +
+          `${currentVersion} **不一致** —— 这次发出去的包会是 ${currentVersion}，` +
+          `而仓库的发布锚点记的是 ${tagVersion}。**发布锚点会说谎**：` +
+          `从 tag 看不出发出去的到底是哪一版，` +
+          `而依赖「已发布版本」这个事实的后续防漂移判据也会跟着失准。` +
+          `请把 package.json 的 version 改成 ${tagVersion}，或改打 ${currentVersion} 这个 tag。`,
+      );
+    }
+  }
+}
+
 // ── 7. 全部一致 ──────────────────────────────────────────────────────
 
 console.log(
   `[version-check] 通过：package.json 与 pnpm-lock.yaml 的 ${pkgDeclared.size} 条依赖声明一致` +
     `，package.json 版本 ${currentVersion} 不低于已发布的 ${semverTags.length} 个发布锚点 tag` +
-    `（${semverTags.join('、') || '无'}）。`,
+    `（${semverTags.join('、') || '无'}）` +
+    (triggeringTag
+      ? `，触发发布的 tag "${triggeringTag}" ${
+          /^plan-\d{13}\/v\d+$/.test(triggeringTag)
+            ? '是版本锚点，按 ADR-110 决策一不校版本一致性'
+            : '与仓库版本一致'
+        }`
+      : '') +
+    `。`,
 );
 process.exit(0);

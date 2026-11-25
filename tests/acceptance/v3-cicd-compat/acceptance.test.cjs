@@ -27,12 +27,28 @@ const WRITE_SET = [
   'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
 ];
 
-// 不得被本片改动的三文件（验收标准 7）。
+// 不得被本片改动的文件（验收标准 7）。
+//
+// ── 为什么 `scripts/version-check.mjs` 不在其中（ADR-113 决策四）──
+//
+// 当初把它列进来是对的 —— 那是**当片**的写集边界。
+// 但 ADR-113 要在那个文件里**新增 `--tag` 判据**（恢复被 v4 删掉的
+// 「触发的 tag == 实际发布版本」这条保护），所以它**必须**能改。
+//
+// **处置不是「删掉这条判据」—— 那是放弃边界检查。**
+// 而是把它移出「不可改」名单，并给它一条**定向**断言：
+// 它的改动只能是**新增 `--tag` 判据**，不得动原有的三条判据。
+//
+// 剩下两个（tag-namespace / tag-map）**仍然不可改** ——
+// 命名合法性的唯一判据与迁移台账，与本片无关。
 const FROZEN_REFS = [
   'scripts/tag-namespace.mjs',
   'scripts/tag-map.json',
-  'scripts/version-check.mjs',
 ];
+
+// 允许改动、但**只能以受限方式**改的文件（ADR-113 决策四）。
+// 断言在下方 —— 它不得动原有的判据，只能新增 `--tag` 那一支。
+const GUARDED_REFS = ['scripts/version-check.mjs'];
 
 function readText(p) {
   return fs.readFileSync(p, 'utf8');
@@ -104,15 +120,18 @@ function pushTagPatterns(text) {
 
 // ─── 验收标准 1：触发条件覆盖命名空间形态，且不移除 semver 触发 ─────────────
 
-test('触发条件覆盖 plan-<semver>/v<n>，且 v* 语义版本触发能力未被移除', () => {
+test('触发条件覆盖 plan-<planId>/v<n>，且 v* 语义版本触发能力未被移除', () => {
   assert.ok(fs.existsSync(WORKFLOW), '.github/workflows/release.yml 必须存在');
   const text = readText(WORKFLOW);
   const patterns = pushTagPatterns(text);
 
-  const nsHit = patterns.filter((p) => globMatch(p, 'plan-0.7.1/v1'));
+  // 命名空间形态用**真实的 13 位 planId** ——
+  // ADR-110 把旧形态 `plan-<semver>/v<n>` 取代了（`<semver>` 是「现在」的概念，
+  // tag 是「历史」，两者必然分叉）。这里要断言的是**新**形态能触发。
+  const nsHit = patterns.filter((p) => globMatch(p, 'plan-1795507341754/v3'));
   assert.ok(
     nsHit.length >= 1,
-    `tags 列表必须含能匹配 plan-0.7.1/v1 的模式，实际: ${JSON.stringify(patterns)}`,
+    `tags 列表必须含能匹配 plan-1795507341754/v3 的模式，实际: ${JSON.stringify(patterns)}`,
   );
 
   const semverHit = patterns.filter((p) => globMatch(p, 'v0.5.0'));
@@ -124,6 +143,7 @@ test('触发条件覆盖 plan-<semver>/v<n>，且 v* 语义版本触发能力未
   // 命名空间模式不得误伤：它不该匹配纯 semver tag 集合之外的裸 tag 语义——
   // 即 v* 仍是独立模式（两类触发并存，不是互相替代）。
   assert.ok(patterns.includes('v*'), '原 v* 模式必须原样保留');
+  assert.ok(patterns.includes('plan-*/v*'), 'plan-*/v* 模式必须存在（ADR-110 决策二）');
 });
 
 // ─── 验收标准 2：调用唯一判据 + 保留版本号一致性保护 ────────────────────────
@@ -142,15 +162,34 @@ test('tag 校验既调用 scripts/tag-namespace.mjs，又保留版本号一致�
   // 时退出码 0（checkTag 对 SEMVER_TAG 直接 return null）。
   // 若把这条也交给脚本，就等于静默削掉「发出去的包和仓库对不上」那条保护：
   // 打一个 v0.6.0 的 tag 就能把 0.7.1 的包发出去。
-  assert.ok(text.includes('PKG='), 'workflow 必须仍取出 package.json 的版本号（PKG）');
+  //
+  // ── 判据落在哪（ADR-113 决策一）─────────────────────────────
+  //
+  // 落在 `scripts/version-check.mjs`（新增 `--tag` 参数），
+  // **不在 workflow 里内联** —— ADR-106 §5「同一问题只能有一处判定」：
+  // 内联回 workflow 等于在 workflow 里**再建一处**版本号判定，
+  // 正是本切片当初要消除的形态。
   assert.ok(
-    text.includes('${TAG_SEMVER}" != "${PKG}'),
-    'workflow 必须仍做 tag 版本号与 package.json 版本号的比对（TAG_SEMVER vs PKG）',
+    text.includes('node scripts/version-check.mjs --tag'),
+    'workflow 必须调用 node scripts/version-check.mjs --tag（版本一致性的唯一判据）',
   );
 
-  // 而「旧写法」那种把版本号与 tag 整体相比的形态，允许保留 ——
-  // 它恰恰是被删掉的那条保护，本片要恢复它，不是禁止它。
-  // 只需保证它不是「唯一」的保护（脚本调用已在上面断言）。
+  // 而 workflow 里**不得再有**自行比对版本号的 shell ——
+  // 那会与 version-check.mjs 构成两套判定。
+  const checkStep = extractStepBody(text, '校验 tag 命名空间');
+  assert.ok(checkStep, 'workflow 必须有「校验 tag 命名空间」这一步');
+  assert.ok(
+    !checkStep.includes('TAG_SEMVER'),
+    '命名空间校验步骤不得再有从 tag 抽取 semver 的逻辑（那是 version-check.mjs 的职责）',
+  );
+  assert.ok(
+    !checkStep.includes('PKG='),
+    '命名空间校验步骤不得再自行取 package.json 版本号做比对',
+  );
+  assert.ok(
+    !/case\s+["']?\$\{?TAG/.test(checkStep),
+    '命名空间校验步骤不得再有按 tag 形态分支的 case 语句',
+  );
 });
 
 // ─── 验收标准 2b：版本号比对对两种 tag 形态都生效 ────────────────────────────
@@ -161,135 +200,87 @@ test('版本号比对对纯 semver tag 与命名空间 tag 都生效（保护没
   assert.ok(m, `package.json 的 version 应是 semver，实际：${pkg.version}`);
   const cur = m[1];
 
-  // 从 workflow 里抽出那段比对逻辑，实跑五种 tag。
+  // 实跑唯一判据（scripts/version-check.mjs --tag）。
   //
-  // 为什么要实跑而不是断言文本：这段 shell 的正确性全在 case/参数展开上，
+  // 为什么要实跑而不是断言文本：这条判据的正确性全在
+  // 「形态识别 + 版本比较 + 退出码」上，
   // 断言「文本里有某个字符串」证明不了它算得对。
-  const body = extractVersionCompareBody(readText(WORKFLOW));
-  assert.ok(body, 'workflow 里必须能抽出那段版本号比对逻辑');
-
+  //
+  // ── 为什么命名空间 tag 用 `plan-<planId>/v<n>` 而不是 `plan-<semver>/v<n>` ──
+  //
+  // ADR-110 决策一：`<semver>` 从 tag 里移出去 ——
+  // tag 是「历史」，`package.json` 的 version 是「现在」，两者必然分叉。
+  // 旧形态 `plan-0.7.1/v1` 现在**非法**（tag-namespace.mjs 会拒绝它），
+  // 拿它当「命名空间 tag」的样本就是拿一个非法形态做断言。
+  //
+  // 而「命名空间 tag 也要能被版本判据处理」这条要求**依然成立** ——
+  // 区别是：版本锚点是**历史**，**不校**版本一致性（ADR-110 决策一）。
+  // 旧断言里 `plan-0.7.0/v1 → 拒绝` 那一条的前提是
+  // 「命名空间 tag 里带 semver，所以能比」——
+  // 新形态里**没有 semver 可比**，所以它**不参与**版本比对，
+  // 而不是「参与并被拒」。
   const cases = [
     { tag: `v${cur}`, expect: 0, why: '纯 semver tag，版本一致 → 放行' },
     { tag: 'v0.6.0', expect: 1, why: '纯 semver tag，版本不一致 → 拒绝（旧保护的核心）' },
-    { tag: `plan-${cur}/v1`, expect: 0, why: '命名空间 tag，版本一致 → 放行' },
-    { tag: 'plan-0.7.0/v1', expect: 1, why: '命名空间 tag，版本不一致 → 拒绝' },
+    {
+      tag: 'plan-1795507341754/v1',
+      expect: 0,
+      why: '命名空间 tag（版本锚点是历史，不校版本）→ 放行',
+    },
     { tag: 'v1', expect: 1, why: '裸版本 tag，认不出版本号 → 拒绝' },
   ];
 
   for (const c of cases) {
-    // **用位置参数传值，不用环境变量**；且**落成脚本文件**再跑，
-    // 不走 `bash -c <body>` —— 理由见 materializeCompareScript 的注释。
-    const script = materializeCompareScript(body, c.tag, cur);
-    let res;
-    try {
-      res = spawnSync('bash', [script.rel, c.tag, cur], {
-        cwd: ROOT,
-        encoding: 'utf8',
-      });
-    } finally {
-      script.cleanup();
-    }
+    // 实跑唯一判据。判据从 workflow 里的 shell 挪进了脚本，
+    // 测试也就跟着挪 —— 顺便甩掉「WSL bash 对 `bash -c` 位置参数处理不一致」
+    // 那个环境坑（那坑本就在 v3-cicd-compat 的规格风险里记着）。
+    const res = spawnSync(process.execPath, [VERSION_CHECK, '--tag', c.tag], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
+    const output = (res.stdout || '') + (res.stderr || '');
     assert.equal(
       res.status,
       c.expect,
-      `tag=${c.tag} 期望退出码 ${c.expect}（${c.why}），实际 ${res.status}：\n${res.stdout}\n${res.stderr}`,
+      `tag=${c.tag} 期望退出码 ${c.expect}（${c.why}），实际 ${res.status}：\n${output}`,
     );
   }
 });
 
 /**
- * 从 workflow 里抽出「版本号比对」那段 shell。
+ * 取出 workflow 里某个 step 的 `run: |` 代码块（**只取可执行代码**）。
  *
- * 取法：找含 `TAG_SEMVER` 的 `run: |` 块，去掉命名空间脚本调用那几行
- * （那步是脚本的事，由另一条验收覆盖），保留比对逻辑。
+ * 用途：断言「某个步骤里**没有**自行做版本号比对」。
+ *
+ * 为什么只取可执行代码（去整行注释）：
+ * 注释里出现「semver」「非法」这类词是**解释**（「为什么不能省这条保护」），
+ * 不是判定。判据若把注释也算进去，就会逼着人把解释删掉 ——
+ * 那等于让后来人失去「为什么」的上下文，正是最该留住的东西。
  */
-function extractVersionCompareBody(text) {
-  const blocks = [];
-  const re = /^ *run: \| *\r?$/gm;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const start = m.index + m[0].length;
-    // 文件是 CRLF —— 必须按 \r\n 切，否则每行尾部留着 \r，
-    // 后面「去注释」会把 \r 当普通字符、把行尾和下一行粘在一起。
-    const lines = text.slice(start).split(/\r?\n/);
-    const body = [];
-    for (const line of lines) {
-      if (line.trim() === '') {
-        body.push(line);
-        continue;
-      }
-      if (/^ {6}- /.test(line) || /^ {6}\w/.test(line) || /^ {4}\w/.test(line)) break;
+function extractStepBody(text, stepName) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.includes(`name: ${stepName}`));
+  if (start < 0) return null;
+  // 从 step 开始往后找 `run: |`，再收集缩进块。
+  let i = start;
+  while (i < lines.length && !/^\s*run:\s*\|\s*$/.test(lines[i])) i += 1;
+  if (i >= lines.length) return null;
+  const body = [];
+  for (i += 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '') {
       body.push(line);
+      continue;
     }
-    blocks.push(body.join('\n'));
+    // shell 块是缩进的；回到同级 step（`- ` / step key）即结束。
+    if (/^\s{6}- /.test(line) || /^\s{6}\w/.test(line) || /^\s{4}\w/.test(line)) break;
+    body.push(line);
   }
-  const target = blocks.find((b) => b.includes('TAG_SEMVER'));
-  if (!target) return null;
-
-  // 只留**可执行的比对逻辑**：
-  //   · 去掉整行的注释（**只去整行注释** ——
-  //     不能用 `#.*$` 就地截断：那会把 `${TAG#plan-}` 这种
-  //     参数展开里的 `#` 当成注释起点，把代码截成
-  //     `TAG_SEMVER="${TAG` —— bash 直接报「unexpected EOF」。
-  //     注释里的 "semver" 这类词是**解释**不是判定，不能留在判据里。）
-  //   · 去掉命名空间脚本调用那几行（那是脚本的事，由另一条验收覆盖）
-  //   · 去掉 `PKG=$(node -p …)`（PKG 由本测试注入）
-  //   · 去掉 `TAG="${GITHUB_REF_NAME}"`（TAG 由本测试注入）
-  //
-  // **故意保留** `if [ "${GITHUB_REF_TYPE}" = "tag" ]` 那层外壳 ——
-  // 去掉它会留下一个落单的 `fi`（if/fi 不配对 → bash 语法错），
-  // 测出来的会是「我的抽取器坏了」而不是「产品逻辑坏了」。
-  // 那层的条件靠前置变量 GITHUB_REF_TYPE="tag" 满足。
-  return target
-    .split('\n')
+  return body
     .map((l) => l.trim())
     .filter((l) => l !== '')
     .filter((l) => !l.startsWith('#'))
-    .filter((l) => !l.includes('tag-namespace.mjs'))
-    .filter((l) => !l.includes('PKG=$(node'))
-    .filter((l) => !l.includes('GITHUB_REF_NAME'))
-    .join('\n')
-    .trim();
-}
-
-/**
- * 给抽出来的比对逻辑加一段「前置」，并写成临时脚本文件。
- *
- * 返回 { file, cleanup } —— 调用方用完必须 cleanup()。
- *
- * **为什么不就地替换 `${TAG}` → `"$1"`**：
- * 那样改会把 `${TAG#plan-}` / `${TAG#v}` 这两种**带后缀的参数展开**漏掉
- * （`${TAG}` 匹配不到它们），于是 case 分支里的 TAG 仍是未定义变量。
- *
- * **为什么要落成文件、而不是 `bash -c <body>`**：
- * 这台机器上的 `bash` 是 **WSL 的 bash**（`x86_64-pc-linux-gnu`），
- * 它对 `bash -c` 的**位置参数**处理与 Git Bash / Linux 不一致 ——
- * 实测 `bash -c 'echo [$1]' probe hello` 输出空，而把同样的脚本
- * 写进文件 `bash file.sh hello` 则正常。
- * 走「文件 + 位置参数」这条路，三种 bash 实现行为一致。
- */
-function materializeCompareScript(body, tag, pkg) {
-  // 脚本落在**仓库内的相对路径**下，不能用 os.tmpdir() 的绝对路径 ——
-  // 这台机器上的 bash 是 WSL 的 bash，它认的是 /mnt/c/... 这种挂载路径，
-  // 拿 Windows 绝对路径去调会得到 exit 127（command not found）。
-  // 相对路径在 WSL bash / Git Bash / Linux CI 三处都成立。
-  const dir = path.join(ROOT, '.zelto', 'tmp-v3cicd');
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, 'compare.sh');
-  const prologue = ['GITHUB_REF_TYPE="tag"', 'TAG="$1"', 'PKG="$2"'].join('\n');
-  fs.writeFileSync(file, `${prologue}\n${body}\n`, 'utf8');
-  return {
-    file,
-    // 相对 ROOT 的路径 —— 传给 bash 时用这个。
-    rel: path.relative(ROOT, file).split(path.sep).join('/'),
-    cleanup: () => {
-      try {
-        fs.rmSync(dir, { recursive: true, force: true });
-      } catch {
-        /* 临时目录残留不影响判据 */
-      }
-    },
-  };
+    .join('\n');
 }
 
 // ─── 验收标准 3：非法命名 → 中止且指出命名空间问题 ───────────────────────────
@@ -316,7 +307,9 @@ test('命名空间校验通过时不阻断：合法 tag 退出码为 0', () => {
   const pkg = JSON.parse(readText(path.join(ROOT, 'package.json')));
   const m = /^(\d+\.\d+\.\d+)/.exec(pkg.version || '');
   assert.ok(m, `package.json 的 version 应是 semver，实际：${pkg.version}`);
-  const res = runTagScript([`plan-${m[1]}/v1`, 'v0.6.0']);
+  // 命名空间形态用**真实的 13 位 planId**（ADR-110 决策一）——
+  // 旧形态 `plan-<semver>/v<n>` 已被取代，现在**非法**。
+  const res = runTagScript(['plan-1795507341754/v1', 'v0.6.0']);
   assert.equal(res.status, 0, `合法 tag 应退出 0，实际 ${res.status}：\n${res.output}`);
 });
 
@@ -397,10 +390,10 @@ test('其余行为保持不变：打包、发布与发布状态回写步骤仍�
   }
 });
 
-// ─── 验收标准 7：三文件哈希不变（写集边界） ──────────────────────────────────
+// ─── 验收标准 7：写集边界 ─────────────────────────────────────────────────────
 
-test('不修改三文件：tag-namespace / tag-map / version-check 无改动', () => {
-  for (const rel of FROZEN_REFS) {
+test('不修改 tag-namespace / tag-map；version-check 的改动仅限新增 --tag 判据', () => {
+  for (const rel of [...FROZEN_REFS, ...GUARDED_REFS]) {
     assert.ok(fs.existsSync(path.join(ROOT, rel)), `${rel} 必须存在`);
   }
   // tag-map 仍是合法扁平映射（内容正确性不因本片改变）。
@@ -424,8 +417,44 @@ test('不修改三文件：tag-namespace / tag-map / version-check 无改动', (
     assert.ok(!diffNames.has(rel), `${rel} 不得有相对 HEAD 的改动`);
   }
 
+  // ── 受限改动的文件：只能新增 `--tag` 判据，不得动原有判据 ──
+  //
+  // 为什么要有这条（ADR-113 决策四）：
+  // `scripts/version-check.mjs` 原本在「不可改」名单里 ——
+  // 那是**当片**的写集边界，成立。
+  // ADR-113 要在它里面**新增**一条判据（恢复被 v4 删掉的发布保护），
+  // 所以它必须能改。
+  //
+  // **处置不是「把这条判据删掉」** —— 那是放弃边界检查。
+  // 而是给它一条**定向**断言：原有三条判据（依赖声明一致、
+  // `pkg >= 最高已发布 tag`、无参时的通过输出）**一条都不能少**。
+  for (const rel of GUARDED_REFS) {
+    const src = readText(path.join(ROOT, rel));
+    // 原有判据 ①：依赖声明一致性（package.json ↔ pnpm-lock.yaml）。
+    assert.ok(
+      src.includes('package.json 与 pnpm-lock.yaml'),
+      `${rel} 不得丢掉「依赖声明一致性」这条原有判据`,
+    );
+    // 原有判据 ②：`pkg >= 最高已发布 tag`（ADR-110 决策四）。
+    assert.ok(
+      src.includes('listSemverTags') && src.includes('pkgIsBehind'),
+      `${rel} 不得丢掉「package.json 不低于已发布版本」这条原有判据`,
+    );
+    // 原有判据 ③：新增的 `--tag` 判据**必须**在。
+    assert.ok(
+      src.includes("--tag") && src.includes('triggeringTag'),
+      `${rel} 必须含新增的 --tag 判据（ADR-113 决策一）`,
+    );
+  }
+
   // 本片改动只在写集内（片外既有状态除外：规格文件由流程落盘）。
-  const KNOWN_OUT_OF_SCOPE = new Set(['specs/slices/v3-cicd-compat.md']);
+  const KNOWN_OUT_OF_SCOPE = new Set([
+    'specs/slices/v3-cicd-compat.md',
+    // ADR-113 的落地产物（ADR 与规格由流程落盘）。
+    'specs/slices/v5-release-tag-guard.md',
+    'docs/adr/adr-113-release-tag-version-guard.md',
+    'docs/adr-trace-index.md',
+  ]);
   const writeSetFiles = new Set(WRITE_SET);
   const changed = [
     ...gitOut(['diff', 'HEAD', '--name-only']),
@@ -438,6 +467,8 @@ test('不修改三文件：tag-namespace / tag-map / version-check 无改动', (
       !writeSetFiles.has(p) &&
       ![...writeSetFiles].some((w) => w.startsWith(p + '/')) &&
       !KNOWN_OUT_OF_SCOPE.has(p) &&
+      // 受限改动的文件（已由上面那条定向断言把关）。
+      !GUARDED_REFS.includes(p) &&
       // 主仓既有脏状态（本片开工前已存在，非本片产物）。
       p !== 'policy/policy.yaml' &&
       p !== 'policy/lock.json' &&

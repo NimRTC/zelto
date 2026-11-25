@@ -10,11 +10,13 @@ name: Release
 # tag 的**命名合法性**由 scripts/tag-namespace.mjs 唯一判定，
 # workflow 只调用它，不手写第二套判定（ADR-106 §5）。
 #
-# **版本号一致性不在这里判**（ADR-110 决策二）——
-# 那是 scripts/version-check.mjs 的职责，它管的是
-# 「package.json 的版本不低于已发布的版本」，
-# 而 tag 与 package.json 的对齐由发布流水线在**打 tag 那一刻**保证
-# （tag 就是从当前 package.json 版本打的）。
+# tag 与 package.json 的**版本一致性**由 scripts/version-check.mjs 唯一判定，
+# workflow 同样只调用它（ADR-110 决策四 + ADR-113 决策一）：
+#   · 「这次触发发布的 tag == 实际发出去的版本」→ version-check.mjs --tag
+#   · 「package.json 的版本不低于已发布的版本」→ version-check.mjs（无参）
+#
+# **两支判据各管一件事、互不重叠** ——
+# 前者管「**这次**发的对不对」，后者管「仓库状态**有没有落后**」。
 #
 # 需要配置两个 secret：
 #   NPM_TOKEN   —— npm 的 automation token（发布用，勾选 2FA 时仍可用）
@@ -55,10 +57,10 @@ jobs:
         # 非交互喂入：把触发本次流水线的 tag 名显式传进去，
         # 不依赖脚本的 stdin/git 兜底（CI 里 stdin 可能挂起等待输入）。
         #
-        # ── 为什么版本号一致性不在这里判（ADR-110 决策二）──
+        # ── 为什么版本号一致性不在**这一步**判（ADR-110 决策二）──
         #
         # 旧版这里有一段 shell，抽 tag 里的 semver 再跟 package.json 比。
-        # ADR-110 之后**必须删掉**它，理由有两条：
+        # ADR-110 之后**必须从这里删掉它**，理由有两条：
         #
         # ① `plan-<planId>/v<n>` 里**没有 semver 可抽** ——
         #    planId 是时间戳（`plan-1795507341754`），抽出来的数字段
@@ -68,9 +70,11 @@ jobs:
         #    于是「package.json 升版」就让历史版本锚点全部失效。
         #    版本锚点是**历史**，不该因当前版本变动而失效。
         #
-        # 「发布的包必须 == 当前版本」这条保护**没有消失** ——
-        # 它搬到 scripts/version-check.mjs 了（管「package.json 不低于已发布版本」），
-        # 而 tag 与 package.json 的对齐由流水线在**打 tag 那一刻**保证。
+        # 但 ① **只对 `plan-*` 形态成立** —— 发布锚点 `v<semver>` 形态
+        # 仍然有 semver 可抽，而且**必须**校。
+        # 那条保护**没有消失**，它搬到了 scripts/version-check.mjs
+        # （ADR-113 决策一），由紧随其后的「校验发布 tag 与仓库版本一致」
+        # 那一步调用。**判据只有一处，workflow 不自己比对。**
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -90,6 +94,43 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - run: pnpm install --frozen-lockfile
+
+      - name: 校验发布 tag 与仓库版本一致
+        # 「**这次触发发布的 tag** == 实际发布出去的版本」这条保护。
+        #
+        # ── 为什么它必须存在（ADR-113）────────────────────────────
+        #
+        # 少了它，打一个错的 tag 就能把仓库的版本发出去：
+        #
+        #   package.json = 0.7.1，打 v0.6.0 这个 tag
+        #     → npm 上收到的是 0.7.1
+        #     → 仓库的发布锚点却记着 v0.6.0  ← **锚点说谎**
+        #
+        # 而「已发布版本」这个事实的代理正是 git tag ——
+        # 锚点一说谎，后续所有依赖它的防漂移判据都跟着失准。
+        #
+        # ── 为什么**只调用**，不自己比对 ─────────────────────────
+        #
+        # ADR-106 §5「同一问题只能有一处判定」。
+        # 版本号的一致性归 scripts/version-check.mjs 管
+        # （ADR-110 决策四：版本号的一致性归它管，才叫同源），
+        # workflow 只调用，不复制它的规则 —— 复制即两套判定。
+        #
+        # ── 为什么放在 pnpm install 之后 ─────────────────────────
+        #
+        # version-check.mjs 要读 pnpm-lock.yaml 并加载 js-yaml，
+        # 依赖必须先装好。
+        #
+        # ── 为什么命名校验在前 ───────────────────────────────────
+        #
+        # 先判命名合法，再判版本一致：命名非法的 tag 本来就
+        # 说不出自己是不是一个版本锚点。
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "待校验 tag：${GITHUB_REF_NAME}"
+            node scripts/version-check.mjs --tag "${GITHUB_REF_NAME}"
+          fi
 
       - name: 编码与凭据扫描
         run: |
