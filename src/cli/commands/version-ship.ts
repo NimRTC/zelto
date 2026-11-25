@@ -527,7 +527,18 @@ export async function handleVersionShip(
       f.out(`🔍 Dry-run —— 不会真的合入。`);
       f.out(`   版本分支：${versionBranch}`);
       f.out(`   合入目标：${cur.ok ? cur.stdout.trim() : '（未知）'}`);
-      f.out(`   标签：${noTag ? '（不打）' : versionTagName(versionLabel)}`);
+      // 标签名必须与**实际 ship 用的一致** ——
+      // 即 `version.tag ?? versionTagName(versionLabel)`（见下方 tag 计算处）。
+      //
+      // 之前这里只算 `versionTagName(versionLabel)`，**没读计划里的 `version.tag`**：
+      // 于是计划里把 tag 设成 `plan-0.7.1/v3` 时，dry-run 显示的是 `v3`，
+      // 实际打的是 `plan-0.7.1/v3` —— **dry-run 显示的与实际做的不一样**。
+      //
+      // dry-run 的全部意义就是「动手前知道会发生什么」。
+      // 显示错了标签，人就按错的预期做决定 —— 与 D-63 / ADR-076 同一个形状：
+      // **声称的与实际的不一致，而声称的那个是错的**。
+      const tagForDisplay = noTag ? '（不打）' : (version.tag ?? versionTagName(versionLabel));
+      f.out(`   标签：${tagForDisplay}`);
     }
     return 0;
   }
