@@ -41,6 +41,13 @@ import { resolveSliceOwnership } from '../../core/version/branch.js';
 import type { Version } from '../../core/version/types.js';
 import { HaltStore } from '../../core/halt/index.js';
 import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
+// ADR-112：驾驶舱按「根」扫描 —— 版本集成目录里的切片不许看不见
+import {
+  discoverCockpitRoots,
+  isRootScope,
+  type CockpitRoot,
+  type CockpitScope,
+} from '../../core/project/cockpit-roots.js';
 // ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
 // run 拉起 CLI 进程。判定不分叉（C3）。
 import {
@@ -154,6 +161,25 @@ export interface SliceSummary {
   progressAt: string | null;
   elapsedMs: number | null;
   elapsedIdleMs: number | null;
+  /**
+   * ── ADR-112：这一行来自哪个「根」──
+   *
+   * 这条总览行的状态取自哪一个 `.zelto/`：
+   * `root` = 仓库根，`version` = 版本集成目录。
+   *
+   * 同一片可能同时存在于多个根（基线切片实测在根 / v1 / v2 / v3 都有副本）。
+   * 合并规则见 `listSlices`：`updatedAt` 较晚的那份决定这一行的事实，
+   * 但它出现过的**所有根**都记在 `roots` 里 —— 「这片在哪些地方有记录」
+   * 是事实，不因合并而消失。
+   *
+   * 前端**写操作**（签字 / 门禁 / 冻结 / 开跑）要靠 `scope + label`
+   * 路由回这个根 —— 落到错的根 = 签了根上那份过期副本。
+   */
+  scope: CockpitScope;
+  /** 版本 label（`scope === 'version'` 时非空） */
+  label: string | null;
+  /** 这一片出现过的所有根（版本 label；仓库根记为 `root`）—— 合并的证据 */
+  roots: string[];
 }
 
 /** 切片详情 —— 含签字复查的事实与判定。 */
@@ -177,15 +203,36 @@ export interface SliceDetail {
   writes: string[];
 }
 
+/**
+ * 一个「根」上的 zelto 状态 —— ADR-112。
+ *
+ * 每个根（仓库根 / 版本集成目录）各自有一整套 store：
+ * 切片、事件、签字请求、审计、预算、worktree 全部是**这个根的**事实。
+ * 写操作必须落回这些 store，不能跨根。
+ */
+interface SliceWorkspace {
+  root: CockpitRoot;
+  /** `.zelto` 目录 */
+  zeltoDir: string;
+  store: SliceStore;
+  events: EventStream;
+  signs: SignManager;
+  audit: AuditTrail;
+  worktrees: WorktreeManager;
+  budget: BudgetCollector;
+}
+
+/** 定位一个根（写操作与详情的路由凭据）。 */
+interface SliceLocation {
+  scope?: CockpitScope;
+  label?: string | null;
+}
+
 export class WebApi {
   private readonly repoRoot: string;
   private readonly zeltoDir: string;
-  private readonly store: SliceStore;
-  private readonly events: EventStream;
-  private readonly signs: SignManager;
-  private readonly audit: AuditTrail;
-  private readonly worktrees: WorktreeManager;
-  private readonly budgetCollector: BudgetCollector;
+  /** 所有根（仓库根永远第一个）—— 只在这里**发现**，进程内不变 */
+  private readonly workspaces: SliceWorkspace[];
   private readonly metricsCollector: MetricsCollector;
   private readonly versions: VersionStore;
   private readonly designs: DesignStore;
@@ -199,16 +246,35 @@ export class WebApi {
     this.repoRoot = repoRoot;
     const zeltoDir = join(repoRoot, '.zelto');
     this.zeltoDir = zeltoDir;
-    this.store = new SliceStore(join(zeltoDir, 'slices'));
-    this.events = new EventStream(join(zeltoDir, 'events'));
-    this.signs = new SignManager(zeltoDir, this.events, this.store);
-    this.audit = new AuditTrail(this.events);
-    this.worktrees = new WorktreeManager(repoRoot);
-    // BudgetCollector 要 zeltoDir 才能读 config.yaml 里的 budgetLimitUsd
-    this.budgetCollector = new BudgetCollector(this.events, zeltoDir);
-    this.metricsCollector = new MetricsCollector(this.events);
+    // ADR-112：扫描仓库根 + 每个版本集成目录。
+    //
+    // 发现只做一次（进程内根集合不变）；每个根各建一套 store。
+    // 传 repoRoot 没变时仓库根那份与改造前**逐字一致** ——
+    // 老调用方（不传 scope/label）看到的仍是以前那份状态。
+    this.workspaces = discoverCockpitRoots(repoRoot).map((root) => {
+      const dir = join(root.dir, '.zelto');
+      const store = new SliceStore(join(dir, 'slices'));
+      const events = new EventStream(join(dir, 'events'));
+      return {
+        root,
+        zeltoDir: dir,
+        store,
+        events,
+        signs: new SignManager(dir, events, store),
+        audit: new AuditTrail(events),
+        // 切片 worktree 仍按仓库根解析 —— worktree 是仓库的，不是某个根私有的
+        worktrees: new WorktreeManager(repoRoot),
+        // BudgetCollector 要这个根的 zeltoDir 才能读它自己的 config.yaml
+        budget: new BudgetCollector(events, dir),
+      };
+    });
+    const rootWs = this.workspaces[0];
+    this.metricsCollector = new MetricsCollector(rootWs.events);
     // 这三个 store 各自往 baseDir 下再拼一层子目录
     // （versions/、design/、requirements/），所以传 .zelto 根而不是子目录
+    //
+    // 需求 / 设计 / 版本计划**只读仓库根**（ADR-112 边界）：
+    // 版本目录里的那些是同步副本，不是真源。
     this.versions = new VersionStore(zeltoDir);
     this.designs = new DesignStore(zeltoDir);
     this.requirements = new RequirementStore(zeltoDir);
@@ -217,9 +283,51 @@ export class WebApi {
     this.questions = new QuestionStore({ baseDir: join(zeltoDir, 'questions') });
   }
 
-  /** 切片总览列表。 */
+  /** 仓库根那份（老行为 —— 不传 scope 时的默认落点）。 */
+  private get rootWs(): SliceWorkspace {
+    return this.workspaces[0];
+  }
+
+  /**
+   * 扫到的根清单 —— 「驾驶舱到底看了哪些地方」本身就是要给人看的信息。
+   *
+   * 看不见的根 = 人不知道版本目录也在跑；不知道就无从去那里签字。
+   */
+  listRoots(): Array<{ scope: CockpitScope; label: string | null; dir: string }> {
+    return this.workspaces.map((ws) => ({
+      scope: ws.root.scope,
+      label: ws.root.label,
+      dir: ws.root.dir,
+    }));
+  }
+
+  /** 按 scope + label 找根；找不到返回 null（不猜）。 */
+  private findWorkspace(loc: SliceLocation): SliceWorkspace | null {
+    if (isRootScope(loc.scope, loc.label)) return this.rootWs;
+    return (
+      this.workspaces.find(
+        (ws) => ws.root.scope === loc.scope && ws.root.label === loc.label,
+      ) ?? null
+    );
+  }
+
+  /**
+   * 从一堆候选里解析出「这片真正所在的根」—— 不传 scope 时用。
+   *
+   * 不进缓存：根扫描本就是一次参数下发的动作，驾驶舱调用频率低。
+   */
+  private async resolveWorkspace(id: string, loc: SliceLocation = {}): Promise<SliceWorkspace | null> {
+    if (loc.scope !== undefined) return this.findWorkspace(loc);
+    // 默认：仓库根里有就落在仓库根（老行为的延伸）；没有就按合并结论找
+    if (await this.rootWs.store.exists(id)) return this.rootWs;
+    const merged = await this.listSlices();
+    const hit = merged.find((s) => s.id === id);
+    if (!hit) return null;
+    return this.findWorkspace({ scope: hit.scope, label: hit.label });
+  }
+
+  /** 切片总览列表 —— 扫所有根，按 id 合并。 */
   async listSlices(): Promise<SliceSummary[]> {
-    const ids = await this.store.list();
     // 并发读，不是串行。
     //
     // 为什么：实测 130 片串行读要 297ms，并发只要 26ms（快 11 倍）——
@@ -227,15 +335,23 @@ export class WebApi {
     // 这个端点是驾驶舱首屏的必经之路（总览页要看「正在运行」那一节），
     // 慢在这里 = 首屏白屏。
     //
-    // 为什么不直接用 `Promise.all(ids.map(...))`：
-    // 一片的状态文件坏了会让 `Promise.all` 整体 reject —— 一片坏，
-    // 整个列表都没了。那比原来更糟。
+    // ADR-112：多个根之间也并发 —— 根的数量 = 1 + 版本数（个位数）。
+    const perRoot = await Promise.all(
+      this.workspaces.map((ws) => this.listSlicesInRoot(ws)),
+    );
+    return mergeSliceSummaries(perRoot);
+  }
+
+  /** 单个根的切片总览 —— 分根读，一片坏不挡住其它。 */
+  private async listSlicesInRoot(ws: SliceWorkspace): Promise<SliceSummary[]> {
+    const ids = await ws.store.list();
     const results = await Promise.all(
       ids.map(async (id) => {
         try {
-          const slice = await this.store.read(id);
-          return await toSummary(slice, this.budgetCollector, this.repoRoot, () =>
-            this.events.read(id),
+          const slice = await ws.store.read(id);
+          return await withRoot(
+            await toSummary(slice, ws.budget, this.repoRoot, () => ws.events.read(id)),
+            ws.root,
           );
         } catch {
           // 状态文件坏了 —— 跳过，不让一片坏的挡住整个列表
@@ -243,25 +359,27 @@ export class WebApi {
           // 但**必须说出来**：原来这里静默吞掉，导致「磁盘上 130 片、
           // 界面显示 113 片」而没人知道少了 17 片。片子的存在本身是
           // 追溯链的一环 —— 它消失了，人就查不到它了。
-          // 所以记一笔到 stderr：不是给用户看的横幅，是给排查的人留的线索。
-          console.error(`[zelto web] 跳过状态文件读不出的切片：${id}`);
+          const where = ws.root.label ? `（版本目录 ${ws.root.label}）` : '（仓库根）';
+          console.error(`[zelto web] 跳过状态文件读不出的切片：${id}${where}`);
           return null;
         }
       }),
     );
-    const out = results.filter((s): s is SliceSummary => s !== null);
-    return out.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+    return results.filter((s): s is SliceSummary => s !== null);
   }
 
   /** 切片详情 —— 含签字复查的事实与判定。 */
-  async getSlice(id: string): Promise<SliceDetail | null> {
-    const slice = await this.store.read(id);
-    const facts = await this.collectFacts(id);
+  async getSlice(id: string, loc: SliceLocation = {}): Promise<SliceDetail | null> {
+    const ws = await this.resolveWorkspace(id, loc);
+    if (!ws) return null;
+    const slice = await ws.store.read(id);
+    const facts = await this.collectFacts(ws, id);
     const checks = evaluateSignChecks(facts);
     return {
       slice,
-      summary: await toSummary(slice, this.budgetCollector, this.repoRoot, () =>
-        this.events.read(id),
+      summary: await withRoot(
+        await toSummary(slice, ws.budget, this.repoRoot, () => ws.events.read(id)),
+        ws.root,
       ),
       facts,
       checks,
@@ -270,29 +388,42 @@ export class WebApi {
     };
   }
 
+  /** 这片在哪些根里有记录（版本 label；仓库根记为 `root`）。 */
+  private async rootsOf(id: string): Promise<string[]> {
+    const present: string[] = [];
+    for (const ws of this.workspaces) {
+      if (await ws.store.exists(id)) present.push(rootLabelOf(ws.root));
+    }
+    return present;
+  }
+
   /**
    * 收集签字复查事实 —— 与 CLI 走**同一个** core 实现（ADR-072 §5.1）。
    */
-  private async collectFacts(id: string): Promise<SignReviewFacts> {
+  private async collectFacts(ws: SliceWorkspace, id: string): Promise<SignReviewFacts> {
     return collectSignReviewFacts(id, {
-      readSlice: (sliceId) => this.store.read(sliceId),
-      readEvents: (sliceId) => this.events.read(sliceId),
+      readSlice: (sliceId) => ws.store.read(sliceId),
+      readEvents: (sliceId) => ws.events.read(sliceId),
       worktreePath: (sliceId) =>
-        this.worktrees.exists(sliceId) ? this.worktrees.pathFor(sliceId) : null,
-      repoRoot: this.repoRoot,
+        ws.worktrees.exists(sliceId) ? ws.worktrees.pathFor(sliceId) : null,
+      repoRoot: ws.root.dir,
     });
   }
 
   /** 某片的事件流。 */
-  async sliceEvents(id: string, limit?: number): Promise<unknown[]> {
-    const list = await this.events.read(id);
+  async sliceEvents(id: string, limit?: number, loc: SliceLocation = {}): Promise<unknown[]> {
+    const ws = await this.resolveWorkspace(id, loc);
+    if (!ws) return [];
+    const list = await ws.events.read(id);
     const trimmed = limit && limit > 0 ? list.slice(-limit) : list;
     return trimmed;
   }
 
   /** 某片的审计报告。 */
-  async sliceAudit(id: string): Promise<unknown> {
-    return this.audit.forSlice(id);
+  async sliceAudit(id: string, loc: SliceLocation = {}): Promise<unknown> {
+    const ws = await this.resolveWorkspace(id, loc);
+    if (!ws) return { entries: [] };
+    return ws.audit.forSlice(id);
   }
 
   /**
@@ -302,7 +433,7 @@ export class WebApi {
    * 与 CLI `zelto summary --metrics` 同一份计算，不另写一套。
    */
   async metrics(): Promise<unknown> {
-    const ids = await this.store.list();
+    const ids = await this.rootWs.store.list();
     return this.metricsCollector.generateReport(ids);
   }
 
@@ -314,23 +445,28 @@ export class WebApi {
    */
   async stalls(): Promise<unknown[]> {
     const out: unknown[] = [];
-    for (const id of await this.store.list()) {
-      try {
-        const slice = await this.store.read(id);
-        // isSliceStalled 要完整的 StallInfo —— 切片文件里的 stall 字段
-        // 缺 autoResolved/gateRetries 时（老状态文件）补齐，
-        // 不然类型对不上（而且 ADR-041 的终态自愈也在读时归一化了）
-        const stall = slice.stall ?? { class: null, autoResolved: 0, gateRetries: 0 };
-        if (!isSliceStalled({ stall: { ...stall, class: stall.class ?? null } })) continue;
-        out.push({
-          id: slice.id,
-          title: slice.title,
-          state: slice.state,
-          stallClass: stall.class ?? null,
-          updatedAt: slice.updatedAt,
-        });
-      } catch {
-        // 状态文件坏了 —— 跳过
+    // ADR-112：每个根各自列停机 —— 版本目录里的停机片同样等人处理
+    for (const ws of this.workspaces) {
+      for (const id of await ws.store.list()) {
+        try {
+          const slice = await ws.store.read(id);
+          // isSliceStalled 要完整的 StallInfo —— 切片文件里的 stall 字段
+          // 缺 autoResolved/gateRetries 时（老状态文件）补齐，
+          // 不然类型对不上（而且 ADR-041 的终态自愈也在读时归一化了）
+          const stall = slice.stall ?? { class: null, autoResolved: 0, gateRetries: 0 };
+          if (!isSliceStalled({ stall: { ...stall, class: stall.class ?? null } })) continue;
+          out.push({
+            id: slice.id,
+            title: slice.title,
+            state: slice.state,
+            stallClass: stall.class ?? null,
+            updatedAt: slice.updatedAt,
+            scope: ws.root.scope,
+            label: ws.root.label,
+          });
+        } catch {
+          // 状态文件坏了 —— 跳过
+        }
       }
     }
     return out;
@@ -483,7 +619,7 @@ export class WebApi {
    * 前端照着 null 显示会变成「$null」。
    */
   async budget(): Promise<unknown> {
-    const rawLimit = await this.budgetCollector.getLimit('');
+    const rawLimit = await this.rootWs.budget.getLimit('');
     const unlimited = rawLimit === UNLIMITED_BUDGET;
     const slices = await this.listSlices();
     const spentUsd = slices.reduce((sum, s) => sum + s.spentUsd, 0);
@@ -546,18 +682,21 @@ export class WebApi {
       count?: number;
       since?: string;
     }> = [];
-    for (const sliceId of this.listEventSlices()) {
-      const list = await this.events.read(sliceId);
-      for (const e of list) {
-        all.push({
-          ts: e.ts,
-          slice: e.slice,
-          type: e.type,
-          actor: e.actor,
-          payload: e.payload,
-          count: 1,
-          since: e.ts,
-        });
+    // ADR-112：每个根的事件各读各的，按时间合并 —— 根之间互不覆盖
+    for (const ws of this.workspaces) {
+      for (const sliceId of listEventSlicesIn(ws.zeltoDir)) {
+        const list = await ws.events.read(sliceId);
+        for (const e of list) {
+          all.push({
+            ts: e.ts,
+            slice: e.slice,
+            type: e.type,
+            actor: e.actor,
+            payload: e.payload,
+            count: 1,
+            since: e.ts,
+          });
+        }
       }
     }
     all.sort((a, b) => (a.ts < b.ts ? 1 : -1));
@@ -576,32 +715,8 @@ export class WebApi {
     return out;
   }
 
-  /**
-   * 事件目录下的切片 id —— 「最近事件」的数据源。
-   *
-   * 直接扫 `.zelto/events`：事件流是追溯的唯一证据载体（C4），
-   * 「最近事件」该照事件目录说话，而不是照「哪些切片还有状态文件」说话。
-   * 只取**真有** `events.jsonl` 的目录，空目录不当成切片。
-   */
-  private listEventSlices(): string[] {
-    const dir = join(this.zeltoDir, 'events');
-    let entries: import('node:fs').Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return [];
-    }
-    const out: string[] = [];
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      if (!existsSync(join(dir, e.name, 'events.jsonl'))) continue;
-      out.push(e.name);
-    }
-    return out;
-  }
-
   /** 签字请求清单。 */
-  async listSignRequests(status?: string): Promise<unknown[]> {
+  async listSignRequests(status?: string, loc: SliceLocation = {}): Promise<unknown[]> {
     // ADR-094 §5.1：签字请求多了两个状态 —— `revised`（退回重跑）与
     // `returned`（退回上游）。白名单漏掉它们的话，驾驶舱按这两个状态
     // 过滤会**返回全部**（status 变成 undefined），页面上的待签字列表
@@ -615,7 +730,23 @@ export class WebApi {
       status === 'returned'
         ? status
         : undefined;
-    return this.signs.list(valid);
+    if (loc.scope !== undefined) {
+      return (await this.findWorkspace(loc))?.signs.list(valid) ?? [];
+    }
+    // 不传 scope：所有根的待签请求合并（ADR-112）——
+    // 版本目录里等人的签字请求不能因为「不在根上」就看不见。
+    //
+    // 每条请求带上 `scope + label`，前端据此把签字路由回正确的根。
+    const perRoot = await Promise.all(
+      this.workspaces.map(async (ws) =>
+        (await ws.signs.list(valid)).map((req) => ({
+          ...req,
+          scope: ws.root.scope,
+          label: ws.root.label,
+        })),
+      ),
+    );
+    return perRoot.flat();
   }
 
   /**
@@ -635,6 +766,8 @@ export class WebApi {
       name,
       root: this.repoRoot,
       host: basename(this.repoRoot),
+      // ADR-112：驾驶舱实际扫了哪些根 —— 看不见的根就是「查不到的状态」
+      roots: this.listRoots(),
     };
   }
 
@@ -678,14 +811,44 @@ export class WebApi {
       devByState[s.state] = (devByState[s.state] ?? 0) + 1;
     }
 
-    const pending = await this.signs.list('pending');
+    // ADR-112：待签请求跨根合并 —— 版本目录里的那条同样要出现在概况里。
+    // 每条带 scope/label，前端据此路由签字。
+    const pendingByRoot = await Promise.all(
+      this.workspaces.map(async (ws) =>
+        (await ws.signs.list('pending')).map((req) => ({
+          ...req,
+          scope: ws.root.scope,
+          label: ws.root.label,
+        })),
+      ),
+    );
+    const pending = pendingByRoot.flat();
     const stalled = slices.filter((s) => s.stalled);
 
     const spentUsd = slices.reduce((sum, s) => sum + s.spentUsd, 0);
-    const rawLimit = await this.budgetCollector.getLimit('');
+    const rawLimit = await this.rootWs.budget.getLimit('');
     const unlimited = rawLimit === UNLIMITED_BUDGET;
     const limitUsd = unlimited ? null : rawLimit;
     const exhausted = !unlimited && spentUsd >= rawLimit;
+
+    // ── 分根的切片分布（ADR-112）──────────────────────────────────
+    //
+    // 为什么单列：合并后的总数会让人以为「都在一个地方」。
+    // 实际上「这 15 片在 v3 目录里」是一个**要人去做决定**的事实 ——
+    // 签字、门禁、开跑都得去那个目录（或经驾驶舱路由过去）。
+    const byRoot = this.workspaces.map((ws) => {
+      const mine = slices.filter((s) => s.scope === ws.root.scope && s.label === ws.root.label);
+      return {
+        scope: ws.root.scope,
+        label: ws.root.label,
+        dir: ws.root.dir,
+        total: mine.length,
+        byState: mine.reduce<Record<string, number>>((acc, s) => {
+          acc[s.state] = (acc[s.state] ?? 0) + 1;
+          return acc;
+        }, {}),
+      };
+    });
 
     return {
       totalSlices: slices.length,
@@ -706,7 +869,12 @@ export class WebApi {
         id: p.id,
         sliceId: p.sliceId,
         requestedAt: p.requestedAt,
+        // ADR-112：签字路由要靠它 —— 请求在哪个根，就签哪个根
+        scope: p.scope,
+        label: p.label,
       })),
+      /** 分根的切片分布 —— 合并总数之外，说清「哪片在哪个目录里」 */
+      roots: byRoot,
       stalledCount: stalled.length,
       stalledSlices: stalled.map((s) => ({ id: s.id, stallClass: s.stallClass })),
       // ── 被动活性（D-30）：running 里到底几个活着、几个可疑、几个死了 ──
@@ -737,6 +905,33 @@ export class WebApi {
   }
 
   /**
+   * 找到「持有这条签字请求的那个根」—— ADR-112 的路由。
+   *
+   * 传了 scope 就只看那个根（找不到就是找不到，**不跨根猜**）；
+   * 没传就按根的顺序找第一个有这条请求的根。
+   *
+   * 为什么不传 scope 时也按「最近写的」合并判断：
+   * 签字请求的 id 是唯一的，同一 id 不会出现在两个根里 ——
+   * 找到即唯一，不存在需要挑「哪份更新」的情形。
+   */
+  private async workspaceHoldingSign(
+    signId: string,
+    loc: SliceLocation,
+  ): Promise<SliceWorkspace | null> {
+    const candidates = loc.scope !== undefined ? [this.findWorkspace(loc)] : this.workspaces;
+    for (const ws of candidates) {
+      if (!ws) continue;
+      try {
+        await ws.signs.get(signId);
+        return ws;
+      } catch {
+        // 这个根没有这条请求 —— 看下一个
+      }
+    }
+    return null;
+  }
+
+  /**
    * 批准签字 —— **唯一的写操作**。
    *
    * 服务端**自己重新算一遍**四项判定（不信前端传来的结果），
@@ -753,16 +948,16 @@ export class WebApi {
   async approveSign(
     signId: string,
     clientChecks?: unknown,
+    loc: SliceLocation = {},
   ): Promise<
     | { ok: true; request: unknown; checks: SignCheck[] }
     | { ok: false; reason: string; checks: SignCheck[]; error?: string }
   > {
-    let request;
-    try {
-      request = await this.signs.get(signId);
-    } catch {
+    const ws = await this.workspaceHoldingSign(signId, loc);
+    if (!ws) {
       return { ok: false, reason: `签字请求不存在：${signId}`, checks: [] };
     }
+    const request = await ws.signs.get(signId);
 
     if (request.status !== 'pending') {
       return {
@@ -786,10 +981,12 @@ export class WebApi {
       };
     }
 
-    // 服务端重算判定 —— 前端传什么都不作数
+    // 服务端重算判定 —— 前端传什么都不作数。
+    // ADR-112：事实必须从**签字请求所在的那个根**收集 ——
+    // 拿根上那份过期副本算出来的是另一片的事实。
     let checks: SignCheck[];
     try {
-      const facts = await this.collectFacts(request.sliceId);
+      const facts = await this.collectFacts(ws, request.sliceId);
       checks = evaluateSignChecks(facts);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -811,7 +1008,7 @@ export class WebApi {
     }
 
     try {
-      const approved = await this.signs.approve(signId, 'human', null);
+      const approved = await ws.signs.approve(signId, 'human', null);
       return { ok: true, request: approved, checks };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -850,23 +1047,21 @@ export class WebApi {
    * 为什么驾驶舱要能拒签：签字队列是「人在被交还控制权的那一刻」看的页面。
    * 只能签不能拒，就等于把人赶回终端 —— 驾驶舱在最该起作用的时候失效。
    */
-  async rejectSign(signId: string, comment?: string | null): Promise<
+  async rejectSign(signId: string, comment?: string | null, loc: SliceLocation = {}): Promise<
     | { ok: true; request: unknown }
     | { ok: false; reason: string }
   > {
-    let request;
-    try {
-      request = await this.signs.get(signId);
-    } catch {
-      return { ok: false, reason: `签字请求不存在：${signId}` };
-    }
+    // ADR-112：拒签落在请求所在的根
+    const ws = await this.workspaceHoldingSign(signId, loc);
+    if (!ws) return { ok: false, reason: `签字请求不存在：${signId}` };
+    const request = await ws.signs.get(signId);
 
     if (request.status !== 'pending') {
       return { ok: false, reason: `签字请求已是 ${request.status} 状态，不能再拒绝` };
     }
 
     try {
-      const rejected = await this.signs.reject(signId, 'human', comment ?? null);
+      const rejected = await ws.signs.reject(signId, 'human', comment ?? null);
       return { ok: true, request: rejected };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -886,6 +1081,7 @@ export class WebApi {
   async answerQuestion(
     sliceId: string,
     answer: string,
+    loc: SliceLocation = {},
   ): Promise<
     | { ok: true; questionId: string; nextStep: string }
     | { ok: false; reason: string }
@@ -894,6 +1090,9 @@ export class WebApi {
     if (!text) {
       return { ok: false, reason: '答案为空' };
     }
+
+    // ADR-112：答案与事件落回切片所在的根
+    const ws = (await this.resolveWorkspace(sliceId, loc)) ?? this.rootWs;
 
     // 找这片待答的问题 —— 认问题 id 与认切片 id 都支持。
     let pending: QuestionRecord[];
@@ -929,7 +1128,7 @@ export class WebApi {
     // 追溯链要能回答「当时是谁在浏览器里回答了这个问题」。
     //
     // actor 与 via 是**两个维度**：actor 说「人做的」，via 说「在哪儿做的」。
-    await this.events.append(sliceId, 'question.answered', 'human', {
+    await ws.events.append(sliceId, 'question.answered', 'human', {
       sliceId,
       questionId: question.id,
       answer: text,
@@ -970,7 +1169,7 @@ export class WebApi {
       return { ok: false, reason: `拉闸失败：${message}` };
     }
 
-    await this.events.append('batch', 'batch.halted', 'human', {
+    await this.rootWs.events.append('batch', 'batch.halted', 'human', {
       scope: haltScope,
       reason: haltReason,
       haltId: req.id,
@@ -998,11 +1197,13 @@ export class WebApi {
   // 两条路都保证「浏览器里点的」与「终端里跑的」结论一致（C3）。
 
   /** 编排层需要的上下文 —— actor 与 via 是两个维度（ADR-084 §4）。 */
-  private lifecycleContext(): LifecycleContext {
+  private lifecycleContext(ws: SliceWorkspace): LifecycleContext {
     return {
-      repoRoot: this.repoRoot,
-      store: this.store,
-      events: this.events,
+      // ADR-112：编排必须跑在**切片所在的那个根**上 ——
+      // 规格、验收目录、事件流、写集预检全是这个根的事实。
+      repoRoot: ws.root.dir,
+      store: ws.store,
+      events: ws.events,
       actor: 'human',
       via: 'web',
     };
@@ -1016,6 +1217,7 @@ export class WebApi {
   async freezeSlice(
     sliceId: string,
     options: { refreeze?: boolean } = {},
+    loc: SliceLocation = {},
   ): Promise<{
     ok: boolean;
     reason: string;
@@ -1030,7 +1232,11 @@ export class WebApi {
     // 那个异常一路冒到 router 就成了「服务器内部错误」——
     // 但人的动作是错的（点了不存在的切片），不是服务器坏了。
     // 500 会把人引去查日志，404 才能让人意识到「点错了」。
-    if (!(await this.store.exists(sliceId))) {
+    //
+    // ADR-112：存在性要在**切片所属的那个根**上查 ——
+    // 根上有、版本目录里没有，与「点错了」是两件事。
+    const ws = await this.resolveWorkspace(sliceId, loc);
+    if (!ws || !(await ws.store.exists(sliceId))) {
       return {
         ok: false,
         reason: `切片 "${sliceId}" 不存在`,
@@ -1040,7 +1246,7 @@ export class WebApi {
       };
     }
 
-    const outcome = await freezeSlice(this.lifecycleContext(), sliceId, {
+    const outcome = await freezeSlice(this.lifecycleContext(ws), sliceId, {
       ...(options.refreeze ? { refreeze: true } : {}),
     });
     return {
@@ -1060,6 +1266,7 @@ export class WebApi {
   async runGate(
     sliceId: string,
     options: { only?: string; retry?: number; dryRun?: boolean; full?: boolean } = {},
+    loc: SliceLocation = {},
   ): Promise<{
     ok: boolean;
     reason: string;
@@ -1068,7 +1275,9 @@ export class WebApi {
     facts?: Record<string, unknown>;
     notFound?: boolean;
   }> {
-    if (!(await this.store.exists(sliceId))) {
+    // ADR-112：门禁跑在切片所属的那个根（规格 / 验收 / 事件都是它的）
+    const ws = await this.resolveWorkspace(sliceId, loc);
+    if (!ws || !(await ws.store.exists(sliceId))) {
       return {
         ok: false,
         reason: `切片 "${sliceId}" 不存在`,
@@ -1078,13 +1287,13 @@ export class WebApi {
       };
     }
 
-    const config = loadConfigAt(this.repoRoot);
-    const gateRoot = this.worktrees.exists(sliceId)
-      ? this.worktrees.pathFor(sliceId)
+    const config = loadConfigAt(ws.root.dir);
+    const gateRoot = ws.worktrees.exists(sliceId)
+      ? ws.worktrees.pathFor(sliceId)
       : undefined;
 
     const outcome = await runGate(
-      this.lifecycleContext(),
+      this.lifecycleContext(ws),
       sliceId,
       {
         commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
@@ -1125,6 +1334,7 @@ export class WebApi {
   async resumeSlice(
     sliceId: string,
     options: { skip?: boolean; abandon?: boolean; resetRetry?: boolean } = {},
+    loc: SliceLocation = {},
   ): Promise<{
     ok: boolean;
     reason: string;
@@ -1133,7 +1343,9 @@ export class WebApi {
     facts?: Record<string, unknown>;
     notFound?: boolean;
   }> {
-    if (!(await this.store.exists(sliceId))) {
+    // ADR-112：续跑落在切片所属的那个根
+    const ws = await this.resolveWorkspace(sliceId, loc);
+    if (!ws || !(await ws.store.exists(sliceId))) {
       return {
         ok: false,
         reason: `切片 "${sliceId}" 不存在`,
@@ -1143,7 +1355,7 @@ export class WebApi {
       };
     }
 
-    const outcome = await resumeSlice(this.lifecycleContext(), sliceId, options);
+    const outcome = await resumeSlice(this.lifecycleContext(ws), sliceId, options);
     return {
       ok: outcome.ok,
       reason: outcome.reason,
@@ -1167,6 +1379,7 @@ export class WebApi {
   async runSlice(
     sliceId: string,
     options: { hotfix?: boolean; confirmHotfix?: boolean } = {},
+    loc: SliceLocation = {},
   ): Promise<{
     ok: boolean;
     reason: string;
@@ -1174,8 +1387,19 @@ export class WebApi {
     supervisorPid?: number;
     nextStep?: string;
   }> {
+    // ADR-112：开跑要拉起**切片所在那个根**的 CLI ——
+    // CLI 的 cwd 决定了它读哪份 `.zelto/`。在仓库根拉起版本目录的切片，
+    // 等于让 CLI 去根上找一片不存在的切片。
+    const ws = await this.resolveWorkspace(sliceId, loc);
+    if (!ws || !(await ws.store.exists(sliceId))) {
+      return { ok: false, reason: `切片 "${sliceId}" 不存在` };
+    }
+
     // 同时在跑的 detached 任务数有上限 —— 点错一下就可能同时拉起多个 agent，
     // 而每个 agent 都在烧 token。这不是安全漏洞，是**成本失控**的闸门。
+    //
+    // 计数按这个根的 tasks 目录算：不同根的 agent 是不同的进程，
+    // 但上限是**这台机器**的烧钱闸门，所以按所有根求和。
     const running = await this.countRunningDetachedTasks();
     const limit = this.maxConcurrentRuns();
     if (running >= limit) {
@@ -1187,7 +1411,7 @@ export class WebApi {
       };
     }
 
-    const launch = await launchRun(this.repoRoot, sliceId, {
+    const launch = await launchRun(ws.root.dir, sliceId, {
       ...options,
       ...(this.launchTimeoutMs() !== undefined ? { launchTimeoutMs: this.launchTimeoutMs() } : {}),
     });
@@ -1214,40 +1438,43 @@ export class WebApi {
    * 切片状态在 agent 跑完后才变，任务文件才是「这一轮还在跑」的凭据。
    */
   private async countRunningDetachedTasks(): Promise<number> {
-    const tasksDir = join(this.zeltoDir, 'tasks');
-    let entries: string[];
-    try {
-      entries = readdirSync(tasksDir);
-    } catch {
-      // 没有任务目录 = 没有任何后台运行
-      return 0;
-    }
-
+    // ADR-112：每个根各有自己的 tasks 目录 —— 加起来才是全机在跑数
     let count = 0;
-    for (const file of entries) {
-      if (!file.endsWith('.json')) continue;
-      let task: { status?: string; supervisorPid?: number };
+    for (const ws of this.workspaces) {
+      const tasksDir = join(ws.zeltoDir, 'tasks');
+      let entries: string[];
       try {
-        task = JSON.parse(readFileSync(join(tasksDir, file), 'utf-8')) as {
-          status?: string;
-          supervisorPid?: number;
-        };
+        entries = readdirSync(tasksDir);
       } catch {
-        // 任务文件读不出来 —— 跳过（它自己都坏了，算不算在跑说不上）
+        // 这个根没有任务目录 = 它没有任何后台运行
         continue;
       }
-      if (task.status !== 'running') continue;
-      if (typeof task.supervisorPid === 'number' && task.supervisorPid > 0) {
-        if (isProcessAlive(task.supervisorPid)) {
-          count++;
+
+      for (const file of entries) {
+        if (!file.endsWith('.json')) continue;
+        let task: { status?: string; supervisorPid?: number };
+        try {
+          task = JSON.parse(readFileSync(join(tasksDir, file), 'utf-8')) as {
+            status?: string;
+            supervisorPid?: number;
+          };
+        } catch {
+          // 任务文件读不出来 —— 跳过（它自己都坏了，算不算在跑说不上）
           continue;
         }
-        // pid 在但进程没了 —— 那一轮已经死了，不算在跑
-        continue;
+        if (task.status !== 'running') continue;
+        if (typeof task.supervisorPid === 'number' && task.supervisorPid > 0) {
+          if (isProcessAlive(task.supervisorPid)) {
+            count++;
+            continue;
+          }
+          // pid 在但进程没了 —— 那一轮已经死了，不算在跑
+          continue;
+        }
+        // 拿不到 pid 时只能信任务文件 —— 但那可能是残留记录。
+        // 宁可多算一个（拒绝启动），也不要少算（超限烧 token）。
+        count++;
       }
-      // 拿不到 pid 时只能信任务文件 —— 但那可能是残留记录。
-      // 宁可多算一个（拒绝启动），也不要少算（超限烧 token）。
-      count++;
     }
     return count;
   }
@@ -1289,6 +1516,82 @@ export class WebApi {
     }
     return undefined;
   }
+}
+
+/**
+ * 一个根的「名字」—— 仓库根记为 `root`，版本目录用 label。
+ *
+ * 合并时的证据字段（`roots`）与稳定排序都用它。
+ */
+function rootLabelOf(root: CockpitRoot): string {
+  return root.label ?? 'root';
+}
+
+/** 把一条总览行标注上它来自哪个根（以及它出现过的其它根）。 */
+function withRoot(
+  summary: Omit<SliceSummary, 'scope' | 'label' | 'roots'>,
+  root: CockpitRoot,
+  otherRoots: string[] = [],
+): SliceSummary {
+  const here = rootLabelOf(root);
+  const roots = [here, ...otherRoots.filter((r) => r !== here)];
+  return { ...summary, scope: root.scope, label: root.label, roots };
+}
+
+/**
+ * 把各根的总览行按 id 合并成一份列表（ADR-112 决策二）。
+ *
+ * 同一片在多个根里都有时（基线切片实测在根 / v1 / v2 / v3 都有副本），
+ * 只留**一行**，事实取「`updatedAt` 较晚」的那份 —— 那是最近被真正动过的一份。
+ * 同一时刻（复制产生的副本时间戳相同）→ 先出现的根胜出（`root` 在前，
+ * 版本按 label 字典序）—— 保证**确定性**，同一棵树两次扫描结论一致。
+ *
+ * `roots` 字段记录这一片出现过的**所有根** —— 合并的是「取哪份」，不是
+ * 「抹掉别的根有过它」这件事。
+ */
+function mergeSliceSummaries(perRoot: SliceSummary[][]): SliceSummary[] {
+  const byId = new Map<string, SliceSummary>();
+  for (const list of perRoot) {
+    for (const s of list) {
+      const prev = byId.get(s.id);
+      if (!prev) {
+        byId.set(s.id, s);
+        continue;
+      }
+      const newer = s.updatedAt > prev.updatedAt ? s : prev;
+      const roots = Array.from(new Set([...prev.roots, ...s.roots]));
+      byId.set(s.id, { ...newer, roots });
+    }
+  }
+  // 稳定排序：updatedAt 倒序；同刻按 id 字典序（Array.sort 在 V8 上稳定，但显式更保险）
+  return Array.from(byId.values()).sort((a, b) => {
+    if (a.updatedAt !== b.updatedAt) return a.updatedAt < b.updatedAt ? 1 : -1;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+}
+
+/**
+ * 一个根的事件目录下有哪些切片的事件流（ADR-112）。
+ *
+ * 直接扫 `<zeltoDir>/events`：事件流是追溯的唯一证据载体（C4），
+ * 「最近事件」该照事件目录说话，而不是照「哪些切片还有状态文件」说话。
+ * 只取**真有** `events.jsonl` 的目录，空目录不当成切片。
+ */
+function listEventSlicesIn(zeltoDir: string): string[] {
+  const dir = join(zeltoDir, 'events');
+  let entries: import('node:fs').Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    if (!existsSync(join(dir, e.name, 'events.jsonl'))) continue;
+    out.push(e.name);
+  }
+  return out;
 }
 
 /**
@@ -1340,7 +1643,7 @@ async function toSummary(
   budget: BudgetCollector,
   repoRoot: string,
   loadEvents: () => Promise<EventEnvelope[]>,
-): Promise<SliceSummary> {
+): Promise<Omit<SliceSummary, 'scope' | 'label' | 'roots'>> {
   const runs = slice.runs ?? [];
   const lastRun = runs.length > 0 ? runs[runs.length - 1] : null;
 

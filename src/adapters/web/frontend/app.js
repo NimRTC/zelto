@@ -17,6 +17,36 @@ const conn = document.getElementById('conn');
 // crashLine 说「服务还在，但出过错，数据可能不新鲜」。
 const crashLine = document.getElementById('crash-line');
 let currentView = 'overview';
+// ── ADR-112：当前详情页看的是哪个「根」上的那片 ──────────────────────
+//
+// 同一个 id 可能同时存在于仓库根和版本目录里（基线切片实测 4 份）。
+// 详情页、事件、审计、签字、门禁……必须**都落在同一个根**上 ——
+// 否则「详情里说的」和「列表里看的」不是同一份事实。
+// 路由凭据就是列表行上的 scope/label，不靠 id 去猜（ADR-112 决策三）。
+let currentLocation = { scope: 'root', label: null };
+
+/** 把 scope/label 拼成查询串 / 请求体里那两项（不传时返回空）。 */
+function locQuery(loc) {
+  if (!loc || !loc.scope) return '';
+  var q = '?scope=' + encodeURIComponent(loc.scope);
+  if (loc.label) q += '&label=' + encodeURIComponent(loc.label);
+  return q;
+}
+function locBody(loc) {
+  if (!loc || !loc.scope) return {};
+  return { scope: loc.scope, label: loc.label || null };
+}
+
+/**
+ * 根的人类可读名 —— 「仓库根」或「版本目录 v3」。
+ *
+ * 版本目录的名字必须出现在列表上：它回答的是「这片在哪个目录里等人」，
+ * 而签字、门禁、开跑都得去那个目录（或经驾驶舱路由过去）。
+ */
+function rootName(scope, label) {
+  if (scope === 'version') return '版本目录 ' + (label || '?');
+  return '仓库根';
+}
 // 当前是否停在**切片详情页**。
 //
 // 为什么单独一个变量，而不是看 currentView：
@@ -292,6 +322,26 @@ async function viewOverview(target) {
 
   target.appendChild(cards);
 
+  // ── 扫了哪些根（ADR-112）─────────────────────────────────────────
+  //
+  // 「看不见的根」本身就是信息：版本目录里有一整套独立状态（切片、
+  // 签字请求、事件），驾驶舱不知道它存在就无从去那里签字。
+  // 这里直说扫了哪几个目录、各有多少片 —— 比让人从总数里猜强。
+  if (Array.isArray(s.roots) && s.roots.length > 0) {
+    target.appendChild(el('h2', null, '扫描的根（' + s.roots.length + '）'));
+    target.appendChild(el('p', 'muted small',
+      '驾驶舱同时看仓库根和每个版本集成目录 —— 切片在版本目录里冻结、过门禁、签字，就落在那个目录里。'));
+    target.appendChild(table(
+      ['根', '切片数', '状态分布'],
+      s.roots.map(function (r) {
+        var dist = Object.keys(r.byState || {}).map(function (k) { return k + ' ' + r.byState[k]; }).join(' · ');
+        return {
+          cells: [rootName(r.scope, r.label), String(r.total), dist || '—']
+        };
+      })
+    ));
+  }
+
   // ── 基线切片的清单 ──
   //
   // 直说「哪些是基线」而不是让人自己猜 —— 判据是内部的，
@@ -329,7 +379,7 @@ async function viewOverview(target) {
           var last = formatIdleMs(x.idleMs) + '没动静';
           if (x.lastActivityAt) last = new Date(x.lastActivityAt).toLocaleTimeString() + ' · ' + last;
           return {
-            onClick: function () { showSliceDetail(x.id); },
+            onClick: function () { showSliceDetail(x.id, false, { scope: x.scope, label: x.label }); },
             cells: [x.id, liveBadge(x), progressCell(x), last]
           };
         })
@@ -378,11 +428,11 @@ async function viewOverview(target) {
     target.appendChild(el('p', 'muted', '没有待签字的切片。'));
   } else {
     target.appendChild(table(
-      ['切片', '请求时间'],
+      ['切片', '根', '请求时间'],
       s.pendingSigns.map(function (p) {
         return {
-          onClick: function () { showSliceDetail(p.sliceId); },
-          cells: [p.sliceId, new Date(p.requestedAt).toLocaleString()]
+          onClick: function () { showSliceDetail(p.sliceId, true, { scope: p.scope, label: p.label }); },
+          cells: [p.sliceId, rootName(p.scope, p.label), new Date(p.requestedAt).toLocaleString()]
         };
       })
     ));
@@ -427,56 +477,90 @@ async function viewSlices(target) {
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
 
-  // 基线切片单列 —— 它们描述现状、不改代码，混在开发切片里
-  // 会让「完成度」看起来比实际多（实测 nimrtc-v14：8 片 completed 里
-  // 3 片是基线，那轮实际只开发了 5 片）。
-  var devSlices = slices.filter(function (s) { return s.kind !== 'baseline'; });
-  var baseSlices = slices.filter(function (s) { return s.kind === 'baseline'; });
+  // ── ADR-112：按「根」分组 ────────────────────────────────────────
+  //
+  // 合并后的总数会让人以为「都在一个地方」。实际上 v3 集成目录里的
+  // 那十几片是**另一份 zelto 状态**（`zelto web` 以前根本看不到它们）——
+  // 「哪片在哪个根」是一个要人去做决定的事实（签字/门禁去哪个目录）。
+  //
+  // 分组判据是列表行上的 scope + label（服务端给的归属），不按 id 猜。
+  var byRoot = {};
+  var rootOrder = [];
+  for (const s of slices) {
+    var key = (s.scope || 'root') + '/' + (s.label || '');
+    if (!byRoot[key]) {
+      byRoot[key] = { scope: s.scope || 'root', label: s.label || null, rows: [] };
+      rootOrder.push(key);
+    }
+    byRoot[key].rows.push(s);
+  }
+  // 仓库根排第一，版本目录按 label 排 —— 与服务端根发现顺序一致
+  rootOrder.sort(function (a, b) {
+    var A = byRoot[a];
+    var B = byRoot[b];
+    if (A.scope !== B.scope) return A.scope === 'root' ? -1 : 1;
+    return String(A.label || '') < String(B.label || '') ? -1 : String(A.label || '') > String(B.label || '') ? 1 : 0;
+  });
 
-  target.appendChild(el('h2', null, '开发切片（' + devSlices.length + '）'));
-  target.appendChild(table(
-    ['切片', '标题', '状态', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新'],
-    devSlices.map(function (s) {
-      var wd = '';
-      if (s.escalated) wd = ' 🚨已上报';
-      else if (s.recoveries > 0) wd = ' 自愈' + s.recoveries + '次';
-      return {
-        onClick: function () { showSliceDetail(s.id); },
-        cells: [
-          s.id,
-          s.title,
-          stateBadge(s.state),
-          livenessCell(s),
-          traceCounts(s.trace),
-          String(s.writeCount),
-          s.runCount === 0 ? '—' : (s.lastRunOk ? '✅ ' + s.runCount : '❌ ' + s.runCount) + wd,
-          costCell(s),
-          new Date(s.updatedAt).toLocaleString()
-        ]
-      };
-    })
-  ));
+  for (const key of rootOrder) {
+    const group = byRoot[key];
+    // 这一组里的开发 / 基线分开 —— 与全量口径同一套理由（基线不算进度）
+    var devSlices = group.rows.filter(function (s) { return s.kind !== 'baseline'; });
+    var baseSlices = group.rows.filter(function (s) { return s.kind === 'baseline'; });
 
-  if (baseSlices.length > 0) {
-    target.appendChild(el('h2', null, '基线切片（' + baseSlices.length + '）'));
-    target.appendChild(el('p', 'muted',
-      '描述接管项目时已有的现状，不改代码 —— 不计入开发进度。'));
-    target.appendChild(table(
-      ['切片', '标题', '状态', '追溯(需/契/测)', '写集', '更新'],
-      baseSlices.map(function (s) {
-        return {
-          onClick: function () { showSliceDetail(s.id); },
-          cells: [
-            s.id,
-            s.title,
-            stateBadge(s.state),
-            traceCounts(s.trace),
-            String(s.writeCount),
-            new Date(s.updatedAt).toLocaleString()
-          ]
-        };
-      })
-    ));
+    target.appendChild(el('h2', null, rootName(group.scope, group.label) + '（' + group.rows.length + '）'));
+    if (group.scope === 'version') {
+      target.appendChild(el('p', 'muted small',
+        '这个版本集成目录里有自己独立的 .zelto 状态 —— 在这里冻结、过门禁、签字的切片，都落在这个目录里。'));
+    }
+
+    if (devSlices.length > 0) {
+      target.appendChild(el('h3', null, '开发切片（' + devSlices.length + '）'));
+      target.appendChild(table(
+        ['切片', '标题', '状态', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新'],
+        devSlices.map(function (s) {
+          var wd = '';
+          if (s.escalated) wd = ' 🚨已上报';
+          else if (s.recoveries > 0) wd = ' 自愈' + s.recoveries + '次';
+          return {
+            onClick: function () { showSliceDetail(s.id, false, { scope: s.scope, label: s.label }); },
+            cells: [
+              s.id,
+              s.title,
+              stateBadge(s.state),
+              livenessCell(s),
+              traceCounts(s.trace),
+              String(s.writeCount),
+              s.runCount === 0 ? '—' : (s.lastRunOk ? '✅ ' + s.runCount : '❌ ' + s.runCount) + wd,
+              costCell(s),
+              new Date(s.updatedAt).toLocaleString()
+            ]
+          };
+        })
+      ));
+    }
+
+    if (baseSlices.length > 0) {
+      target.appendChild(el('h3', null, '基线切片（' + baseSlices.length + '）'));
+      target.appendChild(el('p', 'muted',
+        '描述接管项目时已有的现状，不改代码 —— 不计入开发进度。'));
+      target.appendChild(table(
+        ['切片', '标题', '状态', '追溯(需/契/测)', '写集', '更新'],
+        baseSlices.map(function (s) {
+          return {
+            onClick: function () { showSliceDetail(s.id, false, { scope: s.scope, label: s.label }); },
+            cells: [
+              s.id,
+              s.title,
+              stateBadge(s.state),
+              traceCounts(s.trace),
+              String(s.writeCount),
+              new Date(s.updatedAt).toLocaleString()
+            ]
+          };
+        })
+      ));
+    }
   }
 }
 
@@ -786,9 +870,12 @@ async function viewSigns(target) {
   }
   for (const r of reqs) {
     target.appendChild(el('h2', null, r.sliceId));
+    // ADR-112：签字请求在哪个根，就去哪个根的详情页签 —— 不靠 id 猜
+    target.appendChild(el('p', 'muted small', '所在根：' + rootName(r.scope, r.label)));
     const btn = el('button', 'btn ok', '查看并签字');
-    btn.addEventListener('click', function () { showSliceDetail(r.sliceId, true); });
-    target.appendChild(btn);
+    btn.addEventListener('click', function () {
+      showSliceDetail(r.sliceId, true, { scope: r.scope, label: r.label });
+    });    target.appendChild(btn);
   }
 }
 
@@ -824,16 +911,18 @@ async function viewEvents(target) {
   ));
 }
 
-async function showSliceDetail(id, forSign) {
+async function showSliceDetail(id, forSign, loc) {
   clear(main);
   inDetail = true;
+  // ADR-112：记住这个详情页看的是哪个根 —— 轮询、签字、门禁都落回同一个根
+  currentLocation = loc && loc.scope ? { scope: loc.scope, label: loc.label || null } : { scope: 'root', label: null };
   const back = el('button', 'back', '← 返回');
   back.addEventListener('click', function () { stopDetailPolling(); render(currentView); });
   main.appendChild(back);
 
   let d;
   try {
-    d = await apiGet('/api/slices/' + encodeURIComponent(id));
+    d = await apiGet('/api/slices/' + encodeURIComponent(id) + locQuery(currentLocation));
   } catch (err) {
     main.appendChild(el('p', 'notice bad', '加载失败：' + friendlyError(err)));
     if (isConnectionError(err)) noteDisconnected(err);
@@ -842,6 +931,15 @@ async function showSliceDetail(id, forSign) {
 
   const slice = d.slice;
   main.appendChild(el('h2', null, id + ' — ' + slice.title));
+  // ADR-112：说清这片看的是哪个根 —— 同一个 id 可能在好几个根里都有副本
+  if (d.summary && d.summary.scope) {
+    const roots = (d.summary.roots || []).map(function (r) {
+      return r === 'root' ? '仓库根' : '版本目录 ' + r;
+    }).join('、');
+    main.appendChild(el('p', 'muted small',
+      '所在根：' + rootName(d.summary.scope, d.summary.label) +
+      (roots ? ' · 这片在以下根有记录：' + roots : '')));
+  }
 
   // ── ADR-086：油门 ────────────────────────────────────────────────────
   //
@@ -890,6 +988,8 @@ async function showSliceDetail(id, forSign) {
   // 答案只**记录**，不续跑：续跑要拉起 agent 会话，
   // 驾驶舱不该在 HTTP 请求里挂着它（ADR-084 §1.1）。
   try {
+    // ADR-112：提问在仓库根的问题 store 里读 —— 不按切片根路由，
+    // 版本目录里的提问暂不在驾驶舱归集（见 ADR-112 边界）。
     const pending = await apiGet('/api/questions?status=pending&slice=' + encodeURIComponent(id));
     if (pending && pending.length > 0) {
       main.appendChild(el('h2', null, 'agent 在问你'));
@@ -975,7 +1075,7 @@ async function showSliceDetail(id, forSign) {
   // ── 事件 ────────────────────────────────────────────────────────────
   main.appendChild(el('h2', null, '事件'));
   try {
-    const events = await apiGet('/api/slices/' + encodeURIComponent(id) + '/events?limit=100');
+    const events = await apiGet('/api/slices/' + encodeURIComponent(id) + '/events?limit=100' + locQuery(currentLocation));
     main.appendChild(table(
       ['时间', '类型', '操作者'],
       events.map(function (e) {
@@ -993,7 +1093,7 @@ async function showSliceDetail(id, forSign) {
   // 端点实现了却没人用，等于没实现（ADR-010 §5.4 详情页的「📋 审计」按钮）。
   main.appendChild(el('h2', null, '审计'));
   try {
-    const audit = await apiGet('/api/slices/' + encodeURIComponent(id) + '/audit');
+    const audit = await apiGet('/api/slices/' + encodeURIComponent(id) + '/audit' + locQuery(currentLocation));
     const entries = (audit && audit.entries) || [];
     if (entries.length === 0) {
       main.appendChild(el('p', 'muted', '没有审计记录。'));
@@ -1021,8 +1121,8 @@ async function doApprove(sliceId, btn, checks) {
   btn.disabled = true;
   btn.textContent = '签字中…';
 
-  // 先找这条切片的 pending 签字请求
-  const reqs = await apiGet('/api/sign-requests?status=pending');
+  // 先找这条切片的 pending 签字请求 —— ADR-112：只在该切片所在的根里找
+  const reqs = await apiGet('/api/sign-requests?status=pending' + locQuery(currentLocation));
   const req = reqs.find(function (r) { return r.sliceId === sliceId; });
   if (!req) {
     main.appendChild(el('p', 'notice bad', '找不到这条切片的待签字请求。'));
@@ -1035,7 +1135,7 @@ async function doApprove(sliceId, btn, checks) {
   // 服务端不信任内容（自己重算一遍），但「有没有带」本身是信号。
   const res = await apiPost(
     '/api/sign-requests/' + encodeURIComponent(req.id) + '/approve',
-    { checks: checks || [] }
+    Object.assign({ checks: checks || [] }, locBody(currentLocation))
   );
   if (res.ok && res.body && res.body.ok) {
     // 提示必须在视图切换**之后**追加 —— 切换会 clear(main)，
@@ -1070,7 +1170,7 @@ async function doReject(sliceId, btn) {
   btn.disabled = true;
   btn.textContent = '拒签中…';
 
-  const reqs = await apiGet('/api/sign-requests?status=pending');
+  const reqs = await apiGet('/api/sign-requests?status=pending' + locQuery(currentLocation));
   const req = reqs.find(function (r) { return r.sliceId === sliceId; });
   if (!req) {
     showBanner('notice bad', '找不到这条切片的待签字请求。');
@@ -1082,7 +1182,7 @@ async function doReject(sliceId, btn) {
   const comment = window.prompt('拒签理由（可留空）：') || null;
   const res = await apiPost(
     '/api/sign-requests/' + encodeURIComponent(req.id) + '/reject',
-    { comment: comment }
+    Object.assign({ comment: comment }, locBody(currentLocation))
   );
   if (res.ok && res.body && res.body.ok) {
     await render('signs');
@@ -1111,9 +1211,9 @@ async function doAnswer(sliceId, input, btn) {
   btn.disabled = true;
   btn.textContent = '提交中…';
 
-  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/answer', {
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/answer', Object.assign({
     answer: text
-  });
+  }, locBody(currentLocation)));
   if (res.ok && res.body && res.body.ok) {
     input.value = '';
     showBanner('notice ok', '✅ 答案已记录。');
@@ -1242,7 +1342,7 @@ let detailPollTimer = null;
 function startDetailPolling(sliceId, box) {
   stopDetailPolling();
   detailPollTimer = setInterval(function () {
-    apiGet('/api/slices/' + encodeURIComponent(sliceId)).then(function (d) {
+    apiGet('/api/slices/' + encodeURIComponent(sliceId) + locQuery(currentLocation)).then(function (d) {
       renderLiveBox(box, d.summary);
       noteConnected();
     }).catch(function (err) {
@@ -1266,7 +1366,7 @@ async function doFreeze(sliceId, btn, refreeze) {
   btn.disabled = true;
   btn.textContent = refreeze ? '重新冻结中…' : '冻结中…';
   const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/freeze',
-    refreeze ? { refreeze: true } : {});
+    Object.assign(refreeze ? { refreeze: true } : {}, locBody(currentLocation)));
   if (res.ok && res.body && res.body.ok) {
     showBanner('notice ok', '✅ ' + (res.body.reason || '已冻结'));
     await showSliceDetail(sliceId);
@@ -1296,7 +1396,7 @@ function showFreezeFailure(res, btn, refreeze) {
 async function doGate(sliceId, btn) {
   btn.disabled = true;
   btn.textContent = '门禁运行中…';
-  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/gate', {});
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/gate', locBody(currentLocation));
   if (res.ok && res.body && res.body.ok) {
     showBanner('notice ok', '✅ ' + (res.body.reason || '门禁通过'));
     const facts = res.body.facts || {};
@@ -1324,7 +1424,7 @@ async function doGate(sliceId, btn) {
 async function doRun(sliceId, btn) {
   btn.disabled = true;
   btn.textContent = '起跑中…';
-  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/run', {});
+  const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/run', locBody(currentLocation));
   if (res.ok && res.body && res.body.ok) {
     showBanner('notice ok', '🚀 ' + (res.body.reason || '已在后台起跑'));
     if (res.body.nextStep) showBanner('notice', res.body.nextStep);
@@ -1358,7 +1458,7 @@ async function doResume(sliceId, btn) {
     return;
   }
   const res = await apiPost('/api/slices/' + encodeURIComponent(sliceId) + '/resume',
-    choice ? {} : { abandon: true });
+    Object.assign(choice ? {} : { abandon: true }, locBody(currentLocation)));
   if (res.ok && res.body && res.body.ok) {
     showBanner('notice ok', '✅ ' + (res.body.reason || '已恢复'));
     for (const a of (res.body.advisories || [])) showBanner('notice', '· ' + a);

@@ -49,6 +49,29 @@ import type { ServerResponse } from 'node:http';
 import { sendJson, validId } from './server.js';
 import type { WebApi } from './api.js';
 import type { CockpitCrashGuard } from './crash-guard.js';
+import type { CockpitScope } from '../../core/project/cockpit-roots.js';
+
+/**
+ * 从请求里解析「根」定位（ADR-112）—— `scope` + `label`。
+ *
+ * POST 优先看 body，GET 看 query。缺省时不带 scope：api 层按
+ * 「仓库根优先、再按合并归属」解析（与改造前一致）。
+ *
+ * `scope` 只认两个值；`label` 只收字符串。非法值**忽略**而不是报错 ——
+ * 非法 scope 与「没传」等价（落回默认解析），比一个 400 更好：
+ * 前端漏传字段时旧行为照常工作。
+ */
+function parseLocation(
+  scope: unknown,
+  label: unknown,
+): { scope?: CockpitScope; label?: string | null } {
+  const s = typeof scope === 'string' ? scope.trim() : '';
+  if (s !== 'root' && s !== 'version') return {};
+  return {
+    scope: s,
+    label: typeof label === 'string' && label.trim() ? label.trim() : null,
+  };
+}
 
 export interface WebContext {
   method: string;
@@ -181,7 +204,11 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
   // ── GET /api/sign-requests ──────────────────────────────────────────
   if (method === 'GET' && path === '/api/sign-requests') {
     const status = ctx.query.get('status') ?? undefined;
-    sendJson(res, 200, await api.listSignRequests(status));
+    // ADR-112：可选的 scope/label 收窄到某个根；不带则跨根合并
+    sendJson(res, 200, await api.listSignRequests(status, parseLocation(
+      ctx.query.get('scope') ?? undefined,
+      ctx.query.get('label') ?? undefined,
+    )));
     return;
   }
 
@@ -199,8 +226,8 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
     }
     // 把前端传来的「人确认过了这四项」凭据传给 api 层。
     // 内容不作数（服务端自己重算），但「有没有带」是信号 —— 见 api.ts。
-    const body = ctx.body as { checks?: unknown } | undefined;
-    const result = await api.approveSign(signId, body?.checks);
+    const body = ctx.body as { checks?: unknown; scope?: unknown; label?: unknown } | undefined;
+    const result = await api.approveSign(signId, body?.checks, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       // 409 —— 请求本身合法，但**前置条件不满足**（确认项没过 / 状态不对）
       //
@@ -250,9 +277,9 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '签字请求 id 非法' });
       return;
     }
-    const body = ctx.body as { comment?: unknown } | undefined;
+    const body = ctx.body as { comment?: unknown; scope?: unknown; label?: unknown } | undefined;
     const comment = typeof body?.comment === 'string' ? body.comment : null;
-    const result = await api.rejectSign(signId, comment);
+    const result = await api.rejectSign(signId, comment, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       sendJson(res, 409, { error: result.reason, reason: result.reason });
       return;
@@ -278,12 +305,12 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    const body = ctx.body as { answer?: unknown } | undefined;
+    const body = ctx.body as { answer?: unknown; scope?: unknown; label?: unknown } | undefined;
     if (typeof body?.answer !== 'string' || !body.answer.trim()) {
       sendJson(res, 400, { error: '答案为空' });
       return;
     }
-    const result = await api.answerQuestion(id, body.answer);
+    const result = await api.answerQuestion(id, body.answer, parseLocation(body.scope, body.label));
     if (!result.ok) {
       sendJson(res, 409, { error: result.reason, reason: result.reason });
       return;
@@ -330,10 +357,10 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    const body = ctx.body as { refreeze?: unknown } | undefined;
+    const body = ctx.body as { refreeze?: unknown; scope?: unknown; label?: unknown } | undefined;
     const result = await api.freezeSlice(id, {
       ...(body?.refreeze === true ? { refreeze: true } : {}),
-    });
+    }, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       sendLifecycleFailure(res, result);
       return;
@@ -355,7 +382,10 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    const body = ctx.body as { only?: unknown; retry?: unknown; dryRun?: unknown; full?: unknown } | undefined;
+    const body = ctx.body as {
+      only?: unknown; retry?: unknown; dryRun?: unknown; full?: unknown;
+      scope?: unknown; label?: unknown;
+    } | undefined;
     const only = typeof body?.only === 'string' ? body.only : undefined;
     const retry = typeof body?.retry === 'number' && Number.isFinite(body.retry)
       ? Math.max(0, Math.floor(body.retry))
@@ -365,7 +395,7 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       ...(retry !== undefined ? { retry } : {}),
       ...(body?.dryRun === true ? { dryRun: true } : {}),
       ...(body?.full === true ? { full: true } : {}),
-    });
+    }, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       sendLifecycleFailure(res, result);
       return;
@@ -391,7 +421,9 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    const body = ctx.body as { hotfix?: unknown; confirmHotfix?: unknown } | undefined;
+    const body = ctx.body as {
+      hotfix?: unknown; confirmHotfix?: unknown; scope?: unknown; label?: unknown;
+    } | undefined;
     const hotfix = body?.hotfix === true;
     // ADR-015 §3.1：hotfix 跳过门禁② —— 必须显式确认。
     // Web 端要**两个独立字段**（hotfix + confirmHotfix），比 CLI 的两个词更严。
@@ -406,7 +438,7 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
     const result = await api.runSlice(id, {
       hotfix,
       confirmHotfix: body?.confirmHotfix === true,
-    });
+    }, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       sendJson(res, 409, { ok: false, error: result.reason, reason: result.reason });
       return;
@@ -432,12 +464,14 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       skip?: unknown;
       abandon?: unknown;
       resetRetry?: unknown;
+      scope?: unknown;
+      label?: unknown;
     } | undefined;
     const result = await api.resumeSlice(id, {
       ...(body?.skip === true ? { skip: true } : {}),
       ...(body?.abandon === true ? { abandon: true } : {}),
       ...(body?.resetRetry === true ? { resetRetry: true } : {}),
-    });
+    }, parseLocation(body?.scope, body?.label));
     if (!result.ok) {
       sendLifecycleFailure(res, result);
       return;
@@ -459,7 +493,14 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       return;
     }
     try {
-      const detail = await api.getSlice(id);
+      const detail = await api.getSlice(id, parseLocation(
+        ctx.query.get('scope') ?? undefined,
+        ctx.query.get('label') ?? undefined,
+      ));
+      if (!detail) {
+        sendJson(res, 404, { error: `切片不存在：${id}` });
+        return;
+      }
       sendJson(res, 200, detail);
     } catch {
       sendJson(res, 404, { error: `切片不存在：${id}` });
@@ -480,7 +521,10 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       return;
     }
     const limit = parseLimit(ctx.query.get('limit'), 200);
-    sendJson(res, 200, await api.sliceEvents(id, limit));
+    sendJson(res, 200, await api.sliceEvents(id, limit, parseLocation(
+      ctx.query.get('scope') ?? undefined,
+      ctx.query.get('label') ?? undefined,
+    )));
     return;
   }
 
@@ -496,7 +540,10 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       sendJson(res, 400, { error: '切片 id 非法' });
       return;
     }
-    sendJson(res, 200, await api.sliceAudit(id));
+    sendJson(res, 200, await api.sliceAudit(id, parseLocation(
+      ctx.query.get('scope') ?? undefined,
+      ctx.query.get('label') ?? undefined,
+    )));
     return;
   }
 
