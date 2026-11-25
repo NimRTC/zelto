@@ -161,7 +161,11 @@ describe('installed git hook on a non-ASCII path', { concurrency: false }, () =>
     mkdirSync(hooksDir, { recursive: true });
     writeFileSync(
       join(hooksDir, 'pre-commit'),
-      hookScript('pre-commit', 'git diff --cached --quiet --exit-code'),
+      // 显式钉死 node 路径：hook 脚本经 POSIX shell 找 `node` 时，PATH 里可能
+      // 只有无扩展名的坏 stub（本机实测 PATH 里 `node` 指向 281 字节的文本文件），
+      // shell 会选中它，hook 二进制起不来 → 2>/dev/null 吞掉 → 静默放行。
+      // 用 process.execPath（正在跑测试的那个 node）钉死，不依赖 PATH。
+      hookScript('pre-commit', 'git diff --cached --quiet --exit-code', { nodePath: process.execPath }),
       'utf-8',
     );
 
@@ -233,7 +237,8 @@ describe('installed git hook on a protected path', { concurrency: false }, () =>
     mkdirSync(hooksDir, { recursive: true });
     writeFileSync(
       join(hooksDir, 'pre-commit'),
-      hookScript('pre-commit', 'git diff --cached --quiet --exit-code'),
+      // 与上一组 describe 同理：钉死 node 路径，避免 shell 选中 PATH 里的坏 stub
+      hookScript('pre-commit', 'git diff --cached --quiet --exit-code', { nodePath: process.execPath }),
       'utf-8',
     );
 

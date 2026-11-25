@@ -243,6 +243,33 @@
   and allowed by the policy is let through — the counter-example that
   proves the denial is not a blanket "deny everything".
 
+## [0.7.1] — 未发布（Unreleased）
+
+### Added
+- **发布前的依赖一致性校验**（ADR-108）。`scripts/version-check.mjs` 现在校验
+  `package.json` 与 `pnpm-lock.yaml` 的依赖声明**逐条一致**（每条依赖的存在性 +
+  版本范围字符串），并在仓库里出现 `package-lock.json` / `npm-shrinkwrap.json` 时
+  直接失败。脚本挂在 `prepublishOnly` 末尾，**发布前跑，不装任何东西**。
+- **`version-check.mjs` 缺失依赖时给人话**：改用动态 `import()` 加载 `js-yaml`，
+  装不上时输出可读错误，而不是抛 Node 的 `ERR_MODULE_NOT_FOUND` 堆栈。
+
+### Fixed
+- **发布闸门被换小了**（ADR-108）。`prepublishOnly` 曾经被改成只剩
+  `node scripts/version-check.mjs` —— 原来的「清理 → 构建 → 全量测试」三步
+  整个没了，于是 `npm publish` 之前**不构建、不跑测试**。现已恢复成
+  `pnpm clean && pnpm build && pnpm test && node scripts/version-check.mjs`。
+  闸门只能加，不能换小。
+- **假 npm 锁文件**（ADR-108）。仓库里那个 `package-lock.json` 是从 pnpm 本地
+  store 生成的**假锁文件**（`resolved` 指向 `../../../node_modules/.pnpm/...`，
+  且**零个** `integrity` 哈希）—— `npm ci` 在别的机器上必然失败。本仓库用
+  pnpm，真锁文件是 `pnpm-lock.yaml`。假文件已删除。
+- **README 与 `package.json` 的版本号对不上**。`package.json` 是 `0.7.1`，
+  而中英文 README 都还写 `v0.6.0`。两处 README 现已更新到 `v0.7.1`，并
+  同步了发布措辞。
+- **发布状态真源与现实一致**。`release-status.json` 现在是
+  `published: false` —— `0.7.1` 还没发到 npm（npm 上只有 `0.6.0`），
+  之前的 `published: true` + `npmVersion: 0.6.0` 说的是另一个版本的事。
+
 ## [0.6.0] — 2026-11-18
 
 ### Published
