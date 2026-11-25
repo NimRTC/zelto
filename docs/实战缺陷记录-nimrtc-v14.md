@@ -1704,7 +1704,7 @@ CI 报的东西跟 main 的真实状态无关。
 
 ### 修复
 
-**已修**（2026-11-25，人已批准）—— 见 `docs/adr-107-version-check-pnpm-lockfile.md`
+**已修**（2026-11-25，人已批准）—— 见 `docs/adr-108-version-check-pnpm-lockfile.md`
 与 `specs/slices/v1-version-align.md` 的「修订记录」。
 提交：`version/v1` 的 `2e064a7`。
 
