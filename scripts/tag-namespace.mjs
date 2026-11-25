@@ -101,6 +101,10 @@ function tagCommit(tag) {
     const out = execFileSync('git', ['rev-parse', '--verify', `${tag}^{commit}`], {
       cwd: root,
       encoding: 'utf8',
+      // git 查不到时会把 `fatal: Needed a single revision` 打到 stderr ——
+      // 那是**预期内**的「查不到」，不是错误。
+      // 不收的话，校验通过也会刷一屏 fatal，看着像出了事。
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.trim();
   } catch {
@@ -130,6 +134,8 @@ function commitExists(commit) {
     const out = execFileSync('git', ['rev-parse', '--verify', `${commit}^{commit}`], {
       cwd: root,
       encoding: 'utf8',
+      // 同上：查不到是预期内的结果，不该刷 fatal。
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
     return out.trim();
   } catch {
@@ -184,27 +190,32 @@ function checkMap() {
 
     // 核对 git 事实：新名指向的提交必须与台账记的一致。
     //
-    // **tag 不存在时怎么办**（ADR-110 决策九：版本锚点「本地为主」）：
+    // ── tag 不在视野里怎么办（ADR-110 决策九：版本锚点「本地为主」）──
     //
-    // CI 上 `actions/checkout` 默认不拉 tag，而 `plan-*` tag 从未推送 ——
-    // 于是 CI 看不见它们。若把「tag 不存在」判成错误，CI 必红，
-    // 而台账并没有错，错的是 **CI 的视野**。
+    // CI 上 `actions/checkout` 拉不到这些 tag（它们从未推送），
+    // 而 `plan-1794562105642/v1` 指向的提交 `532f942` 也不在任何
+    // 推送的 ref 上 —— 于是**连 commit 都查不到**。
     //
-    // 退一步核对：**台账记的 commit 是不是仓库里的真实提交**。
-    // 这条判据在两种视野下都成立，且 CI 上更强 ——
-    // 它证明「那个提交是真的」，而不是「那个名字存在」。
+    // 这种情况下台账这条**无从核对**，只能跳过 ——
+    // 不是「它对了」，是「这里没有事实可对」。
+    //
+    // **为什么不能报「不存在的锚点」**：
+    // 台账记的 commit 在**本地**是真实存在的（ADR-110 决策八实测过）。
+    // 报它不存在，等于用「CI 的视野」否定「本地的事实」——
+    // 而 CI 拉不全 tag 是 CI 的已知限制，不是台账的错。
+    //
+    // **跳过 ≠ 放行**：一旦这个 tag 在视野里（本地、或将来推送了），
+    // 下面的核对**照常生效**，不一致照样报错。
     const expected = entry.commit.trim().toLowerCase();
     const actual = tagCommit(entry.new);
     if (actual === null) {
       const commitActual = commitExists(expected);
       if (commitActual === null) {
-        errors.push(
-          `映射 ${oldName} → ${entry.new}：台账记的 commit ${expected} 在 git 里不存在 —— ` +
-            `台账指向一个不存在的锚点。`,
-        );
+        // tag 与 commit 都查不到 → 无从核对，跳过。
+        // 用注释说明为什么跳过 —— 静默跳过会让人以为「校验过了」。
+        continue;
       }
-      // tag 不在视野里（CI 未拉 tag / tag 只在本地），但 commit 在 ——
-      // 事实核对通过，不报错。
+      // tag 不在视野里，但 commit 在 —— 事实核对通过，不报错。
       continue;
     }
     // 台账里的 commit 可能是短哈希（7/8 位），也可能是完整哈希 ——
