@@ -88,6 +88,13 @@ function makeProject(dir: string, opts: { noop: boolean }): { baseCommit: string
             status: 'integrated',
             branch: 'version/vx',
             baseCommit,
+            // 显式钉住 tag 名（ADR-078 的钉子语义）。
+            //
+            // 本测试断言的是「两个版本的 tag 不撞在同一个提交上」——
+            // 那是**锚点正确性**，与 tag 叫什么名字无关。
+            // tag 的命名规则归 ADR-110 管（`planVersionTagName`），
+            // 让这里跟着派生规则走 = 两处判定，必然走偏（ADR-106 §5）。
+            tag: 'vx',
           },
         ],
       },
@@ -316,6 +323,8 @@ describe('D-71：ship 的 mergeCommit 必须是「本次合并产生的」，空
       status: 'integrated',
       branch: 'version/vy',
       baseCommit: git(['rev-parse', 'HEAD'], repo).trim(),
+      // 同上：显式钉住，让断言与派生规则解耦。
+      tag: 'vy',
     });
     writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf-8');
     writeFileSync(

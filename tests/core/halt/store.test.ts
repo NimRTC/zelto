@@ -138,8 +138,16 @@ describe('HaltStore — 暂停请求有 TTL（ZD-023 补）', () => {
     const req = await store.request('all', 'human', '停');
     assert.ok(req.expiresAt, '新写的请求应当带 expiresAt');
     const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
-    // 允许 1 秒的写入耗时误差
-    assert.ok(ttl > 29 * 60 * 1000 && ttl <= 30 * 60 * 1000, `TTL 应当是 30 分钟（实际 ${ttl}ms）`);
+    // 允许 1 秒的写入耗时误差。
+    //
+    // **上下界都要给容差**：实现是 `Date.now() + ttl`（expiresAt 的基准点），
+    // 而 `requestedAt` 是**更早**取的 `new Date().toISOString()`。
+    // 两个取时间点差 1ms，ttl 就变成 `30*60*1000 + 1` ——
+    // 上界卡死的话，这条用例会**偶发**红（实测 1800001ms）。
+    assert.ok(
+      ttl > 29 * 60 * 1000 && ttl <= 30 * 60 * 1000 + 1000,
+      `TTL 应当是 30 分钟（实际 ${ttl}ms）`,
+    );
   });
 
   it('显式永不过期时 expiresAt 为 null', async () => {
@@ -150,7 +158,11 @@ describe('HaltStore — 暂停请求有 TTL（ZD-023 补）', () => {
   it('显式指定 TTL 时按指定的算', async () => {
     const req = await store.request('all', 'human', '短停', 5 * 60 * 1000);
     const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
-    assert.ok(ttl > 4 * 60 * 1000 && ttl <= 5 * 60 * 1000, `TTL 应当是 5 分钟（实际 ${ttl}ms）`);
+    // 同上：上界也要给 1 秒容差（两个取时间点可能差 1ms）。
+    assert.ok(
+      ttl > 4 * 60 * 1000 && ttl <= 5 * 60 * 1000 + 1000,
+      `TTL 应当是 5 分钟（实际 ${ttl}ms）`,
+    );
   });
 
   it('isExpired：没过期 → false，过期 → true', async () => {
