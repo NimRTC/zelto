@@ -2449,6 +2449,135 @@ ADR-097 治「第一轮」。
 
 ---
 
+## ZD-044：「15 片全完成」说的是磁盘，不是分支 —— 驾驶舱里没有「分支证据」，计划也没和盘上并排过
+
+### 场景
+
+2026-11-25，用 zelto 给 nimrtc-v14 规划 v1.4.x 收尾（13 个待做项）。打开驾驶舱看 v3 目录：15 片全 `completed`。同一时刻在命令行核对：
+
+```
+git ls-tree --name-only version/v3 .zelto/slices/
+.zelto/slices/v0-cmake.json
+.zelto/slices/v0-src-log.json
+.zelto/slices/v1-cmake.json        ← 只有 3 片基线
+```
+
+另外 12 片的「完成」只在 `.zelto/version-worktrees/v3/.zelto/slices/` 里 —— `.zelto/` 在 `.gitignore` 中，**换台机器、换一个 worktree 就查不到**。而版本计划里那 16 项全是 `draft`，与盘上也没并排显示过。
+
+### 根因
+
+驾驶舱（ADR-112 之后已能看见版本目录）只把盘上的 `state` 当事实：
+「完成」没有区分「盘上完成」与「**在版本分支里完成**」；
+版本计划（`.zelto/versions`）和盘上状态是两个数据源，界面从没把它们放进同一张表。
+
+### 后果
+
+- 人看到「15 片全完成」，以为是这一版的全部 —— 基于错误事实做决定；
+- 12 片的完成证据不在分支上，事后审计（换机器重跑驾驶舱）看不到；
+- 「计划过期」与「分支缺失」是两种完全不同的处置，界面不区分，人无从下手。
+
+### 修复
+
+- **ADR-114**：切片行带 `onBranch`（true / false / null 三态）+ `committedState`；判据按**这一行所在的根**问 git（`ls-files --error-unmatch` + `diff --quiet HEAD`），纯 git 事实；
+- `/api/plan-coverage`：计划 / 盘上 / 分支**分开数**（`planned / onDisk / completed / onBranch`），逐片给出计划状态与盘上状态；前端总览加「版本计划」表（「N 片仅在盘上」徽标），切片列表加「计划」「分支证据」两列，详情页加分支证据一行；
+- **ADR-115**：`zelto plan version` 从钉死的切片清单确定性建整版，顺手修 `plan patch` 只写真源、不更新被跟踪副本的问题（ADR-110 双写缺口）。
+
+### 回归测试
+
+`tests/web-branch-evidence.test.ts`（三态 + 按根问 git + 计划对照计数）、`tests/plan-version-deterministic.test.ts`（六类校验 + 双写 + 事件）、`tests/web-multi-root-cockpit.test.ts`（回归）。
+
+### 现场验证
+
+nimrtc-v14 驾驶舱（2026-11-25）：扫到 `root(15) / v1(0) / v2(0) / v3(8) / v4(0)` 五个根；计划对照显示 v1–v6 六版，v3 的「盘上完成 / 分支上完成」分开计数，已完成的片全部标「仅在盘上」。
+
+### 剩余问题
+
+1. **「仅在盘上」的完成片怎么进分支**：现状是要人显式提交状态文件（`.zelto/` 在 gitignore 里，需要 `git add -f` 或改 ignore 策略）。这是一个策略决定，不在本缺陷的修复范围；
+2. **切片级合入明细**：现在只给计数，版本分支上「已合入哪几片」仍需 `git ls-tree` 自查。
+
+---
+
+## ZD-039：同一条守卫，merge 放行、ship 拦下 —— 口径分叉把人引去做错事
+
+### 场景
+
+nimrtc-v14 v3 收尾，`zelto version ship v3` 被拦下：
+
+```
+⚠️  主仓工作区有未提交改动，已跳过 ship：
+     M src/third_party/msquic
+     M src/third_party/wolfssl
+     ...（共 9 个 vendor submodule）
+     先提交或暂存这些改动，再重新跑 zelto version ship。
+```
+
+但这 9 个 `M` 是 **submodule 指针与 index 记录不一致**，不是人改的代码。同一份 `git status`，`zelto merge` 早就豁免了（ZD-021），报「ℹ️ 与本次合并无关」后照常合并。
+
+### 根因
+
+`zelto merge` 与 `zelto version ship` 是**同一道守卫的两个入口**，但 ship 的那份没有接 `isSubmoduleOnlyDirty` / `isSubmodulePointerMismatch` 两个判据。
+
+### 后果
+
+人按提示 `git checkout` 那 9 个 vendor 目录 → 指针被 reset 成 index 的旧值 → **版本分支里原本能构建的 vendor 布局被改坏**。误报不是「多拦一次」，而是「照做反而更坏」。
+
+### 修复
+
+`shipBranch` 的守卫接上与 merge 相同的两条豁免，且**只降级为提示、不放过真脏**：指针错位 / 仅内部脏标记 → 打一行 ℹ️ 继续 ship；普通文件真被改 → 仍然拦。
+
+### 回归测试
+
+`tests/zd039-ship-submodule-pointer-guard.test.ts`：①仅指针错位 → ship 成功；②仅内部脏 → 不拦；③普通文件被改 → 仍拦；④两者并存 → 拦且清单只列普通文件。
+
+### 剩余问题
+
+无。
+
+---
+
+## ZD-040：多版本链里 `baseCommit` 不是分叉点 —— 每次 ship 都误报「主干历史被改写」
+
+### 场景
+
+同一次 v3 ship，放下 ZD-039 之后又撞上：
+
+```
+⚠️  版本分支与主干**已分叉**（主干历史被改写过，不是单纯的主干前进）。
+     版本基点：dd396cd5
+     共同祖先：ff9d64b0
+```
+
+提示建议 `git rebase --onto feat/v14-turn-tls ff9d64b0 version/v3`。
+
+### 根因
+
+版本链是 v1 → v2 → v3。`version.start` 给 v3 记的 `baseCommit` 是**依赖版本 v2 的 tip**，而 v2 永远不会进主干。原判据「`baseCommit` 是否是主干 HEAD 的祖先」于是恒为假 → 每次都报分叉。
+
+真实的分叉证据是 `git merge-base HEAD version/v3`，它给出的共同祖先与 `baseCommit` 是两个不同的提交。
+
+### 后果
+
+人按提示 rebase 一条本来就干净的历史 → 106 个提交逐个重放、vendor 子模块指针大面积错位。**误报比不报更坏**：不报只是撞一次冲突，误报会让人亲手把历史改坏。
+
+### 修复
+
+判据改为两条同时成立才算「主干已前进」：
+
+1. `baseCommit` 仍是**版本分支**的祖先（版本分支没被 rebase / 改写）；
+2. 共同祖先（`merge-base HEAD versionBranch`）等于 `baseCommit`，或是它的祖先（历史线性，主干只是在分叉点之后前进）。
+
+反例仍判分叉：共同祖先为空（主干被 squash 成新根）、共同祖先与 `baseCommit` 无可比关系（版本分支被改写）、`baseCommit` 不在版本分支历史里。
+
+### 回归测试
+
+`tests/zd040-ship-multiversion-base-not-forkpoint.test.ts`：①多版本链不报分叉；②版本分支被 rebase → 仍报；③D-70 真场景（主干 squash 成新根）+ 版本链 → 仍报。
+
+### 剩余问题
+
+「分叉」提示里给出的 `rebase --onto` 建议，在判分叉成立时是否总是最优解，仍需要更多现场数据。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。

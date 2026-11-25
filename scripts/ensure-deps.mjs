@@ -165,7 +165,10 @@ function findBrokenPackages() {
  * 为什么不用 `shell: true`：
  *   Node 会发 `DEP0190` 警告（参数不做转义，有注入风险）——
  *   而且这个仓库的依赖名/参数都是固定的，没必要为省事引入 shell 层。
- *   实测这个警告会被 CI 日志当成「可疑输出」看，能不给就不给。
+ *   这条告警听起来像「可疑输出」，能不给就不给。
+ *   （注：正常路径 —— corepack 的 pnpm.js —— 不会走到 `shell` 兜底，
+ *   2026-11-25 带 `--trace-deprecation` 跑完整构建实测未出现 DEP0190；
+ *   只有「依赖损坏 + 找不到 corepack」的罕见组合才可能触发。）
  *
  * 为什么不用直接 spawn `pnpm.cmd`：
  *   Windows 上 `spawnSync` 对 `.cmd` 不带 `shell` 会 `EINVAL`。
