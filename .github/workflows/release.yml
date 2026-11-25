@@ -3,10 +3,18 @@ name: Release
 # 发布到 npm —— 唯一对外分发通道（D4 决策 A，见 docs/zelto-项目目标.md §7）。
 #
 # 触发方式：打 tag 触发。两类 tag 都会触发流水线：
-#   · 纯 semver tag `v<version>`（如 v0.5.0）
-#   · 计划版本 tag `plan-<semver>/v<n>`（如 plan-0.7.1/v1，见 docs/tag-namespace.md）
-# tag 的命名合法性与版本号一致性由 scripts/tag-namespace.mjs 唯一判定，
+#   · 纯 semver tag `v<version>`（如 v0.5.0）—— 发布锚点
+#   · 计划版本 tag `plan-<planId>/v<n>`（如 plan-1795507341754/v3）—— 版本锚点
+#     （命名空间按**计划**寻址，见 docs/tag-namespace.md 与 ADR-110）
+#
+# tag 的**命名合法性**由 scripts/tag-namespace.mjs 唯一判定，
 # workflow 只调用它，不手写第二套判定（ADR-106 §5）。
+#
+# **版本号一致性不在这里判**（ADR-110 决策二）——
+# 那是 scripts/version-check.mjs 的职责，它管的是
+# 「package.json 的版本不低于已发布的版本」，
+# 而 tag 与 package.json 的对齐由发布流水线在**打 tag 那一刻**保证
+# （tag 就是从当前 package.json 版本打的）。
 #
 # 需要配置两个 secret：
 #   NPM_TOKEN   —— npm 的 automation token（发布用，勾选 2FA 时仍可用）
@@ -40,48 +48,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 校验 tag 命名空间与版本一致性
-        # 这里判**两件不同的事**，判据不同源，别混成一件：
+      - name: 校验 tag 命名空间
+        # **只判命名合法性** —— 唯一判据是 scripts/tag-namespace.mjs，
+        # workflow 只**调用**它，不复制它的规则（ADR-106 §5：同一问题两处判定必然走偏）。
         #
-        #   ① 命名合法性（这个 tag 是不是合法的命名空间形态）
-        #      → 唯一判据是 scripts/tag-namespace.mjs，workflow 只**调用**它，
-        #        不复制它的规则（ADR-106 §5：同一问题两处判定必然走偏）。
-        #      → 非交互喂入：把触发本次流水线的 tag 名显式传进去，
-        #        不依赖脚本的 stdin/git 兜底（CI 里 stdin 可能挂起等待输入）。
+        # 非交互喂入：把触发本次流水线的 tag 名显式传进去，
+        # 不依赖脚本的 stdin/git 兜底（CI 里 stdin 可能挂起等待输入）。
         #
-        #   ② 版本号一致性（这个 tag 指的版本是不是仓库当前要发的那个版本）
-        #      → 必须**留在 workflow 里**。
-        #      → 为什么不能省：tag-namespace.mjs 按设计**不管纯 semver tag 的版本一致性**
-        #        （实测 `node scripts/tag-namespace.mjs v0.6.0` 在 package.json 为 0.7.1 时
-        #        退出码 0 —— checkTag 对 SEMVER_TAG 直接 return null）。
-        #        它只在**命名空间 tag** 上校版本。
-        #        若把这条也交给脚本，就等于**静默削掉**「发出去的包和仓库对不上」那条保护：
-        #        打一个 v0.6.0 的 tag 就能把 0.7.1 的包发出去。
-        #        「多一条校验」与「换掉一条校验」不是一回事 —— 这里是前者。
+        # ── 为什么版本号一致性不在这里判（ADR-110 决策二）──
+        #
+        # 旧版这里有一段 shell，抽 tag 里的 semver 再跟 package.json 比。
+        # ADR-110 之后**必须删掉**它，理由有两条：
+        #
+        # ① `plan-<planId>/v<n>` 里**没有 semver 可抽** ——
+        #    planId 是时间戳（`plan-1795507341754`），抽出来的数字段
+        #    跟 package.json 的版本号毫无可比性。
+        #
+        # ② 更要紧的：那条判据会把**版本锚点**也拖进版本比对，
+        #    于是「package.json 升版」就让历史版本锚点全部失效。
+        #    版本锚点是**历史**，不该因当前版本变动而失效。
+        #
+        # 「发布的包必须 == 当前版本」这条保护**没有消失** ——
+        # 它搬到 scripts/version-check.mjs 了（管「package.json 不低于已发布版本」），
+        # 而 tag 与 package.json 的对齐由流水线在**打 tag 那一刻**保证。
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
             echo "待校验 tag：${TAG}"
             echo "${TAG}" | node scripts/tag-namespace.mjs
-
-            # 版本号一致性：tag 指的版本必须 == package.json 的 version。
-            # 两种 tag 形态都要校 —— 命名空间 tag 取 `plan-<semver>/v<n>` 里的 <semver>，
-            # 纯 semver tag 取 `v<semver>` 里的 <semver>。
-            PKG=$(node -p "require('./package.json').version")
-            case "${TAG}" in
-              plan-*/v*) TAG_SEMVER="${TAG#plan-}"; TAG_SEMVER="${TAG_SEMVER%%/*}" ;;
-              v*)         TAG_SEMVER="${TAG#v}" ;;
-              *)          TAG_SEMVER="" ;;
-            esac
-            if [ -z "${TAG_SEMVER}" ]; then
-              echo "::error::tag ${TAG} 里认不出版本号，无法与 package.json 对齐"
-              exit 1
-            fi
-            if [ "${TAG_SEMVER}" != "${PKG}" ]; then
-              echo "::error::tag ${TAG} 的版本号 ${TAG_SEMVER} 与 package.json 的 version ${PKG} 不一致"
-              exit 1
-            fi
           fi
 
       - uses: pnpm/action-setup@v4

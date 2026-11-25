@@ -1,5 +1,32 @@
 {
-  "v1": "plan-0.7.1/v1",
-  "v2": "plan-0.7.1/v2",
-  "v3": "plan-0.7.1/v3"
+  "v1": {
+    "new": "plan-1794562105642/v1",
+    "commit": "532f9420",
+    "note": "裸 v1 指向 sign-review 计划的 v1（Merge slice v1-sign-review-cli）。0.7.0 计划 v1 的四个合并点实测都不在 532f942 里（is-ancestor 全为假），所以它归 sign-review 计划。ADR-110 决策八：保留指向，不重指向。"
+  },
+  "v2": {
+    "new": "plan-1795422836717/v2",
+    "commit": "de3e22c",
+    "note": "裸 v2 指向 0.7.0 计划的 v2（feat(v2): land v2 write-guard）。"
+  },
+  "v3": {
+    "new": "plan-1795422836717/v3",
+    "commit": "0f50c73",
+    "note": "裸 v3 指向 0.7.0 计划的 v3（Ship version version/v3）。实测含 v3-why-command / v3-help-system / v3-docs 三个切片的全部合并点，是该版本诚实锚点。"
+  },
+  "plan-0.7.1/v1": {
+    "new": "plan-1794562105642/v1",
+    "commit": "532f9420",
+    "note": "旧命名空间形态。指向不变，只改名 —— 它装的是 sign-review 计划的 v1。"
+  },
+  "plan-0.7.1/v2": {
+    "new": "plan-1795507341754/v2",
+    "commit": "b61c1186",
+    "note": "旧命名空间形态。指向不变，只改名 —— 它装的是 0.7.1 计划的 v2（Merge slice v2-adr-trace）。"
+  },
+  "plan-0.7.1/v3": {
+    "new": "plan-1795507341754/v3",
+    "commit": "482e0a4",
+    "note": "旧命名空间形态。指向不变，只改名 —— 它装的是 0.7.1 计划的 v3（含 fae3116 release-gate 与 7d22322 cicd-compat 两个切片）。"
+  }
 }

@@ -20,7 +20,7 @@ import { join } from 'node:path';
 import { register, events, ZELTO_DIR, worktreeManager, loadConfig, validateVersionLabelArg } from './shared.js';
 import { VersionStore } from '../../core/version/store.js';
 import type { VersionPlan } from '../../core/version/types.js';
-import { branchOfVersion, versionBranchName, versionTagName } from '../../core/version/branch.js';
+import { branchOfVersion, versionBranchName, planVersionTagName } from '../../core/version/branch.js';
 import {
   isZeltoManagedSpecPath,
   isZeltoStatePath,
@@ -528,7 +528,7 @@ export async function handleVersionShip(
       f.out(`   版本分支：${versionBranch}`);
       f.out(`   合入目标：${cur.ok ? cur.stdout.trim() : '（未知）'}`);
       // 标签名必须与**实际 ship 用的一致** ——
-      // 即 `version.tag ?? versionTagName(versionLabel)`（见下方 tag 计算处）。
+      // 即 `version.tag ?? planVersionTagName(planId, versionLabel)`（见下方 tag 计算处）。
       //
       // 之前这里只算 `versionTagName(versionLabel)`，**没读计划里的 `version.tag`**：
       // 于是计划里把 tag 设成 `plan-0.7.1/v3` 时，dry-run 显示的是 `v3`，
@@ -537,7 +537,13 @@ export async function handleVersionShip(
       // dry-run 的全部意义就是「动手前知道会发生什么」。
       // 显示错了标签，人就按错的预期做决定 —— 与 D-63 / ADR-076 同一个形状：
       // **声称的与实际的不一致，而声称的那个是错的**。
-      const tagForDisplay = noTag ? '（不打）' : (version.tag ?? versionTagName(versionLabel));
+      //
+      // ADR-110：派生改用 `planVersionTagName(planId, label)` ——
+      // 旧写法 `versionTagName(label)` 会产出**裸 tag**（`v1`），
+      // 那正是命名空间规则认定为非法的形态 —— **工具自己造自己的非法**。
+      const tagForDisplay = noTag
+        ? '（不打）'
+        : (version.tag ?? planVersionTagName(targetPlan.id, versionLabel));
       f.out(`   标签：${tagForDisplay}`);
     }
     return 0;
@@ -586,7 +592,15 @@ export async function handleVersionShip(
   // D-71：没有诚实锚点（anchorCommit 为 null）时**不打 tag** ——
   // 打一个指向别的提交的 tag，比没有 tag 更坏：
   // `git merge-base --is-ancestor <tag> main` 会说假话。
-  const tag = version.tag ?? versionTagName(versionLabel);
+  //
+  // ADR-110：缺省派生改用 `planVersionTagName(planId, versionLabel)` ——
+  // 命名空间按**计划**寻址（`plan-<planId>/v<n>`）。
+  // 旧写法 `versionTagName(versionLabel)` 直接返回 label（`v1`），
+  // 那是**裸 tag** —— 命名空间规则认定非法，且会让发布闸门失败。
+  //
+  // `version.tag` 优先：那是**人显式钉的锚点**（ADR-078 的语义），
+  // 不该被自动派生覆盖。
+  const tag = version.tag ?? planVersionTagName(targetPlan.id, versionLabel);
   let tagged = false;
   if (!noTag && result.anchorCommit) {
     tagged = tagVersion(tag, result.anchorCommit, process.cwd(), (m) => f.out(m));

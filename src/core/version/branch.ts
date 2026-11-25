@@ -128,6 +128,10 @@ export function branchOfVersion(version: Version): string {
  *
  * 不再加 `v` 前缀 —— 版本 label 通常已经是 `v2` 这种形式，
  * 再加就成 `vv2` 了。label 是什么就用什么（`2.0` → tag `2.0`）。
+ *
+ * ⚠️ **不要拿它当 ship 的默认 tag 名** ——
+ * 它只做字符清洗，会把 `v1` 原样返回成 `v1`（**裸 tag**，ADR-110 认定为非法）。
+ * ship 的默认 tag 名用 {@link planVersionTagName}。
  */
 export function versionTagName(label: string): string {
   const sanitized = label
@@ -135,6 +139,48 @@ export function versionTagName(label: string): string {
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return sanitized || 'unnamed';
+}
+
+/**
+ * 版本 tag 名（ADR-110）—— `plan-<planId>/v<label>`。
+ *
+ * 命名空间**按计划寻址**，不按发布批次：
+ *
+ * ```
+ * plan-1795507341754/v3
+ * ^^^^^^^^^^^^^^^^ 计划 id（唯一）
+ *         ^ 版本序号
+ * ```
+ *
+ * **为什么不带 semver**（ADR-110 决策一）：
+ * tag 是**历史**，`package.json` 的 `version` 是**现在** ——
+ * 两者必然在某一刻分叉。若把 semver 写进 tag 并要求它等于当前版本，
+ * 升版当天所有历史 tag 全部变非法，`build.mjs --release` 直接失败
+ * （它无参跑 tag 校验，读的是全量 `git tag`）。
+ * **tag 里不该有「当前」概念。**
+ *
+ * **为什么按计划寻址**（ADR-110 决策一）：
+ * 历史上多个计划各自都有自己的 v1/v2/v3。
+ * 用 `plan-<semver>/v<n>` 时，同一个 `<semver>/v<n>` 装不下它们 ——
+ * 名字被抢占，而**每个版本的锚点只有一个**。
+ * planId 唯一（`plan-${Date.now()}` 生成，实测无一重复），
+ * 于是每个计划的每个版本都有唯一合法名。
+ *
+ * **副作用（好的）**：CI 能从 tag 名直接读出计划 ——
+ * 不再需要「版本计划在 `.zelto/`（被 gitignore）导致 CI 读不到」那套补丁。
+ */
+export function planVersionTagName(planId: string, label: string): string {
+  // planId 形如 `plan-1795507341754` —— **自带 `plan-` 前缀**。
+  // 直接套 `plan-${plan}` 会产出 `plan-plan-1795507341754/...`（双前缀）。
+  const plan = planId.trim().replace(/^plan-/, '');
+  // label 形如 `v1` / `v3` —— **自带 `v` 前缀**。
+  // 直接套 `v${label}` 会产出 `.../vv1`（双前缀）。
+  const version = label
+    .trim()
+    .replace(/^v/i, '')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `plan-${plan}/v${version || 'unnamed'}`;
 }
 
 /** 切片归属解析的结果 */

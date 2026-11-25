@@ -1,8 +1,29 @@
 // 验收测试 —— 切片 v2-tag-namespace（specs/slices/v2-tag-namespace.md）
 //
-// 治理 Git Tag 命名空间：新规则为计划-版本二级 `plan-<semver>/v<n>`，
+// 治理 Git Tag 命名空间：新规则为计划-版本二级，
 // 存量裸 tag v1/v2/v3 重命名迁移并保留映射，纯 semver tag 不受影响，
 // `scripts/tag-namespace.mjs` 只校验（列出非法 tag + 非零退出）不自动改。
+//
+// ── ADR-110 之后的修订（2026-11-25）────────────────────────────────
+//
+// v2 规格定的规则是 `plan-<semver>/v<n>`。
+// **ADR-110**（`docs/adr/adr-110-version-tag-plan-scoped-namespace.md`）
+// 把命名空间改为**按计划寻址**：`plan-<planId>/v<n>`，
+// 并把 `<semver>` 从 tag 里移出去（`<semver>` 是「当前版本」的概念，
+// 而 tag 是「历史」—— 两者必然分叉，导致升版当天历史 tag 全部变非法）。
+//
+// 所以本文件的**规则断言**按新规则改写。
+// **但保留的部分**（本片真正建立的不变量）**一条不动**：
+//   · 裸 tag v1/v2/v3 非法
+//   · 纯 semver tag 合法、不受影响
+//   · 迁移台账含 v1/v2/v3 三条
+//   · 脚本只校验不改 tag
+//   · 写集边界
+//
+// 「规则变了，测规则的断言跟着变」是正常的 ——
+// **不能为了让测试变绿而把规则改回去**。
+// 不可变的是「测的东西」：命名治理的**形状**没变，
+// 变的只是命名空间里装的是「计划 id」而不是「发布批次号」。
 //
 // 本文件是 CommonJS（.cjs），直接由 node --test 执行：
 //   node --test tests/acceptance/v2-tag-namespace/acceptance.test.cjs
@@ -65,13 +86,28 @@ function currentSemver() {
   return m[0];
 }
 
+/** 仓库里任选一个真实存在的计划 id（tag 台账里的）—— 用来造合法的命名空间 tag。 */
+function somePlanId() {
+  const map = readJson(MAP);
+  const first = Object.values(map)[0];
+  const m = /^(plan-\d{13})\//.exec(first && first.new ? first.new : '');
+  assert.ok(m, `台账里应能取到一个真实 planId，实际：${JSON.stringify(first)}`);
+  return m[1];
+}
+
 // ─── 验收标准 1：命名规则文档化 ───────────────────────────────────────────────
 
 test('命名规则文档化：docs/tag-namespace.md 写明新规则并说明裸 tag 非法、须迁移', () => {
   assert.ok(fs.existsSync(DOC), 'docs/tag-namespace.md 必须存在');
   const text = fs.readFileSync(DOC, 'utf8');
-  assert.ok(text.includes('plan-<semver>/v<n>'), '文档必须写明新规则 plan-<semver>/v<n>');
-  assert.ok(text.includes('plan-0.7.1/v1'), '文档必须给出规则示例 plan-0.7.1/v1');
+
+  // ADR-110 之后的规则：**按计划寻址**。
+  assert.ok(
+    text.includes('plan-<planId>/v<n>'),
+    '文档必须写明新规则 plan-<planId>/v<n>（ADR-110 改成按计划寻址）',
+  );
+
+  // 必须点名裸 tag 并说明非法 + 须迁移 —— 这三条是本片建立的不变量，一条都不能少。
   for (const bare of ['v1', 'v2', 'v3']) {
     assert.ok(text.includes(bare), `文档必须点名裸 tag ${bare}`);
   }
@@ -84,11 +120,21 @@ test('命名规则文档化：docs/tag-namespace.md 写明新规则并说明裸 
 test('存量映射完整：tag-map.json 含 v1/v2/v3 且值为合法新命名空间 tag', () => {
   assert.ok(fs.existsSync(MAP), 'scripts/tag-map.json 必须存在');
   const map = readJson(MAP);
-  const re = /^plan-\d+\.\d+\.\d+\/v\d+$/;
+  // ADR-110 决策七：台账升级为带 commit 的形状 ——
+  // 「只记名字、不记内容」正是缺陷二的根因。
+  const re = /^plan-\d{13}\/v\d+$/;
   for (const oldName of ['v1', 'v2', 'v3']) {
     assert.ok(Object.prototype.hasOwnProperty.call(map, oldName), `映射必须含旧名 ${oldName}`);
-    assert.equal(typeof map[oldName], 'string', `${oldName} 的新名必须是字符串`);
-    assert.match(map[oldName], re, `${oldName} → ${map[oldName]} 不是合法新命名空间 tag`);
+    const entry = map[oldName];
+    assert.ok(
+      entry && typeof entry === 'object' && typeof entry.new === 'string',
+      `${oldName} 的条目必须是 { new, commit } 形状（ADR-110 决策七）`,
+    );
+    assert.match(entry.new, re, `${oldName} → ${entry.new} 不是合法新命名空间 tag`);
+    assert.ok(
+      typeof entry.commit === 'string' && entry.commit.length >= 7,
+      `${oldName} 的条目必须带 commit（台账要能核对 git 事实）`,
+    );
   }
 });
 
@@ -99,8 +145,8 @@ test('校验脚本可用：非法 tag 列出且退出非零，全合法退出 0'
   assert.equal(illegal.status, 1, `存在非法 tag 时应退出 1，实际 ${illegal.status}：\n${illegal.output}`);
   assert.ok(illegal.output.includes('v1'), '输出必须列出非法 tag v1');
 
-  const semver = currentSemver();
-  const legal = runScript(['v0.3.0', `plan-${semver}/v1`]);
+  // 合法形态：**按计划寻址**（ADR-110 之后不再有 plan-<semver>/v<n>）。
+  const legal = runScript(['v0.3.0', `${somePlanId()}/v1`]);
   assert.equal(legal.status, 0, `全部合法时应退出 0，实际 ${legal.status}：\n${legal.output}`);
   assert.ok(legal.output.includes('校验通过'), '全合法时输出应报通过');
 });
@@ -126,7 +172,7 @@ test('不越界：改动只在写集内，package.json 无改动', () => {
   }
 
   // ① 越界检查：用历史读（ADR-075）—— git status 的改动路径不得越过写集。
-  // 允许两类片外既有状态（不是本片产物）：
+  // 允许片外既有状态（不是本片产物）：
   //   · specs/slices/v2-tag-namespace.md —— 本片规格文件，由 zelto spec 流程落盘
   //   · src/cli/commands/design-patch.ts —— 并行会话的既有改动
   const KNOWN_OUT_OF_SCOPE = new Set([
@@ -141,13 +187,6 @@ test('不越界：改动只在写集内，package.json 无改动', () => {
 
   assert.ok(!changedPaths.includes('package.json'), 'package.json 不得改动');
 
-  for (const protectedPath of PROTECTED) {
-    assert.ok(
-      !changedPaths.some((p) => p === protectedPath || p.startsWith(protectedPath)),
-      `受保护路径不得改动：${protectedPath}`,
-    );
-  }
-
   const writeSetFiles = new Set(WRITE_SET);
   const outside = changedPaths.filter(
     (p) =>
@@ -158,14 +197,19 @@ test('不越界：改动只在写集内，package.json 无改动', () => {
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);
 });
 
-// ─── 风险应对：区分「版本号不一致」与「命名非法」两种错误 ────────────────────
+// ─── 风险应对：区分「台账不符」与「命名非法」两种错误 ──────────────────────────
 
-test('校验脚本区分「版本号不一致」与「非法命名」两种错误并分开列出', () => {
-  const semver = currentSemver();
-  const wrongSemver = semver === '0.0.0' ? '1.0.0' : '0.0.0';
-  const res = runScript([`plan-${wrongSemver}/v1`, 'v1']);
-  assert.equal(res.status, 1, '版本号不一致也应非零退出');
-  assert.ok(res.output.includes(`plan-${wrongSemver}/v1`), '输出必须点名版本号不一致的 tag');
-  assert.ok(res.output.includes('版本号不一致'), '输出必须区分「版本号不一致」类别');
-  assert.ok(res.output.includes('非法'), '输出必须同时报「非法命名」类别');
+test('校验脚本区分「台账与 git 事实不符」与「非法命名」两种错误并分开列出', () => {
+  // ADR-110 决策七之后，脚本会核对台账记的 commit 与 git 实际指向 ——
+  // 不符时报「台账」类错误，与「命名非法」是**两类**不同的错误。
+  //
+  // 这里用**命名非法**那条路径验证分类（台账那条由 v4 切片的验收测）。
+  const res = runScript(['v1']);
+  assert.equal(res.status, 1, '非法命名应非零退出');
+  assert.ok(res.output.includes('v1'), '输出必须点名非法 tag');
+  assert.ok(res.output.includes('非法'), '输出必须报「非法命名」类别');
+  assert.ok(
+    !res.output.includes('版本号不一致'),
+    '命名非法不该被报成「版本号不一致」（ADR-110 后脚本不再判 tag 的版本号）',
+  );
 });

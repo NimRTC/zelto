@@ -22,7 +22,13 @@ export interface Version {
   branch?: string;
   /** 版本分支的基点 commit（建分支时的位置；可以是主干 HEAD、前置版本 tip，或计划里显式钉死的提交） */
   baseCommit?: string | null;
-  /** 版本 tag 名；缺省派生为 `v<label>`（ADR-056 D6） */
+  /**
+   * 版本 tag 名；缺省派生为 `plan-<planId>/v<label>`（ADR-110）。
+   *
+   * 显式写这个字段 = **人在这个版本上钉一个锚点**（ADR-078 的语义）：
+   * 它优先于派生值，且不会被自动覆盖。
+   * 不写则由 `zelto version ship` 按 `planVersionTagName(planId, version)` 派生。
+   */
   tag?: string;
   /**
    * 这个版本的分支是不是**补建**的（ADR-056 迁移）。

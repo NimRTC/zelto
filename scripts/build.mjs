@@ -57,7 +57,21 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 // 顺序是**规格定死的**（验收标准 2）：任一段失败即中止，后续段不再执行。
 // 每一段都是**既有脚本**，本片只做串联与判定，不重写任何检查逻辑。
 const RELEASE_STAGES = [
-  { key: 'tag-namespace', label: 'Git Tag 命名空间治理', script: 'scripts/tag-namespace.mjs' },
+  {
+    key: 'tag-namespace',
+    label: 'Git Tag 命名空间治理',
+    script: 'scripts/tag-namespace.mjs',
+    // ADR-110 决策五：**必须**带 `--published-only`。
+    //
+    // 为什么：不带的话，tag 校验读的是**全量** `git tag`，
+    // 于是「历史上任何一条非法 tag」都会阻断今天的发版。
+    // 旧规则 `plan-<semver>/v<n>` 绑死 semver ——
+    // 升版当天**所有历史 tag 同时变非法**，发布闸门被永久锁死。
+    // 那就是 ADR-110 缺陷一实测到的「发布闸门自锁」。
+    //
+    // 带了这个参，只校「与当前发布相关的 tag」。
+    args: ['--published-only'],
+  },
   { key: 'version-check', label: '版本一致性检查', script: 'scripts/version-check.mjs' },
   { key: 'adr-trace', label: 'ADR 追溯检查', script: 'scripts/adr-trace-check.mjs' },
   { key: 'acceptance', label: '验收测试编排', script: 'scripts/test.mjs' },
@@ -100,7 +114,7 @@ function runStage(stage, index, total) {
     };
   }
 
-  const result = spawnSync(process.execPath, [scriptPath], {
+  const result = spawnSync(process.execPath, [scriptPath, ...(stage.args ?? [])], {
     cwd: root,
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],

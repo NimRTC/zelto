@@ -54,10 +54,34 @@
 //
 // ── 脚本只读，不修改任何文件（验收标准）──
 import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * 列出仓库里的**发布锚点** tag（纯 semver 形态 `v<major.minor.patch>`）。
+ *
+ * 只取这一种形态 —— 版本锚点（`plan-<planId>/v<n>`）是历史，
+ * 不参与版本一致性判定（ADR-110 决策四）。
+ */
+function listSemverTags() {
+  try {
+    const out = execFileSync('git', ['tag', '--list', 'v*'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+    });
+    return out
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => /^v\d+\.\d+\.\d+$/.test(s));
+  } catch {
+    // 不是 git 仓库 / git 不可用 —— 那就没有发布锚点可校，
+    // 不该因为「列不出 tag」而阻断发布。
+    return [];
+  }
+}
 
 function fail(message) {
   console.error(`[version-check] 失败：${message}`);
@@ -94,16 +118,24 @@ async function loadYamlParser() {
 }
 
 // ── 1. 读 package.json ────────────────────────────────────────────────
-
-const pkgPath = join(ROOT, 'package.json');
+//
+// **从 cwd 读，不是从脚本所在目录读。**
+//
+// 为什么：cwd 才是「正在被校验的那个项目」。
+// 从脚本位置读，等于「永远在校验 zelto 自己」——
+// 换个项目跑这个脚本，它报的永远是 zelto 的版本号，**判据就废了**。
+//
+// （脚本本身装在 zelto 仓里，但它的职责是校验**别的**仓库 ——
+//  npm 发布流水线在别的仓库里也调它。）
+const pkgPath = join(process.cwd(), 'package.json');
 if (!existsSync(pkgPath)) {
-  fail(`找不到 ${pkgPath}。`);
+  fail(`找不到 ${pkgPath}（cwd = ${process.cwd()}）。`);
 }
 const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
 
 // ── 2. 读 pnpm-lock.yaml ──────────────────────────────────────────────
 
-const lockPath = join(ROOT, 'pnpm-lock.yaml');
+const lockPath = join(process.cwd(), 'pnpm-lock.yaml');
 if (!existsSync(lockPath)) {
   fail(`找不到 ${lockPath}（本仓库用 pnpm，真锁文件是它）。`);
 }
@@ -253,7 +285,7 @@ if (problems.length > 0) {
 //   - 它的 resolved 指向 npm registry 或 pnpm 本地 store，
 //     两边都不对；
 //   - 两套锁文件必然漂 —— 而这个脚本的存在意义就是防漂。
-const npmLockPath = join(ROOT, 'package-lock.json');
+const npmLockPath = join(process.cwd(), 'package-lock.json');
 if (existsSync(npmLockPath)) {
   fail(
     `仓库里存在 ${npmLockPath} —— 本仓库用 pnpm，真锁文件是 pnpm-lock.yaml。` +
@@ -266,7 +298,7 @@ if (existsSync(npmLockPath)) {
 // npm-shrinkwrap.json 比 package-lock.json 更强：npm **优先**用它，
 // 存在时 package-lock.json 会被忽略。所以它一旦出现，
 // 装出来的依赖树就完全不受 pnpm-lock.yaml 控制。
-const shrinkwrapPath = join(ROOT, 'npm-shrinkwrap.json');
+const shrinkwrapPath = join(process.cwd(), 'npm-shrinkwrap.json');
 if (existsSync(shrinkwrapPath)) {
   fail(
     `仓库里存在 ${shrinkwrapPath} —— npm 优先用它（会忽略 package-lock.json），` +
@@ -274,9 +306,91 @@ if (existsSync(shrinkwrapPath)) {
   );
 }
 
-// ── 6. 全部一致 ──────────────────────────────────────────────────────
+// ── 6. 发布锚点的版本一致性（ADR-110 决策四）────────────────────────
+//
+// **这条判据从 tag-namespace.mjs 搬到了这里。**
+//
+// 为什么搬：ADR-110 把 tag 分成两个轴 ——
+//
+//   plan-<planId>/v<n>   版本锚点（某个计划的某版做完时的产物汇聚点）
+//   v<semver>            发布锚点（发到 npm 的那一版）
+//
+// 「发的包必须 == 当前要发的版本」只对**发布锚点**有意义。
+// 版本锚点是**历史** —— 它不该因为 `package.json` 升版就失效
+// （旧规则 `plan-<semver>/v<n>` 就是因为绑死了 semver，
+// 导致升版当天所有历史 tag 全部变非法，发布闸门被锁死）。
+//
+// 而「发布锚点版本必须 == package.json」这件事，本脚本本来就在管
+// `package.json` 的一致性 —— **版本号的一致性归它管，才叫同源**
+// （ADR-106 §5：同一问题只能有一处判定）。
+//
+// ── 判据的精确形状 ─────────────────────────────────────────────────
+//
+// **要拦的是一件事**：仓库的 `package.json` 版本 **低于** 已经发出去的版本。
+//
+//   package.json = 0.6.0，但 npm 上已经有 v0.7.1 了
+//   → package.json 落后了。下一次发版会把 0.6.0 当成「新版本」发出去，
+//     而 npm 上 0.7.1 已经在那里 —— **发出去的包比已发布的旧**。
+//
+// **不是**「每个发布锚点都要等于当前版本」—— 那是错的：
+// `v0.3.0` / `v0.4.0` / `v0.5.0` 是**过去**发出去的版本，
+// 它们当然小于当前的 `0.7.1`。若那样判，这个脚本**永远跑不过**。
+//
+// **也不是**「最新的发布锚点必须等于当前版本」—— 那也错：
+// 0.7.1 还没发到 npm（`release-status.json` 的 `published: false`），
+// 所以「最新的发布锚点」是 `v0.6.0`，它与 `0.7.1` 不等是**正常的**。
+// 那样判等于**逼着人先发版才能跑预检** —— 循环依赖。
+//
+// 所以判据是**单向**的：`package.json` 的版本必须 **>=** 最高的发布锚点版本。
+// 版本**更高**（准备发新版）→ 放行（那正是发布的正常状态）。
+// 版本**更低**（仓库落后于已发布）→ 拦下。
+//
+// 为什么这条不空转：它拦的是**真的发生过**的状态漂移
+// （回滚了 package.json 却没回滚发布状态、或者并行分支改了版本号）。
+const currentSemver = /^(\d+\.\d+\.\d+)/.exec(pkg.version || '');
+const currentVersion = currentSemver ? currentSemver[1] : pkg.version;
+const semverTags = listSemverTags();
+
+if (semverTags.length > 0 && currentSemver) {
+  // 逐段按数值比（字符串排序会把 v0.10.0 排在 v0.9.0 前面）。
+  const parse = (t) => t.replace(/^v/, '').split('.').map(Number);
+  const current = parse(currentVersion);
+
+  let highest = null;
+  let highestTag = null;
+  for (const tag of semverTags) {
+    const parts = parse(tag);
+    if (
+      highest === null ||
+      parts[0] > highest[0] ||
+      (parts[0] === highest[0] && parts[1] > highest[1]) ||
+      (parts[0] === highest[0] && parts[1] === highest[1] && parts[2] > highest[2])
+    ) {
+      highest = parts;
+      highestTag = tag;
+    }
+  }
+
+  const pkgIsBehind =
+    current[0] < highest[0] ||
+    (current[0] === highest[0] && current[1] < highest[1]) ||
+    (current[0] === highest[0] && current[1] === highest[1] && current[2] < highest[2]);
+
+  if (pkgIsBehind) {
+    fail(
+      `package.json 的 version ${currentVersion} **低于**已发布的发布锚点 tag "${highestTag}"` +
+        `（${highest.join('.')}）—— 仓库版本落后于已发布的版本。` +
+        `下一次发布会把 ${currentVersion} 当成新版本发出去，而 ${highest.join('.')} 已经在 npm 上。` +
+        `请把 package.json 的 version 提到 ${highest.join('.')} 或更高。`,
+    );
+  }
+}
+
+// ── 7. 全部一致 ──────────────────────────────────────────────────────
 
 console.log(
-  `[version-check] 通过：package.json 与 pnpm-lock.yaml 的 ${pkgDeclared.size} 条依赖声明一致。`,
+  `[version-check] 通过：package.json 与 pnpm-lock.yaml 的 ${pkgDeclared.size} 条依赖声明一致` +
+    `，package.json 版本 ${currentVersion} 不低于已发布的 ${semverTags.length} 个发布锚点 tag` +
+    `（${semverTags.join('、') || '无'}）。`,
 );
 process.exit(0);

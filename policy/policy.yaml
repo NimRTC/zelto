@@ -7,6 +7,34 @@ rules:
     match: { path: "src/**/*.ts", operation: "write" }
     action: allow
     basis: "policy.yaml#allow-src-ts"
+  - id: allow-root-package
+    match: { path: "package.json" }
+    action: allow
+    basis: "plan-1795507341754#v1-version-align"
+  - id: allow-root-lockfile
+    match: { path: "package-lock.json" }
+    action: allow
+    basis: "plan-1795507341754#v1-version-align"
+  - id: allow-scripts-mjs
+    match: { path: "scripts/**/*.mjs" }
+    action: allow
+    basis: "plan-1795507341754#v1"
+  - id: allow-scripts-tagmap
+    match: { path: "scripts/tag-map.json" }
+    action: allow
+    basis: "plan-1795507341754#v2-tag-namespace"
+  # 版本计划的跟踪副本（ADR-110 决策六）。
+  #
+  # 为什么需要这条规则：`versions/<planId>.json` 是**规格**（人批准的产物），
+  # 不是运行时状态 —— 它必须被 git 跟踪，CI 才能读出 plan↔tag 关系。
+  # 没有这条规则时它落在 default deny，agent 写不进去。
+  #
+  # 范围只限 `versions/*.json` —— 副本目录里不该有别的东西。
+  - id: allow-tracked-version-plans
+    match: { path: "versions/*.json" }
+    action: allow
+    basis: "docs/adr/adr-110-version-tag-plan-scoped-namespace.md#决策六"
+
 
   - id: allow-ci-workflow
     match: { path: ".github/**", operation: "write" }
