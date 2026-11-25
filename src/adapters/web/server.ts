@@ -1,19 +1,26 @@
 // Web 驾驶舱 —— HTTP 服务端（ADR-072）
 //
 // 形态：`node:http`，零额外运行时依赖（C2 的精神：只用 Node 内置）。
-// 绑定：**硬编码** `127.0.0.1`，不可配置 —— ADR-072 §7。
+// 绑定：**默认** `127.0.0.1`；放开到 VPN / 内网要**显式** `--host`（ADR-109 决策三）。
 //
 // 只服务三样东西：
 //   1. 内嵌的 SPA（HTML/CSS/JS 三个字符串，不读任意文件）
 //   2. 只读 API
 //   3. **唯一**的写操作：签字（带 token + Origin 双因子校验）
 //
-// 安全要点（ADR-072 §3 / §7）：
+// 安全要点（ADR-072 §3 / ADR-109 决策一 / 决策二）：
 //   - 会话 token：启动时生成，写操作必须在 `X-Zelto-Token` 头里带回
-//   - Origin 校验：写操作的 Origin 必须为空或等于本服务
-//   - 从不发 `Access-Control-Allow-Origin` —— 第三方网页读不到本页内容，
-//     所以拿不到 token（CSRF 失效的根本原因在这里）
+//   - Origin 校验：写操作的 Origin 必须为空，或与 `Host` 头同源
+//     （**同源判据是 Origin ≡ Host，不是 Origin ≡ 我启动时的地址** —— ADR-109 决策一）
+//   - 从不发 `Access-Control-Allow-Origin` —— 第三方网页读不到本页内容
 //   - 路径参数过滤，不把 id 拼进文件路径前先校验
+//
+// ── 绑定面放开之后，token 不再是「只有本机能拿到」的秘密 ───────────────
+//
+// ADR-072 §3 说「第三方网页拿不到 token」—— 那句话的**根因是端口只有本机能访问**，
+// 不是 CORS。绑定面放开到 VPN 网段后，同网的任何设备 `GET /` 就能读到 token。
+// 这是 ADR-109 决策二**已知并接受**的取舍（人选择了信任网络隔离）。
+// 所以 `--host` 非回环时，CLI 层必须打印警示横幅 —— 见 `src/cli/commands/web.ts`。
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -27,7 +34,15 @@ export interface WebServerOptions {
   port: number;
   /** 仓库根（跑 git、定位 .zelto） */
   repoRoot: string;
-  /** 宿主地址 —— 硬编码 127.0.0.1，不对外暴露 */
+  /**
+   * 宿主地址 —— **默认** `127.0.0.1`；放开到 VPN / 内网要**显式**传（ADR-109 决策三）。
+   *
+   * ADR-109 取代了 ADR-072 §7「绑定面不可配置」——
+   * 变的不是「能不能配」，而是「配了要**显式**配，且**配了会告知代价**」。
+   *
+   * 代价是什么：放开后，同网段任何设备都能读到会话 token，
+   * 然后替人签字 / 拉闸 / 开跑。详见 ADR-109 决策二。
+   */
   host?: string;
   /**
    * 崩溃兜底器（可选）。
@@ -43,11 +58,31 @@ export interface WebServerOptions {
   crashGuard?: CockpitCrashGuard;
 }
 
-/** 只允许本机回环地址。ADR-072 §7：绑定面不可配置。 */
+/** 默认只绑本机回环 —— 对外可达必须显式 `--host`（ADR-109 决策三）。 */
 const DEFAULT_HOST = '127.0.0.1';
 
 /** 路径参数允许的字符集 —— 挡住 `..` 与路径分隔符。 */
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * 判断一个绑定地址是不是**本机回环**。
+ *
+ * 为什么要判：绑回环 = 只有本机能连 = token 仍是「只有本机能拿到」的秘密
+ * = ADR-072 §3 的 CSRF 前提成立。绑非回环 = 前提被打破（ADR-109 决策二），
+ * 必须告知代价。
+ *
+ * **只认这几个**：IPv4 回环 `127.0.0.0/8` 整个段、IPv6 回环 `::1`、
+ * 以及字面量 `localhost`。
+ *
+ * **为什么 `0.0.0.0` 不算回环**：它不是回环地址，是「**所有**网卡」的通配 ——
+ * 绑它等于把服务开到所有网卡上，正是最需要警示的那种。
+ */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase();
+  if (h === 'localhost' || h === '::1' || h === '[::1]') return true;
+  // IPv4 回环整段 127.0.0.0/8 —— 不只 127.0.0.1
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
 
 export class WebServer {
   private readonly port: number;
@@ -285,15 +320,48 @@ export class WebServer {
   }
 
   /**
-   * Origin 校验：写操作的 `Origin` 必须为空或等于本服务。
+   * Origin 校验：写操作的 `Origin` 必须为空，或与 `Host` 头**同源**。
    *
-   * 空 = 非浏览器发起的（同源导航、`curl`、脚本）—— 那些不是 CSRF 面。
-   * 非空 = 浏览器发起的，必须同源。
+   * ── 为什么不再比 `this.url`（ADR-109 决策一）───────────────────────
+   *
+   * 原来的判据是 `origin === this.url`（即 `http://127.0.0.1:4321`）。
+   * 那只在「浏览器访问的就是启动时那个地址」时成立 ——
+   * 一旦从别的地址访问（换网卡、换 hostname、经 VPN），**同源请求会被误拒**。
+   * 手机走 VPN 访问台式机时，Origin 是 `http://192.168.x.x:4321`，
+   * 与 `this.url` 永远不等 → 所有 POST 被 403 → 「重启切片」全灭。
+   *
+   * **同源的正确判据**是 `Origin` 的 host:port 等于 `Host` 头的 host:port。
+   * 这是浏览器同源策略自己的定义（scheme + host + port），不是本工具的发明。
+   *
+   * ── 为什么这没有削弱 CSRF 防线 ──────────────────────────────────────
+   *
+   * 跨站请求的 Origin 是**攻击者自己的域**（`https://evil.example.com`），
+   * 而 Host 头是**浏览器要访问的目标**（`192.168.1.50:4321`）。
+   * 两者永远不可能相等 —— 除非攻击者能让受害者的浏览器把请求发到一个
+   * **恰好同源**的地址，那它就不是攻击者了。
+   *
+   * > 浏览器**不允许**脚本伪造 `Origin` 头（跨站时一定会带真实 Origin），
+   * > 所以这条判据是可靠的。
+   *
+   * ── 但 `Host` 头本身**可以**被客户端伪造 ─────────────────────────────
+   *
+   * 所以这条是**同源判据**，不是**授权判据**。
+   * **授权仍然由 token 承担**（ADR-072 §3 的 token 那一半）。
+   * 两者是「与」的关系，不是「或」。
+   *
+   * ── 空 Origin 放行 ──────────────────────────────────────────────────
+   *
+   * 空 = 非浏览器发起的（`curl`、脚本、同源导航）—— 那些不是 CSRF 面。
+   * 行为与 ADR-072 一致，不变。
    */
   private checkOrigin(req: IncomingMessage): boolean {
     const origin = req.headers.origin;
     if (!origin) return true;
-    return origin === this.url;
+
+    const hostHeader = req.headers.host;
+    if (typeof hostHeader !== 'string') return false;
+
+    return isSameOrigin(origin, hostHeader);
   }
 
   /**
@@ -388,4 +456,141 @@ export function validId(id: string | null): string | null {
   // `.` 与 `..` 单独拦一道 —— 它们符合上面的字符集但仍是穿越原料
   if (id === '.' || id === '..') return null;
   return id;
+}
+
+/**
+ * 同源判定：`Origin` 与 `Host` 头是否指向同一个源（ADR-109 决策一）。
+ *
+ * 导出是为了**能直接单测** —— HTTP 层盖不住所有形态
+ * （Node 的 `fetch` 不允许覆盖 `Host` 头，所以「Host 头不带端口」这类形态
+ * 在端到端测试里根本构造不出来）。
+ *
+ * ── 判据 ──────────────────────────────────────────────────────────────
+ *
+ * 同源 = scheme + host + **port** 三者全同（浏览器同源策略自己的定义）。
+ * 本函数比的是 **host:port** 两项 —— scheme 不参与，理由见下。
+ *
+ * ── 为什么不比 scheme ────────────────────────────────────────────────
+ *
+ * Origin 的 scheme 一定是 `http:` 或 `https:`（规范如此）。
+ * Host 头里**没有** scheme。
+ * 所以要比 scheme 就得把「本服务是 http 还是 https」这个**服务侧事实**
+ * 掺进来 —— 而那会让判据依赖「我是怎么启动的」，
+ * 正是 ADR-109 决策一要摆脱的那个东西。
+ *
+ * 放弃比对 scheme 的**实际风险**：一个 https 页面能向 http 服务发跨站请求，
+ * 它的 Origin 是 `https://evil.com`，Host 头是 `192.168.1.50:4321` ——
+ * 两者不等 → **被拒**。scheme 不同本身不会造成误判，
+ * 因为**跨站请求的 Origin 永远不等于目标地址的 Host**。
+ *
+ * ── 三种情形一律 fail closed ─────────────────────────────────────────
+ *
+ * - Origin 解析不出来 → false
+ * - Host 头缺失/为空 → false
+ * - Host 头格式非法 → false
+ *
+ * 「不确定就拒」—— 不能把「说不清」当成「没有 Origin」（那会放行）。
+ */
+export function isSameOrigin(origin: string, hostHeader: string): boolean {
+  const originHost = hostPortOfOrigin(origin);
+  if (originHost === null) return false;
+
+  if (typeof hostHeader !== 'string' || hostHeader.trim() === '') return false;
+  const hostNormalized = normalizeHostPort(hostHeader);
+  if (hostNormalized === null) return false;
+
+  return originHost === hostNormalized;
+}
+
+/**
+ * 取 `Origin` 头的 host:port（ADR-109 决策一）。
+ *
+ * 返回 null = **解析不出来** —— 调用方必须 fail closed（拒绝），
+ * 不许「解析失败就当没有 Origin」。
+ *
+ * ── 为什么带上端口 ────────────────────────────────────────────────────
+ *
+ * 同源要 scheme + host + **port** 三者全同。
+ * `http://a.com:4321` 与 `http://a.com:9999` 是**不同源** ——
+ * 只比 host 会把「同一台机器的不同端口」误判成同源，
+ * 而那正是「另一个服务」的常见形态。
+ *
+ * ── 默认端口的处理 ────────────────────────────────────────────────────
+ *
+ * `http://a.com` 的隐含端口是 80，`https://a.com` 是 443。
+ * `Origin` 头**总是**带显式端口（浏览器不会省略），
+ * 但 `Host` 头可能不带（默认端口时浏览器会省）。
+ * 所以两边的规范化都要处理「省掉默认端口」的形态。
+ */
+function hostPortOfOrigin(origin: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return null;
+  }
+  // 只认 http / https —— Origin 的规范只可能是这两种。
+  // 其它 scheme（`file:` / `null` / 自定义协议）一律当解析不出来。
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  // `new URL('http://a.com')` 的 host 是 `a.com`，port 是 ''（省略了默认端口）
+  //
+  // IPv6 的 `hostname` **带方括号**（`[::1]`）——
+  // 与 Host 头侧的规范化形态对齐，两边才能比得上。
+  const host = parsed.hostname.toLowerCase();
+  if (!host) return null;
+  const port = parsed.port !== '' ? parsed.port : defaultPortOf(parsed.protocol);
+  return `${host}:${port}`;
+}
+
+/**
+ * 规范化 `Host` 头 → host:port。
+ *
+ * 返回 null = 解析不出来（调用方 fail closed）。
+ *
+ * `Host` 头的形态：
+ * - `192.168.1.50:4321` —— 带端口（绝大多数情况）
+ * - `192.168.1.50` —— 不带端口（默认端口 80）
+ * - `[::1]:4321` —— IPv6，必须带方括号
+ * - `::1` —— IPv6 不带端口（**裸 IPv6 的 Host 头必须加方括号**，
+ *   所以裸 `::1` 在 Host 头里是合法的，但解析要多想一步）
+ */
+function normalizeHostPort(hostHeader: string): string | null {
+  const raw = hostHeader.trim().toLowerCase();
+  if (!raw) return null;
+
+  // IPv6 带方括号：`[::1]:4321` 或 `[::1]`
+  if (raw.startsWith('[')) {
+    const close = raw.indexOf(']');
+    if (close === -1) return null;
+    const host = raw.slice(0, close + 1); // 保留方括号
+    const rest = raw.slice(close + 1);
+    if (rest === '') return `${host}:80`;
+    if (!rest.startsWith(':')) return null;
+    const port = rest.slice(1);
+    if (!/^\d{1,5}$/.test(port)) return null;
+    return `${host}:${port}`;
+  }
+
+  // 裸 IPv6（含多个冒号）—— Host 头里裸写 IPv6 是允许的
+  //
+  // **必须补方括号**：URL 解析出的 `hostname` 对 IPv6 是**带方括号**的
+  // （`new URL('http://[::1]:4321').hostname === '[::1]'`）。
+  // 两边形态不一致就会让「本该同源的 IPv6 请求」被误拒。
+  if ((raw.match(/:/g) ?? []).length > 1) {
+    return `[${raw}]:80`;
+  }
+
+  // IPv4 或 hostname，可能带端口
+  const colon = raw.lastIndexOf(':');
+  if (colon === -1) return `${raw}:80`;
+  const host = raw.slice(0, colon);
+  const port = raw.slice(colon + 1);
+  if (!host) return null;
+  if (!/^\d{1,5}$/.test(port)) return null;
+  return `${host}:${port}`;
+}
+
+/** scheme → 默认端口。 */
+function defaultPortOf(protocol: string): string {
+  return protocol === 'https:' ? '443' : '80';
 }

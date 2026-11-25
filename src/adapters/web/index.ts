@@ -6,7 +6,14 @@
 //
 // 零第三方运行时依赖：只用 `node:http` + `node:crypto`（C2）。
 
-export { WebServer, sendJson, validId, type WebServerOptions } from './server.js';
+export {
+  WebServer,
+  sendJson,
+  validId,
+  isLoopbackHost,
+  isSameOrigin,
+  type WebServerOptions,
+} from './server.js';
 export { WebApi, type SliceSummary, type SliceDetail } from './api.js';
 export { createWebRouter, type WebContext, type WebRouter } from './router.js';
 export { renderIndexHtml } from './frontend.js';

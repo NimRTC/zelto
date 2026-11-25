@@ -213,3 +213,133 @@ pre {
   margin: 1px 3px 1px 0;
   font-size: 11px;
 }
+
+/* ── 窄屏适配（ADR-109 决策四）────────────────────────────────────────
+ *
+ * 触发条件：`max-width: 720px` —— 覆盖绝大多数手机的竖屏宽度
+ * （iPhone SE 375px、iPhone 15 393px、Pixel 412px）。
+ * 平板横屏一般 ≥ 768px，走桌面版排版 —— 那一档的横向空间是够的。
+ *
+ * ── 为什么核心手法是「表格转卡片」──────────────────────────────────
+ *
+ * 驾驶舱有 13 处表格，列数从 2 到 9 不等。手机上 `width: 100%` 的表格
+ * 会被压到每列几像素 —— 横向滚到底都看不清关键列。
+ *
+ * 转卡片的做法：
+ *   table/thead/tbody/tr → `display: block`（脱离表格布局）
+ *   thead                → `display: none`（表头整行藏起来）
+ *   tr                   → 卡片（边框 + 圆角 + 间距）
+ *   td                   → 块级，`::before` 显示列名（来自 data-label）
+ *
+ * 列名从哪来：`table()` 助手给每个 `td` 挂了 `data-label`。
+ * 所以**内容只有一份** —— 不存在「桌面版与手机版内容不一致」的可能。
+ *
+ * ── 为什么断点之外零变化 ───────────────────────────────────────────
+ *
+ * 下面所有规则都在 `@media` 里。桌面端一像素都不动 ——
+ * 不动的原因是：桌面端是主要使用场景（agent 跑在台式机上），
+ * 不该为手机端牺牲任何桌面体验。
+ */
+@media (max-width: 720px) {
+  /* ── 页面骨架：收紧留白 ────────────────────────────────────────── */
+  body { font-size: 13px; }
+  header { padding: 10px 12px; }
+  h1 { font-size: 15px; }
+  main { padding: 12px; }
+  #banner { padding: 0 12px; }
+  #conn { margin: 0 12px 8px; }
+
+  /* ── 顶栏元信息：竖排，别挤成一行 ─────────────────────────────── */
+  .head-meta {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+  }
+  /* 进度行在窄屏不能截断成省略号 —— 那正是人最想看的那一行 */
+  .progress-line {
+    max-width: 100%;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
+  /* ── 导航：允许换行，不横向溢出 ─────────────────────────────────
+   * 9 个按钮 + 拉闸按钮一行放不下 —— 挤成横向滚动条的话，
+   * 人不知道右边还有按钮，就以为没有「停机」「策略」这些视图。
+   */
+  nav { flex-wrap: wrap; gap: 5px; }
+  nav button {
+    /* 内边距按「触摸目标 ≥ 44px」倒推：
+     * 内容高 22.8px（13px 字 × 1.6 行高 + 2px 边框）
+     * + 上下各 11px 内边距 = 44.8px ✓ */
+    padding: 11px 12px;
+    /* 拉闸按钮的 margin-left:auto 会在换行后产生诡异的空隙 */
+    margin-left: 0;
+  }
+  /* 拉闸是「刹车」，单独占一行更醒目，也避免它被挤到换行中间 */
+  nav button.danger { margin-top: 2px; }
+
+  /* ── 按钮：触摸目标 ≥ 44px（iOS HIG 的下限）──────────────────────
+   * 13px 的等宽字在手机上偏小，按钮内边距要加。
+   *
+   * 内边距按实测倒推（不是拍脑袋）：
+   *   内容高 22.8px + 上下各 11px = 44.8px ✓
+   */
+  .btn { padding: 11px 16px; }
+  .throttle-row { gap: 8px; }
+  .throttle-row .btn { flex: 1 1 auto; min-width: 40%; }
+
+  /* ── 卡片（概况区）──────────────────────────────────────────────── */
+  .cards { gap: 8px; }
+  .card {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+    padding: 9px 12px;
+  }
+  .card .n { font-size: 19px; }
+
+  /* ── 表格 → 卡片（核心手法）────────────────────────────────────── */
+  table { display: block; width: 100%; }
+  thead { display: none; }
+  tbody { display: block; }
+  tr {
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 6px 10px;
+    margin-bottom: 8px;
+  }
+  /* 卡片里单元格竖排 —— 横排的话窄屏上还是挤 */
+  td {
+    display: block;
+    border-bottom: 1px dashed var(--border);
+    padding: 5px 0;
+    /* 单元格是块级了，`vertical-align: top` 已无意义，但留着无害 */
+  }
+  /* 最后一行不画分隔线 —— 否则卡片底部多一道多余的线 */
+  tr td:last-child { border-bottom: none; }
+  /* 列名：`td::before` 显示 data-label（由 table() 助手挂上去） */
+  td::before {
+    content: attr(data-label) "：";
+    color: var(--muted);
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  /* 没有 data-label 的单元格（手写 td）不该显示空的「：」 */
+  td:not([data-label])::before { content: ""; }
+
+  /* ── 详情页的键值对：标签在上、值在下 ─────────────────────────── */
+  .kv { grid-template-columns: 1fr; gap: 0; }
+  .kv dt { margin-top: 8px; font-size: 11px; }
+  .kv dd { margin-bottom: 2px; word-break: break-word; }
+
+  /* ── 确认项（签字四项）竖排 ─────────────────────────────────────── */
+  .check { flex-wrap: wrap; }
+  .check .label { min-width: 0; }
+  .check .adr { margin-left: 0; width: 100%; }
+
+  /* ── 长内容可换行，别撑破卡片 ───────────────────────────────────── */
+  pre { font-size: 11px; }
+  .tag { font-size: 10px; }
+}

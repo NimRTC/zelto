@@ -3,6 +3,31 @@
 ## [Unreleased]
 
 ### Added
+- **驾驶舱现在能开到 VPN / 内网，手机端也能用了**（ADR-109）。
+  需求是「周末在外面想看进度、想重启切片开发」。核实后发现
+  **要的能力驾驶舱已经有了**，缺的是「手机连得上」与「窄屏能用」两件事 ——
+  所以不是「做手机端」，是补两处缺口。
+  - **Origin 校验改判 `Host` 头**（决策一）。原来判 `origin === this.url`
+    （即等于启动时的地址），手机浏览器的 Origin 是
+    `http://192.168.x.x:4321` → **所有 POST 被 403**，
+    而「重启切片」恰恰全是 POST。现在改判 `Origin` 的 host:port 是否等于
+    `Host` 头的 host:port —— 这是浏览器同源策略自己的定义，
+    零配置、零维护，且「换个地址访问」时自动正确。
+    **CSRF 防线一点没弱**：跨站请求的 Origin 永远是攻击者自己的域，
+    不等于目标的 Host → 照拒；Origin 解析不出来 → fail closed 拒绝。
+    token 仍是唯一授权凭据，两者是「与」不是「或」。
+  - **`--host` 显式放开绑定面**（决策三）。默认**仍是 `127.0.0.1`**，
+    既有行为一字不变；对外可达必须显式 `--host 0.0.0.0`。
+    绑非回环时启动会打印警示横幅 —— 因为放开后**同网段任何设备
+    `GET /` 就能读到会话 token**，然后替人签字 / 拉闸 / 开跑。
+    这是人明确选择的取舍（信任网络隔离），代价在此记录在案。
+    非法 `--host` 值**明确报错退出**，不静默回退到回环。
+  - **窄屏适配**（决策四）：`@media (max-width: 720px)` 下表格转卡片
+    （列名靠 `table()` 助手挂的 `data-label` 显示），
+    导航按钮换行不再横向溢出，按钮触摸目标 ≥44px。
+    **纯 CSS 断点、内容只有一份**，桌面端排版一像素不变。
+  - 新增 `tests/web-adr109-vpn-mobile.test.ts`（22 个用例）——
+    同源判据的纯函数单测 + CSRF 防线不退 + 绑定面三条 + 窄屏四条。
 - **Events are now a hash chain — tampering is verifiable from the outside**
   (ADR-100). The event stream was append-only (C4), but "append-only" only
   meant *zelto* wouldn't rewrite it; an external reader had no way to tell

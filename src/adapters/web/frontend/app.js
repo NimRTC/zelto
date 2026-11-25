@@ -136,6 +136,24 @@ function setValue(parent, value) {
   }
 }
 
+/**
+ * 造一张表格。
+ *
+ * ── 窄屏适配（ADR-109 决策四）──────────────────────────────────────
+ *
+ * 每个 `td` 挂一个 `data-label`（值 = 对应列名）——
+ * 窄屏下表格整体转成**卡片**（CSS `display: block`），
+ * 列名靠 `td::before { content: attr(data-label) }` 显示出来。
+ *
+ * **为什么用 CSS 断点而不是渲染两套 DOM**：
+ * `table()` 是**唯一**的表格构造入口，驾驶舱 13 处表格全由它生成 ——
+ * 所以一个断点就能覆盖全部。而两套 DOM 会让「桌面版与手机版内容不一致」
+ * 成为可能（改了一处忘了另一处）。CSS 断点是**同一份 DOM 的两种排版**。
+ *
+ * **为什么用 data 属性而不是改可见结构**：
+ * 不改 DOM 结构 = 不改 XSS 防线（前端只用 textContent）、
+ * 不改事件流契约、不改 API 契约。
+ */
 function table(headers, rows) {
   const t = el('table');
   const thead = el('thead');
@@ -150,12 +168,14 @@ function table(headers, rows) {
       tr.className = 'clickable';
       tr.addEventListener('click', r.onClick);
     }
-    for (const cell of r.cells) {
+    r.cells.forEach(function (cell, i) {
       const td = el('td');
+      // 列名挂进 data-label —— 窄屏转卡片时用 ::before 显示
+      if (headers[i] !== undefined) td.setAttribute('data-label', String(headers[i]));
       if (cell instanceof Node) td.appendChild(cell);
       else td.textContent = cell === null || cell === undefined ? '' : String(cell);
       tr.appendChild(td);
-    }
+    });
     tbody.appendChild(tr);
   }
   t.appendChild(tbody);
