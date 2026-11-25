@@ -19,7 +19,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { isAppendOnlyDocPath, writeSetsConflict } from '../src/core/sched/paths.js';
+import { isAppendOnlyDocPath, writeSetsConflict } from '../src/core/pathspec/index.js';
 import { Scheduler } from '../src/core/sched/engine.js';
 import { EventStream } from '../src/core/events/stream.js';
 import { SliceStore, type SliceData } from '../src/core/slice/store.js';

@@ -12,7 +12,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 
 import type { BatchMember } from '../../core/sched/batch.js';
-import { pathsOverlap } from '../../core/sched/paths.js';
+import { pathsOverlap } from '../../core/pathspec/index.js';
 import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
 import { parsePrerequisites, parseScopePaths } from '../../core/spec/scope.js';
 import { BudgetCollector } from '../../core/budget/collector.js';

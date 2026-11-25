@@ -8,7 +8,7 @@
 // C3: 纯计算，不调模型、不触网
 // C2: core/ 内，不依赖 adapters/
 
-import { pathInWriteSet, pathsOverlap } from '../sched/paths.js';
+import { pathInWriteSet, pathsOverlap } from '../pathspec/index.js';
 import type { Decision } from '../policy/types.js';
 import type { ArchitectureReport, Deviation, DeviationKind, ModuleSpec } from './types.js';
 

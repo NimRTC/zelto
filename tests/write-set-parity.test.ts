@@ -1,7 +1,7 @@
 // 写集匹配的两份实现必须逐字等价 —— ADR-014 §4
 //
 // `pathInWriteSet` 在两处各有一份：
-//   - src/core/sched/paths.ts    —— 准入、合并冲突、运行后审计
+//   - src/core/pathspec/index.ts    —— 准入、合并冲突、运行后审计
 //   - src/hook/pretool.ts        —— agent 运行时的 PreToolUse 判定
 //
 // hook 那份刻意不 import core/（hook 要能单独编译分发），所以两份必然并存。
@@ -17,7 +17,7 @@ import { strict as assert } from 'node:assert';
 import {
   pathInWriteSet as admissionPathInWriteSet,
   pathMatches,
-} from '../src/core/sched/paths.js';
+} from '../src/core/pathspec/index.js';
 import { pathInWriteSet as hookPathInWriteSet } from '../src/hook/pretool.js';
 import { matchPath as policyMatchPath } from '../src/core/policy/engine.js';
 

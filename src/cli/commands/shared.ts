@@ -21,7 +21,7 @@ import { SliceStore, checkSliceId } from '../../core/slice/store.js';
 import { hashSpecFile as hashSpecFileCore } from '../../core/lifecycle/freeze.js';
 import { extractRequirementReferences } from '../../core/spec/trace-extract.js';
 import type { SpecIntegrity } from '../../core/sched/audit.js';
-import { pathInWriteSet } from '../../core/sched/paths.js';
+import { pathInWriteSet } from '../../core/pathspec/index.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,

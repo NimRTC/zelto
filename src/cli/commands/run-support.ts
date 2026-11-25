@@ -18,7 +18,7 @@ import type { GateConfig } from '../../core/gate/types.js';
 import { detectSliceType } from '../../core/gate/types.js';
 import type { GateCommandSummary, GateScopeSummary } from '../../core/sched/types.js';
 import { resolveScope } from '../../core/gate/scope.js';
-import { pathMatches } from '../../core/sched/paths.js';
+import { pathMatches } from '../../core/pathspec/index.js';
 import { classifyStall, isAutoResolvable, type StallClass } from '../../core/stall/classifier.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';

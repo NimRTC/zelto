@@ -8,7 +8,7 @@ import {
   pathMatches,
   pathsOverlap,
   writeSetsOverlap,
-} from '../../../src/core/sched/paths.js';
+} from '../../src/core/pathspec/index.js';
 
 describe('pathMatches', () => {
   it('matches a single-level glob', () => {

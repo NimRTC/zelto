@@ -27,13 +27,10 @@ import {
   type ScopeConfig,
   type ScopeMatch,
 } from './scope.js';
-import { matchPath } from '../policy/engine.js';
 
-/** gate 内用的路径匹配 —— 与 sched/paths 同规则（policy engine 是唯一实现），
- * 本地适配一层免得 gate 反向依赖 sched（架构环的根因）。 */
-function pathMatches(filePath: string, pattern: string): boolean {
-  return matchPath(pattern, filePath);
-}
+// 路径匹配走 core/pathspec 的单一实现（与 sched 准入层、arch 层同源），
+// 不再经 sched —— gate 不依赖调度器。
+import { pathMatches } from '../pathspec/index.js';
 import {
   DEFAULT_ACCEPTANCE_BUILD_DIR,
   DEFAULT_ACCEPTANCE_COMMAND,

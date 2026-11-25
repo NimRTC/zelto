@@ -36,7 +36,7 @@
 // 这一层**只报告、不拦**（G-4/B）：偏离是给人看的证据，不是判定。
 // 要变成硬护栏是 G-4/A，要改 policy 契约，届时单独写 ADR。
 
-import { pathMatches } from '../sched/paths.js';
+import { pathMatches } from '../pathspec/index.js';
 import { normalizeModuleSpecs } from './normalize.js';
 import { resolveDependencyNames } from './resolve.js';
 import type {

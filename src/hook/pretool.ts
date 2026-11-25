@@ -576,7 +576,7 @@ export function judgeWriteTargets(
 /**
  * 某个路径是否落在写集内。
  *
- * 与 core/sched/paths.ts 的 pathInWriteSet 同规则；这里独立一份是因为
+ * 与 `core/pathspec/index.ts` 的 pathInWriteSet 同规则；这里独立一份是因为
  * hook 必须能被单独编译分发（不依赖 core 的其余部分）。
  */
 export function pathInWriteSet(filePath: string, writes: string[]): boolean {

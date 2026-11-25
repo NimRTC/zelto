@@ -16,7 +16,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
-import { pathMatches } from '../sched/paths.js';
+import { pathMatches } from '../pathspec/index.js';
 import {
   classifyLangCategory,
   detectLang,

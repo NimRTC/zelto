@@ -32,7 +32,7 @@ import {
   sanitizeForFilename,
   type ScopeRule,
 } from '../src/core/gate/scope.js';
-import { pathMatches } from '../src/core/sched/paths.js';
+import { pathMatches } from '../src/core/pathspec/index.js';
 import { GateExecutor } from '../src/core/gate/executor.js';
 import { runGate } from '../src/core/lifecycle/gate.js';
 import { SliceStore } from '../src/core/slice/store.js';

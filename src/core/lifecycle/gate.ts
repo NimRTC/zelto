@@ -32,7 +32,7 @@ import {
   sanitizeForFilename,
 } from '../gate/diagnostics.js';
 import { resolveScope } from '../gate/scope.js';
-import { pathMatches } from '../sched/paths.js';
+import { pathMatches } from '../pathspec/index.js';
 import { detectSliceType } from '../gate/types.js';
 import { checkSliceGateGuard, describeGuardKinds } from '../arch/guard-wiring.js';
 import type { LifecycleContext, LifecycleOutcome } from './types.js';

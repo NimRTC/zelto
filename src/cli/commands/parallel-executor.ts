@@ -16,7 +16,7 @@ import { join } from 'node:path';
 
 import { Scheduler } from '../../core/sched/engine.js';
 import { listFilesUnder } from '../../core/sched/audit.js';
-import { pathInWriteSet } from '../../core/sched/paths.js';
+import { pathInWriteSet } from '../../core/pathspec/index.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import type { SliceData } from '../../core/slice/store.js';
