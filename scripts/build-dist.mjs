@@ -49,6 +49,8 @@ import { execFileSync } from 'node:child_process';
 import { cpSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { ensureDependenciesHealthy } from './ensure-deps.mjs';
+
 /**
  * 构建 `dist/`。
  *
@@ -57,6 +59,22 @@ import { join } from 'node:path';
  * 否则会**死锁**（同一把锁，进程内等自己）。
  */
 export function buildDist(root) {
+  // 0. 依赖自检与自愈
+  //
+  // 为什么放在**编译之前**：
+  //   依赖坏了的时候，`tsc` 报的是 `Cannot find module '@anthropic-ai/...'`
+  //   —— 那句话**完全不提「依赖坏了」**，人第一反应是「代码写错了」。
+  //   而代码没问题，是环境坏了（并发 `pnpm install` 留下的半成品）。
+  //
+  //   详见 `scripts/ensure-deps.mjs` 的文件头。
+  //
+  // 这里**不自己拿锁**的原因同下：锁由调用方拿。
+  const deps = ensureDependenciesHealthy();
+  if (!deps.ok) {
+    // 抛出去，不要 process.exit() —— 见下面 catch 块的说明。
+    throw new Error(`依赖检查未通过：${deps.reason}`);
+  }
+
   // 1. 清旧产物（D-1：产物目录必须是当前源码的精确映射）
   rmSync(join(root, 'dist'), { recursive: true, force: true });
 
