@@ -337,6 +337,8 @@ for (const message of mapErrors) console.error(`[tag-map] ${message}`);
 for (const err of illegal) console.error(`[非法命名] ${err.detail}`);
 for (const err of mismatched) console.error(`[版本号不一致] ${err.detail}`);
 console.error(
-  `[zelto] tag-namespace 校验失败：${mapErrors.length} 处映射台账错误，${illegal.length} 个非法命名，${mismatched.length} 个版本号不一致。`,
+  // 摘要行不再带「版本号不一致」字样 —— ADR-110 后本脚本不再判 tag 的版本号，
+  // 不在摘要里出现这个词（mismatched 恒为 0，保留数组只为兼容既有分类）。
+  `[zelto] tag-namespace 校验失败：${mapErrors.length} 处映射台账错误，${illegal.length} 个非法命名。`,
 );
 process.exit(1);
