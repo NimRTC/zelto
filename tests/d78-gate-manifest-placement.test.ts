@@ -41,11 +41,14 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { join, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 
 import { resolveCtestManifestPlacement } from '../src/core/gate/diagnostics.js';
 
-const ROOT = '/work/tree';
+// 门禁工作目录。用 `resolve` 拿到**当前平台**的绝对路径 ——
+// 断言里要 `join(ROOT, 'build')`，两边必须同一个基准，
+// 否则 Windows 上会变成 `\work\tree\build` vs `/work/tree/build` 的差异。
+const ROOT = resolve('/work/tree');
 
 /** 把带引号的引用去掉引号 —— 引号只是为了让 cmd 不劈开路径里的空格。 */
 function unquote(ref: string): string {
@@ -78,9 +81,13 @@ describe('D-78 · 收窄清单落点跟着 --test-dir 走', () => {
   });
 
   it('--test-dir 是绝对路径时，清单落在那个绝对目录里', () => {
-    const run = 'ctest --test-dir /opt/build --output-on-failure';
+    // 同上：绝对路径必须用**当前平台的**绝对路径形态。
+    // POSIX 的 `/opt/build` 在 Windows 上不是绝对路径（没有盘符），
+    // `isAbsolute` 判 false，落点就会落到 projectRoot 底下。
+    const absDir = resolve('/opt/build');
+    const run = `ctest --test-dir ${absDir} --output-on-failure`;
     const placement = resolveCtestManifestPlacement(run, ROOT, 'm.txt');
-    assert.equal(placement.absolutePath, join('/opt/build', 'm.txt'));
+    assert.equal(placement.absolutePath, join(absDir, 'm.txt'));
   });
 
   it('没有 --test-dir 时，清单留在工作目录根（ctest 以 cwd 为工作目录）', () => {
@@ -101,9 +108,20 @@ describe('D-78 · 收窄清单落点跟着 --test-dir 走', () => {
   });
 
   it('引号形态的 --test-dir 也要认', () => {
-    const run = 'ctest --test-dir "D:/my build" --output-on-failure';
+    // **用平台自己的绝对路径**（`resolve('/opt/my build')` 在 POSIX 上是
+    // `/opt/my build`，在 Windows 上是 `D:\opt\my build`）。
+    //
+    // 硬编码 `D:/my build` 会让这条用例**只在 Windows 上成立**：
+    // POSIX 的 `path.isAbsolute('D:/my build')` 是 false ——
+    // `D:` 在 POSIX 上只是一个普通目录名，于是落点会变成
+    // `/work/tree/D:/my build/m.txt`，与断言不符。
+    //
+    // 这条断言真正要验的是「**带引号的 --test-dir 也能被认出来**」，
+    // 与路径长什么样无关 —— 所以路径必须是当前平台上真正的绝对路径。
+    const absDir = resolve('/opt/my build');
+    const run = `ctest --test-dir "${absDir}" --output-on-failure`;
     const placement = resolveCtestManifestPlacement(run, ROOT, 'm.txt');
-    assert.equal(placement.absolutePath, join('D:/my build', 'm.txt'));
+    assert.equal(placement.absolutePath, join(absDir, 'm.txt'));
   });
 
   it('落点与命令行引用必须自洽：引用指的就是清单本体', () => {
