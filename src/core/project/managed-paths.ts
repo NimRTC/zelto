@@ -20,6 +20,18 @@ export const MANAGED_SPEC_PREFIX = 'specs/slices/';
 export const ZELTO_STATE_PREFIX = '.zelto/';
 
 /**
+ * zelto 管理的**被跟踪**状态目录（相对仓库根）。
+ *
+ * ADR-110 决策六：版本计划双写一份到仓库根的 `versions/<id>.json`
+ * —— 因为 `.zelto/` 整体在 .gitignore 里，CI 读不到「哪个计划的哪一版
+ * 对应哪个 tag」，而追溯链要求它可查。
+ *
+ * 这个目录既然是**被跟踪**的，就一定会以「未提交改动」的形式出现 ——
+ * 与 `.zelto/` 同理，不该被「工作区必须干净」的守卫当成「人改了代码」。
+ */
+export const TRACKED_STATE_PREFIX = 'versions/';
+
+/**
  * 这个路径是不是 zelto 的**运行时状态**（`.zelto/` 下的东西）？
  *
  * 为什么要单列（ADR-056 真实项目验证）：
@@ -40,7 +52,10 @@ export const ZELTO_STATE_PREFIX = '.zelto/';
 export function isZeltoStatePath(path: string): boolean {
   const normalized = path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '');
   if (normalized === '.zelto') return true;
-  return normalized.startsWith(ZELTO_STATE_PREFIX);
+  if (normalized === TRACKED_STATE_PREFIX.replace(/\/+$/, '')) return true;
+  return (
+    normalized.startsWith(ZELTO_STATE_PREFIX) || normalized.startsWith(TRACKED_STATE_PREFIX)
+  );
 }
 
 

@@ -1,3 +1,6 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join } from 'node:path';
+
 // 门禁失败的**精准证据提取** —— 从测试输出里抽「哪个用例挂了、断言说了什么」
 // See docs/实战缺陷记录-nimrtc-v14.md（ZD-027）
 //
@@ -780,8 +783,14 @@ export function narrowCtestCommand(run: string, filter: string | null): string |
  * 退出码是 **0**（stderr 打印 `No tests were found!!!`）—— 这是假绿陷阱。
  * 由 `verifyNarrowedTestsRan` 在判定层堵住（见该函数注释）。
  *
- * `manifestFile` 是清单文件的**相对路径**（相对于门禁工作目录）——
- * 用相对路径可以避开 Windows 绝对路径里的空格与引号问题。
+ * `manifestFile` 是清单文件的**引用路径** —— 由 `resolveCtestManifestPlacement`
+ * 给出（相对路径或带引号的绝对路径）。
+ *
+ * 为什么现在可能是**带引号的绝对路径**（2026-11-25 改）：
+ * 真 ctest 相对 `--test-dir` 解析 `--tests-from-file`，而 ctest 替身
+ * （端到端 fixture）相对进程 cwd 解析 —— 只有**绝对路径**在两边都指向
+ * 同一个文件。绝对路径里的空格由引号兜住；清单文件名由 zelto 生成，
+ * 不含空格与引号。
  *
  * 返回 null 表示「这条命令不适合收窄」—— 调用方保留原命令。
  * 纯字符串拼接，不执行任何东西（C3）。
@@ -794,6 +803,103 @@ export function narrowCtestCommandByFile(run: string, manifestFile: string): str
   // 在 `ctest` 后紧接插入。`cmd /c "ctest ..."` 里 `ctest` 后面紧跟的是空格，
   // 插进去的参数仍在引号内 —— 实测可用。
   return insertAfterCtestToken(run, `--tests-from-file ${manifestFile}`);
+}
+
+/**
+ * CTest 命令里的 `--test-dir <dir>`（老写法 `-B <dir>` / `--build-config` 不算）。
+ *
+ * 返回 null 表示命令里没有 `--test-dir`。
+ */
+function parseCtestTestDir(run: string): string | null {
+  const m = /(?:^|\s)--test-dir(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(run);
+  if (!m) return null;
+  return m[1] ?? m[2] ?? m[3] ?? null;
+}
+
+/**
+ * 收窄清单文件该**放在哪**、**用什么路径引用**。
+ *
+ * ── 病灶（2026-11-25，nimrtc v1.4 实测）────────────────────────────────
+ *
+ * `ctest --test-dir build --tests-from-file <清单>` 里，**`<清单>` 是相对
+ * `--test-dir` 解析的，不是相对进程 cwd 解析的**。
+ *
+ * 也就是说：清单写在**工作目录根**（worktree 根）时，ctest 会去
+ * `<worktree>/build/<清单>` 找 —— 找不到就报：
+ *
+ * ```text
+ * Problem reading test list file: .zelto-gate-tests-<id>.txt
+ * while generating list of tests to run.
+ * ```
+ *
+ * 退出码 8。**门禁于是红了，但红的原因与被测代码毫无关系** ——
+ * 是 zelto 自己的收窄机制把测试命令打坏了。
+ *
+ * 实测对照（同一棵 build 树）：
+ * - 清单在 worktree 根 → `Problem reading test list file`（exit 8）
+ * - 清单在 `build/` 里   → 正常读到（exit 0）
+ * - 清单用**绝对路径**     → 正常读到（exit 0）
+ *
+ * ── 修法 ────────────────────────────────────────────────────────────────
+ *
+ * 清单**写进 `--test-dir` 指向的目录**，命令行里仍用**相对路径**引用。
+ *
+ * 为什么不用绝对路径：绝对路径里有空格/引号时，`cmd /c "..."` 会把它
+ * 劈成两个参数（ADR-096 当初选相对路径就是为了避开这个）。
+ * 既然相对路径在 `--test-dir` 下是可行的，就不需要引号 gymnastics。
+ *
+ * 为什么不用「把清单放 cwd、并把 `--test-dir` 改成 `.`」：那会改掉
+ * 人写的命令语义（`--test-dir build` 是人显式指定的），而且
+ * `ctest --test-dir .` 的行为与 `--test-dir build` 不完全等价。
+ *
+ * 没有 `--test-dir` 时：ctest 用 cwd 当工作目录，相对路径直接可用 ——
+ * 清单留在工作目录根，命令行里的相对路径不用改。
+ *
+ * @param run ctest 命令行
+ * @param projectRoot 门禁工作目录（清单的落点根）
+ * @returns 清单的**落点绝对路径**与**命令行里该写的相对路径**
+ */
+export function resolveCtestManifestPlacement(
+  run: string,
+  projectRoot: string,
+  manifestFile: string,
+): { absolutePath: string; relativeRef: string } {
+  const testDir = parseCtestTestDir(run);
+  if (!testDir) {
+    // 没有 --test-dir → ctest 以 cwd 为工作目录 → 相对路径可用。
+    //
+    // 但仍然用**绝对路径**引用：真 ctest 与 ctest 替身（端到端 fixture）
+    // 都以进程 cwd 为基准，这时裸文件名两边都认 ——
+    // 不过统一用绝对路径能省掉「这条命令到底有没有 --test-dir」的分支判断，
+    // 且落点与引用永远自洽。
+    const absolutePath = join(projectRoot, manifestFile);
+    return {
+      absolutePath,
+      relativeRef: `"${absolutePath}"`,
+    };
+  }
+  // 有 --test-dir → 清单相对它解析 → 清单放进那个目录。
+  const dir = isAbsolute(testDir) ? testDir : join(projectRoot, testDir);
+  const absolutePath = join(dir, manifestFile);
+  return {
+    absolutePath,
+    // **引用路径必须与落点自洽**。
+    //
+    // ctest 是相对 `--test-dir` 解析 `--tests-from-file` 的 —— 所以清单放进
+    // `build/` 后，命令行里仍写**裸文件名**（ctest 会去 `build/` 里找）。
+    //
+    // 但这个「ctest 相对 --test-dir 解析」只在**真 ctest** 里成立；
+    // 端到端 fixture 的 ctest 替身是**按 cwd 解析**清单的
+    // （它就是 `node worker.cjs %*`，读相对路径走的是进程 cwd）。
+    // 于是「写进 build/ + 命令行写裸名」在替身上读不到，
+    // 而「写进 build/ + 命令行写 build/xxx.txt」在真 ctest 上反而找不到
+    // （真 ctest 会去 `build/build/xxx.txt`）。
+    //
+    // **解法：用带引号的绝对路径**。绝对路径在两边都指向同一个文件 ——
+    // 真 ctest 与替身都认。引号兜住 Windows 路径里的空格；
+    // 清单文件名由 zelto 生成（固定前缀 + 切片 id，无空格无引号）。
+    relativeRef: `"${absolutePath}"`,
+  };
 }
 
 /**
@@ -856,6 +962,40 @@ function insertAfterCtestToken(run: string, args: string): string | null {
   const insertAt = ctestInsertPoint(run);
   if (insertAt === null) return null;
   return `${run.slice(0, insertAt)} ${args}${run.slice(insertAt)}`;
+}
+
+/**
+ * 把清单文件写到**它该在的地方**，必要时先建出那个目录。
+ *
+ * 落点由 `resolveCtestManifestPlacement` 决定（跟着 `--test-dir` 走）。
+ *
+ * ── 为什么必须建目录（ZD-027 端到端用例暴露）────────────────────────────
+ *
+ * 落点目录（`build/`）通常是 CMake 生成的，但**收窄**可能发生在任何时候 ——
+ * 包括「测试命令因为别的原因先失败、还没轮到 CMake 建出 build 目录」。
+ *
+ * 目录不存在时 `writeFile` 抛 ENOENT。原来的代码把异常吞掉、「退回全量重试」，
+ * 看起来是**保守降级**，实际上是：
+ * - 收窄**永远不生效**（每次重试都全量跑 —— 正是 ADR-096 要治的病，
+ *   那边记着 810s 的浪费）；
+ * - 而且**没人知道**收窄为什么失效了。
+ *
+ * 建目录的成本远低于「收窄静默失效」的成本。
+ *
+ * 返回 false 表示「写不出去」—— 调用方退回全量。
+ */
+export async function writeCtestManifestFile(
+  absolutePath: string,
+  content: string,
+): Promise<boolean> {
+  try {
+    // 递归建父目录 —— 已存在时是 no-op。
+    await mkdir(dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, content, 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

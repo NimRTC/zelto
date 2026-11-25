@@ -11,6 +11,13 @@
 | ADR-102 | agent 占位符剥离 | v0.7.0 | c6e8aea3dbebe543de6f8d64ecc49b0e4f11165f | [git show --stat 抽查 + 人工复核] | 已回填 |
 | ADR-103 | submodule 离线同步 | v0.7.0 | e90949c3db9a9024024cb27bf56620bf05990286 | [git show --stat 抽查 + 人工复核] | 已回填 |
 | ADR-104 | sign-review 作用域证据 | v0.7.0 | cf467264e444c7e007a3af4f3d844d5f1075ca58 | [git show --stat 抽查 + 人工复核] | 已回填 |
+| ADR-110 | 版本 tag 命名空间按计划寻址 | v0.7.1 | 06eefe9a469ce636f0c9bf2683c39cc30f913af2 | [git show --stat 抽查 + 人工复核] | 已回填 |
+
+> **ADR-110 不在脚本的受检范围内** ——
+> `scripts/adr-trace-check.mjs` 的 `ADR_PREFIXES` 只列了 `adr-102` / `adr-103` / `adr-104`，
+> 那是**脚本**的固定清单（改它是脚本的契约面变更）。
+> 这一行是**人手工登记**的：ADR-110 的哈希已在 ADR 文档里回填并人工复核过。
+> 若将来要把 ADR-110 纳入脚本受检，需要同步改 `ADR_PREFIXES` —— 那是一次独立的决定。
 
 ## 校验入口
 

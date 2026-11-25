@@ -14,7 +14,8 @@
 import { join, basename } from 'node:path';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { SliceStore } from '../../core/slice/store.js';
-import { EventStream } from '../../core/events/stream.js';
+import { classifySliceKindAsync, type SliceKind } from '../../core/slice/baseline-kind.js';
+import { EventStream, type EventEnvelope } from '../../core/events/stream.js';
 import { SignManager } from '../../core/gate/sign.js';
 import { AuditTrail } from '../../core/audit/trail.js';
 import { collectSignReviewFacts } from '../../core/sign-review/collect.js';
@@ -59,6 +60,18 @@ export interface SliceSummary {
   type: string | null;
   updatedAt: string;
   createdAt: string;
+  /**
+   * 这片是**基线切片**还是**开发切片**。
+   *
+   * 为什么前端需要知道：基线切片描述**现状**（接管既有项目时登记的），
+   * 开发切片是**待办的活**。两者都可能是 `completed`，
+   * 混在一个计数里就说谎 —— 实测（nimrtc-v14）8 片 completed 里
+   * 有 3 片是基线（`v0-cmake` / `v0-src-log` / `v1-cmake`），
+   * 那轮实际只开发了 5 片。
+   *
+   * 判定在 `core/slice/baseline-kind.ts`（C3：纯判定，读文件不触网）。
+   */
+  kind: SliceKind;
   /**
    * 追溯三元组 —— **条目 + 明细**（ADR-072 §6：「切片总览（… 追溯 …）」）。
    *
@@ -221,7 +234,9 @@ export class WebApi {
       ids.map(async (id) => {
         try {
           const slice = await this.store.read(id);
-          return await toSummary(slice, this.budgetCollector, this.repoRoot);
+          return await toSummary(slice, this.budgetCollector, this.repoRoot, () =>
+            this.events.read(id),
+          );
         } catch {
           // 状态文件坏了 —— 跳过，不让一片坏的挡住整个列表
           //
@@ -245,7 +260,9 @@ export class WebApi {
     const checks = evaluateSignChecks(facts);
     return {
       slice,
-      summary: await toSummary(slice, this.budgetCollector, this.repoRoot),
+      summary: await toSummary(slice, this.budgetCollector, this.repoRoot, () =>
+        this.events.read(id),
+      ),
       facts,
       checks,
       trace: facts.trace,
@@ -636,10 +653,31 @@ export class WebApi {
    */
   async summary(): Promise<unknown> {
     const slices = await this.listSlices();
+
+    // ── 基线切片 vs 开发切片（分开数）──────────────────────────────
+    //
+    // 为什么必须分开：基线切片描述**现状**（接管既有项目时登记的），
+    // 开发切片是**待办的活**。两者都可能是 `completed`。
+    //
+    // 实测（nimrtc-v14，2026-11-25）：8 片 completed 里 3 片是基线
+    // （`v0-cmake` / `v0-src-log` / `v1-cmake`）—— 那轮实际只开发了 5 片。
+    // 混在一起数，人看到「8 个切片都完成了」，而实际在开发的是 5 片。
+    //
+    // `byState` 保留**全量**（含基线）—— 它是「盘上有多少片这个状态」的事实，
+    // 去掉基线会让「磁盘上 8 片 completed」这个事实查不出来。
+    // 分开计数是**加**上去的维度，不是替换。
+    const devSlices = slices.filter((s) => s.kind === 'development');
+    const baselineSlices = slices.filter((s) => s.kind === 'baseline');
+
     const byState: Record<string, number> = {};
     for (const s of slices) {
       byState[s.state] = (byState[s.state] ?? 0) + 1;
     }
+    const devByState: Record<string, number> = {};
+    for (const s of devSlices) {
+      devByState[s.state] = (devByState[s.state] ?? 0) + 1;
+    }
+
     const pending = await this.signs.list('pending');
     const stalled = slices.filter((s) => s.stalled);
 
@@ -652,6 +690,17 @@ export class WebApi {
     return {
       totalSlices: slices.length,
       byState,
+      // ── 开发切片（不含基线）—— 「这轮做了多少」的诚实口径 ──
+      development: {
+        total: devSlices.length,
+        byState: devByState,
+        completed: devByState.completed ?? 0,
+      },
+      // ── 基线切片（描述现状，不改代码）—— 单独报，别混进完成度 ──
+      baseline: {
+        total: baselineSlices.length,
+        ids: baselineSlices.map((s) => s.id),
+      },
       pendingSignCount: pending.length,
       pendingSigns: pending.map((p) => ({
         id: p.id,
@@ -1286,12 +1335,21 @@ async function toSummary(
     writes?: string[];
     stall?: { class: string | null };
     runs?: Array<{ ok: boolean }>;
+    baseline?: boolean;
   },
   budget: BudgetCollector,
   repoRoot: string,
+  loadEvents: () => Promise<EventEnvelope[]>,
 ): Promise<SliceSummary> {
   const runs = slice.runs ?? [];
   const lastRun = runs.length > 0 ? runs[runs.length - 1] : null;
+
+  // 基线还是开发 —— 判定在 core（C3）。事件流只在真需要时才读
+  // （`classifySliceKindAsync` 自己管这个）。
+  const kind = await classifySliceKindAsync(
+    { id: slice.id, state: slice.state, baseline: slice.baseline },
+    loadEvents,
+  );
 
   const requirements = toStringList(slice.trace?.requirements);
   const contracts = toStringList(slice.trace?.contracts);
@@ -1350,6 +1408,7 @@ async function toSummary(
     title: slice.title,
     state: slice.state,
     type: slice.type ?? null,
+    kind,
     updatedAt: slice.updatedAt,
     createdAt: slice.createdAt,
     trace: {

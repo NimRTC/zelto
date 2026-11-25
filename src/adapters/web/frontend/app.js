@@ -262,12 +262,54 @@ async function viewOverview(target) {
     c.appendChild(el('div', 'l', l));
     return c;
   };
-  cards.appendChild(card(s.totalSlices, '切片'));
+
+  // ── 开发切片 / 基线切片（分开数）────────────────────────────────
+  //
+  // 为什么必须分开：基线切片描述**现状**（接管既有项目时登记的），
+  // 不是待办的活。两者都可能是 completed，混在一个计数里就说谎。
+  //
+  // 实测（nimrtc-v14，2026-11-25）：8 片 completed 里 3 片是基线，
+  // 那轮实际只开发了 5 片 —— 混着数的话人看到「8 个切片都完成了」。
+  //
+  // 「开发切片」这一组是**这轮做了多少**的诚实口径。
+  // 状态分布也只列开发切片的 —— 否则 completed 里混着基线，读不出进度。
+  const dev = s.development || { total: 0, byState: {}, completed: 0 };
+  const base = s.baseline || { total: 0, ids: [] };
+
+  cards.appendChild(card(dev.total, '开发切片'));
   cards.appendChild(card(s.pendingSignCount, '待签字'));
   cards.appendChild(card(s.stalledCount, '停机'));
-  const states = Object.keys(s.byState || {});
-  for (const st of states) cards.appendChild(card(s.byState[st], st));
+  const states = Object.keys(dev.byState || {});
+  for (const st of states) cards.appendChild(card(dev.byState[st], st));
+
+  // 基线切片单列一张卡 —— 它是**上下文**，不是进度。
+  // 数字旁带一句说明，让人知道这数字是什么、为什么单列。
+  const baseCard = el('div', 'card');
+  baseCard.appendChild(el('div', 'n', base.total));
+  baseCard.appendChild(el('div', 'l', '基线切片'));
+  baseCard.title = '描述现状、不改代码的切片（接管既有项目时登记）—— 不计入开发进度';
+  cards.appendChild(baseCard);
+
   target.appendChild(cards);
+
+  // ── 基线切片的清单 ──
+  //
+  // 直说「哪些是基线」而不是让人自己猜 —— 判据是内部的，
+  // 人没有义务知道 `baseline` 字段缺失也算基线。
+  if (base.total > 0) {
+    target.appendChild(el('h2', null, '基线切片（' + base.total + '）'));
+    target.appendChild(el('p', 'muted',
+      '这些切片描述的是接管项目时已有的现状，不改代码 —— 所以不计入上面的开发进度。'));
+    target.appendChild(table(
+      ['切片'],
+      (base.ids || []).map(function (id) {
+        return {
+          onClick: function () { showSliceDetail(id); },
+          cells: [id]
+        };
+      })
+    ));
+  }
 
   // ── 正在运行（D-30 补）：不只说「活着」，要说「在干什么」 ──
   //
@@ -384,9 +426,17 @@ async function viewSlices(target) {
   const slices = await apiGet('/api/slices');
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
+
+  // 基线切片单列 —— 它们描述现状、不改代码，混在开发切片里
+  // 会让「完成度」看起来比实际多（实测 nimrtc-v14：8 片 completed 里
+  // 3 片是基线，那轮实际只开发了 5 片）。
+  var devSlices = slices.filter(function (s) { return s.kind !== 'baseline'; });
+  var baseSlices = slices.filter(function (s) { return s.kind === 'baseline'; });
+
+  target.appendChild(el('h2', null, '开发切片（' + devSlices.length + '）'));
   target.appendChild(table(
     ['切片', '标题', '状态', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新'],
-    slices.map(function (s) {
+    devSlices.map(function (s) {
       var wd = '';
       if (s.escalated) wd = ' 🚨已上报';
       else if (s.recoveries > 0) wd = ' 自愈' + s.recoveries + '次';
@@ -406,6 +456,28 @@ async function viewSlices(target) {
       };
     })
   ));
+
+  if (baseSlices.length > 0) {
+    target.appendChild(el('h2', null, '基线切片（' + baseSlices.length + '）'));
+    target.appendChild(el('p', 'muted',
+      '描述接管项目时已有的现状，不改代码 —— 不计入开发进度。'));
+    target.appendChild(table(
+      ['切片', '标题', '状态', '追溯(需/契/测)', '写集', '更新'],
+      baseSlices.map(function (s) {
+        return {
+          onClick: function () { showSliceDetail(s.id); },
+          cells: [
+            s.id,
+            s.title,
+            stateBadge(s.state),
+            traceCounts(s.trace),
+            String(s.writeCount),
+            new Date(s.updatedAt).toLocaleString()
+          ]
+        };
+      })
+    ));
+  }
 }
 
 /**

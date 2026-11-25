@@ -528,18 +528,19 @@ CI 也无法从 tag 名推出计划 —— 缺陷四原样存在。
 | --- | --- |
 | 所属版本号 | v0.7.1 |
 | 关联 ADR 编号 | ADR-110 |
-| 提交哈希 | 0000000000000000000000000000000000000000 |
-| 验证方式 | [本 ADR 为规则提案，实施切片落地后回填真实哈希 + 人工复核] |
+| 提交哈希 | 06eefe9a469ce636f0c9bf2683c39cc30f913af2 |
+| 验证方式 | [git show --stat 抽查 + 人工复核] |
 
-> **提交哈希为什么是全零**：ADR-110 目前**只立规则、代码未改**
-> （`scripts/tag-namespace.mjs` 仍按旧规则判）。
-> 全零 = **「还没有对应提交」**，不是「忘了填」。
-> 实施切片落地后用 `git show --stat <hash>` 抽查并回填真实哈希。
+> **提交哈希**：实施切片 `v4-tag-namespace-adr110` 的落地提交
+> （`feat(v4-tag-namespace-adr110): 版本 tag 命名空间按计划寻址，semver 移出 tag`）。
+> 抽查：`git show --stat 06eefe9` —— 16 个文件，其中
+> `scripts/tag-namespace.mjs` / `scripts/tag-map.json` / `scripts/version-check.mjs`
+> 是规则实现，`src/core/version/branch.ts` 是 `planVersionTagName`，
+> `src/core/version/store.ts` 是双写，`tests/` 两处是本 ADR 的验收。
 >
 > **注意**：`scripts/adr-trace-check.mjs` 当前只检 `adr-102` / `adr-103` / `adr-104`
-> 三份（`ADR_PREFIXES` 是写死的），本 ADR 不在受检范围内。
-> 实施切片若要把 ADR-110 纳入受检范围，需同步改那个前缀列表
-> —— **那是实施切片的事，本 ADR 不预先改**。
+> 三份（`ADR_PREFIXES` 是写死的），本 ADR 不在受检范围内 ——
+> 实施切片只回填哈希，不改那个脚本（改它是契约面变更，需另立决定）。
 
 ---
 

@@ -4,14 +4,16 @@
 
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { GateConfig, GateCommand, GateResult, GateReport, GateScopeFacts, SliceType, AcceptanceOutcome } from './types.js';
 import { detectSliceType, orderGateCommands } from './types.js';
 import {
   extractGateFailures,
   narrowCtestCommandByFile,
+  resolveCtestManifestPlacement,
   verifyNarrowedTestsRan,
+  writeCtestManifestFile,
   GATE_NARROWING_MANIFEST_PREFIX,
   sanitizeForFilename,
 } from './diagnostics.js';
@@ -25,7 +27,13 @@ import {
   type ScopeConfig,
   type ScopeMatch,
 } from './scope.js';
-import { pathMatches } from '../sched/paths.js';
+import { matchPath } from '../policy/engine.js';
+
+/** gate 内用的路径匹配 —— 与 sched/paths 同规则（policy engine 是唯一实现），
+ * 本地适配一层免得 gate 反向依赖 sched（架构环的根因）。 */
+function pathMatches(filePath: string, pattern: string): boolean {
+  return matchPath(pattern, filePath);
+}
 import {
   DEFAULT_ACCEPTANCE_BUILD_DIR,
   DEFAULT_ACCEPTANCE_COMMAND,
@@ -38,6 +46,22 @@ import {
 } from './acceptance.js';
 import type { SliceData, SliceStore } from '../slice/store.js';
 import type { EventStream, EventType } from '../events/stream.js';
+
+/**
+ * 把清单文件写到**它该在的地方**，必要时先建出那个目录。
+ *
+ * 落点由 `resolveCtestManifestPlacement` 决定（跟着 `--test-dir` 走）——
+ * 见该函数的注释：ctest 是相对 `--test-dir` 解析 `--tests-from-file` 的。
+ *
+ * 实现放在 `diagnostics.ts` —— 与 `lifecycle/gate.ts` 共用**同一份**，
+ * 不两处各写一份（ADR-106 §5 的教训：同一个问题两处判定，必然走偏）。
+ */
+async function writeManifestFile(
+  absolutePath: string,
+  content: string,
+): Promise<boolean> {
+  return writeCtestManifestFile(absolutePath, content);
+}
 
 /**
  * 跑一条命令。
@@ -203,7 +227,7 @@ export class GateExecutor {
     const scope = await this.resolveScope(slice);
     const scoped = await this.applyScope(slice, commands, scope);
     const scopedCommands = scoped.commands;
-    const scopeManifestFiles = scoped.manifestFiles;
+    const scopeManifestPaths = scoped.manifestPaths;
 
     // Log profile selection
     await this.appendEvent(sliceId, 'gate.executed', actor, {
@@ -304,8 +328,11 @@ export class GateExecutor {
     } finally {
       // 作用域清单跑完就删 —— **不管走哪条出口**都要删（不留垃圾）。
       // 与 ADR-096 的重试清单同理：清单文件是工作目录里的临时产物。
+      //
+      // 删的是**实际落点**（可能在 `--test-dir` 指向的目录里），
+      // 不是想当然的工作目录根 —— 2026-11-25 nimrtc 实测踩过这个坑。
       await Promise.all(
-        scopeManifestFiles.map((f) => rm(join(this.projectRoot, f), { force: true }).catch(() => {})),
+        scopeManifestPaths.map((p) => rm(p, { force: true }).catch(() => {})),
       );
     }
 
@@ -541,7 +568,8 @@ export class GateExecutor {
     scope: ScopeMatch,
   ): Promise<{
     commands: GateCommand[];
-    manifestFiles: string[];
+    /** 清单的**实际落点**（绝对路径）—— 跑完按这个删。 */
+    manifestPaths: string[];
     testCount: number | null;
     totalTestCount: number | null;
     /** 收窄失败的事实（非空 = 那条命令不跑，门禁判失败）。 */
@@ -551,7 +579,7 @@ export class GateExecutor {
   }> {
     const unchanged = {
       commands,
-      manifestFiles: [] as string[],
+      manifestPaths: [] as string[],
       testCount: null as number | null,
       totalTestCount: null as number | null,
       scopeFailure: null as { command: string; reason: string } | null,
@@ -606,24 +634,31 @@ export class GateExecutor {
 
     // 写清单文件（相对路径 —— 避开 Windows 绝对路径的空格/引号）。
     const manifestFile = scopeManifestFile(slice.id, 0);
-    try {
-      await writeFile(join(this.projectRoot, manifestFile), buildScopeManifestContent(selected.names), 'utf8');
-    } catch {
+    // 落点必须与 ctest 解析相对路径的基准一致 ——
+    // `ctest --test-dir build` 是相对 `build/` 解析 `--tests-from-file` 的
+    // （2026-11-25 nimrtc 实测：清单写在工作目录根 → exit 8「找不到清单」）。
+    const placement = resolveCtestManifestPlacement(ctestCmd.run, this.projectRoot, manifestFile);
+    const written = await writeManifestFile(
+      placement.absolutePath,
+      buildScopeManifestContent(selected.names),
+    );
+    if (!written) {
       // 清单写不出来 → 退回全量。
       return unchanged;
     }
 
     // 改写 ctest 命令：加 `--tests-from-file <清单>`。
-    const rewritten = narrowCtestCommandByFile(ctestCmd.run, manifestFile);
+    // 引用用 `placement.relativeRef` —— 与落点自洽（真 ctest 与替身都认）。
+    const rewritten = narrowCtestCommandByFile(ctestCmd.run, placement.relativeRef);
     if (!rewritten) {
       // 命令里已经带了过滤参数 → 不叠加（尊重人显式写的过滤）。
-      await rm(join(this.projectRoot, manifestFile), { force: true }).catch(() => {});
+      await rm(placement.absolutePath, { force: true }).catch(() => {});
       return unchanged;
     }
 
     return {
       commands: commands.map((c) => (c === ctestCmd ? { ...c, run: rewritten } : c)),
-      manifestFiles: [manifestFile],
+      manifestPaths: [placement.absolutePath],
       testCount: selected.names.length,
       totalTestCount,
       scopeFailure: null,
@@ -741,7 +776,7 @@ export class GateExecutor {
       }
 
       if (narrowing) {
-        await this.removeNarrowingManifest(narrowing.manifestFile);
+        await this.removeNarrowingManifest(narrowing.manifestPath);
       }
     }
 
@@ -772,7 +807,12 @@ export class GateExecutor {
     cmd: GateCommand,
     previous: GateResult,
     slice: SliceData,
-  ): Promise<{ command: string; testNames: string[]; manifestFile: string } | null> {
+  ): Promise<{
+    command: string;
+    testNames: string[];
+    manifestFile: string;
+    manifestPath: string;
+  } | null> {
     // 只对「认得出是 CTest 失败」的失败收窄。
     const extraction = extractGateFailures(`${previous.stdout}\n${previous.stderr}`);
     if (extraction.runner !== 'ctest') return null;
@@ -780,26 +820,33 @@ export class GateExecutor {
     if (testNames.length === 0) return null;
 
     const manifestFile = GATE_NARROWING_MANIFEST_PREFIX + `${sanitizeForFilename(slice.id)}.txt`;
-    const manifestPath = join(this.projectRoot, manifestFile);
+
+    // 清单的**落点**必须与 ctest 解析相对路径的基准一致 ——
+    // `ctest --test-dir build` 是相对 `build/` 解析 `--tests-from-file` 的，
+    // 清单写在工作目录根就找不到（2026-11-25 nimrtc 实测，exit 8）。
+    const placement = resolveCtestManifestPlacement(cmd.run, this.projectRoot, manifestFile);
 
     // 命令本身不适合收窄（不是 ctest / 已经带了过滤参数）→ 不收窄。
-    const rewritten = narrowCtestCommandByFile(cmd.run, manifestFile);
+    //
+    // **引用路径用 `relativeRef`（落点的自洽写法）**，不是裸文件名 ——
+    // 真 ctest 相对 `--test-dir` 解析清单，而 ctest 替身相对 cwd 解析；
+    // 只有指向同一个绝对路径，两边才都对。
+    const rewritten = narrowCtestCommandByFile(cmd.run, placement.relativeRef);
     if (!rewritten) return null;
 
-    try {
-      await writeFile(manifestPath, `${testNames.join('\n')}\n`, 'utf8');
-    } catch {
+    const written = await writeManifestFile(placement.absolutePath, `${testNames.join('\n')}\n`);
+    if (!written) {
       // 清单写不出来 → 不收窄（退回全量）。
       return null;
     }
 
-    return { command: rewritten, testNames, manifestFile };
+    return { command: rewritten, testNames, manifestFile: placement.relativeRef, manifestPath: placement.absolutePath };
   }
 
   /** 删掉收窄清单文件（跑完就删，不留垃圾）。 */
-  private async removeNarrowingManifest(manifestFile: string): Promise<void> {
+  private async removeNarrowingManifest(manifestPath: string): Promise<void> {
     try {
-      await rm(join(this.projectRoot, manifestFile), { force: true });
+      await rm(manifestPath, { force: true });
     } catch {
       // 删不掉不是致命问题 —— 下一轮会覆盖同名文件。
     }

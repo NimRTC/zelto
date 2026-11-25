@@ -73,6 +73,13 @@ function makeProject(dir: string): { baseCommit: string } {
             status: 'integrated',
             branch: 'version/vx',
             baseCommit,
+            // ADR-078 的「钉子」语义：显式钉住 tag 名。
+            //
+            // D-73 关心的是「ship 记下的 tag 不被二次 ship 抹掉」，
+            // 不是「派生出来的 tag 长什么样」——派生规则归 ADR-110 管
+            // （`planVersionTagName` 另有单测）。
+            // 显式钉住才能让本测试的断言与派生规则解耦。
+            tag: 'vx',
           },
         ],
       },

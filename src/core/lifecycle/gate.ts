@@ -21,10 +21,16 @@
 
 import { GateExecutor } from '../gate/executor.js';
 import { SignManager } from '../gate/sign.js';
-import { rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { rm } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import type { GateConfig } from '../gate/types.js';
-import { narrowCommandsToFailedTestsByFile, GATE_NARROWING_MANIFEST_PREFIX, sanitizeForFilename } from '../gate/diagnostics.js';
+import {
+  narrowCommandsToFailedTestsByFile,
+  resolveCtestManifestPlacement,
+  writeCtestManifestFile,
+  GATE_NARROWING_MANIFEST_PREFIX,
+  sanitizeForFilename,
+} from '../gate/diagnostics.js';
 import { resolveScope } from '../gate/scope.js';
 import { pathMatches } from '../sched/paths.js';
 import { detectSliceType } from '../gate/types.js';
@@ -265,8 +271,10 @@ export async function runGate(
 
 /** 删掉收窄清单文件（跑完就删，不留垃圾）。 */
 async function cleanupManifests(files: string[], gateRoot: string): Promise<void> {
+  // `files` 里存的是**绝对路径**（清单落点可能是 `--test-dir` 指向的目录）——
+  // 所以直接删，不再拼 `gateRoot`。
   await Promise.all(
-    files.map((f) => rm(join(gateRoot, f), { force: true }).catch(() => {})),
+    files.map((f) => rm(isAbsolute(f) ? f : join(gateRoot, f), { force: true }).catch(() => {})),
   );
 }
 
@@ -502,14 +510,21 @@ async function narrowToFailedTests(
   for (const [commandName, names] of failedByName) {
     const manifestFile = `${GATE_NARROWING_MANIFEST_PREFIX}${sanitizeForFilename(sliceId)}-${index}.txt`;
     index++;
-    try {
-      await writeFile(join(gateRoot, manifestFile), `${names.join('\n')}\n`, 'utf8');
-    } catch {
+    // 落点必须与 ctest 解析相对路径的基准一致 ——
+    // `ctest --test-dir build` 是相对 `build/` 解析 `--tests-from-file` 的，
+    // 清单写在门禁工作目录根就找不到（2026-11-25 nimrtc 实测，exit 8）。
+    const cmd = commands.find((c) => c.name === commandName);
+    const placement = cmd
+      ? resolveCtestManifestPlacement(cmd.run, gateRoot, manifestFile)
+      : { absolutePath: join(gateRoot, manifestFile), relativeRef: manifestFile };
+    const written = await writeCtestManifestFile(placement.absolutePath, `${names.join('\n')}\n`);
+    if (!written) {
       // 写不出来就不收窄这一条（退回全量）。
       continue;
     }
-    manifestFiles.set(commandName, manifestFile);
-    writtenFiles.push(manifestFile);
+    // 引用用 `placement.relativeRef` —— 与落点自洽（真 ctest 与替身都认）。
+    manifestFiles.set(commandName, placement.relativeRef);
+    writtenFiles.push(placement.absolutePath);
   }
 
   if (manifestFiles.size === 0) return null;
@@ -518,7 +533,8 @@ async function narrowToFailedTests(
   const result = narrowCommandsToFailedTestsByFile(commands, failedByName, manifestFiles);
   if (!result) {
     // 一条都没收窄成功 → 把已写的清单删掉，退回全量。
-    await Promise.all(writtenFiles.map((f) => rm(join(gateRoot, f), { force: true }).catch(() => {})));
+    // `writtenFiles` 里存的是**绝对路径**（落点可能是 `--test-dir` 目录）。
+    await Promise.all(writtenFiles.map((f) => rm(f, { force: true }).catch(() => {})));
     return null;
   }
   return { ...result, manifestFiles: writtenFiles };
