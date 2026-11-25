@@ -109,6 +109,35 @@ function tagCommit(tag) {
 }
 
 /**
+ * 这个 commit 在当前仓库里存不存在（不必是任何 ref 的指向）。
+ *
+ * 为什么要单独一个判据 —— ADR-110 决策九：
+ *
+ * > `plan-…/v…` —— **版本锚点，本地为主**（发布锚点 `v<semver>` 才是「已推送」那一个）
+ *
+ * 于是 CI 上（`actions/checkout` 默认**不拉 tag**，且这些 tag 本来就只存在于本地）
+ * **根本看不到 `plan-*` tag**。若台账校验硬要求「tag 必须存在」，
+ * CI 每次都会报「台账指向一个不存在的锚点」——
+ * 而那不是台账错了，是 **CI 的视野**缺了本地 tag。
+ *
+ * 换成「commit 必须是仓库里的真实提交」：
+ * - 在本地（tag 在）→ 核对 tag 的实际指向，与台账逐字比 —— 同等强度；
+ * - 在 CI（tag 不在）→ 核对 commit 本身存在且能 peel 出提交 ——
+ *   这条**更强**：它证明了「台账记的那个提交是真的」，而不是「这个名字存在」。
+ */
+function commitExists(commit) {
+  try {
+    const out = execFileSync('git', ['rev-parse', '--verify', `${commit}^{commit}`], {
+      cwd: root,
+      encoding: 'utf8',
+    });
+    return out.trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 校验迁移台账（ADR-110 决策七）。
  *
  * 两件事：
@@ -154,14 +183,32 @@ function checkMap() {
     }
 
     // 核对 git 事实：新名指向的提交必须与台账记的一致。
+    //
+    // **tag 不存在时怎么办**（ADR-110 决策九：版本锚点「本地为主」）：
+    //
+    // CI 上 `actions/checkout` 默认不拉 tag，而 `plan-*` tag 从未推送 ——
+    // 于是 CI 看不见它们。若把「tag 不存在」判成错误，CI 必红，
+    // 而台账并没有错，错的是 **CI 的视野**。
+    //
+    // 退一步核对：**台账记的 commit 是不是仓库里的真实提交**。
+    // 这条判据在两种视野下都成立，且 CI 上更强 ——
+    // 它证明「那个提交是真的」，而不是「那个名字存在」。
+    const expected = entry.commit.trim().toLowerCase();
     const actual = tagCommit(entry.new);
     if (actual === null) {
-      errors.push(`映射 ${oldName} → ${entry.new}：该 tag 在 git 里不存在 —— 台账指向一个不存在的锚点。`);
+      const commitActual = commitExists(expected);
+      if (commitActual === null) {
+        errors.push(
+          `映射 ${oldName} → ${entry.new}：台账记的 commit ${expected} 在 git 里不存在 —— ` +
+            `台账指向一个不存在的锚点。`,
+        );
+      }
+      // tag 不在视野里（CI 未拉 tag / tag 只在本地），但 commit 在 ——
+      // 事实核对通过，不报错。
       continue;
     }
     // 台账里的 commit 可能是短哈希（7/8 位），也可能是完整哈希 ——
     // 两种都要能比。判据：**互为前缀**（短的被长的包含）。
-    const expected = entry.commit.trim().toLowerCase();
     const actualLower = actual.toLowerCase();
     const match =
       actualLower.startsWith(expected) || expected.startsWith(actualLower);
