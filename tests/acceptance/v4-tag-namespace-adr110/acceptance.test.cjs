@@ -212,13 +212,37 @@ test('验收标准 6：台账记的 commit 与 git 实际指向必须一致', ()
     );
 
     // **核对 git 事实** —— 台账说的与实际指向必须一致。
+    //
+    // ── tag 不在视野里怎么办（ADR-110 决策九）──
+    //
+    // `plan-*` 是**版本锚点，本地为主**（发布锚点 `v<semver>` 才是已推送的那一个）。
+    // 于是 CI 上 checkout 拉不到这些 tag —— 甚至 `plan-1794562105642/v1`
+    // 指向的提交也不在任何推送的 ref 上。
+    //
+    // 那种视野下**无从核对**：不是「台账错了」，是「这里没有事实可对」。
+    // 所以 tag 查不到时退一步核对**台账记的 commit 本身是不是真实提交** ——
+    // 这条在两种视野下都成立，且 CI 上同样有约束力。
+    //
+    // **跳过 ≠ 放行**：tag 一旦在视野里（本地），下面的核对照常生效。
+    const expected = entry.commit.trim().toLowerCase();
     const res = spawnSync('git', ['rev-parse', '--verify', `${entry.new}^{commit}`], {
       cwd: ROOT,
       encoding: 'utf8',
     });
-    assert.equal(res.status, 0, `台账 ${oldName} → ${entry.new}：该 tag 在 git 里不存在`);
+    if (res.status !== 0) {
+      // tag 不在视野里 → 改核对 commit 本身。
+      const commitRes = spawnSync('git', ['rev-parse', '--verify', `${entry.commit}^{commit}`], {
+        cwd: ROOT,
+        encoding: 'utf8',
+      });
+      assert.equal(
+        commitRes.status,
+        0,
+        `台账 ${oldName} → ${entry.new}：tag 与它记的 commit ${entry.commit} 在 git 里都不存在`,
+      );
+      continue;
+    }
     const actual = res.stdout.trim().toLowerCase();
-    const expected = entry.commit.trim().toLowerCase();
     assert.ok(
       actual.startsWith(expected) || expected.startsWith(actual),
       `台账 ${oldName} → ${entry.new}：记的 commit ${expected.slice(0, 7)} 与 git 实际 ${actual.slice(0, 7)} 不一致`,
