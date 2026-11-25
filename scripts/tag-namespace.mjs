@@ -60,17 +60,6 @@ const SEMVER_TAG = /^v\d+\.\d+\.\d+$/;
  */
 const NAMESPACE_TAG = /^plan-(\d{13})\/v(\d+)$/;
 
-/** package.json 当前版本（`--published-only` 模式与迁移台账用）。 */
-function currentVersion() {
-  try {
-    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-    const m = /^\d+\.\d+\.\d+/.exec(pkg.version || '');
-    return m ? m[0] : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * 迁移台账的形状（ADR-110 决策七）。
  *
@@ -237,9 +226,13 @@ function checkMap() {
 }
 
 /**
- * 校验单个 tag。返回 null（合法）或 { kind, tag, detail }。
+ * 校验单个 tag。返回 null（合法）或 { kind: 'naming', tag, detail }。
+ *
+ * **只有命名这一种判据** —— ADR-110 决策四：
+ * 「发布锚点的版本必须 == 当前版本」归 `version-check.mjs` 管
+ * （两条判据职责不重叠，本脚本不碰版本）。
  */
-function checkTag(tag, publishedOnly, version) {
+function checkTag(tag, publishedOnly) {
   if (SEMVER_TAG.test(tag)) {
     // 发布锚点：**命名**合法。它与 package.json 的版本一致不归本脚本管
     // （那是 version-check.mjs 的事 —— ADR-110 决策四）。
@@ -312,18 +305,15 @@ const argv = process.argv.slice(2);
 const publishedOnly = argv.includes('--published-only');
 const tagArgs = argv.filter((a) => a !== '--published-only');
 
-const version = currentVersion();
 const mapErrors = checkMap();
 const illegal = [];
-const mismatched = [];
 
 for (const tag of collectTags(tagArgs)) {
-  const err = checkTag(tag, publishedOnly, version);
+  const err = checkTag(tag, publishedOnly);
   if (err && err.kind === 'naming') illegal.push(err);
-  if (err && err.kind === 'version') mismatched.push(err);
 }
 
-const failed = mapErrors.length > 0 || illegal.length > 0 || mismatched.length > 0;
+const failed = mapErrors.length > 0 || illegal.length > 0;
 if (!failed) {
   console.log(
     publishedOnly
@@ -335,10 +325,9 @@ if (!failed) {
 
 for (const message of mapErrors) console.error(`[tag-map] ${message}`);
 for (const err of illegal) console.error(`[非法命名] ${err.detail}`);
-for (const err of mismatched) console.error(`[版本号不一致] ${err.detail}`);
 console.error(
-  // 摘要行不再带「版本号不一致」字样 —— ADR-110 后本脚本不再判 tag 的版本号，
-  // 不在摘要里出现这个词（mismatched 恒为 0，保留数组只为兼容既有分类）。
+  // 摘要行不带「版本号不一致」字样 —— ADR-110 后本脚本不再判 tag 的版本号，
+  // 不在摘要里出现这个词（ADR-110 决策四：版本一致性归 version-check.mjs）。
   `[zelto] tag-namespace 校验失败：${mapErrors.length} 处映射台账错误，${illegal.length} 个非法命名。`,
 );
 process.exit(1);
