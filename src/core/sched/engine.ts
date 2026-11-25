@@ -8,7 +8,7 @@ import type { PolicyConfig, PolicyRule } from '../policy/types.js';
 import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateScopeSummary, GateFeedback, HumanFeedback } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
-import { pathMatches, writeSetsOverlap } from './paths.js';
+import { pathMatches, writeSetsConflict, writeSetsOverlap } from './paths.js';
 import { readGateFeedback, renderGateFeedback } from '../gate/feedback.js';
 import { readHumanFeedback, renderHumanFeedback } from '../review/human-feedback.js';
 
@@ -145,9 +145,18 @@ export class Scheduler {
     }
 
     // Check for write-set overlap
+    //
+    // ADR-107：共享**只追加文档**（`CHANGELOG.md` / `docs/api/*.md`）
+    // 不算硬冲突 —— 那是「各写各的一节」，报出来但不拦。
+    // 代码路径重叠照旧拦（C9 的写集预约前提是「同时只有一片在写」）。
+    const softOverlaps: string[] = [];
     for (const [runningId, writes] of runningWrites) {
-      if (this.hasOverlap(slice.writes, writes)) {
+      const { hard, soft } = writeSetsConflict(slice.writes, writes);
+      if (hard.length > 0) {
         blockedBy.push(runningId);
+      }
+      for (const p of soft) {
+        if (!softOverlaps.includes(p)) softOverlaps.push(p);
       }
     }
 
@@ -169,7 +178,11 @@ export class Scheduler {
       };
     }
 
-    await this.appendEvent(sliceId, 'sched.admitted', actor, { sliceId });
+    // 软重叠也留痕（C4）——「两片明知共享一个文档文件」是追溯链上的一笔。
+    await this.appendEvent(sliceId, 'sched.admitted', actor, {
+      sliceId,
+      ...(softOverlaps.length > 0 ? { softOverlaps } : {}),
+    });
 
     return {
       sliceId,

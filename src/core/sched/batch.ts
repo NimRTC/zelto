@@ -11,7 +11,7 @@
 
 import { detectArtifactConflicts } from './artifact.js';
 import { DependencyGraph } from './depgraph.js';
-import { writeSetsOverlap } from './paths.js';
+import { writeSetsConflict, writeSetsOverlap } from './paths.js';
 import { judgeTrace, severityOf } from '../trace/index.js';
 
 /** 问题严重程度 */
@@ -490,7 +490,9 @@ export function planExecutionPhases(
       for (let g = 0; g < groups.length; g++) {
         const conflicting = groups[g].filter((otherId) => {
           const other = byId.get(otherId);
-          return other ? writeSetsOverlap(writes, other.writes) : false;
+          // ADR-107：只有**代码**路径重叠才降级为串行；
+          // 共享「只追加文档」不算 —— 那不撞车（§3.3）。
+          return other ? writeSetsConflict(writes, other.writes).hard.length > 0 : false;
         });
 
         if (conflicting.length === 0) {
@@ -541,12 +543,16 @@ export function evaluateBatchConflicts(
     const phaseSlices = phases[p];
 
     // 写集重叠
+    //
+    // ADR-107：硬重叠（代码路径）= error；软重叠（只追加文档）= info，
+    // 只提示不拦 —— 共享一个 CHANGELOG.md 不该把两片拆成先后两个阶段。
     for (let i = 0; i < phaseSlices.length; i++) {
       for (let j = i + 1; j < phaseSlices.length; j++) {
         const a = byId.get(phaseSlices[i]);
         const b = byId.get(phaseSlices[j]);
         if (!a || !b) continue;
-        if (writeSetsOverlap(a.writes, b.writes)) {
+        const { hard, soft } = writeSetsConflict(a.writes, b.writes);
+        if (hard.length > 0) {
           issues.push({
             sliceId: null,
             severity: 'error',
@@ -554,6 +560,15 @@ export function evaluateBatchConflicts(
             message:
               `Phase ${p}: "${a.id}" 与 "${b.id}" 写集重叠，不能并行开工` +
               `（A: ${a.writes.join(', ')} / B: ${b.writes.join(', ')}）`,
+          });
+        } else if (soft.length > 0) {
+          issues.push({
+            sliceId: null,
+            severity: 'warning',
+            code: 'shared_doc_overlap',
+            message:
+              `Phase ${p}: "${a.id}" 与 "${b.id}" 共享只追加文档 ` +
+              `（${soft.join(', ')}）—— 不拦，但合并时要人工确认这两处都还在`,
           });
         }
       }

@@ -18,6 +18,8 @@ export {
   pathMatches,
   pathsOverlap,
   writeSetsOverlap,
+  writeSetsConflict,
+  isAppendOnlyDocPath,
   pathInWriteSet,
 } from './paths.js';
 export {

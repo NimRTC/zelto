@@ -66,6 +66,76 @@ export function writeSetsOverlap(a: string[], b: string[]): boolean {
   return false;
 }
 
+// ─── ADR-107：共享「只追加文档」不算硬冲突 ─────────────────────────────────
+
+/**
+ * 是否是「可并行的共享文档」路径（ADR-107 §3.1）。
+ *
+ * 判据（三条都要满足）：
+ * 1. **具体的** markdown 文件 —— 不含 glob、不含目录形态；
+ * 2. 落在 `docs/` 下，或根级的 `.md`；
+ * 3. 不是 `specs/` 下的 —— 规格副本归 ADR-046 / ADR-106 管，
+ *    两片改同一份规格是**真冲突**（ADR-107 §3.2）。
+ *
+ * 为什么 glob 形态不算：一片声称「双星号 + .md」或「docs + 双星号」，
+ * 是在声称**整片文档面**，不是「往这一个文件里追加一节」。
+ * 那样的两片并行写就是两个 agent 同时改一片文档 —— 真冲突。
+ *
+ * C3: 纯字符串判定，确定性。
+ */
+export function isAppendOnlyDocPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, '/').trim();
+  if (!normalized) return false;
+
+  // 形态门槛：具体文件，不带 glob、不带目录前缀/尾斜杠。
+  if (normalized.includes('*')) return false;
+  if (normalized.endsWith('/')) return false;
+
+  // 必须是 markdown。
+  if (!normalized.toLowerCase().endsWith('.md')) return false;
+
+  // 规格副本排除（ADR-046 / ADR-106）。
+  if (normalized.startsWith('specs/')) return false;
+
+  // 文档面：docs/ 下的，或根级 md。
+  return normalized.startsWith('docs/') || !normalized.includes('/');
+}
+
+/**
+ * 两个写集之间的冲突，区分硬与软（ADR-107 §3）。
+ *
+ * - **硬冲突**：共享同一条**代码**路径 —— 两片会同时改同一个源文件，
+ *   拦。
+ * - **软冲突**：共享同一条**只追加文档**路径（`isAppendOnlyDocPath`）——
+ *   报出来，但**不拦**。文档是追加式的，两片各写各的一节，
+ *   真撞上了也是 git 合并期可见的冲突，不是代码被静默写坏。
+ *
+ * 与 `writeSetsOverlap` 的关系：`writeSetsOverlap` 保持原语义
+ * （「可能指向同一批文件」，严格），给需要严格口径的调用方用；
+ * 这里给出的是**冲突判定**口径。
+ */
+export function writeSetsConflict(
+  a: string[],
+  b: string[],
+): { hard: string[]; soft: string[] } {
+  const hard: string[] = [];
+  const soft: string[] = [];
+
+  for (const pa of a) {
+    for (const pb of b) {
+      if (!pathsOverlap(pa, pb)) continue;
+      // 两个写集条目**都**是只追加文档时才判软 —— 一边是 glob 就不算。
+      if (isAppendOnlyDocPath(pa) && isAppendOnlyDocPath(pb)) {
+        if (!soft.includes(pa)) soft.push(pa);
+      } else {
+        if (!hard.includes(pa)) hard.push(pa);
+      }
+    }
+  }
+
+  return { hard, soft };
+}
+
 /**
  * 某个具体文件是否落在写集内。
  *
