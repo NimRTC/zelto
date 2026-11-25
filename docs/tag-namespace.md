@@ -2,6 +2,22 @@
 
 治理 Git Tag 命名空间，消除 `v1/v2/v3` 这类裸版本 tag 与计划版本（0.7.x）的歧义。
 
+> ⚠️ **本文档描述的 `plan-<semver>/v<n>` 规则已被 ADR-110 取代。**
+>
+> **ADR-110**（`docs/adr/adr-110-version-tag-plan-scoped-namespace.md`）
+> 把命名空间改为**按计划寻址**：`plan-<planId>/v<n>`，
+> 并把 `<semver>` 从 tag 里移出去。
+>
+> 取代理由（四个实测缺陷）：
+> ① `<semver>` 与 `package.json` 绑定 → **升版当天历史 tag 全部变非法**，
+>    而 `build.mjs --release` 无参跑 `tag-namespace.mjs` → **发布闸门自锁**；
+> ② 多个计划各有自己的 v1 → 同一个 `<semver>/v<n>` **装不下**，名字被抢占；
+> ③ `ship` 默认派生的是裸 tag → **工具自己造自己的非法**；
+> ④ 版本计划在 `.zelto/`（被 gitignore）→ **CI 读不到 plan↔tag 关系**。
+>
+> **本文档保留**作为「旧规则与迁移历史」的记录；
+> 实施 ADR-110 后本文件将重写。
+
 ## 命名规则
 
 - **计划-版本二级命名**：`plan-<semver>/v<n>`，如 `plan-0.7.1/v1`。

@@ -1805,6 +1805,135 @@ importers:
 
 ---
 
+## ZD-038：tag 命名空间把「当前版本」和「历史版本」混在一处 —— 升版当天发布闸门自锁
+
+### 场景
+
+2026-11-25 迁移存量裸 tag（`v1` / `v2` / `v3` → `plan-<semver>/v<n>`）
+时，逐条核对 git 事实，发现**四个**真缺陷。
+不是「迁移做得不干净」—— 是**规则本身有洞**。
+
+### 根因
+
+`v2-tag-namespace` 切片定下的规则是：
+
+```
+plan-<semver>/v<n>     <semver> 必须 == package.json 的 version
+```
+
+**`<semver>` 在 tag 里表达的是「这一版属于哪个发布批次」，
+而 `package.json` 的 `version` 表达的是「**现在**要发的是哪一版」。**
+两者必然在某一刻分叉。
+
+### 后果
+
+**① 升版当天，历史 tag 全部变非法，发布闸门自锁。**
+
+实测（2026-11-25，`package.json` = `0.7.1`）：
+
+```
+node scripts/tag-namespace.mjs plan-0.7.1/v3   → 合法
+node scripts/tag-namespace.mjs plan-0.7.0/v1   → 退出码 1
+    [版本号不一致] plan-0.7.0/v1 的 <semver> 是 0.7.0，package.json 当前版本是 0.7.1
+```
+
+而 `scripts/build.mjs` 的发布预检第一段**无参**调用它：
+
+```js
+const RELEASE_STAGES = [
+  { key: 'tag-namespace', label: 'Git Tag 命名空间治理', script: 'scripts/tag-namespace.mjs' },
+  // ...
+];
+// runStage() → spawnSync(process.execPath, [scriptPath])   ← 不传参
+```
+
+无参运行 → 读 `git tag` **全量** → `package.json` 一升版，
+**历史上完全正常的 tag 会让 `build.mjs --release` 失败**。
+
+**下一次发版必踩**（当前 `package.json` = `0.7.1`，
+仓库已有 `plan-0.7.1/v2`、`plan-0.7.1/v3`）。
+
+**② 多个计划各有自己的 v1，同一个 `<semver>/v<n>` 装不下 —— 名字被抢占。**
+
+实测：三个计划各自都有 v1（`plan-1794562105642` / `plan-1795422836717` /
+`plan-1795507341754`），都想叫 `plan-0.7.1/v1` —— **只有一个能叫**。
+
+已造成实际后果：裸 tag `v1` 改名成 `plan-0.7.1/v1` 后指向 `532f942`
+（sign-review 计划的 v1）。实测 `532f942` **不含** 0.7.0 计划 v1 的四个合并点
+（`21a89d9` / `8e2d9b6` / `afa0057` / `e4034af` 全部 `is-ancestor` 为假）。
+
+> **精确表述（避免夸大）**：0.7.0 计划 v1 的四个合并点**都在 main 上**，
+> 且都是 `plan-0.7.1/v2` 的祖先 —— **内容没丢**。
+> 但**没有任何一个 tag 把它们当作自己的指向** ——
+> 「0.7.0 计划 v1」这个版本**从来没有自己的锚点**。
+> **内容在 ≠ 锚点在。**
+
+**③ `ship` 默认打出的 tag 是非法 tag —— 工具自己造自己的非法。**
+
+```ts
+// src/core/version/branch.ts
+export function versionTagName(label: string): string {
+  ...
+  return sanitized || 'unnamed';       // label 是 "v1" 就返回 "v1"
+}
+// src/cli/commands/version-ship.ts
+const tag = version.tag ?? versionTagName(versionLabel);   // ← 缺省 → 裸 tag
+```
+
+实测：`plan-1795422836717` 的 v1/v2/v3 里 `tag` 字段是 `v1`/`v2`/`v3`，
+`plan-1794562105642` 的 v1 是 `v1` —— 计划里存的**就是**非法名。
+而 `plan-1795507341754` 的 v1/v2 **没填** `tag`，
+一旦 ship 就会打出裸 `v1`/`v2` —— **当场违反自己刚定的规则**。
+
+**④ CI 读不到「哪个 tag 属于哪个计划」。**
+
+版本计划在 `.zelto/versions/*.json`，而 `.zelto/` 在 `.gitignore` 里
+（实测 `git ls-files .zelto` → **0 个文件**）。
+实测：95 个被跟踪的规格文件里**没有一个**带 `version:` frontmatter
+（`readVersionFromSpec()` 那条路对现有规格**完全失效**）；
+计划 id 在被跟踪文件里只出现 2 次，且都在 `docs/` 和 `policy/` 里，
+不是结构化数据。
+
+### 修复
+
+**ADR-110**（`docs/adr/adr-110-version-tag-plan-scoped-namespace.md`）：
+tag 命名空间改为**按计划寻址** —— `plan-<planId>/v<n>`，
+`<semver>` 从 tag 里**移出去**（它本来就不该在 tag 里）。
+
+一次解决四个缺陷：
+
+| 缺陷 | 新规则下 |
+|-----|---------|
+| ① 版本漂移致历史 tag 失效 | tag 里没有版本号，**与 `package.json` 无关**，永不失效 |
+| ② 多计划抢占同名 | planId 唯一，**每个计划的每个版本都有唯一名字** |
+| ③ ship 打出非法 tag | 派生成 `plan-<planId>/v<n>`，**天然合法** |
+| ④ CI 读不到 plan↔tag 关系 | planId 在 tag 里，**CI 直接从 tag 名读出计划** |
+
+配套：版本一致性判定移到 `scripts/version-check.mjs`（发布锚点才管版本一致）；
+`build.mjs --release` 的 tag 段**带参**（不再全量扫描）；
+版本计划**双写**到被跟踪的 `versions/<planId>.json`；
+`tag-map.json` 升级为带 `commit` 的台账并**核对 git 事实**。
+
+### 回归测试
+
+`tests/tag-namespace-adr110.test.ts`（新增，ADR-110 验收标准 11 条）。
+
+### 剩余问题
+
+1. **本条只立了 ADR，实施是下一个切片的事** ——
+   规则改了但代码没改，`scripts/tag-namespace.mjs` 仍按旧规则判。
+   存量裸 tag 已在 2026-11-25 清掉（`node scripts/tag-namespace.mjs` 退出码 0），
+   但那是在**旧规则**下合法。
+2. **`plan-1794562105642/v1` 指向 `532f942`，它不在 main 上** ——
+   sign-review 的**代码内容**都在 main 上（以 `fa8e34e` 等重新提交进入，
+   ADR-104 又改进过），丢的只是原始提交历史。
+   按人批决定**保留**（宁可让 tag 装历史计划的内容，也不毁掉一个计划的锚点）。
+3. **迁移台账仍按「旧名 → 新名」记，不保证内容相同** ——
+   ADR-110 决策七要求加 `commit` 字段并核对 git 事实，
+   但那只在**实施**之后生效。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
