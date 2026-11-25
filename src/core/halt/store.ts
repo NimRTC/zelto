@@ -87,15 +87,33 @@ export class HaltStore {
   ): Promise<HaltRequest> {
     await mkdir(this.dir, { recursive: true });
     const effectiveTtl = ttlMs ?? this.defaultTtlMs;
+
+    // **一次取时，三处共用**（ZD-023 补）。
+    //
+    // 原来这里取了**三次**当前时间：`id` 用 `Date.now()`、
+    // `requestedAt` 用 `new Date()`、`expiresAt` 又用一次 `Date.now()`。
+    // 三次调用之间只要跨过一个毫秒边界，`expiresAt - requestedAt`
+    // 就不是 TTL，而是 `TTL + 1`（或更多）——
+    // 同一个对象里两个时间戳的关系**取决于取时间的先后**，
+    // 这与 C3「判定要确定性」相悖：TTL 应当是**声明的值**，
+    // 而不是「取时间的运气」。
+    //
+    // 后果实测：`expiresAt - requestedAt` 偶发 1800001ms，
+    // 断言 `ttl <= 30*60*1000` 于是**偶发红**（全量并发跑时必现）。
+    //
+    // 一次取时 → `expiresAt - requestedAt === effectiveTtl` **恒成立**，
+    // 毫秒级精确，与 TTL 是多少无关。
+    const now = Date.now();
+
     const req: HaltRequest = {
-      id: `halt-${Date.now()}`,
+      id: `halt-${now}`,
       scope,
       requestedBy,
       reason,
-      requestedAt: new Date().toISOString(),
+      requestedAt: new Date(now).toISOString(),
       expiresAt:
         effectiveTtl > 0
-          ? new Date(Date.now() + effectiveTtl).toISOString()
+          ? new Date(now + effectiveTtl).toISOString()
           : null,
     };
     await writeFile(this.path(scope), JSON.stringify(req, null, 2), 'utf-8');

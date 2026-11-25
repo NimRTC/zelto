@@ -138,16 +138,19 @@ describe('HaltStore — 暂停请求有 TTL（ZD-023 补）', () => {
     const req = await store.request('all', 'human', '停');
     assert.ok(req.expiresAt, '新写的请求应当带 expiresAt');
     const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
-    // 允许 1 秒的写入耗时误差。
+    // **精确相等**，不是「约等于」。
     //
-    // **上下界都要给容差**：实现是 `Date.now() + ttl`（expiresAt 的基准点），
-    // 而 `requestedAt` 是**更早**取的 `new Date().toISOString()`。
-    // 两个取时间点差 1ms，ttl 就变成 `30*60*1000 + 1` ——
-    // 上界卡死的话，这条用例会**偶发**红（实测 1800001ms）。
-    assert.ok(
-      ttl > 29 * 60 * 1000 && ttl <= 30 * 60 * 1000 + 1000,
-      `TTL 应当是 30 分钟（实际 ${ttl}ms）`,
-    );
+    // 实现改成一次取时（`const now = Date.now()`）后，
+    // `requestedAt` 与 `expiresAt` 来自**同一个**时刻，
+    // 于是 `expiresAt - requestedAt === TTL` **恒成立**。
+    //
+    // 之前的实现各取一次时间（`new Date()` 与 `Date.now()`），
+    // 差 1ms 时 TTL 就变成 `TTL + 1` —— 这条断言于是偶发红
+    // （实测 1800001ms，全量并发跑时必现）。
+    //
+    // 所以断言必须**卡死**：留容差等于把「时间戳不自洽」这个事实
+    // 写进测试 —— 那样实现改了也没人发现。
+    assert.equal(ttl, 30 * 60 * 1000, `TTL 应当精确是 30 分钟（实际 ${ttl}ms）`);
   });
 
   it('显式永不过期时 expiresAt 为 null', async () => {
@@ -158,10 +161,34 @@ describe('HaltStore — 暂停请求有 TTL（ZD-023 补）', () => {
   it('显式指定 TTL 时按指定的算', async () => {
     const req = await store.request('all', 'human', '短停', 5 * 60 * 1000);
     const ttl = Date.parse(req.expiresAt as string) - Date.parse(req.requestedAt);
-    // 同上：上界也要给 1 秒容差（两个取时间点可能差 1ms）。
+    // 同上：精确相等。
+    assert.equal(ttl, 5 * 60 * 1000, `TTL 应当精确是 5 分钟（实际 ${ttl}ms）`);
+  });
+
+  // ─── 回归：一次取时，三处共用（ZD-023 补）────────────────────────────
+  //
+  // 病灶：`id` / `requestedAt` / `expiresAt` 各取一次当前时间，
+  // 三个取时间点之间差 1ms 时，`expiresAt - requestedAt` 就不是 TTL。
+  //
+  // 这条断言把「三个时间戳必须来自同一刻」钉死 ——
+  // 不然以后有人再改回多次取时，测试不会响。
+  it('id / requestedAt / expiresAt 来自同一时刻', async () => {
+    const req = await store.request('all', 'human', '停');
+    const fromId = Number.parseInt(req.id.replace('halt-', ''), 10);
+    const fromRequestedAt = Date.parse(req.requestedAt);
+    assert.equal(
+      fromId,
+      fromRequestedAt,
+      'id 里的时间戳必须与 requestedAt 是同一刻 —— 否则 id 与时间戳会互相矛盾',
+    );
     assert.ok(
-      ttl > 4 * 60 * 1000 && ttl <= 5 * 60 * 1000 + 1000,
-      `TTL 应当是 5 分钟（实际 ${ttl}ms）`,
+      req.expiresAt !== null,
+      '默认 TTL 下 expiresAt 必有值',
+    );
+    assert.equal(
+      Date.parse(req.expiresAt as string) - fromId,
+      30 * 60 * 1000,
+      'expiresAt 必须是 requestedAt + TTL，一毫秒不多',
     );
   });
 
