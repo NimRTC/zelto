@@ -25,7 +25,7 @@ import {
   isZeltoManagedSpecPath,
   isZeltoStatePath,
 } from '../../core/project/managed-paths.js';
-import { parsePorcelainStatus } from '../../core/sched/audit.js';
+import { parsePorcelainStatus, isSubmoduleOnlyDirty, isSubmodulePointerMismatch } from '../../core/sched/audit.js';
 import { clearUntrackedManagedSpecs } from '../../core/project/untracked-specs.js';
 import { isUntouchedAcceptanceSkeleton } from '../../core/project/managed-acceptance.js';
 import { branchExists, pathDiffersFromAnyRef } from './version-runtime.js';
@@ -152,6 +152,8 @@ function shipBranch(
     const managedSpecs: string[] = [];
     const managedSkeletons: string[] = [];
     const managedState: string[] = [];
+    const submoduleDirtyOnly: string[] = [];
+    const submodulePointerMismatch: string[] = [];
     // 来源分支（版本分支）—— 合并会碰到它的改动
     const candidateRefs = [`refs/heads/${versionBranch}`];
     for (let i = 0; i < entries.length; i += 1) {
@@ -167,6 +169,16 @@ function shipBranch(
         !pathDiffersFromAnyRef(path, 'HEAD', candidateRefs, repoRoot)
       ) {
         managedState.push(entry);
+      } else if (isSubmoduleOnlyDirty(repoRoot, path)) {
+        // 与 `zelto merge` 同一口径（ZD-021）：submodule 只有 `-dirty` 标记
+        //（指针没变）→ 合并碰不到它，不算脏。
+        submoduleDirtyOnly.push(entry);
+      } else if (isSubmodulePointerMismatch(repoRoot, path)) {
+        // 与 `zelto merge` 同一口径（ZD-021）：submodule 的指针与 index 记录
+        // 不一致 → 不算「人改了代码」。ship 与 merge 是同一道守卫的两个入口，
+        // 口径分叉的后果是「merge 放行、ship 拦下」—— 人被引去手动 reset
+        // vendor 目录，而那会把版本分支里原本能构建的指针改坏。
+        submodulePointerMismatch.push(entry);
       } else {
         dirty.push(entry);
       }
@@ -188,6 +200,18 @@ function shipBranch(
       log(`  ℹ️  ${managedState.length} 个 zelto 运行时状态未提交（不影响 ship）：`);
       for (const m of managedState.slice(0, 5)) log(`     ${m}`);
       if (managedState.length > 5) log('     …');
+    }
+
+    if (submoduleDirtyOnly.length > 0) {
+      log(`  ℹ️  ${submoduleDirtyOnly.length} 个 submodule 只有内部脏标记（指针未变，不影响 ship）：`);
+      for (const m of submoduleDirtyOnly.slice(0, 5)) log(`     ${m}`);
+      if (submoduleDirtyOnly.length > 5) log('     …');
+    }
+
+    if (submodulePointerMismatch.length > 0) {
+      log(`  ℹ️  ${submodulePointerMismatch.length} 个 submodule 的指针与 index 记录不一致（与本次 ship 无关，不影响 ship）：`);
+      for (const m of submodulePointerMismatch.slice(0, 5)) log(`     ${m}`);
+      if (submodulePointerMismatch.length > 5) log('     …');
     }
 
     if (dirty.length > 0) {
@@ -270,12 +294,6 @@ function shipBranch(
     //
     // ── 判据 ──────────────────────────────────────────────────
     //
-    // 用**版本分支记录的基点**（`version.baseCommit`）判，而不是用祖先关系：
-    //
-    //   - 基点仍是主干 HEAD 的祖先 → 主干只是前进，历史没被动过 → 正常 --no-ff；
-    //   - 基点**不再**是主干 HEAD 的祖先 → 主干历史被改写过（squash / rebase /
-    //     filter-branch）→ 版本分支挂在旧历史上，合并必然大面积冲突。
-    //
     // 为什么不用祖先关系判（`is-ancestor versionBranch HEAD`）：
     // 那判的是「版本分支的提交有没有进主干」，而**正常流程里答案本来就是「没有」**
     // —— 版本分支的产物正是要靠这次 ship 才进主干。
@@ -285,20 +303,73 @@ function shipBranch(
     // 这是**人做决定前**唯一拿到的信号。提示说「改用合并提交」时，
     // 人以为 --no-ff 就行；真撞上 40 文件冲突时，
     // 人完全不知道该 rebase 版本分支还是该从主干重建。
-    const baseAncestor =
-      versionBaseCommit !== null &&
-      git(['merge-base', '--is-ancestor', versionBaseCommit, 'HEAD'], repoRoot).ok;
+    //
+    // ── ZD-040：判据必须用**真正的分叉点**，不能用 `version.baseCommit` ──
+    //
+    // 病灶（实测 nimrtc-v14 v3 ship，2026-11-25）：
+    //   `version.baseCommit` 记的是「本版本所依赖版本（v2）的 tip」，
+    //   不是「本版本从主干分出时的基点」。多版本链 v1→v2→v3 里，
+    //   baseCommit 永远**不**是主干 HEAD 的祖先 —— 于是每次 ship 都误报
+    //   「主干历史被改写过」，把人引去 `git rebase --onto` 一条本来干净的历史。
+    //
+    //   真实的诊断是：`git merge-base HEAD versionBranch` 给出的共同祖先
+    //   与 `baseCommit` 是两个不同的提交。前者才是「两条线在哪分道」。
+    //
+    // 判据（修正后，ZD-040）：
+    //   1. `baseCommit` 仍是版本分支的祖先（版本分支没有被 rebase/改写）；
+    //   2. 共同祖先（`merge-base HEAD versionBranch`）**也是** `baseCommit` 的祖先
+    //      ——即真正分叉点不早于 versionBaseCommit。
+    //
+    //   两条都成立 → 主干只是前进 → 正常 --no-ff。
+    //   任一条不成立 → 分叉：版本分支被改写，或主干历史被改写。
+    //
+    // 为什么不单独用「baseCommit 是否是 HEAD 的祖先」判（D-70 原判据）：
+    //   多版本链里 baseCommit 是**上一个版本的 tip**，它天然不是主干 HEAD 的祖先；
+    //   拿它判等于把「依赖版本没进主干」误报成「主干历史被改写」（ZD-040）。
+    //
+    // 为什么不单独用「baseCommit 是否仍在版本分支里」判：
+    //   D-70 的真实场景（主干被 squash 成**新根**）里，版本分支本身没动，
+    //   baseCommit 还在它的历史里 —— 只看这一条会漏报那个真分叉。
+    //
+    // 保守方向：判不出来 → 当「已前进」（宁可让人撞一次合并冲突，
+    // 也不误报分叉把人引去改写版本分支的历史）。
+    const mb = git(['merge-base', 'HEAD', versionBranch], repoRoot);
+    const mergeBase = mb.ok ? mb.stdout.trim() : null;
+    const baseInVersionBranch =
+      versionBaseCommit === null ||
+      git(['merge-base', '--is-ancestor', versionBaseCommit, versionBranch], repoRoot).ok;
+    // 分叉点是主干祖先链上的一个合法提交 —— 也就是说：
+    // 共同祖先（两条线在哪儿分道）与 baseCommit 之间**没有**主干的重写痕迹。
+    //
+    // 具体判据（ZD-040）：共同祖先必须是 baseCommit 的祖先或等于它。
+    //   - 相等              → 版本分支就从 baseCommit 分出；
+    //   - 共同祖先是 baseCommit 的祖先 → 版本分支比 baseCommit 更早分出
+    //     （多版本链里正是这种形态：主干从 v1.3.0 分道，v2/v3 在版本链上往前走）。
+    //   两者都说明历史是线性的 —— 主干只是前进，没有任何改写。
+    //
+    //   反例（真分叉）：
+    //     D-70 的 squash 场景里，主干被换成新根，**共同祖先为空** ——
+    //     两条线彻底分开。这必须判分叉（不是「保守让一步」）。另外，
+    //     共同祖先存在但**既不是** baseCommit 的祖先、**也不是**它的后代，
+    //     同样说明历史被改写过。
+    //
+    // 判不出来（git 调用失败）→ 保守判「已前进」—— 宁可让人撞一次合并冲突。
+    const mbOk = mb.ok;
+    const mergeBaseEmpty = mb.stdout.trim() === '';
+    const mergeBaseIsAtOrBeforeBase = !mbOk || mergeBaseEmpty
+      ? false // git merge-base 失败或返回空（没共同祖先）→ 两条无关历史或损坏 → 必然是分叉
+      : versionBaseCommit === null
+        ? true
+        : mergeBase === versionBaseCommit ||
+          git(['merge-base', '--is-ancestor', mergeBase ?? '', versionBaseCommit], repoRoot).ok;
 
     if (versionBaseCommit === null) {
-      // 没有基点可判 → 不乱说（保守方向：宁可说「已前进」让人撞一次，
-      // 也不要误报「分叉」把人引去 rebase 一条本来干净的历史）。
       log('  ℹ️  主干已前进，改用合并提交（--no-ff）。');
       log('     ℹ️  版本基点未记录，无法判断主干历史是否被改写过。');
-    } else if (baseAncestor) {
+    } else if (baseInVersionBranch && mergeBaseIsAtOrBeforeBase) {
       log('  ℹ️  主干已前进，改用合并提交（--no-ff）。');
     } else {
-      const mb = git(['merge-base', 'HEAD', versionBranch], repoRoot);
-      const mbShort = mb.ok ? mb.stdout.trim().slice(0, 8) : '未知';
+      const mbShort = mergeBase ? mergeBase.slice(0, 8) : '未知';
       log('  ⚠️  版本分支与主干**已分叉**（主干历史被改写过，不是单纯的主干前进）。');
       log(`     版本基点：${versionBaseCommit ? versionBaseCommit.slice(0, 8) : '（未记录）'}`);
       log(`     共同祖先：${mbShort}`);
