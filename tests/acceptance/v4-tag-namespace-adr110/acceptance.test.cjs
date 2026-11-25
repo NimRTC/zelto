@@ -538,6 +538,15 @@ test('验收标准 12：改动不越写集，ADR 与缺陷记录未被改动', (
       p !== 'src/core/project/managed-paths.ts' &&
       p !== 'tests/d73-ship-tag-record-preserved.test.ts' &&
       p !== 'docs/adr/adr-111-baseline-vs-development-slice-counting.md' &&
+      // ADR-113 与它的追溯索引行 —— 后续切片（v5-release-tag-guard）的产物。
+      //
+      // **与 ADR-111 同一个理由**：那些文件是**后来**的切片落的，
+      // 它们出现在这里不是「v4 越界」，是「v4 之后又有人干活了」。
+      // 排掉的只有 v4 **自己**没碰过的文件 —— v4 自己的写集边界由上面的
+      // `WRITE_SET` 判据守着呢。
+      p !== 'docs/adr/adr-113-release-tag-version-guard.md' &&
+      p !== 'docs/adr-trace-index.md' &&
+      p !== 'specs/slices/v5-release-tag-guard.md' &&
       p !== 'full-suite.tap',
   );
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);

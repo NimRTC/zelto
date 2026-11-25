@@ -243,7 +243,7 @@ node scripts/version-check.mjs --tag "${GITHUB_REF_NAME}"
 | --- | --- |
 | 所属版本号 | v0.7.1 |
 | 关联 ADR 编号 | ADR-113 |
-| 提交哈希 | 0000000000000000000000000000000000000000 |
+| 提交哈希 | 9861f74306d1349a492ff0a447033d8bb1c48466 |
 | 验证方式 | [git show --stat 抽查 + 人工复核] |
 
 > **提交哈希**：本 ADR 落地提交（实施切片 `v5-release-tag-guard`）。

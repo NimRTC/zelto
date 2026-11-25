@@ -13,7 +13,7 @@
 | ADR-104 | sign-review 作用域证据 | v0.7.0 | cf467264e444c7e007a3af4f3d844d5f1075ca58 | [git show --stat 抽查 + 人工复核] | 已回填 |
 | ADR-110 | 版本 tag 命名空间按计划寻址 | v0.7.1 | 06eefe9a469ce636f0c9bf2683c39cc30f913af2 | [git show --stat 抽查 + 人工复核] | 已回填 |
 | ADR-111 | 基线切片与开发切片分开计数 | v0.7.1 | a9a870232023c27efdd58e32b6e007c87f358669 | [git show --stat 抽查 + 人工复核 + 隔离跑受影响测试全绿] | 已回填 |
-| ADR-113 | 触发的 tag 名 == 实际发布版本 | v0.7.1 | 0000000000000000000000000000000000000000 | [git show --stat 抽查 + 人工复核] | 已采纳 |
+| ADR-113 | 触发的 tag 名 == 实际发布版本 | v0.7.1 | 9861f74306d1349a492ff0a447033d8bb1c48466 | [git show --stat 抽查 + 人工复核] | 已采纳 |
 
 > **ADR-110 不在脚本的受检范围内** ——
 > `scripts/adr-trace-check.mjs` 的 `ADR_PREFIXES` 只列了 `adr-102` / `adr-103` / `adr-104`，
