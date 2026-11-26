@@ -204,6 +204,28 @@ test('versionPathFor：合法 label 落在 version-worktrees 之下', () => {
   }
 });
 
+test('versionPathFor：版本工作目录里 merge 时，版本工作目录在**外层**', () => {
+  // 实测（nimrtc-v14 v1-rtcp-processor-collaborator，2026-11-26）：
+  // 人在 `version-worktrees/v3` 里签字后跑
+  // `zelto merge <id> --target version/v3`，拼出的是
+  // `version-worktrees/v3/.zelto/version-worktrees/v3` —— 不存在，
+  // merge 报「版本 v3 的工作目录不存在，先跑 zelto version start v3」。
+  // 而那个目录**就在脚下**。两边的路径约定互相咬死，人只能手工 cd 绕开。
+  const repo = mkdtempSync(join(tmpdir(), 'zelto-escape-'));
+  try {
+    const manager = new WorktreeManager(repo);
+    // (a) 普通仓库根：基准是 `.zelto/version-worktrees`
+    assert.equal(
+      manager.versionPathFor('v3'),
+      join(repo, '.zelto', 'version-worktrees', 'v3'),
+    );
+    // 版本上下文判定用 git 事实 —— 这个临时目录不是 git 仓库，
+    // 于是「外层基准」分支不会被触发，路径必须原样落在子仓之下。
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test('pathFor：逃逸的切片 id 抛错', () => {
   const repo = mkdtempSync(join(tmpdir(), 'zelto-escape-'));
   try {

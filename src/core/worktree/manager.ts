@@ -6,7 +6,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, cpSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, lstatSync, unlinkSync } from 'node:fs';
-import { join, relative, isAbsolute, dirname, resolve } from 'node:path';
+import { join, relative, isAbsolute, dirname, resolve, basename } from 'node:path';
 import { resolveWithin } from '../io/path-safe.js';
 
 /** worktree 根目录（相对仓库根） */
@@ -390,10 +390,71 @@ export class WorktreeManager {
    * 绝不建、也绝不删。
    */
   versionPathFor(label: string): string {
-    return resolveWithin(
-      join(this.repoRoot, VERSION_WORKTREE_BASE_DIR),
-      label,
-    );
+    // 先按**子仓基准**做包含性判定（逃逸即抛错）——
+    // 这一步与「基准目录可能上移一层」无关：逃出 repoRoot 的 label 一律拒绝，
+    // 绝不因为外层基准存在就放宽防护。
+    resolveWithin(join(this.repoRoot, VERSION_WORKTREE_BASE_DIR), label);
+    return resolveWithin(this.versionWorktreeBaseDir(), label);
+  }
+
+  /**
+   * 版本工作目录的**基准目录**。
+   *
+   * 默认是 `<repoRoot>/.zelto/version-worktrees`。但如果 `repoRoot` 本身
+   * 就是一个**版本工作目录**（人在里面跑 `zelto merge --target version/v3`），
+   * 版本工作目录住在**外层** —— `zelto version start` 总是在仓库顶层建的：
+   *
+   *   <顶层>/.zelto/version-worktrees/<label>/
+   *     └── <label>/                      ← repoRoot 可能是这一层
+   *           .zelto/worktrees/<slice>/   ← 切片 worktree 在这里（相对 —— 正确）
+   *
+   * 病灶（实测 nimrtc-v14 v1-rtcp-processor-collaborator，2026-11-26）：
+   * 在 `version-worktrees/v3` 里签字后跑 `zelto merge <id> --target version/v3`，
+   * 拼出的是 `version-worktrees/v3/.zelto/version-worktrees/v3` —— **不存在**，
+   * 于是 merge 报「版本 v3 的工作目录不存在，先跑 zelto version start v3」，
+   * 而那个目录**明明就在脚下**。唯一的绕法是人手工 `cd` 到顶层再合 ——
+   * 但那样切片 worktree（相对 repoRoot）又找不到了。两边的约定互相咬死。
+   *
+   * 判据分两层：先看 **git 事实**（当前检出分支是 `version/<label>`，与 ADR-121 一致 ——
+   * 不看目录路径，worktree 可能被人挪过），再沿祖先目录找
+   * `<祖先>/.zelto/version-worktrees/<label>`（同一个版本，而且那层目录**确实在**）。
+   * 非版本上下文里行为完全不变。
+   */
+  private versionWorktreeBaseDir(): string {
+    const candidate = join(this.repoRoot, VERSION_WORKTREE_BASE_DIR);
+    if (!this.isOnVersionBranch()) return candidate;
+    // 版本上下文里：沿**本仓库的祖先目录**向上找真正装着版本工作目录的那一层。
+    //
+    // 为什么不能固定「上两级」：版本工作目录自己的 `.zelto/version-worktrees`
+    // 一旦存在，`<v3>/.zelto/version-worktrees/..` 同样会被拼成
+    // `<v3>/.zelto` —— 固定两级会指向**工作目录自己的 `.zelto`**，永远找不到外层。
+    // 版本工作目录住在 `<任意祖先>/.zelto/version-worktrees/<label>`，
+    // 所以逐级向上问「这一层的 `.zelto/version-worktrees/<label>` 在不在」才是准的。
+    const label = basename(this.repoRoot);
+    let dir = dirname(this.repoRoot);
+    for (let depth = 0; depth < 6; depth++) {
+      const base = join(dir, VERSION_WORKTREE_BASE_DIR);
+      if (existsSync(join(base, label))) return base;
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return candidate;
+  }
+
+  /** 当前检出的是不是 `version/<label>` 分支（repoRoot 下的 git 事实）。 */
+  private isOnVersionBranch(): boolean {
+    try {
+      const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+        cwd: this.repoRoot,
+        encoding: 'utf-8',
+        timeout: 15_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return head.startsWith('version/');
+    } catch {
+      return false;
+    }
   }
 
   /** 版本工作目录的相对仓库根路径 */
