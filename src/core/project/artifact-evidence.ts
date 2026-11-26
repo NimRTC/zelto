@@ -46,6 +46,16 @@ export interface SliceArtifactEvidence {
   commit: string | null;
   /** 命中提交的信息首行 —— 没有则 null */
   subject: string | null;
+  /**
+   * 这一片的产物是不是在**所属分支的祖先**上（null = 不知道）。
+   *
+   * 「不在所属分支上、但在它的祖先上」= 这一片**已经**随祖先版本进入了本版，
+   * 只是本版没有自己的 trailer 提交。栈式版本里绝大多数片都是这种形态 ——
+   * `onBranch=false` 单独读会得出「这版没做」的假结论，必须并排展示。
+   */
+  ancestorOnBranch: boolean | null;
+  /** 祖先分支上的命中提交（短哈希）—— 没有则 null */
+  ancestorCommit: string | null;
 }
 
 /** 探针（注入以便测试）。 */
@@ -55,6 +65,16 @@ export interface ArtifactEvidenceProbe {
    * 读不到（不是 git 仓库 / git 失败）返回 null。
    */
   findSliceCommits(dir: string, branch: string, sliceIds: string[]): Promise<Map<string, { hash: string; subject: string }> | null>;
+  /**
+   * 这个分支的**祖先分支**上（不含它自己），带 trailer 的提交。
+   * 「祖先分支」= 本地 `version/*` 中是本分支祖先、且不是本分支的那些。
+   * 读不到返回 null。
+   */
+  findSliceCommitsOnAncestors(
+    dir: string,
+    branch: string,
+    sliceIds: string[],
+  ): Promise<Map<string, { hash: string; subject: string; fromBranch: string }> | null>;
 }
 
 const GIT_TIMEOUT_MS = 8000;
@@ -111,6 +131,59 @@ const execAsync = (
  *   25 片就是几秒）。一次 `git log` + 格式化成 `%H%x00%s%x00%(trailers…)`
  *   一次读全量，几十毫秒。
  */
+const parseTrailerLog = (
+  stdout: string,
+  wanted: Set<string>,
+  found: Map<string, { hash: string; subject: string }> = new Map(),
+): Map<string, { hash: string; subject: string }> => {
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const parts = line.split('\0');
+    const hash = parts[0];
+    const subject = parts[1] ?? '';
+    const trailer = parts.slice(2).join(' ');
+    if (!hash) continue;
+    // trailer 可能是 `a, b` 或 `a b` —— 两种分隔都认
+    for (const id of trailer.split(/[,\s]+/).filter(Boolean)) {
+      if (!wanted.has(id)) continue;
+      // 取**最新**的那个提交（git log 是新→旧，第一次命中就是最新的）
+      if (!found.has(id)) found.set(id, { hash: hash.slice(0, 8), subject });
+    }
+  }
+  return found;
+};
+
+/**
+ * 这些 id 的命中提交里，哪些**已经在 `branch` 的祖先版本分支上**。
+ *
+ * 判定方式与 `findSliceCommitsOnAncestors` 相同（本地 `version/*` 中
+ * 是 `branch` 祖先的分支），但按**提交**判而不是按分支 tip 判 ——
+ * 祖先分支上较新的提交（`--not` 能排除）与较旧的提交（只能这样排除）都要对上。
+ * 读不到返回 null。
+ */
+const ancestorsContaining = async (
+  dir: string,
+  branch: string,
+  sliceIds: string[],
+): Promise<Set<string> | null> => {
+  const refs = await execAsync(['for-each-ref', '--format=%(refname:short)', 'refs/heads/version/'], dir, GIT_TIMEOUT_MS);
+  if (!refs.ok) return null;
+  const ancestors: string[] = [];
+  for (const ref of refs.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
+    if (ref === branch) continue;
+    const a = await execAsync(['merge-base', '--is-ancestor', ref, branch], dir, GIT_TIMEOUT_MS);
+    if (a.ok) ancestors.push(ref);
+  }
+  if (ancestors.length === 0) return new Set();
+  const log = await execAsync(
+    ['log', ...ancestors, '--format=%H%x00%s%x00%(trailers:key=Refs-Slice,valueonly)'],
+    dir,
+    GIT_TIMEOUT_MS * 3,
+  );
+  if (!log.ok) return null;
+  return new Set(parseTrailerLog(log.stdout, new Set(sliceIds)).keys());
+};
+
 export const defaultArtifactProbe: ArtifactEvidenceProbe = {
   async findSliceCommits(dir, branch, sliceIds) {
     if (sliceIds.length === 0) return new Map();
@@ -128,22 +201,55 @@ export const defaultArtifactProbe: ArtifactEvidenceProbe = {
     );
     if (!log.ok) return null;
 
-    const wanted = new Set(sliceIds);
+    // 先解析全量，再看每个 id 的**首个**提交是不是本版自己的（祖先带来的不算）——
+    // 用 `--not <ancestors>` 会让同一 id 的「本版提交比祖先提交旧」时落到祖先去，
+    // 判错归属。这里逐 id 判定：首个命中提交若已在本分支祖先上，就不算本版产物。
+    const all = parseTrailerLog(log.stdout, new Set(sliceIds));
+    if (all.size === 0) return new Map();
+    const ancHas = await ancestorsContaining(dir, branch, [...all.keys()]);
     const found = new Map<string, { hash: string; subject: string }>();
-    for (const line of log.stdout.split('\n')) {
-      if (!line.trim()) continue;
-      const parts = line.split('\0');
-      const hash = parts[0];
-      const subject = parts[1] ?? '';
-      const trailer = parts.slice(2).join(' ');
-      if (!hash) continue;
-      // trailer 可能是 `a, b` 或 `a b` —— 两种分隔都认
-      for (const id of trailer.split(/[,\s]+/).filter(Boolean)) {
-        if (!wanted.has(id)) continue;
-        // 取**最新**的那个提交（git log 是新→旧，第一次命中就是最新的）
-        if (!found.has(id)) found.set(id, { hash: hash.slice(0, 8), subject });
-      }
+    for (const [id, hit] of all) {
+      if (ancHas === null) return null;
+      if (!ancHas.has(id)) found.set(id, { hash: hit.hash, subject: hit.subject });
     }
+    return found;
+  },
+
+  async findSliceCommitsOnAncestors(dir, branch, sliceIds) {
+    if (sliceIds.length === 0) return new Map();
+    const inside = await execAsync(['rev-parse', '--is-inside-work-tree'], dir, GIT_TIMEOUT_MS);
+    if (!inside.ok || inside.stdout.trim() !== 'true') return null;
+    const branchExists = await execAsync(['rev-parse', '--verify', `${branch}^{commit}`], dir, GIT_TIMEOUT_MS);
+    if (!branchExists.ok) return null;
+
+    // 本地 version/* 分支里，是本分支祖先且不是本分支本身的那些
+    const refs = await execAsync(
+      ['for-each-ref', '--format=%(refname:short)', 'refs/heads/version/'],
+      dir,
+      GIT_TIMEOUT_MS,
+    );
+    if (!refs.ok) return null;
+    const ancestors: string[] = [];
+    for (const ref of refs.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
+      if (ref === branch) continue;
+      const a = await execAsync(['merge-base', '--is-ancestor', ref, branch], dir, GIT_TIMEOUT_MS);
+      if (a.ok) ancestors.push(ref);
+    }
+    if (ancestors.length === 0) return new Map();
+
+    const log = await execAsync(
+      ['log', branch, '--format=%H%x00%s%x00%(trailers:key=Refs-Slice,valueonly)'],
+      dir,
+      GIT_TIMEOUT_MS * 3,
+    );
+    if (!log.ok) return null;
+    // `--not <ancestors>`：只看「本分支有、祖先没有」的提交 —— 一个 trailer
+    // 若只在祖先分支上，它就不是本版自己的产物，交给 ancestorOnBranch 那列。
+    const hits = parseTrailerLog(log.stdout, new Set(sliceIds));
+    // 同一提交可能同时挂在多个祖先分支上 —— 取分支名最短的那个（version/v1 < version/v10 的边界情况）
+    const fromBranch = [...ancestors].sort((a, b) => a.length - b.length)[0];
+    const found = new Map<string, { hash: string; subject: string; fromBranch: string }>();
+    for (const [id, hit] of hits) found.set(id, { ...hit, fromBranch });
     return found;
   },
 };
@@ -163,16 +269,31 @@ export async function annotateArtifactEvidence<T extends { id: string }>(
 ): Promise<Array<T & SliceArtifactEvidence>> {
   const ids = rows.map((r) => r.id);
   const found = await probe.findSliceCommits(dir, branch, ids);
+  if (found === null) {
+    return rows.map((row) => ({
+      ...row,
+      onBranch: null,
+      commit: null,
+      subject: null,
+      ancestorOnBranch: null,
+      ancestorCommit: null,
+    }));
+  }
+  const missing = ids.filter((id) => !found.has(id));
+  let onAncestors: Map<string, { hash: string; subject: string }> | null = new Map();
+  if (missing.length > 0) {
+    onAncestors = (await probe.findSliceCommitsOnAncestors(dir, branch, missing)) ?? null;
+  }
   return rows.map((row) => {
-    if (found === null) {
-      return { ...row, onBranch: null, commit: null, subject: null };
-    }
     const hit = found.get(row.id);
+    const anc = hit ? undefined : onAncestors?.get(row.id);
     return {
       ...row,
       onBranch: hit !== undefined,
       commit: hit?.hash ?? null,
       subject: hit?.subject ?? null,
+      ancestorOnBranch: onAncestors === null ? null : anc !== undefined,
+      ancestorCommit: anc?.hash ?? null,
     };
   });
 }
@@ -181,15 +302,21 @@ export async function annotateArtifactEvidence<T extends { id: string }>(
 export function annotateArtifactEvidenceSync<T extends { id: string }>(
   rows: T[],
   found: Map<string, { hash: string; subject: string }> | null,
+  onAncestors: Map<string, { hash: string; subject: string }> | null = new Map(),
 ): Array<T & SliceArtifactEvidence> {
   return rows.map((row) => {
-    if (found === null) return { ...row, onBranch: null, commit: null, subject: null };
+    if (found === null) {
+      return { ...row, onBranch: null, commit: null, subject: null, ancestorOnBranch: null, ancestorCommit: null };
+    }
     const hit = found.get(row.id);
+    const anc = hit ? undefined : onAncestors?.get(row.id);
     return {
       ...row,
       onBranch: hit !== undefined,
       commit: hit?.hash ?? null,
       subject: hit?.subject ?? null,
+      ancestorOnBranch: onAncestors === null ? null : anc !== undefined,
+      ancestorCommit: anc?.hash ?? null,
     };
   });
 }

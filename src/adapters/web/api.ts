@@ -1149,15 +1149,32 @@ export class WebApi {
       // 不依赖 `.zelto/` 是否进 git。
       //
       // 每个版本问一次 git（一次 `git log` 读全量 trailer），不逐片问。
-      const artifactByVersion = new Map<string, Map<string, { hash: string; subject: string }> | null>();
+      //
+      // 外加一列 ancestorOnBranch：栈式版本里 v1 的片在 v2 上 `onBranch=false`
+      // （v2 自己没有它的 trailer 提交），但它**随 v1 进了 v2** —— 只报 false
+      // 会得出「v2 没做」的假结论（实测 nimrtc-v14 v3：本版命中 1 片，
+      // 祖先分支上另有 20 片）。
+      const artifactByVersion = new Map<
+        string,
+        {
+          own: Map<string, { hash: string; subject: string }> | null;
+          anc: Map<string, { hash: string; subject: string }> | null;
+        }
+      >();
       for (const v of plan.versions) {
         const branch = branchOfVersion(v);
-        const found = await defaultArtifactProbe.findSliceCommits(
-          this.repoRoot,
-          branch,
-          v.slices.map((s) => s.id),
-        );
-        artifactByVersion.set(v.version, found);
+        const ids = v.slices.map((s) => s.id);
+        const own = await defaultArtifactProbe.findSliceCommits(this.repoRoot, branch, ids);
+        let anc: Map<string, { hash: string; subject: string }> | null = new Map();
+        if (own !== null) {
+          const missing = ids.filter((id) => !own.has(id));
+          if (missing.length > 0) {
+            anc = await defaultArtifactProbe.findSliceCommitsOnAncestors(this.repoRoot, branch, missing);
+          }
+        } else {
+          anc = null;
+        }
+        artifactByVersion.set(v.version, { own, anc });
       }
 
       plans.push({
@@ -1167,10 +1184,13 @@ export class WebApi {
         scope,
         label,
         versions: plan.versions.map((v) => {
-          const artifacts = artifactByVersion.get(v.version) ?? null;
+          const artifacts = artifactByVersion.get(v.version) ?? { own: null, anc: null };
+          const own = artifacts.own;
+          const anc = artifacts.anc;
           const rows = v.slices.map((s) => {
             const actual = byId.get(s.id) ?? null;
-            const hit = artifacts?.get(s.id) ?? null;
+            const hit = own?.get(s.id) ?? null;
+            const ancHit = own !== null && hit === null ? (anc?.get(s.id) ?? null) : null;
             return {
             id: s.id,
             title: s.title,
@@ -1192,9 +1212,15 @@ export class WebApi {
              * （`.zelto/` 被忽略 → 恒为 false）；这一项问的是「产物在分支上了没」
              * —— 那才是「这版做完没有」的真凭据。
              */
-            artifactOnBranch: artifacts === null ? null : hit !== null,
+            artifactOnBranch: own === null ? null : hit !== null,
             artifactCommit: hit?.hash ?? null,
             artifactSubject: hit?.subject ?? null,
+            /**
+             * ADR-126r2：产物在**祖先版本分支**上（栈式版本的本版形态）。
+             * 与 `artifactOnBranch` 并排展示 —— 不合成一个百分比。
+             */
+            artifactOnAncestor: own === null ? null : anc === null ? null : ancHit !== null,
+            artifactAncestorCommit: ancHit?.hash ?? null,
           };
         });
         return {
@@ -1215,6 +1241,8 @@ export class WebApi {
            *   保留是为了不丢掉 ADR-114 已有的事实）
            * - artifactOnBranch：**产物提交**在所属版本分支上的片数
            *   （ADR-126）—— 这才是「这版做完没有」的可查证凭据
+           * - artifactOnAncestor：产物在**祖先版本分支**上的片数（ADR-126r2）
+           *   —— 栈式版本里这部分才是本版的大多数
            *
            * 「计划 10 片里 7 片在分支上完成」与「盘上 10 片全 completed
            * 但分支只跟踪 0 片」是两种事实，合成一个百分比会抹掉差别。
@@ -1225,6 +1253,7 @@ export class WebApi {
             completed: rows.filter((r) => r.actualState === 'completed').length,
             onBranch: rows.filter((r) => r.actualState === 'completed' && r.onBranch === true).length,
             artifactOnBranch: rows.filter((r) => r.artifactOnBranch === true).length,
+            artifactOnAncestor: rows.filter((r) => r.artifactOnBranch === false && r.artifactOnAncestor === true).length,
           },
         };
         }),

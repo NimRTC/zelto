@@ -51,10 +51,13 @@ after(async () => {
 
 /** 造一个带 Refs-Slice trailer 的提交。 */
 async function commitWithSlice(file: string, content: string, sliceId: string, message: string) {
-  await writeFile(join(ROOT, file), content, 'utf-8');
+  // 每个用例的「第一步」都会碰到同一个文件名 —— 用计数器保证内容始终是新的
+  commitSeq += 1;
+  await writeFile(join(ROOT, file), `${content}#${Date.now()}-${commitSeq}`, 'utf-8');
   git('add', file);
   git('commit', '-q', '-m', `${message}\n\nRefs-Slice: ${sliceId}\n`);
 }
+let commitSeq = 0;
 
 describe('ADR-126: 产物证据（真实 git）', () => {
   it('分支上有 Refs-Slice 提交 → onBranch = true，并给出短哈希与标题', async () => {
@@ -115,12 +118,53 @@ describe('ADR-126: 产物证据（真实 git）', () => {
   });
 
   it('归属错位要暴露：查的是**所属版本**的分支，不是「哪儿有算哪儿」', async () => {
-    // slice-misplaced 的产物在 version/v2 上，但计划说它属于 v1
+    // slice-misplaced 的产物在 version/v2 上（v2 已越过 v1，v2 不是 v1 的祖先），
+    // 但计划说它属于 v1
     await commitWithSlice('f.txt', 'f', 'slice-misplaced', 'feat(slice-misplaced): 合错版本');
     git('branch', '-f', 'version/v2');
 
     const rows = await annotateArtifactEvidence(ROOT, 'version/v1', [{ id: 'slice-misplaced' }]);
     assert.equal(rows[0].onBranch, false, '所属分支查不到就说查不到 —— 不替它改归属');
+    assert.equal(rows[0].ancestorOnBranch, false, '也不许假装它「随祖先并入」');
+  });
+});
+
+describe('ADR-126r2: 祖先分支上的产物也在，但要说清是「祖先」', () => {
+  it('栈式版本：v2 在 v1 之上切 —— v1 的片对 v2 是 ancestorOnBranch=true，onBranch 仍为 false', async () => {
+    await commitWithSlice('a.txt', 'a', 'slice-in-v1', 'feat: v1 的片');
+    git('branch', '-f', 'version/v1');
+    await commitWithSlice('b.txt', 'b', 'slice-in-v2', 'feat: v2 的片');
+    git('branch', '-f', 'version/v2');
+
+    const [row] = await annotateArtifactEvidence(ROOT, 'version/v2', [{ id: 'slice-in-v1' }]);
+    // 判据「在所属分支上」：只认这一版自己的提交，祖先带来的不算
+    assert.equal(row.onBranch, false);
+    assert.equal(row.commit, null);
+    // 但产物确实随栈进入了 v2 —— 不能因此说「v2 里没有」
+    assert.equal(row.ancestorOnBranch, true);
+    assert.ok(row.ancestorCommit);
+  });
+
+  it('同一条线上更早的分支不算祖先：它的 tip 被 version/v3 越过 → 不是祖先', async () => {
+    // version/early 在当时的 main tip 上挂一个空提交，之后 main 继续前进、
+    // v3 从新 tip 切 —— early 的 tip 不在 v3 历史里
+    const earlyBase = git('rev-parse', 'HEAD').trim();
+    git('commit', '-q', '--allow-empty', '-m', 'chore: early 分支的起点');
+    git('branch', '-f', 'version/early');
+    git('reset', '-q', '--hard', earlyBase);
+    await commitWithSlice('e.txt', 'e', 'slice-main', 'feat: 主干继续');
+    git('branch', '-f', 'version/v3');
+
+    // early 的 tip 是 v3 的兄弟提交，不是祖先 —— 任何片都不许说「随祖先并入」
+    const [row] = await annotateArtifactEvidence(ROOT, 'version/v3', [{ id: 'slice-early-only' }]);
+    assert.equal(row.onBranch, false);
+    assert.equal(row.ancestorOnBranch, false);
+  });
+
+  it('所属分支不存在 → 两列都是 null（不知道）', async () => {
+    const [row] = await annotateArtifactEvidence(ROOT, 'version/nope', [{ id: 'slice-in-v1' }]);
+    assert.equal(row.onBranch, null);
+    assert.equal(row.ancestorOnBranch, null);
   });
 });
 

@@ -292,8 +292,17 @@ function artifactCell(planIndex, id) {
     return b;
   }
   if (p.artifactOnBranch === false) {
+    // ADR-126r2：栈式版本里，本版自己没有这一片的 trailer 提交，
+    // 但它随祖先版本进了本版 —— 那不是「查不到」，是「在祖先上」。
+    if (p.artifactOnAncestor === true) {
+      var b3 = el('span', 'badge live-active', '✔ 随祖先版本并入');
+      b3.title = '本版分支上没有这一片自己的 Refs-Slice 提交，但它在**祖先版本分支**上'
+        + (p.artifactAncestorCommit ? '（提交 ' + p.artifactAncestorCommit + '）' : '')
+        + ' —— 产物已随栈进入本版';
+      return b3;
+    }
     var b2 = el('span', 'badge live-stale', '⚠ 分支上查不到');
-    b2.title = '所属版本分支（' + (p.versionBranch || '?') + '）上没有这一片的 Refs-Slice 提交'
+    b2.title = '所属版本分支（' + (p.versionBranch || '?') + '）和它的祖先分支上都没有这一片的 Refs-Slice 提交'
       + ' —— 可能合到了别的分支（归属错位），也可能还没合';
     return b2;
   }
@@ -408,6 +417,8 @@ function buildPlanIndex(coverage) {
           artifactOnBranch: row.artifactOnBranch,
           artifactCommit: row.artifactCommit,
           artifactSubject: row.artifactSubject,
+          artifactOnAncestor: row.artifactOnAncestor,
+          artifactAncestorCommit: row.artifactAncestorCommit,
           versionBranch: v.branch
         };
       }
@@ -456,14 +467,14 @@ function renderPlanCoverage(target, coverage) {
 
     var rows = (plan.versions || []).map(function (v) {
       var c = v.counts || {};
-      var gap = (c.completed || 0) - (c.artifactOnBranch || 0);
+      var gap = (c.completed || 0) - (c.artifactOnBranch || 0) - (c.artifactOnAncestor || 0);
       var cells = [
         v.version,
         String(v.status || '?'),
         String(c.planned || 0),
         String(c.onDisk || 0),
         String(c.completed || 0),
-        artifactCountCell(c.artifactOnBranch || 0, gap),
+        artifactCountCell(c.artifactOnBranch || 0, c.artifactOnAncestor || 0, gap),
         String(c.onBranch || 0),
         (v.dependsOn || []).join(', ') || '—',
         v.branch || '—'
@@ -471,24 +482,34 @@ function renderPlanCoverage(target, coverage) {
       return { cells: cells };
     });
     target.appendChild(table(
-      ['版本', '版本状态', '计划片数', '盘上有片', '盘上完成', '分支上有产物', '状态文件进分支', '依赖', '分支'],
+      ['版本', '版本状态', '计划片数', '盘上有片', '盘上完成', '本版分支有产物', '随祖先版本并入', '状态文件进分支', '依赖', '分支'],
       rows
     ));
   }
 }
 
 /**
- * 「分支上有产物」单元格 —— 盘上完成与分支上有产物差得多时，直说差多少。
+ * 「分支上有产物」单元格 —— 本版分支命中 / 随祖先版本并入 / 盘上完成却两边都查不到。
  *
- * 差得多**不是**坏事：产物可能在别的版本分支上（归属错位），
+ * 为什么拆两列（ADR-126r2）：栈式版本（v2 从 v1 切出）里，本版**没有**
+ * 祖先片的 trailer 提交 —— 只报「本版 0 片」会把「这版什么都没做」当成结论。
+ * 实测 nimrtc-v14 v3：本版命中 1 片，祖先分支上另有 20 片。
+ *
+ * 两边都查不到**不是**坏事：产物可能在别的版本分支上（归属错位），
  * 或者这版还没合。这一格只说事实，不下结论（ADR-114 决策二的精神）。
  */
-function artifactCountCell(artifactOnBranch, gap) {
-  var box = el('span', null, String(artifactOnBranch));
+function artifactCountCell(own, anc, gap) {
+  var box = el('span', null, String(own));
+  if (anc > 0) {
+    var a = el('span', 'badge live-active', '+ ' + anc + ' 随祖先版本');
+    a.title = '这些片的产物在祖先版本分支上（栈式版本的常态）—— 已随祖先进入本版';
+    box.appendChild(document.createTextNode(' '));
+    box.appendChild(a);
+  }
   if (gap > 0) {
-    var w = el('span', 'badge live-stale', gap + ' 片产物不在本版分支');
-    w.title = '这些片在盘上是 completed，但所属版本分支上没有它们的 Refs-Slice 提交'
-      + '—— 可能合到了别的分支（归属错位），也可能还没合。逐片看「分支证据」列。';
+    var w = el('span', 'badge live-stale', gap + ' 片两边都查不到');
+    w.title = '这些片在盘上是 completed，但所属版本分支与它的祖先分支上都没有它们的 Refs-Slice 提交'
+      + '—— 可能合到了别的分支（归属错位），也可能还没合。逐片看产物证据列。';
     box.appendChild(document.createTextNode(' '));
     box.appendChild(w);
   }
@@ -1369,8 +1390,12 @@ async function showSliceDetail(id, forSign, loc) {
     var pa = planIndexForDetail[id];
     if (pa.artifactOnBranch === false) {
       aLine.appendChild(el('span', 'muted small',
-        ' 所属版本分支（' + (pa.versionBranch || '?') + '）上没有这一片的 Refs-Slice 提交'
-        + ' —— 可能合到了别的分支（归属错位），也可能还没合。'));
+        pa.artifactOnAncestor === true
+          ? ' 本版分支上没有它自己的 Refs-Slice 提交，但产物在**祖先版本分支**上'
+            + (pa.artifactAncestorCommit ? '（提交 ' + pa.artifactAncestorCommit + '）' : '')
+            + ' —— 已随栈进入本版。'
+          : ' 所属版本分支（' + (pa.versionBranch || '?') + '）和它的祖先分支上都没有这一片的 Refs-Slice 提交'
+            + ' —— 可能合到了别的分支（归属错位），也可能还没合。'));
     } else if (pa.artifactOnBranch === true && pa.artifactCommit) {
       aLine.appendChild(el('span', 'muted small',
         ' ' + pa.artifactCommit + (pa.artifactSubject ? ' ' + pa.artifactSubject : '')));

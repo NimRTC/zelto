@@ -90,16 +90,37 @@ artifactOnBranch = null   拿不到证据（不是 git 仓库 / 分支不存在�
 `null`（拿不到证据）≠ `false`（查到了，没有）——
 这是 ADR-081 / ADR-114 一直守的口径，本 ADR 沿用。
 
+### 五（r2，同日实测补正）：栈式版本必须并排给「随祖先版本并入」
+
+nimrtc-v14 的版本是**栈式**的（v3 从 v2 切、v2 从 v1 切）。按「所属分支上」的判据，
+v2/v3 **永远不会**有 v1 片的 trailer 提交 —— 实测 v3：本版命中 **1** 片，
+祖先分支上另有 **20** 片。只报「本版 0/21」会把「这版没做」当成结论。
+
+所以每行多两列（不合成、不改上面的判据）：
+
+| 列 | 含义 |
+|---|---|
+| `artifactOnBranch` | 这一片**自己的** Refs-Slice 提交在所属分支上（祖先带来的不算） |
+| `artifactOnAncestor` | 不在本版分支、但在**祖先版本分支**（本地 `version/*` 中属于本分支祖先的）上 |
+
+「祖先带来的不算」按**提交**判：同一 id 的首个命中提交若已在祖先分支历史里，
+就只算 `artifactOnAncestor`（不用 `git log --not` 排除 —— 那会让「本版提交比祖先提交旧」
+的 id 落到祖先去，把归属错位藏起来）。
+
+界面：计划表两列（「本版分支有产物」/「随祖先版本并入」），差的片单独标
+「两边都查不到」；切片徽标三态改为「有产物 / 随祖先版本并入 / 分支上查不到」。
+
 ## 影响
 
 - **core**：`core/project/artifact-evidence.ts`（新）。零第三方依赖，
   只用 `node:child_process`（C2）；只读 git、纯计算（C3）；不落任何状态（C1）。
-- **adapters**：`/api/plan-coverage` 每行多三个字段
-  （`artifactOnBranch` / `artifactCommit` / `artifactSubject`），
-  每版 `counts` 多一个 `artifactOnBranch`。
-  每个版本问一次 git（一次 `git log` 读全量 trailer），**不逐片问**。
-- **驾驶舱**：计划对照表新增「分支上有产物」列（取代「分支上完成」的展示位）；
-  切片列表新增「产物证据」列；切片详情新增「产物证据」行。
+- **adapters**：`/api/plan-coverage` 每行多五个字段
+  （`artifactOnBranch` / `artifactCommit` / `artifactSubject` /
+  `artifactOnAncestor` / `artifactAncestorCommit`），
+  每版 `counts` 多 `artifactOnBranch` / `artifactOnAncestor`。
+  每个版本问两次 git（本分支一次、祖先分支一次），**不逐片问**。
+- **驾驶舱**：计划对照表新增「本版分支有产物」+「随祖先版本并入」两列
+  （取代「分支上完成」的展示位）；切片列表新增「产物证据」列；切片详情新增「产物证据」行。
 
 ## 被否决的替代方案
 
@@ -112,3 +133,6 @@ artifactOnBranch = null   拿不到证据（不是 git 仓库 / 分支不存在�
   写集之外的改动会污染判断，且切片之间写集重叠时无法区分归属。
 - **让前端自己算**（前端拉 `git log`）：判定必须在服务端（C3），
   前端只做展示。
+- **用 `git log <branch> --not <ancestors>` 排除祖先提交**：同一 id 若本版提交比
+  祖先提交旧，首个命中会落到「本版有、据此却排除了」上；按 id 的首个命中提交
+  逐个判「是否已在祖先历史里」，归属错位才暴露得出来。
