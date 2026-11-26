@@ -97,6 +97,8 @@ describe('ZD-062：门禁超时杀整棵命令树', () => {
       commands: [{ name: 'hang', run }],
       timeoutSec: 3,
       retry: { max: 1, budgetStepUsd: 0 },
+      // 命令把自己（孙子）的 pid 落盘 —— 杀树兜底据此再强杀一次。
+      grandchildPidFile: pidFile,
     };
     const executor = new GateExecutor(store, events, config, TEST_DIR);
     const slice = store.create('zd062', 'ZD-062');

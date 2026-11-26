@@ -195,6 +195,8 @@ const PENDING_BEFORE_V4 = new Set([
   'src/adapters/web/frontend/app.js',
   'src/core/gate/diagnostics.ts',
   'src/core/gate/executor.ts',
+  'src/core/gate/types.ts',
+  'tests/zd062-gate-kill-tree.test.ts',
   'src/core/lifecycle/gate.ts',
   'src/core/slice/index.ts',
   'src/core/slice/baseline-kind.ts',

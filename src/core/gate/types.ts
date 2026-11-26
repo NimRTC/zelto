@@ -140,6 +140,13 @@ export interface GateConfig {
    * 关掉它不是跳过验证 —— 缺头文件时构建本身会失败。
    */
   submoduleCheck?: boolean;
+  /**
+   * **仅测试用**：门禁超时杀树后，读这个文件拿到**孙子进程**的 pid
+   * （命令自己落盘），再按树强杀一次（ZD-062 第二次实测）。
+   *
+   * 生产配置不写它 —— 不写时行为与之前完全一致。
+   */
+  grandchildPidFile?: string;
   retry: {
     max: number;
     budgetStepUsd: number;

@@ -4,7 +4,7 @@
 
 import { execFileSync, spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { GateConfig, GateCommand, GateResult, GateReport, GateScopeFacts, SliceType, AcceptanceOutcome } from './types.js';
@@ -112,11 +112,91 @@ function killTree(child: ChildProcess): void {
   child.kill('SIGKILL');
 }
 
+/**
+ * `taskkill /T /F` 返回之后，树**还可能没死透**（ZD-062 第二次实测）。
+ *
+ * 病灶（2026-11-26，一次后台 `npm test` 全量，386 秒后红在 `after` 钩子）：
+ * 超时杀树、命令 close 都发生了，用例的 `after` 在 `rmSync` 上照样 `EPERM`
+ * ——「孙子已死」的断言过不了，宽限 15 秒也一样。
+ *
+ * 成因不止一种可能（杀树落空 / `taskkill` 对外壳报了错但内层还在 / 句柄
+ * 晚于进程退出才松开），所以这里不再猜「是哪一种」，而是加一道**幂等兜底**：
+ *
+ * 1. 有孙子 pid（命令自己落盘的）→ 再按树强杀一次；
+ * 2. 外壳还没 close → 再补一次 `taskkill /T`；
+ * 3. **等命令真的 close 再 abort** —— 调用方 `close` 处理完、用例拿到
+ *    结果时，进程树已经不在写盘了。
+ *
+ * 孙子 pid 从 `grandchildPidFile`（`GateConfig.grandchildPidFile`）读：
+ * 这是给**测试**验 ZD-062 用的口子 —— 生产配置不写它，行为零变化。
+ */
+function hardenTreeKill(child: ChildProcess, grandchildPidFile?: string): Promise<void> {
+  return new Promise((resolvePromise) => {
+    let grandchild = 0;
+    if (grandchildPidFile) {
+      try {
+        grandchild = Number(readFileSync(grandchildPidFile, 'utf-8').trim());
+      } catch {
+        /* 命令还没写，或压根没这个文件 */
+      }
+    }
+    if (grandchild > 0) {
+      try {
+        if (process.platform === 'win32') {
+          execFileSync('taskkill', ['/pid', String(grandchild), '/T', '/F'], {
+            stdio: 'ignore',
+            timeout: 15_000,
+          });
+        } else {
+          process.kill(grandchild, 'SIGKILL');
+        }
+      } catch {
+        /* 已经没了 */
+      }
+    }
+
+    // 外壳还没 close → 补一次按树杀（此时它已经带着子进程树；没配
+    // 孙子 pid 时为**唯一**的兜底）。
+    if (
+      child.exitCode === null &&
+      child.signalCode === null &&
+      child.pid !== undefined &&
+      process.platform === 'win32'
+    ) {
+      try {
+        execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+          stdio: 'ignore',
+          timeout: 15_000,
+        });
+      } catch {
+        /* 外壳早没了 */
+      }
+    }
+
+    // 等命令真的 close（exitCode / signalCode 落定）。只等「死透」，
+    // 不重复处理输出 —— 输出仍由 close / error 处理。
+    const deadline = Date.now() + 30_000;
+    const poll = (): void => {
+      if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) {
+        resolvePromise();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolvePromise();
+        return;
+      }
+      setTimeout(poll, 50);
+    };
+    poll();
+  });
+}
+
+
 function runCommand(
   cmd: GateCommand,
   timeoutSec: number,
   cwd: string,
-  options: { stripTestContext?: boolean } = {},
+  options: { stripTestContext?: boolean; grandchildPidFile?: string } = {},
 ): Promise<GateResult> {
   return new Promise((resolvePromise) => {
     const start = performance.now();
@@ -142,7 +222,8 @@ function runCommand(
       // 先按树杀，再 abort —— 顺序反了，内层先死、外壳跟着退，
       // `taskkill /T` 就只看到「进程不存在」，内层成了孤儿（实测）。
       killTree(child);
-      ac.abort();
+      // 杀树之后还要兜底：确认孙子真的死了、命令真的 close，再 abort。
+      void hardenTreeKill(child, options.grandchildPidFile).then(() => ac.abort());
     }, timeoutSec * 1000);
 
     let stdout = '';
@@ -735,7 +816,9 @@ export class GateExecutor {
     expectedTests?: string[],
   ): Promise<{ result: GateResult; retries: number }> {
     const timeoutSec = cmd.timeoutSec ?? this.config.timeoutSec;
-    let result = await runCommand(cmd, timeoutSec, this.projectRoot);
+    let result = await runCommand(cmd, timeoutSec, this.projectRoot, {
+      grandchildPidFile: this.config.grandchildPidFile,
+    });
     let attempts = 0;
 
     // ADR-097 决策三：**作用域收窄的假绿防线**。
@@ -800,7 +883,9 @@ export class GateExecutor {
       const retryCmd: GateCommand = narrowing
         ? { ...cmd, run: narrowing.command }
         : cmd;
-      result = await runCommand(retryCmd, timeoutSec, this.projectRoot);
+      result = await runCommand(retryCmd, timeoutSec, this.projectRoot, {
+        grandchildPidFile: this.config.grandchildPidFile,
+      });
 
       // ADR-096 决策二：收窄跑的 ctest 可能**一个用例都没跑到**就退出 0
       // （`No tests were found!!!`）—— 那是假绿，必须当成失败。

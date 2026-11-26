@@ -63,6 +63,7 @@ const AFTER_V4_PATHS = new Set([
   'src/core/activity/watchdog.ts',
   'src/core/gate/diagnostics.ts',
   'src/core/gate/executor.ts',
+  'src/core/gate/types.ts',
   'src/core/lifecycle/gate.ts',
   'src/core/project/branch-evidence.ts',
   'src/core/project/cockpit-roots.ts',

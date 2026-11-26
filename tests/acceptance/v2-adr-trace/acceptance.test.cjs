@@ -436,6 +436,10 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'src/cli/commands/task-store.ts',
     'tests/adr-129-run-identity.test.ts',
     'tests/zd049-supervisor-takeover.test.ts',
+    // ZD-062 第二次实测：杀树兜底（等 close 再 abort + 孙子 pid 补刀）
+    'src/core/gate/executor.ts',
+    'src/core/gate/types.ts',
+    'tests/zd062-gate-kill-tree.test.ts',
     ]);
 
   const offenders = [];
