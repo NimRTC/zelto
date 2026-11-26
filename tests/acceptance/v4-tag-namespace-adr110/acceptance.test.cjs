@@ -203,6 +203,13 @@ const PENDING_BEFORE_V4 = new Set([
   'src/core/project/managed-paths.ts',
   'tests/d73-ship-tag-record-preserved.test.ts',
   'docs/adr/adr-111-baseline-vs-development-slice-counting.md',
+  // 并行会话的改动（2026-11-26）：执行目录脉络三态修订 + 看门狗已放弃不折算成「在跑」
+  'src/core/project/worktree-map.ts',
+  'tests/web-worktree-map.test.ts',
+  'docs/adr/adr-120-cockpit-worktree-map-and-merged-into-trunk.md',
+  'docs/adr/adr-123-cockpit-watchdog-gave-up-is-not-running.md',
+  // ADR-122（重新冻结改写集 + 作用域解析）是另一并行会话落地的 ADR，本会话没碰
+  'docs/adr/adr-122-refreeze-rewrites-writeset-and-scope-parser.md',
 ]);
 
 /** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {

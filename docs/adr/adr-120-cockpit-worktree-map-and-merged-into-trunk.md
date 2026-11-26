@@ -65,3 +65,16 @@ HEAD 是主干 HEAD 的祖先（`git merge-base --is-ancestor`）。
 - `readGitWorktrees` 从 `core/project/branch-evidence.ts` 搬到 `core/project/worktree-map.ts`
   （它属于「执行目录脉络」的事实来源；`core/project/index.ts` 继续导出，调用方不变）。
 - 纯事实呈现：不改任何判定、不写任何状态文件（C3、C1 不变）。
+
+## 修订（2026-11-26，同日）
+
+实测对照后两处对齐：
+
+1. **`mergedIntoTrunk` 由 `boolean | null` 改为三态 `'merged' | 'diverged' | null`。**
+   nimrtc-v14 的 v3 版本状态是 `delivered`，但 `version/v3` 比远端 main 还快 73 个提交 ——
+   `false` 被渲染成告警色「有未合并提交」，和同一行的 delivered 摆在一起被人读成矛盾。
+   `'diverged'` 是中性的 git 事实（版本分支跑在主干前面是常态），
+   版本交付状态仍只由 `version status` 回答。
+2. **主干锚点改为异步解析并注入。** `discoverWorktrees` 新增可选第三参
+   `trunkHead`，`/api/worktrees` 用 `resolveTrunkAsync`（异步 spawn，ZD-045）取得后才调用 ——
+   避免每次请求多一次同步 git 挂住事件循环。不传第三参时退回同步 `resolveTrunk`（老行为）。

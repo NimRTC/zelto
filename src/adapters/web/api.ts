@@ -55,6 +55,7 @@ import {
   discoverWorktrees,
   normalizeDir,
   readGitWorktrees,
+  resolveTrunkAsync,
   type WorktreeEntry,
 } from '../../core/project/worktree-map.js';
 // ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
@@ -68,7 +69,6 @@ import {
 import { loadConfigAt } from '../../core/config/index.js';
 import { launchRun } from './throttle.js';
 
-/** 一片切片的总览行 —— 前端列表用。 */
 export interface SliceSummary {
   id: string;
   title: string;
@@ -206,6 +206,23 @@ export interface SliceSummary {
   onBranch: boolean | null;
   /** 提交形态的状态（与盘上 `state` 对照）—— 不跟踪时 `null` */
   committedState: string | null;
+  /**
+   * ── running 片到底还活着没有（D-30 活性的「可能自愈」档）──
+   *
+   * `liveness === 'dead'` 是**确定**死了（进程没了）；`stale` 只是「很久没动静」——
+   * 最常见的原因是看门狗会把它自愈（重跑 / 续跑），所以 stale **不是**停机
+   * （`stall.class` 仍为 null，`/api/stalls` 也不报它）。
+   *
+   * 但看门狗追赶有限（`recoveries` 计到上限就 `escalated` = 交还给人）。
+   * 于是会出现：进程早就没了、看门狗已经放弃、状态文件却还停在 running ——
+   * 它不是停机类的任何一档（`/api/stalls` 看不见它），只有活性/自愈计数
+   * 两条线索拼起来才知道「这片要人来收」。
+   *
+   * 这里的判定只做**文件事实的拼装**（活性 + 自愈上限），不另立停机判据；
+   * 前端根据它把这类片在总览里单独说出来，而不是让它混在「在跑」里。
+   * 非 running 片恒为 false。
+   */
+  watchdogGaveUp: boolean;
 }
 
 /** 切片详情 —— 含签字复查的事实与判定。 */
@@ -343,12 +360,13 @@ export class WebApi {
     repoRoot: string;
     entries: Array<WorktreeEntry & { slices: SliceSummary[]; version: string | null }>;
   }> {
-    const [gitWorktrees, slices, plans] = await Promise.all([
+    const [gitWorktrees, trunk, slices, plans] = await Promise.all([
       readGitWorktrees(this.repoRoot),
+      resolveTrunkAsync(this.repoRoot),
       this.listSlices(),
       Promise.resolve(readVersionPlans(join(this.zeltoDir, 'versions'))),
     ]);
-    const entries = discoverWorktrees(this.repoRoot, gitWorktrees);
+    const entries = discoverWorktrees(this.repoRoot, gitWorktrees, trunk);
 
     // 版本 label → 计划里的版本状态（只呈现，不判定）
     const versionStatus = new Map<string, string>();
@@ -1044,6 +1062,22 @@ export class WebApi {
         })),
         dead: slices.filter((s) => s.liveness === 'dead').map((s) => ({
           id: s.id, reason: s.liveReason, recoveries: s.recoveries, escalated: s.escalated,
+        })),
+        /**
+         * 看门狗已经放弃、状态却停在 running 的片（D-30 / `watchdogGaveUp`）。
+         *
+         * 为什么要单列：这类片**不是**停机类的任一档（`stall.class` 为 null，
+         * `/api/stalls` 与 `stalledCount` 都看不见它），却也不该算「在跑」。
+         * 不给前端这一条，总览页的「正在运行」就会把一具尸体算成活的
+         * （实测 nimrtc-v14：两片进程没了、自愈 7 次 / 上报过，界面毫无提示）。
+         */
+        gaveUp: slices.filter((s) => s.watchdogGaveUp).map((s) => ({
+          id: s.id,
+          liveness: s.liveness,
+          recoveries: s.recoveries,
+          escalated: s.escalated,
+          lastActivityAt: s.lastActivityAt,
+          reason: s.liveReason,
         })),
       },
       // ── 看门狗上报（D-30）：超 3 次不再自救的，等人看 ──
@@ -1992,6 +2026,7 @@ async function toSummary(
     lastActivityAt,
     recoveries,
     escalated,
+    watchdogGaveUp: slice.state === 'running' && (liveness === 'dead' || liveness === 'stale'),
     progressLine,
     progressAt,
     elapsedMs,

@@ -67,10 +67,20 @@ export interface WorktreeEntry {
   head: string | null;
   /** 这一条的依据 —— 「怎么发现的」要说清楚，不然人不知道该信哪一层 */
   evidence: string;
-  /** 编码用：版本分支/HEAD 已 merge 进主干、且没有自己的未合并提交。
-   *  只对 kind='version' 有意义；未提供 git 事实时为 null。
-   *  它只回答「这条战线的活是不是已经在主干里了」，不判定版本交付状态本身。 */
-  mergedIntoTrunk?: boolean | null;
+  /**
+   * 编码用：版本分支/HEAD 与主干的祖先关系。只对 kind='version' 有意义；
+   * 未提供 git 事实（HEAD / 主干锚点都拿不到）时为 null。
+   *
+   *   'merged'  —— HEAD 是主干的祖先：这条战线的活已经在主干里
+   *   'diverged' —— HEAD 有主干没有的提交（版本分支常比主干跑得快）
+   *   null       —— 不知道（没有 git 事实），不许说成「未合并」
+   *
+   * 它只回答 git 事实，不判定版本交付状态本身（那归 `version status`）。
+   * 为什么要单独区分 'diverged'（实测 nimrtc-v14，2026-11-26）：
+   * v3 版本的 status 是 delivered，但 version/v3 比远端 main 还快 73 个提交 ——
+   * 只报「有未合并提交」会和同一行的 delivered 摆在一起，人读成矛盾。
+   */
+  mergedIntoTrunk?: 'merged' | 'diverged' | null;
 }
 
 /** 路径归一：统一正斜杠、去掉末尾分隔符、Windows 下大小写不敏感。 */
@@ -105,10 +115,13 @@ function hasZeltoState(dir: string): boolean {
  * @param repoRoot 仓库根
  * @param gitWorktrees git 记录的 worktree（`readGitWorktrees` 的结果）；
  *   不传 = 不认额外工作区（老行为，零变化）
+ * @param trunkHead 主干锚点提交（调用方注入，`merge-base` 判祖先关系的远端）；
+ *   不给 = 用 `resolveTrunk(repoRoot)` 现查；查不到就是 null（「不知道」）
  */
 export function discoverWorktrees(
   repoRoot: string,
   gitWorktrees: GitWorktreeEntry[] = [],
+  trunkHead?: string | null,
 ): WorktreeEntry[] {
   const out: WorktreeEntry[] = [];
   const seen = new Set<string>();
@@ -145,7 +158,7 @@ export function discoverWorktrees(
   // 主干锚点：本地 main/master → 远端 origin/ghssh/github 的 main/master
   // （实测 nimrtc-v14：没有本地 main，developing 分支叫 feat/v14-turn-tls，
   //  版本合进的「主干」是远端 main —— 只认本地 refs/heads/main 会一条都判不出）
-  const trunk = resolveTrunk(repoRoot);
+  const trunk = trunkHead === undefined ? resolveTrunk(repoRoot) : trunkHead;
   for (const label of versionNames
     .filter((n) => isValidVersionLabel(n))
     .filter((n) => isDirectory(join(versionBase, n)))
@@ -222,7 +235,11 @@ export function discoverWorktrees(
  * 只做「知道 / 不知道」的降级 —— 问不出来就返回 null，
  * 不按「未合并」装一个确定的答案出来。
  */
-function isMergedInto(repoRoot: string, head: string | null, trunk: string | null): boolean | null {
+function isMergedInto(
+  repoRoot: string,
+  head: string | null,
+  trunk: string | null,
+): 'merged' | 'diverged' | null {
   if (!head || !trunk) return null;
   try {
     execFileSync('git', ['merge-base', '--is-ancestor', head, trunk], {
@@ -230,10 +247,10 @@ function isMergedInto(repoRoot: string, head: string | null, trunk: string | nul
       stdio: 'ignore',
       timeout: 5000,
     });
-    return true;
+    return 'merged';
   } catch (e) {
-    // 退出 1 = 不是祖先（知道了）；超时 / 对象不存在 = 不知道
-    return (e as { status?: number }).status === 1 ? false : null;
+    // 退出 1 = 不是祖先（知道了，这就是 diverged）；超时 / 对象不存在 = 不知道
+    return (e as { status?: number }).status === 1 ? 'diverged' : null;
   }
 }
 
@@ -306,6 +323,25 @@ function resolveTrunk(repoRoot: string): string | null {
 }
 
 // ─── git worktree 事实 ───────────────────────────────────────────────────────
+
+/**
+ * 主干锚点，**异步**版：驾驶舱每一条请求都走这条路径，同步 spawn 会卡事件循环
+ * （ZD-045）。失败同样是 null（「不知道」），不猜。
+ */
+export async function resolveTrunkAsync(repoRoot: string): Promise<string | null> {
+  const candidates: string[] = [];
+  for (const name of ['main', 'master']) candidates.push(`refs/heads/${name}`);
+  for (const remote of ['origin', 'ghssh', 'github'])
+    for (const name of ['main', 'master']) candidates.push(`refs/remotes/${remote}/${name}`);
+  // 逐条问：`rev-parse --verify` 一次给多个 ref 时**任一**不存在就整体退出非零，
+  // 已存在的 ref 也不输出 —— 批量问等于永远拿不到（实测 rev-parse 多参）。
+  for (const ref of candidates) {
+    const r = await runGit(['rev-parse', '--verify', '--quiet', ref], repoRoot, 5_000);
+    const rev = r.ok ? r.stdout.trim() : '';
+    if (rev) return rev;
+  }
+  return null;
+}
 
 /**
  * 「这条战线在 git 眼里长什么样」—— 一次 `git worktree list --porcelain`。

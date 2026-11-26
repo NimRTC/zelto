@@ -98,6 +98,12 @@ const AFTER_V4_PATHS = new Set([
   'docs/adr/adr-117-submodule-pointer-alignment.md',
   'docs/adr/adr-118-spec-conformance-and-glossary.md',
   'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+  // 并行会话的改动（2026-11-26）：执行目录脉络三态修订 + 看门狗已放弃不折算成「在跑」
+  'docs/adr/adr-120-cockpit-worktree-map-and-merged-into-trunk.md',
+  'docs/adr/adr-123-cockpit-watchdog-gave-up-is-not-running.md',
+  // ADR-122（重新冻结改写集 + 作用域解析）是另一并行会话落地的 ADR，本会话没碰
+  'docs/adr/adr-122-refreeze-rewrites-writeset-and-scope-parser.md',
+  'tests/web-worktree-map.test.ts',
   'src/adapters/web/api.ts',
   'src/adapters/web/frontend/app.js',
   'src/adapters/web/router.ts',

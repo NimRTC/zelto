@@ -476,10 +476,18 @@ function renderWorktreeMap(target, map) {
       // 不是版本交付状态。全列出来的时候 v1/v2/v3 早就合进主干，
       // 不标的话人会把「5 条版本战线」读成「5 个版本在并行」。
       if (e.kind === 'version') {
-        if (e.mergedIntoTrunk === true) {
+        if (e.mergedIntoTrunk === 'merged') {
           bh.appendChild(el('span', 'badge', ' 已并入主干'));
-        } else if (e.mergedIntoTrunk === false) {
-          bh.appendChild(el('span', 'badge live-stale', ' 有未合并提交'));
+        } else if (e.mergedIntoTrunk === 'diverged') {
+          // 中性徽标，不是告警色：版本分支比主干跑得快是常态（v3 delivered 时
+          // 可能还领先主干几十个提交）。红字会让人读成「和 delivered 矛盾」。
+          // 真正该警惕的是「有未合并提交**且**版本状态说已交付」—— 那种由
+          // 版本状态单元格自己去对照，这里只摆 git 事实。
+          const d = el('span', 'badge', ' 主干之外');
+          d.title = '这条版本分支/HEAD 有主干还没有的提交（git 祖先关系）'
+            + (e.version ? '；版本状态是 ' + e.version : '')
+            + ' —— 只是 git 事实，不代表台账错了';
+          bh.appendChild(d);
         }
       }
       const stateCell = el('span', 'muted small', e.hasZeltoState ? '有 .zelto 状态' : '无');
@@ -736,6 +744,29 @@ async function viewOverview(target) {  const s = await apiGet('/api/summary');
   const escalated = wd.escalated || [];
   if (escalated.length > 0) {
     target.appendChild(el('p', 'notice bad', '🚨 看门狗已上报（假死超 3 次不再自救）：' + escalated.join('、') + ' —— 请看现场后 zelto resume 重跑'));
+  }
+  // ── 看门狗已放弃、状态却停在 running 的片 ──
+  //
+  // 它们既不在「停机」（stall.class 为 null，stalledSlices 里没有），
+  // 也不该算「在跑」。不给这一节，总览就把尸体算成活的了。
+  const gaveUp = live.gaveUp || [];
+  if (gaveUp.length > 0) {
+    target.appendChild(el('h2', null, '需人收（看门狗已停救）'));
+    target.appendChild(el('p', 'muted small',
+      '这些片的状态还是 running，但进程已经没了（或很久没动静），且自动自愈已经到头。'
+      + '它们不属于任何停机分类，所以上面的「停机」数里没有它们。'
+      + '处理：看现场后 zelto resume <id> 重跑，或 zelto abandon <id> 收掉。'));
+    target.appendChild(table(
+      ['切片', '活性', '自愈 / 上报', '最后活动', '现场'],
+      gaveUp.map(function (x) {
+        const tag = x.liveness === 'dead' ? '💀 dead' : '⚠️ stale';
+        const rec = '已自愈 ' + (x.recoveries || 0) + ' 次' + (x.escalated ? ' · 已上报' : '');
+        return {
+          onClick: (function (id) { return function () { showSliceDetail(id); }; })(x.id),
+          cells: [x.id, tag, rec, x.lastActivityAt ? new Date(x.lastActivityAt).toLocaleString() : '—', x.reason || '']
+        };
+      })
+    ));
   }
 }
 
@@ -1958,8 +1989,17 @@ async function refreshSummary() {
   if (!projectLoaded) void loadProjectInfo();
   try {
     const s = await apiGet('/api/summary');
-    summaryLine.textContent = s.totalSlices + ' 切片 · ' + s.pendingSignCount + ' 待签字 · ' + s.stalledCount + ' 停机' +
-      (s.live && s.live.active && s.live.active.length ? ' · ' + s.live.active.length + ' 在跑' : '');
+    // 在跑 / 可疑 / 已死分开说（D-30）：只报 active 的话，
+    // 一片进程早就没了的 running 片会从总览行里彻底消失，人以为一切正常。
+    const live = s.live || {};
+    const gaveUp = (live.gaveUp || []).length;
+    // 「在跑」只算看门狗没放弃的 —— gaveUp 那批进程都没了，算进在跑就是说谎
+    const runningNow = (live.active || []).length + (live.stale || []).length - gaveUp;
+    let line = s.totalSlices + ' 切片 · ' + s.pendingSignCount + ' 待签字 · ' + s.stalledCount + ' 停机'
+      + (runningNow > 0 ? ' · ' + runningNow + ' 在跑' : '');
+    if ((live.dead || []).length > 0) line += ' · ' + live.dead.length + ' 已死';
+    if (gaveUp > 0) line += ' · ' + gaveUp + ' 需人收（看门狗已停救）';
+    summaryLine.textContent = line;
     noteConnected();
   } catch (err) {
     // 概况拿不到不影响主视图 —— 但要记一笔，连续失败会判定为「断了」

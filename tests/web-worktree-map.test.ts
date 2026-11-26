@@ -285,16 +285,39 @@ describe('版本战线：已并入主干 + 计划补片', () => {
     await rm(extraDir, { recursive: true, force: true });
   });
 
-  it('已合进主干的版本标 mergedIntoTrunk=true，未合的标 false', async () => {
+  it('已合进主干的版本标 mergedIntoTrunk=merged，未合的标 diverged', async () => {
     const { WebApi } = await import('../src/adapters/web/api.js');
     const map = (await new WebApi(TRUNK_REPO).worktreeMap()) as {
-      entries: Array<{ kind: string; label: string | null; mergedIntoTrunk?: boolean | null }>;
+      entries: Array<{ kind: string; label: string | null; mergedIntoTrunk?: 'merged' | 'diverged' | null }>;
     };
     const v3 = map.entries.find((e) => e.kind === 'version' && e.label === 'v3');
     const v4 = map.entries.find((e) => e.kind === 'version' && e.label === 'v4');
     assert.ok(v3 && v4, JSON.stringify(map.entries.map((e) => [e.kind, e.label, e.mergedIntoTrunk])));
-    assert.equal(v3.mergedIntoTrunk, true, 'v3 的 HEAD 是主干祖先 = 已并入');
-    assert.equal(v4.mergedIntoTrunk, false, 'v4 有自己没合进主干的提交: ' + JSON.stringify(map.entries.filter((e) => e.label === 'v4')));
+    assert.equal(v3.mergedIntoTrunk, 'merged', 'v3 的 HEAD 是主干祖先 = 已并入');
+    assert.equal(v4.mergedIntoTrunk, 'diverged', 'v4 有自己没合进主干的提交: ' + JSON.stringify(map.entries.filter((e) => e.label === 'v4')));
+  });
+
+  it('主干锚点问不出来时 mergedIntoTrunk=null（「不知道」不许说成「未合并」）', async () => {
+    // 一个没有 main/master、也没有 origin/ghssh/github 远端的仓库：
+    // 主干是谁无从知道 —— 这时只能是 null，不能回落到 diverged。
+    const { execFileSync } = await import('node:child_process');
+    const bare = join(tmpdir(), `zelto-notrunk-${Date.now()}`);
+    await mkdir(bare, { recursive: true });
+    execFileSync('git', ['init', '-q', '-b', 'work'], { cwd: bare, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 't@t'], { cwd: bare, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', 't'], { cwd: bare, stdio: 'ignore' });
+    await writeFile(join(bare, 'a.txt'), 'a\n', 'utf-8');
+    execFileSync('git', ['add', '.'], { cwd: bare, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-q', '-m', 'a'], { cwd: bare, stdio: 'ignore' });
+    await mkZeltoState(join(bare, '.zelto', 'version-worktrees', 'v1'));
+    const { WebApi } = await import('../src/adapters/web/api.js');
+    const map = (await new WebApi(bare).worktreeMap()) as {
+      entries: Array<{ kind: string; label: string | null; mergedIntoTrunk?: 'merged' | 'diverged' | null }>;
+    };
+    const v1 = map.entries.find((e) => e.kind === 'version' && e.label === 'v1');
+    assert.ok(v1, JSON.stringify(map.entries.map((e) => [e.kind, e.label])));
+    assert.equal(v1.mergedIntoTrunk, null);
+    await rm(bare, { recursive: true, force: true });
   });
 
   it('版本行的切片按计划补齐（状态在根、label 未改也要出现）', async () => {
@@ -343,13 +366,13 @@ describe('版本战线：已并入主干 + 计划补片', () => {
     await mkZeltoState(join(local, '.zelto', 'version-worktrees', 'v3'));
     const { WebApi } = await import('../src/adapters/web/api.js');
     const map = (await new WebApi(local).worktreeMap()) as {
-      entries: Array<{ kind: string; label: string | null; mergedIntoTrunk?: boolean | null; branch: string | null }>;
+      entries: Array<{ kind: string; label: string | null; mergedIntoTrunk?: 'merged' | 'diverged' | null; branch: string | null }>;
     };
     const v3 = map.entries.find((e) => e.kind === 'version' && e.label === 'v3');
     assert.ok(v3, JSON.stringify(map.entries.map((e) => [e.kind, e.label])));
-    assert.equal(v3.mergedIntoTrunk, true, JSON.stringify(map.entries.map((e) => [e.kind, e.label, e.branch, e.mergedIntoTrunk])));
+    assert.equal(v3.mergedIntoTrunk, 'merged', JSON.stringify(map.entries.map((e) => [e.kind, e.label, e.branch, e.mergedIntoTrunk])));
     // 本地没有 main；它检出在 feat-x 上 —— 普通检出目录的 HEAD 已合进远端 main
-    assert.equal(v3.mergedIntoTrunk, true, JSON.stringify(map.entries.map((e) => [e.kind, e.label, e.branch, e.mergedIntoTrunk])));
+    assert.equal(v3.mergedIntoTrunk, 'merged', JSON.stringify(map.entries.map((e) => [e.kind, e.label, e.branch, e.mergedIntoTrunk])));
     await rm(bare, { recursive: true, force: true });
     await rm(seed, { recursive: true, force: true });
     await rm(local, { recursive: true, force: true });

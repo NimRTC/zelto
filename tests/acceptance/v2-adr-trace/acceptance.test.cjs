@@ -396,6 +396,11 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
     'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
     'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+    // 2026-11-26 并行会话：执行目录脉络三态修订 + 看门狗已放弃不折算成「在跑」
+    'docs/adr/adr-120-cockpit-worktree-map-and-merged-into-trunk.md',
+    'docs/adr/adr-123-cockpit-watchdog-gave-up-is-not-running.md',
+    // ADR-122（重新冻结改写集 + 作用域解析）是另一并行会话落地的 ADR，本会话没碰
+    'docs/adr/adr-122-refreeze-rewrites-writeset-and-scope-parser.md',
   ]);
 
   const offenders = [];
