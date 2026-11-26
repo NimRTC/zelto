@@ -573,6 +573,11 @@ test('验收标准 12：改动不越写集，ADR 与缺陷记录未被改动', (
       p !== 'docs/adr/adr-113-release-tag-version-guard.md' &&
       p !== 'docs/adr-trace-index.md' &&
       p !== 'specs/slices/v5-release-tag-guard.md' &&
+      // ZD-039 / ZD-040 —— ship 守卫口径与分叉判据的两条回归测试，
+      // 同样是 v4 之后才落的（2026-11-25）。与 ADR-111/113 同一个理由：
+      // 它们出现在这里不是「v4 越界」，是「v4 之后又有人干活了」。
+      p !== 'tests/zd039-ship-submodule-pointer-guard.test.ts' &&
+      p !== 'tests/zd040-ship-multiversion-base-not-forkpoint.test.ts' &&
       p !== 'full-suite.tap',
   );
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);
