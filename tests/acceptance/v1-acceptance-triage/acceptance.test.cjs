@@ -94,6 +94,13 @@ const AFTER_V4_PATHS = new Set([
   'tests/adr-053-dead-slice-reap.test.ts',
   'tests/d065-stuck-running-shell.test.ts',
   'tests/adr-124-duplicate-agent-guard.test.ts',
+  // ADR-125（监督进程收尾之后不许卡在退出）的落点：适配器心跳 unref +
+  // 监督进程入口强制退出。与 ADR-124 同一并行会话。
+  'src/adapters/claude-agent/index.ts',
+  'src/adapters/claude-agent-sdk/index.ts',
+  'src/adapters/cursor-agent/index.ts',
+  'src/cli/commands/supervisor-entry.ts',
+  'tests/adr-125-supervisor-exit.test.ts',
 ]);
 
 /** 后来被删掉的文件（删动作本身也是「后来落的」）。 */

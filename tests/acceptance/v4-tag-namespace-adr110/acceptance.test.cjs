@@ -222,6 +222,13 @@ const PENDING_BEFORE_V4 = new Set([
   'tests/adr-053-dead-slice-reap.test.ts',
   'tests/d065-stuck-running-shell.test.ts',
   'tests/adr-124-duplicate-agent-guard.test.ts',
+  // ADR-125（监督进程收尾之后不许卡在退出）的落点：三个适配器的心跳 unref
+  // + 监督进程入口的强制退出。与 ADR-124 同一并行会话落地。
+  'src/adapters/claude-agent/index.ts',
+  'src/adapters/claude-agent-sdk/index.ts',
+  'src/adapters/cursor-agent/index.ts',
+  'src/cli/commands/supervisor-entry.ts',
+  'tests/adr-125-supervisor-exit.test.ts',
 ]);
 
 /** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {

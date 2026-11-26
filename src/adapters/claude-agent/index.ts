@@ -579,6 +579,18 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
           this.onProgress(sessionId, elapsed, 'running');
         }
       }, 5000);
+      // ADR-125：心跳**不许**拖住进程退出。
+      //
+      // 病灶（实测 nimrtc-v14 v4-d5-audio-dtx，2026-11-26）：监督进程
+      // 收尾全部做完（切片已退回 frozen、预约已释放、日志写了「退出」），
+      // 进程却一直挂在进程表上 —— 因为收尾完成后这个方法还被调用过一次
+      // （收尾流水线里的预算核对会 `markProgress` → `resetIdleTimer` →
+      // 重建心跳），一个没 `unref` 的 `setInterval` 让事件循环永远不空，
+      // `process.exit` 之后的自然退出永远不到来。
+      //
+      // 心跳的职责是「落盘活性证据」，不是「让进程活着」——
+      // 进程该不该活由 supervise 的收尾负责，不由一个定时器决定。
+      (heartbeat as unknown as { unref?: () => void }).unref?.();
       this.progressIntervals.set(sessionId, heartbeat);
     }
 

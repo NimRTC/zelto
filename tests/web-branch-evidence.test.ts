@@ -184,7 +184,7 @@ describe('ADR-114：计划对照（计划 / 盘上 / 分支 分开数）', () =>
         versions: Array<{
           version: string;
           slices: Array<{ id: string; onDisk: boolean; actualState: string | null; plannedState: string }>;
-          counts: { planned: number; onDisk: number; completed: number; onBranch: number };
+          counts: { planned: number; onDisk: number; completed: number; onBranch: number; artifactOnBranch: number };
         }>;
       }>;
     };
@@ -195,7 +195,8 @@ describe('ADR-114：计划对照（计划 / 盘上 / 分支 分开数）', () =>
     assert.equal(p.label, 'v3');
 
     const v = p.versions[0];
-    assert.deepEqual(v.counts, { planned: 2, onDisk: 1, completed: 1, onBranch: 0 });
+    // artifactOnBranch 是 ADR-126 新加的列：测试仓库里没有 Refs-Slice 提交，恒 0
+    assert.deepEqual(v.counts, { planned: 2, onDisk: 1, completed: 1, onBranch: 0, artifactOnBranch: 0 });
     const done = v.slices.find((s) => s.id === 'r-done');
     assert.ok(done);
     assert.equal(done.plannedState, 'draft', '计划里那份仍是 draft —— 计划没跟上盘上');

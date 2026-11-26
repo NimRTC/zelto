@@ -267,6 +267,40 @@ function branchCell(s) {
 }
 
 /**
+ * 产物证据徽标（ADR-126）—— 这一片的**产物**在所属版本分支上吗。
+ *
+ * 与「分支证据」（ADR-114）是两件事：
+ *   - 分支证据：切片**状态文件**是否已提交进所属分支
+ *     （`.zelto/` 在 .gitignore 里 → 这一项通常恒为「仅在盘上」）；
+ *   - 产物证据：这一片有没有在所属版本分支上留下过 `Refs-Slice:` 提交
+ *     —— 那才是「这版做完没有」的**可查证凭据**。
+ *
+ * 三态（与 API 同口径）：
+ * - true：分支上有产物提交（给出短哈希与标题）
+ * - false：查不到 —— 可能合到了别的分支（归属错位），也可能还没合
+ * - null：拿不到证据（不是 git 仓库 / 分支不存在）—— 说「未知」，不说「没有」
+ */
+function artifactCell(planIndex, id) {
+  var p = planIndex && planIndex[id];
+  if (!p) return el('span', 'muted', '—');
+  if (p.artifactOnBranch === true) {
+    var b = el('span', 'badge live-active', '✔ 有产物');
+    if (p.artifactCommit) {
+      b.title = (p.artifactSubject ? p.artifactSubject + '\n' : '') +
+        '提交 ' + p.artifactCommit + '（分支 ' + (p.versionBranch || '?') + '）';
+    }
+    return b;
+  }
+  if (p.artifactOnBranch === false) {
+    var b2 = el('span', 'badge live-stale', '⚠ 分支上查不到');
+    b2.title = '所属版本分支（' + (p.versionBranch || '?') + '）上没有这一片的 Refs-Slice 提交'
+      + ' —— 可能合到了别的分支（归属错位），也可能还没合';
+    return b2;
+  }
+  return el('span', 'muted', '未知');
+}
+
+/**
  * 一个切片的「计划对照」单元格（ADR-114）—— 计划里的状态 vs 盘上。
  *
  * 数据来自 `/api/plan-coverage`（按 id 索引后递进来）；不在任何计划里时
@@ -369,7 +403,12 @@ function buildPlanIndex(coverage) {
           plannedState: row.plannedState,
           onDisk: row.onDisk,
           actualState: row.actualState,
-          onBranch: row.onBranch
+          onBranch: row.onBranch,
+          // ADR-126：产物证据（所属版本分支上有没有 Refs-Slice 提交）
+          artifactOnBranch: row.artifactOnBranch,
+          artifactCommit: row.artifactCommit,
+          artifactSubject: row.artifactSubject,
+          versionBranch: v.branch
         };
       }
     }
@@ -384,10 +423,21 @@ function buildPlanIndex(coverage) {
  * 展开到片会让页面淹没；切片级的「计划 vs 盘上」在切片列表的「计划」列里。
  *
  * 计数口径（与 API 同口径，**不做合成**）：
- *   计划 N 片 · 盘上 M 片 · 盘上完成 C 片 · **分支上完成 B 片**
+ *   计划 N 片 · 盘上 M 片 · 盘上完成 C 片 · 分支上有产物 A 片
  *
- * B 才是「版本分支里有证据的完成」。M/C 很大而 B 很小时，页面必须让人
- * 一眼看出「完成只在盘上」—— 这正是 nimrtc-v14 实测踩到的坑。
+ * **为什么「分支上有产物」取代了 ADR-114 那列「分支上完成」**（ADR-126）：
+ * ADR-114 问的是「切片**状态文件**是否已提交进所属分支」——
+ * 但 `.zelto/` 整体在 `.gitignore` 里，状态文件**永远**不进版本分支，
+ * 于是那列恒为 0。它不仅没有信息量，还给出误导性结论：
+ * 「分支上完成 0 / 盘上完成 10」读起来像「这版什么都没做完」，
+ * 而真相是「这版的产物**就在**分支上，只是状态文件没进 git」。
+ *
+ * 产物证据问的是另一件事：**这个切片 id 有没有在所属版本的分支上
+ * 留下过 `Refs-Slice:` 标记的提交** —— 那才是「这版做完没有」的
+ * 可查证凭据，且不依赖 `.zelto/` 是否进 git。
+ *
+ * ADR-114 那列**保留**（叫「状态文件进分支」）—— 它仍是事实，
+ * 只是它现在诚实地说自己是 0，而不是冒充「完成度」。
  */
 function renderPlanCoverage(target, coverage) {
   var plans = (coverage && coverage.plans) || [];
@@ -396,7 +446,8 @@ function renderPlanCoverage(target, coverage) {
   target.appendChild(el('h2', null, '版本计划（' + plans.length + ' 份）'));
   target.appendChild(el('p', 'muted small',
     '计划 vs 盘上 vs 分支：分开数、不合成。计划里的状态来自 .zelto/versions，' +
-    '盘上是切片状态文件，「分支上完成」是已完成且状态文件已提交进所属分支（ADR-114）。'));
+    '盘上是切片状态文件，「分支上有产物」= 该片在所属版本分支上留过 ' +
+    'Refs-Slice 标记的提交（ADR-126）。'));
 
   for (var i = 0; i < plans.length; i++) {
     var plan = plans[i];
@@ -405,32 +456,39 @@ function renderPlanCoverage(target, coverage) {
 
     var rows = (plan.versions || []).map(function (v) {
       var c = v.counts || {};
-      var gap = (c.completed || 0) - (c.onBranch || 0);
+      var gap = (c.completed || 0) - (c.artifactOnBranch || 0);
       var cells = [
         v.version,
         String(v.status || '?'),
         String(c.planned || 0),
         String(c.onDisk || 0),
         String(c.completed || 0),
-        branchCountCell(c.onBranch || 0, gap),
+        artifactCountCell(c.artifactOnBranch || 0, gap),
+        String(c.onBranch || 0),
         (v.dependsOn || []).join(', ') || '—',
         v.branch || '—'
       ];
       return { cells: cells };
     });
     target.appendChild(table(
-      ['版本', '版本状态', '计划片数', '盘上有片', '盘上完成', '分支上完成', '依赖', '分支'],
+      ['版本', '版本状态', '计划片数', '盘上有片', '盘上完成', '分支上有产物', '状态文件进分支', '依赖', '分支'],
       rows
     ));
   }
 }
 
-/** 「分支上完成」单元格 —— 盘上完成与分支上完成差得多时，直说差多少。 */
-function branchCountCell(onBranch, gap) {
-  var box = el('span', null, String(onBranch));
+/**
+ * 「分支上有产物」单元格 —— 盘上完成与分支上有产物差得多时，直说差多少。
+ *
+ * 差得多**不是**坏事：产物可能在别的版本分支上（归属错位），
+ * 或者这版还没合。这一格只说事实，不下结论（ADR-114 决策二的精神）。
+ */
+function artifactCountCell(artifactOnBranch, gap) {
+  var box = el('span', null, String(artifactOnBranch));
   if (gap > 0) {
-    var w = el('span', 'badge live-stale', gap + ' 片仅在盘上');
-    w.title = '这些片在盘上是 completed，但状态文件没有进所属分支（.zelto/ 在 .gitignore 里）—— 换机器就查不到';
+    var w = el('span', 'badge live-stale', gap + ' 片产物不在本版分支');
+    w.title = '这些片在盘上是 completed，但所属版本分支上没有它们的 Refs-Slice 提交'
+      + '—— 可能合到了别的分支（归属错位），也可能还没合。逐片看「分支证据」列。';
     box.appendChild(document.createTextNode(' '));
     box.appendChild(w);
   }
@@ -837,7 +895,7 @@ async function viewSlices(target) {
       target.appendChild(el('h3', null, '开发切片（' + devSlices.length + '）'));
       var devHeaders = ['切片', '标题', '状态'];
       if (planIndex) devHeaders.push('计划');
-      devHeaders.push('分支证据', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新');
+      devHeaders.push('分支证据', '产物证据', '活性 / 进度', '追溯(需/契/测)', '写集', '运行', '花费', '更新');
       target.appendChild(table(
         devHeaders,
         devSlices.map(function (s) {
@@ -852,6 +910,7 @@ async function viewSlices(target) {
           if (planIndex) cells.push(planCell(planIndex, s.id));
           cells.push(
             branchCell(s),
+            artifactCell(planIndex, s.id),
             livenessCell(s),
             traceCounts(s.trace),
             String(s.writeCount),
@@ -1270,6 +1329,15 @@ async function showSliceDetail(id, forSign, loc) {
 
   const slice = d.slice;
   main.appendChild(el('h2', null, id + ' — ' + slice.title));
+
+  // ADR-126：产物证据需要计划索引（所属版本分支从计划来）——
+  // 拿不到就不显示这一行（不编）。
+  var planIndexForDetail = null;
+  try {
+    planIndexForDetail = buildPlanIndex(await apiGet('/api/plan-coverage'));
+  } catch (err) {
+    planIndexForDetail = null;
+  }
   // ADR-112：说清这片看的是哪个根 —— 同一个 id 可能在好几个根里都有副本
   if (d.summary && d.summary.scope) {
     const roots = (d.summary.roots || []).map(function (r) {
@@ -1287,9 +1355,27 @@ async function showSliceDetail(id, forSign, loc) {
     bLine.appendChild(branchCell(d.summary));
     if (d.summary.onBranch === false) {
       bLine.appendChild(el('span', 'muted small',
-        ' 状态文件 .zelto/slices/' + id + '.json 未提交进所属分支 —— 版本分支上没有这一片的完成证据。'));
+        ' 状态文件 .zelto/slices/' + id + '.json 未提交进所属分支（.zelto/ 在 .gitignore 里）'
+        + ' —— 这项恒为「仅在盘上」不是缺陷；产物证据见下一行。'));
     }
     main.appendChild(bLine);
+  }
+
+  // ADR-126：产物证据 —— 这一片的产物在所属版本分支上吗
+  if (planIndexForDetail && planIndexForDetail[id]) {
+    var aLine = el('p', 'small');
+    aLine.appendChild(el('span', null, '产物证据：'));
+    aLine.appendChild(artifactCell(planIndexForDetail, id));
+    var pa = planIndexForDetail[id];
+    if (pa.artifactOnBranch === false) {
+      aLine.appendChild(el('span', 'muted small',
+        ' 所属版本分支（' + (pa.versionBranch || '?') + '）上没有这一片的 Refs-Slice 提交'
+        + ' —— 可能合到了别的分支（归属错位），也可能还没合。'));
+    } else if (pa.artifactOnBranch === true && pa.artifactCommit) {
+      aLine.appendChild(el('span', 'muted small',
+        ' ' + pa.artifactCommit + (pa.artifactSubject ? ' ' + pa.artifactSubject : '')));
+    }
+    main.appendChild(aLine);
   }
 
   // ── ADR-086：油门 ────────────────────────────────────────────────────

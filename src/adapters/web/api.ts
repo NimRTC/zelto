@@ -38,6 +38,9 @@ import { VersionStore } from '../../core/version/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { resolveSliceOwnership, branchOfVersion, readVersionPlans } from '../../core/version/branch.js';
+// ADR-126：产物证据（`Refs-Slice:` trailer 在版本分支上）——
+// 补上 ADR-114 那列恒为 0 的「状态文件是否进分支」给不出的信息。
+import { defaultArtifactProbe } from '../../core/project/artifact-evidence.js';
 import type { Version, VersionPlan } from '../../core/version/types.js';
 import { HaltStore } from '../../core/halt/index.js';
 import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
@@ -1133,16 +1136,42 @@ export class WebApi {
       }
     }
 
-    const plans = candidates.map(({ scope, label, plan }) => ({
-      id: plan.id,
-      title: plan.title,
-      status: plan.status,
-      scope,
-      label,
-      versions: plan.versions.map((v) => {
-        const rows = v.slices.map((s) => {
-          const actual = byId.get(s.id) ?? null;
-          return {
+    const plans = [];
+    for (const { scope, label, plan } of candidates) {
+      // ── ADR-126：产物证据（每个版本分支问一次 git）────────────────────
+      //
+      // ADR-114 的 `onBranch`（状态文件是否进分支）**恒为 0** ——
+      // `.zelto/` 整体在 .gitignore 里，状态文件永远不进版本分支。
+      // 这一列没有信息量，还给出误导性结论（读起来像「这版什么都没做完」）。
+      //
+      // 产物证据问的是**另一件事**：「这个切片 id 在所属版本的分支上
+      // 有没有出现过 `Refs-Slice:` trailer」—— 那是提交约定（AGENTS.md），
+      // 不依赖 `.zelto/` 是否进 git。
+      //
+      // 每个版本问一次 git（一次 `git log` 读全量 trailer），不逐片问。
+      const artifactByVersion = new Map<string, Map<string, { hash: string; subject: string }> | null>();
+      for (const v of plan.versions) {
+        const branch = branchOfVersion(v);
+        const found = await defaultArtifactProbe.findSliceCommits(
+          this.repoRoot,
+          branch,
+          v.slices.map((s) => s.id),
+        );
+        artifactByVersion.set(v.version, found);
+      }
+
+      plans.push({
+        id: plan.id,
+        title: plan.title,
+        status: plan.status,
+        scope,
+        label,
+        versions: plan.versions.map((v) => {
+          const artifacts = artifactByVersion.get(v.version) ?? null;
+          const rows = v.slices.map((s) => {
+            const actual = byId.get(s.id) ?? null;
+            const hit = artifacts?.get(s.id) ?? null;
+            return {
             id: s.id,
             title: s.title,
             plannedState: s.state ?? 'draft',
@@ -1155,6 +1184,17 @@ export class WebApi {
             /** ADR-114：状态文件是否已进所属根的 git 跟踪 */
             onBranch: actual?.onBranch ?? null,
             committedState: actual?.committedState ?? null,
+            /**
+             * ADR-126：产物证据 —— 这一片在**所属版本的分支**上有没有
+             * 留下过 `Refs-Slice:` 标记的提交。
+             *
+             * 与 `onBranch` 的区别：`onBranch` 问的是「状态文件进 git 了没」
+             * （`.zelto/` 被忽略 → 恒为 false）；这一项问的是「产物在分支上了没」
+             * —— 那才是「这版做完没有」的真凭据。
+             */
+            artifactOnBranch: artifacts === null ? null : hit !== null,
+            artifactCommit: hit?.hash ?? null,
+            artifactSubject: hit?.subject ?? null,
           };
         });
         return {
@@ -1171,6 +1211,10 @@ export class WebApi {
            * - onDisk：盘上有状态文件的片数
            * - completed：盘上 completed 的片数
            * - onBranch：已完成且状态文件已进版本分支的片数
+           *   （`.zelto/` 在 .gitignore 里 → 这一项通常恒为 0，
+           *   保留是为了不丢掉 ADR-114 已有的事实）
+           * - artifactOnBranch：**产物提交**在所属版本分支上的片数
+           *   （ADR-126）—— 这才是「这版做完没有」的可查证凭据
            *
            * 「计划 10 片里 7 片在分支上完成」与「盘上 10 片全 completed
            * 但分支只跟踪 0 片」是两种事实，合成一个百分比会抹掉差别。
@@ -1180,10 +1224,12 @@ export class WebApi {
             onDisk: rows.filter((r) => r.onDisk).length,
             completed: rows.filter((r) => r.actualState === 'completed').length,
             onBranch: rows.filter((r) => r.actualState === 'completed' && r.onBranch === true).length,
+            artifactOnBranch: rows.filter((r) => r.artifactOnBranch === true).length,
           },
         };
-      }),
-    }));
+        }),
+      });
+    }
 
     return { plans };
   }

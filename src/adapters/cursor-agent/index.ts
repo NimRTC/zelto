@@ -521,6 +521,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
           this.onProgress(sessionId, Date.now() - startedAt, 'running');
         }
       }, 5000);
+      // ADR-125：心跳不许拖住进程退出 —— 它只负责落盘活性证据。
+      (heartbeat as unknown as { unref?: () => void }).unref?.();
       this.progressIntervals.set(sessionId, heartbeat);
     }
 

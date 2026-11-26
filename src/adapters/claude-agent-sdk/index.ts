@@ -275,6 +275,8 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     const timeout = setTimeout(() => {
       this.handleTimeout(sessionId);
     }, this.timeoutMs);
+    // ADR-125：与 shell 适配器同口径 —— 空转倒计时不拖住进程退出。
+    (timeout as unknown as { unref?: () => void }).unref?.();
     this.timeouts.set(sessionId, timeout);
 
     // Start progress reporting interval (every 5 seconds)
@@ -288,6 +290,8 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
         const elapsed = Date.now() - startedAtMs;
         this.onProgress!(sessionId, elapsed, 'running');
       }, 5000);
+      // ADR-125：心跳不许拖住进程退出 —— 它只负责落盘活性证据。
+      (progressInterval as unknown as { unref?: () => void }).unref?.();
       this.progressIntervals.set(sessionId, progressInterval);
     }
 
