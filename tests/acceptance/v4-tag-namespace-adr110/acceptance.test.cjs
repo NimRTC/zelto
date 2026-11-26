@@ -229,6 +229,19 @@ const PENDING_BEFORE_V4 = new Set([
   'src/adapters/cursor-agent/index.ts',
   'src/cli/commands/supervisor-entry.ts',
   'tests/adr-125-supervisor-exit.test.ts',
+  // ADR-126 / ADR-127 / ADR-128 与 ZD-055/056/059 的落点（2026-11-26 并行会话：
+  // 产物证据改看提交 trailer、归属错位按计划修正、未跟踪规格副本备份让位）
+  'docs/adr/adr-127-misplaced-slices-ownership-is-in-the-plan-not-the-merge.md',
+  'docs/adr/adr-128-writeset-must-carry-merge-commit.md',
+  'src/cli/commands/plan-patch.ts',
+  'src/cli/commands/catalog.ts',
+  'src/cli/commands/merge-executor.ts',
+  'src/cli/commands/version-ship.ts',
+  'src/core/project/untracked-specs.ts',
+  'src/core/version/patch.ts',
+  'tests/adr-127-plan-patch-state.test.ts',
+  'tests/d62-untracked-spec-blocks-merge.test.ts',
+  'tests/path-escape-guard.test.ts',
 ]);
 
 /** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {

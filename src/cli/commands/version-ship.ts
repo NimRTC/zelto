@@ -248,16 +248,24 @@ function shipBranch(
   //
   // 这些副本是 zelto 自己写的产物；版本分支上有它们的正式版本。
   // 内容一致（只差行尾）就删掉工作区这份，让合并把版本分支上的落下来。
-  // 内容不一致 → 不删，报出来让人看（保守方向）。
+  // 内容不一致 → 工作区那份是更早的冻结版：先备份、再让位（ZD-056）。
   const specCleanup = clearUntrackedManagedSpecs(repoRoot, `refs/heads/${versionBranch}`);
   if (specCleanup.removed.length > 0) {
-    log(`  ℹ️  清理了 ${specCleanup.removed.length} 个未跟踪的规格文件副本（与 ${versionBranch} 上的一致）：`);
-    for (const p of specCleanup.removed.slice(0, 5)) log(`     ${p}`);
-    if (specCleanup.removed.length > 5) log('     …');
+    const same = specCleanup.removed.length - specCleanup.backups.length;
+    if (same > 0) {
+      log(`  ℹ️  清理了 ${same} 个未跟踪的规格文件副本（与 ${versionBranch} 上的一致）：`);
+      for (const p of specCleanup.removed.slice(0, 5)) log(`     ${p}`);
+      if (specCleanup.removed.length > 5) log('     …');
+    }
+    if (specCleanup.backups.length > 0) {
+      log(`  ℹ️  ${specCleanup.backups.length} 个规格文件副本与 ${versionBranch} 不同（工作区是更早的冻结版），已备份后以分支版为准：`);
+      for (const b of specCleanup.backups.slice(0, 5)) log(`     ${b.path}`);
+      if (specCleanup.backups.length > 5) log('     …');
+    }
   }
   for (const note of specCleanup.notes) log(`  ⚠️  ${note}`);
   if (specCleanup.conflicts.length > 0) {
-    log(`  ⚠️  ${specCleanup.conflicts.length} 个规格文件副本与 ${versionBranch} 上不一致，已保留（合并可能被 git 拦）：`);
+    log(`  ⚠️  ${specCleanup.conflicts.length} 个规格文件副本处理不了，已保留（合并可能被 git 拦）：`);
     for (const p of specCleanup.conflicts.slice(0, 5)) log(`     ${p}`);
   }
 

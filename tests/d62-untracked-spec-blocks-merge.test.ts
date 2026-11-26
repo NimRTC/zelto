@@ -86,13 +86,31 @@ describe('D-62：未跟踪的规格文件副本不能挡住合并', () => {
     assert.equal(existsSync(join(repo, 'specs', 'slices', 'v3-x.md')), false);
   });
 
-  it('内容不一致 → 不删，报出来', () => {
-    writeFileSync(join(repo, 'specs', 'slices', 'v3-x.md'), '# 完全不同的一份\n', 'utf-8');
+  it('内容不一致 → 备份后再删，合并能继续（ZD-056）', () => {
+    // 实测 nimrtc-v14：切片分支上的规格**多出**「实施发现」一节（agent 那一轮的产物，
+    // 规格第 12 条要求的就是它），工作区副本是更早的冻结版。原来的「保留 + 请人确认」
+    // 让 git merge **必然**被挡；而工作区副本一定比分支版旧（`zelto run` 开跑时同步的
+    // 就是冻结版）。所以：分支版为准，工作区那份先挪进备份目录 —— 内容绝不丢。
+    const localText = '# 更早的冻结版\n';
+    writeFileSync(join(repo, 'specs', 'slices', 'v3-x.md'), localText, 'utf-8');
 
     const res = clearUntrackedManagedSpecs(repo, 'refs/heads/slice/v3-x');
-    assert.deepEqual(res.removed, []);
-    assert.deepEqual(res.conflicts, ['specs/slices/v3-x.md']);
-    assert.equal(existsSync(join(repo, 'specs', 'slices', 'v3-x.md')), true);
+    assert.deepEqual(res.removed, ['specs/slices/v3-x.md']);
+    assert.deepEqual(res.conflicts, []);
+    assert.equal(existsSync(join(repo, 'specs', 'slices', 'v3-x.md')), false, '工作区副本已让位');
+
+    // 备份确实在，内容一模一样
+    assert.equal(res.backups.length, 1);
+    assert.equal(res.backups[0].path, 'specs/slices/v3-x.md');
+    assert.equal(readFileSync(res.backups[0].backup, 'utf-8'), localText);
+    assert.match(res.notes.join('\n'), /已备份/);
+
+    // 合并现在能过，落下来的是分支上那份
+    git(['merge', 'slice/v3-x'], repo);
+    assert.equal(
+      readFileSync(join(repo, 'specs', 'slices', 'v3-x.md'), 'utf-8').replace(/\r\n/g, '\n'),
+      SPEC_TEXT,
+    );
   });
 
   it('不是 zelto 托管的路径（人的代码）→ 绝不碰', () => {
@@ -102,6 +120,13 @@ describe('D-62：未跟踪的规格文件副本不能挡住合并', () => {
     assert.deepEqual(res.removed, []);
     assert.deepEqual(res.conflicts, []);
     assert.equal(existsSync(join(repo, 'my-code.py')), true);
+  });
+
+  it('备份目录确实在 .zelto 外（不污染工作区、不进合并）', () => {
+    writeFileSync(join(repo, 'specs', 'slices', 'v3-x.md'), '# 旧版\n', 'utf-8');
+    const res = clearUntrackedManagedSpecs(repo, 'refs/heads/slice/v3-x');
+    assert.equal(res.backups.length, 1);
+    assert.ok(res.backups[0].backup.startsWith(join(repo, '.zelto', 'backups', 'specs')), res.backups[0].backup);
   });
 
   it('ref 上没有那个文件 → 不用管（合并不会覆盖它）', () => {

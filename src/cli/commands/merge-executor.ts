@@ -532,13 +532,23 @@ export async function executeMergePlan(
   for (const ref of refsForSpecCleanup) {
     const cleanup = clearUntrackedManagedSpecs(targetDir, ref);
     if (cleanup.removed.length > 0) {
-      log(`  ℹ️  清理了 ${cleanup.removed.length} 个未跟踪的规格文件副本（与 ${ref} 上的一致）：`);
-      for (const p of cleanup.removed.slice(0, 5)) log(`     ${p}`);
-      if (cleanup.removed.length > 5) log('     …');
+      const same = cleanup.removed.length - cleanup.backups.length;
+      if (same > 0) {
+        log(`  ℹ️  清理了 ${same} 个未跟踪的规格文件副本（与 ${ref} 上的一致）：`);
+        for (const p of cleanup.removed.slice(0, 5)) log(`     ${p}`);
+        if (cleanup.removed.length > 5) log('     …');
+      }
+      if (cleanup.backups.length > 0) {
+        // ZD-056：内容不一致时「保留工作区副本」让 git merge 必然失败 ——
+        // 工作区那份是更早的冻结版，分支版才是本切片的产物。先备份再让位。
+        log(`  ℹ️  ${cleanup.backups.length} 个规格文件副本与 ${ref} 不同（工作区是更早的冻结版），已备份后以分支版为准：`);
+        for (const b of cleanup.backups.slice(0, 5)) log(`     ${b.path}`);
+        if (cleanup.backups.length > 5) log('     …');
+      }
     }
     for (const note of cleanup.notes) log(`  ⚠️  ${note}`);
     if (cleanup.conflicts.length > 0) {
-      log(`  ⚠️  ${cleanup.conflicts.length} 个规格文件副本与待合分支不一致，已保留（合并可能被 git 拦）：`);
+      log(`  ⚠️  ${cleanup.conflicts.length} 个规格文件副本处理不了，已保留（合并可能被 git 拦）：`);
       for (const p of cleanup.conflicts.slice(0, 5)) log(`     ${p}`);
     }
   }
@@ -824,6 +834,22 @@ async function executePhase(
       if (files.length > 0) {
         log('     冲突文件：');
         for (const f of files) log(`       - ${f}`);
+      }
+      // ZD-056：未跟踪文件挡住的失败，给**可执行**的修法，而不是让人手工 `git merge`
+      // （那会绕过 zelto 的合并路径 —— 不写 merge.completed、不同步版本状态、不清 worktree）。
+      if (/would be overwritten by merge/i.test(message)) {
+        const blocked = message
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => /^specs\/slices\/.+\.md$/.test(l));
+        if (blocked.length > 0) {
+          log('     被未跟踪的规格文件副本挡住（ZD-056）。两种修法，任选其一后重跑本命令：');
+          log(`       1) 删除副本（zelto 管理的规格，分支上的版本才是正式产物）：`);
+          log(`          git -C "${targetDir}" clean -f -- ${blocked.slice(0, 5).join(' ')}`);
+          log(`       2) 保留副本内容（先手工备份），再删除：`);
+          log(`          cp "${blocked[0]}" /tmp/ && git -C "${targetDir}" clean -f -- ${blocked[0]}`);
+          return;
+        }
       }
       log(`     手动解决：git merge ${info.branch}`);
       return;

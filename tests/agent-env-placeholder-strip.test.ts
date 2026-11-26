@@ -93,6 +93,10 @@ describe('mergeAgentEnv — 剔除占位符（ADR-090 + 实测修复）', () => 
   });
 
   it('正常值照常合并（不误伤）', () => {
+    // 注意：传给 `process.env` 参数的永远是**显式构造的对象**。
+    // 实测（2026-11-26，本轮全量）：这里原本传的是**真实的** `process.env` ——
+    // 只要跑测试的那个终端自己导出了 `${VAR}` 形状的未展开占位符，
+    // 这个用例就会把「终端环境」当成被测输入，时红时绿。
     const out = mergeAgentEnv(
       { NIMRTC_TURN_URI: 'turns:127.0.0.1:5349' },
       { PATH: 'x' } as NodeJS.ProcessEnv,

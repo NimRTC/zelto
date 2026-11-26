@@ -35,7 +35,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 
@@ -204,25 +205,75 @@ test('versionPathFor：合法 label 落在 version-worktrees 之下', () => {
   }
 });
 
-test('versionPathFor：版本工作目录里 merge 时，版本工作目录在**外层**', () => {
-  // 实测（nimrtc-v14 v1-rtcp-processor-collaborator，2026-11-26）：
-  // 人在 `version-worktrees/v3` 里签字后跑
-  // `zelto merge <id> --target version/v3`，拼出的是
-  // `version-worktrees/v3/.zelto/version-worktrees/v3` —— 不存在，
-  // merge 报「版本 v3 的工作目录不存在，先跑 zelto version start v3」。
-  // 而那个目录**就在脚下**。两边的路径约定互相咬死，人只能手工 cd 绕开。
-  const repo = mkdtempSync(join(tmpdir(), 'zelto-escape-'));
+test('versionPathFor：在版本工作目录里（检出 version/v3），基准上移到外层（ZD-055）', () => {
+  // 实测 nimrtc-v14 v1-rtcp-processor-collaborator，2026-11-26：
+  // 人在 `version-worktrees/v3` 里签字后跑 `zelto merge <id> --target version/v3`，
+  // 拼出的是 `version-worktrees/v3/.zelto/version-worktrees/v3` —— 不存在，
+  // 而那个目录**就在往上两层**。于是 merge 报「版本 v3 的工作目录不存在」，
+  // 人只能手工 `cd` 到顶层 —— 但那样切片 worktree（相对 repoRoot）又找不到了。
+  //
+  // 判据是 **git 事实**（检出 version/<label>）+ 祖先目录里**同名且存在**的
+  // `.zelto/version-worktrees/<label>`，不看目录路径。
+  const top = mkdtempSync(join(tmpdir(), 'zelto-zd055-'));
+  const sh = (args: string[], cwd: string) =>
+    execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
   try {
-    const manager = new WorktreeManager(repo);
-    // (a) 普通仓库根：基准是 `.zelto/version-worktrees`
-    assert.equal(
-      manager.versionPathFor('v3'),
-      join(repo, '.zelto', 'version-worktrees', 'v3'),
-    );
-    // 版本上下文判定用 git 事实 —— 这个临时目录不是 git 仓库，
-    // 于是「外层基准」分支不会被触发，路径必须原样落在子仓之下。
+    sh(['init', '-q', '-b', 'main'], top);
+    sh(['config', 'user.email', 'test@zelto.local'], top);
+    sh(['config', 'user.name', 'zelto test'], top);
+    writeFileSync(join(top, 'keep.txt'), 'keep\n');
+    sh(['add', '-A'], top);
+    sh(['commit', '-q', '-m', 'init'], top);
+    // 版本分支从 main 拉出来
+    sh(['branch', 'version/v3'], top);
+    const v3dir = join(top, '.zelto', 'version-worktrees', 'v3');
+    sh(['worktree', 'add', '-q', v3dir, 'version/v3'], top);
+
+    // (a) 在版本工作目录里：基准必须上移到外层
+    const inV3 = new WorktreeManager(v3dir);
+    assert.equal(inV3.versionPathFor('v3'), v3dir, '版本工作目录就在外层 repoRoot/.zelto/version-worktrees/v3');
+    assert.equal(inV3.versionPathFor('v1'), join(top, '.zelto', 'version-worktrees', 'v1'));
+
+    // (b) 逃逸防护不放宽：外层基准下带 `..` 的 label 仍然抛错
+    assert.throws(() => inV3.versionPathFor('../../evil'), PathEscapeError);
+    assert.equal(existsSync(join(top, 'evil')), false);
+
+    // (c) 同一路径但**不在** version 分支上 → 退回子仓基准（版本上下文不成立）
+    const fromTop = new WorktreeManager(top);
+    assert.equal(fromTop.versionPathFor('v3'), v3dir);
+    assert.equal(fromTop.versionPathFor('v9'), join(top, '.zelto', 'version-worktrees', 'v9'));
   } finally {
-    rmSync(repo, { recursive: true, force: true });
+    try {
+      sh(['worktree', 'remove', '--force', join(top, '.zelto', 'version-worktrees', 'v3')], top);
+    } catch {
+      /* 清理尽力而为 */
+    }
+    rmSync(top, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test('versionPathFor：在**非版本分支**的仓库根上，基准不会上移（不上移就找不到外层的同名目录）', () => {
+  // 反向用例：仓库名恰好与某个版本 label 相同（这里是 v3），但检出的是 main ——
+  // 若判据只看「祖先里有同名目录」而不看 git 事实，会把 main 的版本工作目录
+  // 指到**别的仓库**里去。
+  const top = mkdtempSync(join(tmpdir(), 'zelto-zd055b-'));
+  const sh = (args: string[], cwd: string) =>
+    execFileSync('git', args, { cwd, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    sh(['init', '-q', '-b', 'main'], top);
+    sh(['config', 'user.email', 'test@zelto.local'], top);
+    sh(['config', 'user.name', 'zelto test'], top);
+    writeFileSync(join(top, 'keep.txt'), 'keep\n');
+    sh(['add', '-A'], top);
+    sh(['commit', '-q', '-m', 'init'], top);
+    // 祖先之外建一个同名的「假外层」目录：它不该被选中
+    const fakeOuter = join(top, 'outer', '.zelto', 'version-worktrees', 'v3');
+    mkdirSync(fakeOuter, { recursive: true });
+
+    const manager = new WorktreeManager(top);
+    assert.equal(manager.versionPathFor('v3'), join(top, '.zelto', 'version-worktrees', 'v3'));
+  } finally {
+    rmSync(top, { recursive: true, force: true, maxRetries: 3 });
   }
 });
 
