@@ -78,7 +78,7 @@ function splitPatterns(values: string[]): string[] {
  * ```
  * zelto plan patch <plan-id> \
  *   --version <v> [--description <text>] [--depends-on <v1,v2>] [--status <s>] [--tag <name|none>] \
- *   [--base-commit <sha|none>] \
+ *   [--base-commit <sha|none>] [--remove-version] \
  *   --add-slice <id> --slice-title <t> --slice-module <m> --slice-spec <path> --write <p>... \
  *   --remove-slice <id> \
  *   --slice <id> [--write <p>...] [--slice-title <t>] [--slice-module <m>] [--slice-spec <path>]
@@ -139,6 +139,14 @@ function parsePlanPatch(args: string[]): PlanPatch {
   const baseOpt = optionValue(args, '--base-commit');
   if (baseOpt !== undefined) {
     v.baseCommit = baseOpt === 'none' ? null : baseOpt;
+  }
+
+  // ── 移除整个版本（ADR-077）──
+  //
+  // `--remove-version` 与 `--version <v>` 合用，把该版本整条从计划删掉。
+  // 用于「整个版本已并入更早的版本、一片都不剩」的清退。
+  if (args.includes('--remove-version')) {
+    v.removeVersion = true;
   }
 
   // ── 加切片 / 改切片 / 删切片 ──
@@ -224,7 +232,7 @@ function parsePlanPatch(args: string[]): PlanPatch {
 export async function planPatch(args: string[]): Promise<number> {
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--slice <id> --write <p> ...] [--tag <name|none>] [--base-commit <sha|none>]');
+    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--remove-version] [--slice <id> --write <p> ...] [--tag <name|none>] [--base-commit <sha|none>]');
     return 1;
   }
 

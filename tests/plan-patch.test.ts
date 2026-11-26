@@ -215,6 +215,49 @@ describe('版本计划的确定性修正（zelto plan patch）', () => {
       assert.deepEqual(result.missingVersions, ['v99']);
       assert.equal(result.changed.length, 0);
     });
+
+    it('移除整个版本（ADR-077）：记录 before 并删掉整条', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', removeVersion: true }],
+      });
+      assert.equal(result.changed.length, 1);
+      assert.equal(result.changed[0].field, 'removed');
+      assert.match(result.changed[0].before as string, /1 个切片/);
+      assert.equal(result.plan.versions.length, 1);
+      assert.equal(result.plan.versions[0].version, 'v1');
+    });
+
+    it('被其它版本依赖的版本不能移除（记入 missingVersions，不静默删）', () => {
+      const plan = makePlan();
+      // v2 依赖 v1 → 移除 v1 应被拦下
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', removeVersion: true }],
+      });
+      assert.equal(result.changed.length, 0);
+      assert.equal(result.plan.versions.length, 2, 'v1 不该被删掉');
+      assert.equal(result.missingVersions.length, 1);
+      assert.match(result.missingVersions[0], /v1（被 v2 依赖/);
+    });
+
+    it('removeVersion 优先于同时给出的其它字段', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', removeVersion: true, description: '改描述但应被忽略' }],
+      });
+      assert.equal(result.plan.versions.length, 1);
+      assert.equal(result.changed.length, 1, '只应有一条 removed，不应有 description 改动');
+      assert.equal(result.changed[0].field, 'removed');
+    });
+
+    it('移除不存在的版本被记为 missing', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v99', removeVersion: true }],
+      });
+      assert.deepEqual(result.missingVersions, ['v99']);
+      assert.equal(result.changed.length, 0);
+    });
   });
 
   describe('版本 tag 的修正（D-78）', () => {

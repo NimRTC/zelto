@@ -79,6 +79,21 @@ export interface VersionPatch {
    * 所以这里给它一条确定性通道（ADR-063 的精神）。
    */
   baseCommit?: string | null;
+  /**
+   * 把整个版本从计划里移除（ADR-077）。
+   *
+   * 为什么需要这个字段：计划与树对齐时，常常出现「整个版本已经并入了更早的
+   * 版本、一片都不剩」的情形（nimrtc v1.4 的 v6：6 片全部已在 v3/v4 上落地，
+   * 逐片移除后变成一个空版本）。空版本会一直挂在 `version status` 里显示
+   * `planned []`，且 `version start` 会「无片可跑」—— 一个骗人的待办。
+   *
+   * 之前只能手改 `.zelto/versions/<id>.json` 删掉这条 —— 追溯链上的谎言（C4）。
+   * 这里给它一条确定性通道：`removeVersion: true` 删掉整条版本记录，并写事件。
+   *
+   * 其它字段（description / dependsOn / …）与 `removeVersion` 同时给出时，
+   * **移除优先** —— 删掉的版本没有字段可改。
+   */
+  removeVersion?: boolean;
 }
 
 /** 一次计划修正 */
@@ -134,6 +149,34 @@ export function applyPlanPatch(plan: VersionPlan, patch: PlanPatch): PlanPatchRe
     const version = next.versions.find((v) => v.version === vPatch.version);
     if (!version) {
       missingVersions.push(vPatch.version);
+      continue;
+    }
+
+    // ── 移除整个版本（ADR-077）──
+    //
+    // 「移除优先」：删掉的版本没有字段可改，其它 patch 字段一并忽略。
+    // 移除前先查一遍「别的版本是否依赖它」—— 删掉一个还被依赖的版本会让
+    // `version start` 的前置检查永远失败（依赖指向一个不存在的版本）。
+    // 这是计划层面的错，在这里拦下比在启动时炸掉好。
+    if (vPatch.removeVersion) {
+      const dependents = next.versions.filter(
+        (v) => v.version !== version.version && (v.dependsOn ?? []).includes(version.version),
+      );
+      if (dependents.length > 0) {
+        missingVersions.push(
+          `${version.version}（被 ${dependents.map((d) => d.version).join(', ')} 依赖，不能移除）`,
+        );
+        continue;
+      }
+      const idx = next.versions.indexOf(version);
+      if (idx !== -1) next.versions.splice(idx, 1);
+      changed.push({
+        version: vPatch.version,
+        slice: null,
+        field: 'removed',
+        before: `${version.slices.length} 个切片，状态 ${version.status}`,
+        after: '(整个版本已移除)',
+      });
       continue;
     }
 
