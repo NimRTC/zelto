@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { annotateBranchEvidence, type GitProbe } from '../src/core/project/branch-evidence.js';
+import { annotateBranchEvidence, annotateBranchEvidenceAsync, type AsyncGitProbe, type GitProbe } from '../src/core/project/branch-evidence.js';
 
 function root(scope: 'root' | 'version', label: string | null, dir: string) {
   return { root: { scope, label, dir } };
@@ -211,5 +211,90 @@ describe('ADR-114：计划对照（计划 / 盘上 / 分支 分开数）', () =>
     const done = rows.find((r) => r.id === 'r-done');
     assert.ok(done);
     assert.equal(done.onBranch, null);
+  });
+});
+
+// ─── 异步探针（驾驶舱的路径）──────────────────────────────────────────
+//
+// 为什么必须有用例钉住异步版：同步 `execFileSync` 会把事件循环卡住 ——
+// 实测 24 行切片让 `/api/slices` 阻塞 93 秒，`/api/health` 也跟着排队，
+// 驾驶舱页面永远停在「加载中…」。异步版与同步版**判据逐字相同**，
+// 这里钉的是「同一张假表，两个实现给出同一份答案」。
+
+function fakeAsyncProbe(table: {
+  tracked: Record<string, boolean | null>;
+  head: Record<string, string | null>;
+}): AsyncGitProbe {
+  return {
+    async trackedAtHeadMany(dir, rels) {
+      let unknown = false;
+      const same = new Set<string>();
+      const notTracked = new Set<string>();
+      for (const rel of rels) {
+        const k = `${dir}|${rel}`;
+        const v = k in table.tracked ? (table.tracked[k] as boolean | null) : false;
+        if (v === null) unknown = true;
+        else if (v) same.add(rel);
+        else notTracked.add(rel);
+      }
+      return unknown ? null : { same, notTracked };
+    },
+    async readAtHeadMany(dir, rels) {
+      return new Map(rels.map((rel) => [rel, table.head[`${dir}|${rel}`] ?? null]));
+    },
+  };
+}
+
+describe('ADR-114：异步探针与同步探针给出同一份证据', () => {
+  it('三态、按根问 git、不改入参 —— 与 annotateBranchEvidence 逐条一致', async () => {
+    const rootDir = join(tmpdir(), 'proj-a');
+    const v3Dir = join(tmpdir(), 'proj-a', '.zelto', 'version-worktrees', 'v3');
+    const table = {
+      tracked: {
+        [`${rootDir}|.zelto/slices/on-branch.json`]: true,
+        [`${v3Dir}|.zelto/slices/only-disk.json`]: false,
+        [`${join(tmpdir(), 'nogit-a')}|.zelto/slices/unknown.json`]: null,
+      },
+      head: {
+        [`${rootDir}|.zelto/slices/on-branch.json`]: JSON.stringify({ state: 'frozen' }),
+      },
+    };
+    const roots = [
+      root('root', null, rootDir),
+      root('version', 'v3', v3Dir),
+      root('version', 'v9', join(tmpdir(), 'nogit-a')),
+    ];
+    const rows = [
+      { id: 'on-branch', scope: 'root' as const, label: null, state: 'completed', onBranch: null, committedState: null },
+      { id: 'only-disk', scope: 'version' as const, label: 'v3', state: 'completed', onBranch: null, committedState: null },
+      { id: 'unknown', scope: 'version' as const, label: 'v9', state: 'running', onBranch: null, committedState: null },
+    ];
+
+    const sync = annotateBranchEvidence(roots, rows, fakeProbe(table));
+    const async = await annotateBranchEvidenceAsync(roots, rows, fakeAsyncProbe(table));
+
+    assert.deepEqual(async, sync);
+    assert.equal(async[0].committedState, 'frozen');
+    assert.equal(async[1].onBranch, false);
+    assert.equal(async[2].onBranch, null);
+    assert.equal(rows[0].onBranch, null, '异步版也不许改入参');
+  });
+
+  it('探针抛错 → 这一行是「不知道」，不是「不在」', async () => {
+    const rootDir = join(tmpdir(), 'proj-b');
+    const probe: AsyncGitProbe = {
+      async trackedAtHeadMany() {
+        throw new Error('git 起不来');
+      },
+      async readAtHeadMany() {
+        return new Map();
+      },
+    };
+    const out = await annotateBranchEvidenceAsync(
+      [root('root', null, rootDir)],
+      [{ id: 'x', scope: 'root' as const, label: null, state: 'completed', onBranch: null, committedState: null }],
+      probe,
+    );
+    assert.equal(out[0].onBranch, null);
   });
 });

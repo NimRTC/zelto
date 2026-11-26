@@ -49,7 +49,7 @@ import {
   type CockpitScope,
 } from '../../core/project/cockpit-roots.js';
 // ADR-114：分支可见性 —— 「完成」是在盘上完成，还是在版本分支里完成
-import { annotateBranchEvidence } from '../../core/project/branch-evidence.js';
+import { annotateBranchEvidenceAsync } from '../../core/project/branch-evidence.js';
 // ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
 // run 拉起 CLI 进程。判定不分叉（C3）。
 import {
@@ -358,7 +358,53 @@ export class WebApi {
     const perRoot = await Promise.all(
       this.workspaces.map((ws) => this.listSlicesInRoot(ws)),
     );
-    return annotateBranchEvidence(this.workspaces, mergeSliceSummaries(perRoot));
+    // ADR-114 的分支证据要问 git —— 用**异步**探针：
+    // 同步 spawn 会把事件循环卡住（实测几十行 × 3 次调用合计阻塞 93 秒，
+    // 期间 /api/health 都排队），而驾驶舱的每一次请求都落在这条路径上。
+    //
+    // ZD-045：git 的启动开销在 Windows 上 30–200ms 且会抖 —— 每条请求
+    // 各自问一遍，换页一次就要几十次 spawn。按「行身份 + 状态 + updatedAt」
+    // 做指纹缓存：任何一行变了就整批重算（宁可多算一次，不许显示旧证据）。
+    const merged = mergeSliceSummaries(perRoot);
+    const evidence = await this.branchEvidenceFor(merged);
+    return merged.map((row, i) => ({ ...row, ...evidence[i] }));
+  }
+
+  /**
+   * 分支证据（ADR-114）+ 指纹缓存（ZD-045）。
+   *
+   * 指纹只取「这一行的身份 + 当前状态 + 更新时间」：状态文件变了
+   * `updatedAt` 必变；切片增删，行集合必变。**缓存只省 git 进程**，
+   * 盘上那份事实每次都重新读 —— 两者不能混成一个缓存。
+   */
+  private evidenceCache: {
+    key: string;
+    rows: Array<{ onBranch: boolean | null; committedState: string | null }>;
+  } | null = null;
+  private evidenceInflight: Promise<Array<{ onBranch: boolean | null; committedState: string | null }>> | null =
+    null;
+
+  private branchEvidenceFor(
+    rows: SliceSummary[],
+  ): Promise<Array<{ onBranch: boolean | null; committedState: string | null }>> {
+    const key = rows
+      .map((r) => `${r.scope}|${r.label ?? ''}|${r.id}|${r.state}|${r.updatedAt}`)
+      .join('\n');
+    if (this.evidenceCache?.key === key) return Promise.resolve(this.evidenceCache.rows);
+    // 同一时刻只跑一批 —— 几个端点同时被拉时（总览 + 计划对照），
+    // 不能让它们各自去 spawn 一遍 git。
+    if (this.evidenceInflight) return this.evidenceInflight;
+    const run = annotateBranchEvidenceAsync(this.workspaces, rows)
+      .then((annotated) => {
+        const out = annotated.map(({ onBranch, committedState }) => ({ onBranch, committedState }));
+        this.evidenceCache = { key, rows: out };
+        return out;
+      })
+      .finally(() => {
+        if (this.evidenceInflight === run) this.evidenceInflight = null;
+      });
+    this.evidenceInflight = run;
+    return run;
   }
 
   /** 单个根的切片总览 —— 分根读，一片坏不挡住其它。 */
@@ -394,12 +440,13 @@ export class WebApi {
     const slice = await ws.store.read(id);
     const facts = await this.collectFacts(ws, id);
     const checks = evaluateSignChecks(facts);
-    const [summary] = annotateBranchEvidence(this.workspaces, [
-      withRoot(
-        await toSummary(slice, ws.budget, this.repoRoot, () => ws.events.read(id)),
-        ws.root,
-      ),
-    ]);
+    const summaryBase = withRoot(
+      await toSummary(slice, ws.budget, this.repoRoot, () => ws.events.read(id)),
+      ws.root,
+    );
+    // 走与列表同一个证据缓存 —— 详情页不该再去 spawn 一遍 git
+    const [evidence] = await this.branchEvidenceFor([summaryBase]);
+    const summary: SliceSummary = evidence ? { ...summaryBase, ...evidence } : summaryBase;
     return {
       slice,
       summary,
