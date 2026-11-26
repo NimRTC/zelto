@@ -2,7 +2,8 @@
 // See docs/zelto-技术架构.md §6.1
 // C3: deterministic only — no model calls, no network
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -70,6 +71,47 @@ async function writeManifestFile(
  *
  * 验收命令必须真跑，所以这个变量要摘掉。
  */
+/**
+ * 杀掉门禁的整棵命令树（超时用）。
+ *
+ * 病灶（实测 2026-11-26，`npm test` 全量里偶发，一次 `EPERM` 一次「57s 才报错」）：
+ * 门禁命令是 `shell: true` 拉起的 —— 超时后只杀外壳，里面的 `node --test ...`
+ * **继续跑**：
+ *
+ *   - 占着临时目录里的文件 → 紧接着的 `rmSync` 变成 `EPERM`；
+ *   - 自己的结果继续写出来 → 混进**本轮**的测试报告（实测冒出一行 `?? tests 3xxx`）；
+ *   - 外壳一死，内层就成了孤儿 —— 按「父进程树」找它已经找不到了。
+ *
+ * Windows：`taskkill /T /F` 按父子树杀。这一步必须赶在 `abort()` 之前 ——
+ * abort 先打内层，内层一死外壳跟着退，树就散了。
+ *
+ * POSIX：spawn 时 `detached: true` 自成一个进程组，`kill(-pid)` 整组带走；
+ * 组已不存在就退回单杀。
+ */
+function killTree(child: ChildProcess): void {
+  if (process.platform === 'win32') {
+    if (child.pid === undefined) return;
+    try {
+      execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 15_000,
+      });
+    } catch {
+      /* 树已经没了 */
+    }
+    return;
+  }
+  try {
+    if (child.pid !== undefined) {
+      process.kill(-child.pid, 'SIGKILL');
+      return;
+    }
+  } catch {
+    /* 组已经不在了 */
+  }
+  child.kill('SIGKILL');
+}
+
 function runCommand(
   cmd: GateCommand,
   timeoutSec: number,
@@ -91,11 +133,16 @@ function runCommand(
       shell: true,
       signal: ac.signal,
       env,
+      // POSIX：自成一个进程组，超时才能按组杀（内层孤儿一起带走）。
+      // Windows 不用这个字段（`taskkill /T` 按父子树杀）。
+      detached: process.platform !== 'win32',
     });
 
     const timer = setTimeout(() => {
+      // 先按树杀，再 abort —— 顺序反了，内层先死、外壳跟着退，
+      // `taskkill /T` 就只看到「进程不存在」，内层成了孤儿（实测）。
+      killTree(child);
       ac.abort();
-      child.kill();
     }, timeoutSec * 1000);
 
     let stdout = '';

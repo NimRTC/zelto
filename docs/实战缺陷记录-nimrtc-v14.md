@@ -1,4 +1,4 @@
-﻿# Zelto 实战缺陷记录（nimrtc v1.4 演练）
+# Zelto 实战缺陷记录（nimrtc v1.4 演练）
 
 > 每条都附一条可复现的回归测试。跑：`npm test -- --filter <测试文件>`
 
@@ -2752,6 +2752,9 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 
 **回归测试**：待修复落地时补 —— kill 主管后 30s 内必须出现收尾事件，且 `pid` 字段是主管 pid。
 
+**剩余问题**：detach 主管的运行期心跳 / 看门狗与 `run.aborted` 的 pid 拆分**都还没做**（见 ZD-050，三者一起落）—— 否则「主管半路死了」仍然无人可见。动的是收尾事件与事件 payload，要先写 ADR。
+
+
 ## ZD-050：没跑完的 post-run 让 worktree 裸奔 —— 「结果不明」的一轮被当成了「新的一轮」，同一片被跑了两遍
 
 **场景**：同一片。17:30Z 那一轮（前台）：会话 17:57Z 记 `failed`，**`run.finished` /
@@ -2784,6 +2787,9 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 **回归测试**：待修复落地时补 —— kill 主管进程后，事件流里**必须有**收尾事件，
 **且**它为 release 之前；`zelto run` 对「running 但没有收尾事件、主管不在」的切片**拒绝**并提示 `zelto resume`。
 
+**剩余问题**：「先落事实、后释放」是**契约变化**（`run.finished` 与 `reservation.released` 的落盘顺序），按 AGENTS.md 要先写 ADR —— **尚未写**。与 ZD-049 / ZD-051 同批。
+
+
 ## ZD-051：同一天五轮运行，事件流里只有两轮有「结束」—— 会话文件名、任务 pid、事件三者没有一条引用链
 
 **场景**：同一片一天里被拉起 5 次：
@@ -2813,6 +2819,8 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 
 **回归测试**：待修复落地时补 —— 连续 retry 两次后三段 `runId` 互不相同；按 `runId` 聚时，
 每一轮都有起跑与结束两端（或显式 `unknown`）。
+
+**剩余问题**：`runId` 要贯穿 `run.started` / `run.finished` / `run.aborted` 与任务文件，是**契约变化**（事件 payload + `task` 文件格式），先写 ADR。与 ZD-049 / ZD-050 同批。
 
 ---
 
@@ -2845,6 +2853,9 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 **回归测试**：待修复落地时补 —— `tee /tmp/x.log` 与 `build/` 下的日志 allow 且带目标；
 写集之外的真实仓库文件仍 deny。
 
+**剩余问题**：写集判定区分「工作区文件」与「运行期一次性产物」动的是 **policy 判定口径**（C5 保护域不动），要先写 ADR 并过 policy 锁；「收尾报告列出增删行数」可以独立先做。
+
+
 ## ZD-053：验收文件里的断言**与规格条目没有编号对应** —— 门禁只问「有没有真断言」
 
 **场景**：同一片。验收文件 `tests/acceptance/v1-rtcp-processor-collaborator/acceptance.test.cjs`
@@ -2869,6 +2880,9 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 
 **回归测试**：待修复落地时补 —— 故意删掉一个编号断言 → 门禁 failed；
 非测试条目未在摘要里出现 → 视为摘要失败。
+
+**剩余问题**：验收标准编号（`AC-01 …`）进的是**规格格式**（schema 级变化），要先写 ADR；编号核对可以先做成门禁的**附加检查**。
+
 
 ## ZD-054：规格点 2（「`engine_media.cpp` 中皆无具体 `rtp::` RTCP 类型」）与实现存在**口径分叉**，需要 owner 裁决
 
@@ -2900,6 +2914,8 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 由工具核对「checker 的例外表」与「规格的窄豁免」**完全一致**，不一致就红。
 
 **回归测试**：待修复落地时补 —— 给 checker 加一条例外而规格没加 → 门禁 failed（反向亦然）。
+
+**剩余问题**：三个裁决选项**都要 owner 拍板**（规格措辞 / 代码搬移 / checker 规则）；工具只负责「checker 例外表 vs 规格窄豁免不一致就红」，不替人选。
 
 ---
 
@@ -2942,6 +2958,8 @@ zelto merge v1-rtcp-processor-collaborator --target version/v3
 实测 `versionPathFor('v3')` 在 `version-worktrees/v3` 下返回真实目录（exists=true），
 `zelto merge … --target version/v3` 成功 fast-forward 并清理了 worktree 与切片分支。
 
+**剩余问题**：「外层基准」的判定依赖**当前检出分支是 `version/<label>`**（git 事实）。若人把版本工作目录拷到别处、或检出的是游离 HEAD，会退回子仓基准、再次报「工作目录不存在」—— 这是有意的保守方向（判不出来就当版本上下文不成立），但错误信息应提示这一点，尚未做。
+
 ---
 
 ## ZD-056：`milestones` 之前的规格副本让 fast-forward 合并必失败，建议的修法又打死 next
@@ -2972,14 +2990,24 @@ zelto merge v1-rtcp-processor-collaborator --target version/v3
 **后果**：**在任何「agent 改了规格副本」的切片上，ff 合并都要人工先手动对齐副本**；
 不一致时「保留工作区的」这个默认会让合并**必然失败**（不是偶发）。
 
-**修复（待做）**：合并前若「目标分支上已提交的规格」与「工作区未跟踪副本」不同，
-应**以分支上那份为准**（它是本切片的产物，且已由门禁签名覆盖），把工作区副本
-**先移走/备份**再合并；或直接拒绝并给出**可执行的**修复命令（`git checkout -f` 之类），
-而不是「保留 + 请人确认」这种**必然失败**的组合。
+**修复（已落地，2026-11-26）**：`clearUntrackedManagedSpecs`（`src/core/project/untracked-specs.ts`）
+遇到「工作区未跟踪副本与待合 ref 内容不同」时，**先把副本备份**到
+`.zelto/backups/specs/<时间戳>/<原路径>`，再删掉工作区副本让合并落下来 ——
+以分支上那份为准（它是本切片的产物，且已由门禁签名覆盖）。备份失败则一律不删、报出来。
+`merge-executor` / `version-ship` 的输出同步改了措辞；合并仍被未跟踪文件挡住时，
+给出可执行的 `git clean -f -- <paths>` 修法，不再建议手工 `git merge`（那会绕过 zelto）。
+
 
 本次实情：人工把分支版规格同步到工作区（内容完全一致）后再跑 merge 才成功。
 
+**回归测试**：`tests/d62-untracked-spec-blocks-merge.test.ts` —— 「内容不一致 → 备份后再删，合并能继续」（备份内容逐字节相同、合并落下来的是分支版）；「备份目录在 `.zelto/backups/specs/` 下、不进工作区」。
+
+**剩余问题**：本修把「内容不一致 → 保留」改成「备份 → 让位」，但它**假定**工作区副本
+一定比分支版旧（`zelto run` 开跑时同步的是冻结版）。若将来出现「工作区副本更新」的路径
+（例如人在版本工作目录里手工改规格），这个假定会失效 —— 届时必须先补判定或换方案。
+
 ---
+
 
 ## ZD-057：驾驶舱「分支上完成」恒为 0，把「这版全做完了」说成了「一片都没进分支」（ADR-126）
 
@@ -3141,6 +3169,44 @@ ADR-112 的边界也写明了「**不做**版本目录里的需求 / 设计 / �
 
 **剩余问题**：没有机制阻止以后的新用例再传真实 `process.env`。可以加一条 lint 规则
 （测试里出现 `mergeAgentEnv(` 且第二参是 `process.env` 就报），尚未做。
+
+---
+
+## ZD-062：门禁超时只杀**外壳**，内层进程继续跑 —— 下一轮的测试被上一轮的残留搅乱
+
+**场景**：`npm test` 全量（2026-11-26），两次复跑各出一次红灯，**同一轮里都不复现**：
+
+- 第一轮：`tests/design-parse.test.js` 报 `test failed`，单跑 21/21 全绿；
+- 第二轮：`tests/core/worktree/manager.test.js` 的「submodule」用例跑了 **57s** 才失败，
+  报 `EPERM, Permission denied: .../zelto-wt-nested-XXXX`（`rmSync` 删不掉临时目录）；
+  同一份报告里还冒出一行 `?? tests 3xxx` —— 本轮文件里根本不存在这行。
+
+**根因**：门禁（`core/gate/executor.ts`）用 `shell: true` 拉命令，超时后只
+`child.kill()` / `ac.abort()` 杀**外壳**（cmd.exe / sh）。内层的 `node --test ...`
+继续跑：
+
+1. 占着它自己的临时目录 → 用它的那个测试用例 `rmSync` 时 `EPERM`；
+2. 结果继续往 stdout 写 → 混进**下一个**门禁命令/测试的报告（`?? tests 3xxx`）；
+3. 外壳一死，内层成孤儿，按「父进程树」已经找不到它。
+
+更隐蔽的一层：`ac.abort()` 先打**内层**，内层一死外壳跟着退 —— 即便之后用 `child.pid`
+去 `taskkill /T`，树也已经散了。
+
+**后果**：全量测试**时红时绿**，红灯不可信；真正坏掉的东西会被当成「又抖了」。
+（ZD-061 是同一轮里另一个「时红时绿」的根因：测试读了终端自己的环境。）
+
+**修复（已落地，2026-11-26）**：
+
+- Windows：超时时**先** `taskkill /pid <shell> /T /F` 按父子树杀，**再** `abort()`；
+- POSIX：spawn 时 `detached: true` 自成一个进程组，超时 `kill(-pid, SIGKILL)` 整组带走；
+- 超时判定本身不变（仍判失败、仍记事件），只是「停下来」变成真的停下来。
+
+**回归测试**：`tests/zd062-gate-kill-tree.test.ts` —— 门禁跑「父 shell 拉一个
+写 pid 后长睡的孙子」，超时后 15s 内孙子必须死，且临时目录能删（不 `EPERM`）。
+
+**剩余问题**：POSIX 上杀进程组要求 spawn 时是 detached —— 已加；但 Windows 上若内层
+进程**重新挂到别的父进程**（`timeout /t` 之类），树杀仍会漏。目前没有补刀机制（按
+命令行 + 创建时间扫孤儿），尚未做。
 
 ---
 
