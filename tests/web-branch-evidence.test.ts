@@ -223,6 +223,91 @@ describe('ADR-114：计划对照（计划 / 盘上 / 分支 分开数）', () =>
   });
 });
 
+// ─── 计划对照：同一份计划不许出现两个版本（ADR-127 落地时暴露）──────────
+//
+// 病灶（实测 nimrtc-v14，2026-11-26，ADR-127 修完归属之后）：
+//
+//   仓库根那份计划：  v1 = 3 片 / v3 = 12 片（已按规格归属修正）
+//   v5 版本目录那份：  v1 = 10 片 / v3 = 5 片（修正前的旧副本）
+//
+//   驾驶舱把两份**并排当成两个计划**报出来 —— 页面上同时出现
+//   「v1 有 3 片」和「v1 有 10 片」。人看着只会以为「计划有两套」，
+//   而真相是「其中一套是过期副本」。
+//
+// 版本目录里的 `versions/` 是**同步副本**，不是真源（ADR-110 双写、
+// ADR-112 边界「不做版本目录里的需求/设计/版本计划的分散读取」）。
+// 所以同一 plan id 只报一份，仓库根那份优先。
+
+describe('ADR-127：同一份计划不许被报成两个互相矛盾的计划', () => {
+  const REPO2 = join(tmpdir(), `zelto-plan-dedupe-${Date.now()}`);
+
+  before(async () => {
+    await mkdir(join(REPO2, '.zelto', 'versions'), { recursive: true });
+    await mkdir(join(REPO2, '.zelto', 'slices'), { recursive: true });
+
+    const mkPlan = (v1Count: number) => ({
+      id: 'plan-same',
+      designId: 'dsg-same',
+      title: '同一份计划',
+      status: 'confirmed',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      confirmedAt: '2026-01-01T00:00:00.000Z',
+      versions: [
+        {
+          version: 'v1',
+          dependsOn: [],
+          description: '第一版',
+          integrationTestDir: 'tests/version/v1',
+          status: 'integrated',
+          slices: Array.from({ length: v1Count }, (_, i) => ({
+            id: `s-${i}`,
+            module: 'm',
+            title: `片 ${i}`,
+            writes: [],
+            specPath: `specs/slices/s-${i}.md`,
+            state: 'completed',
+          })),
+        },
+      ],
+    });
+
+    // 仓库根（真源）：v1 = 3 片
+    await writeFile(join(REPO2, '.zelto', 'versions', 'plan-same.json'), JSON.stringify(mkPlan(3), null, 2), 'utf-8');
+
+    // v5 版本目录（同步副本）：v1 = 10 片 —— 旧内容
+    const v5 = join(REPO2, '.zelto', 'version-worktrees', 'v5');
+    await mkdir(join(v5, '.zelto', 'slices'), { recursive: true });
+    await mkdir(join(v5, '.zelto', 'versions'), { recursive: true });
+    await writeFile(join(v5, '.zelto', 'versions', 'plan-same.json'), JSON.stringify(mkPlan(10), null, 2), 'utf-8');
+  });
+
+  after(async () => {
+    await rm(REPO2, { recursive: true, force: true });
+  });
+
+  it('同一个 plan id 只报一份，且仓库根（真源）优先', async () => {
+    const { WebApi } = await import('../src/adapters/web/api.js');
+    const api = new WebApi(REPO2);
+    const coverage = (await api.planCoverage()) as {
+      plans: Array<{ id: string; scope: string; label: string | null; versions: Array<{ slices: unknown[] }> }>;
+    };
+    assert.equal(coverage.plans.length, 1, '同一份计划不许报成两份');
+    assert.equal(coverage.plans[0].scope, 'root', '仓库根是真源，副本让位');
+    assert.equal(coverage.plans[0].label, null);
+    assert.equal(coverage.plans[0].versions[0].slices.length, 3, '报的是真源那份（3 片），不是旧副本（10 片）');
+  });
+
+  it('版本目录里那份过时的副本不许把真源覆盖掉', async () => {
+    const { WebApi } = await import('../src/adapters/web/api.js');
+    const api = new WebApi(REPO2);
+    const coverage = (await api.planCoverage()) as {
+      plans: Array<{ versions: Array<{ slices: Array<{ id: string }> }> }>;
+    };
+    const ids = coverage.plans[0].versions[0].slices.map((s) => s.id);
+    assert.deepEqual(ids, ['s-0', 's-1', 's-2'], '不该出现旧副本里的 s-3..s-9');
+  });
+});
+
 // ─── 异步探针（驾驶舱的路径）──────────────────────────────────────────
 //
 // 为什么必须有用例钉住异步版：同步 `execFileSync` 会把事件循环卡住 ——

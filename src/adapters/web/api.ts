@@ -1109,8 +1109,8 @@ export class WebApi {
    * 3 片基线 —— 三个口径没有任何一处并排呈现过。
    *
    * 这里把三个口径并排：
-   *   - **计划**：`.zelto/versions/<id>.json`（版本目录里有就用版本目录的，
-   *     否则用仓库根的）—— 只读，不判定；
+   *   - **计划**：`.zelto/versions/<id>.json` —— **只读仓库根**（ADR-112 边界：
+   *     版本目录里的 `versions/` 是**同步副本**，不是真源）；
    *   - **盘上**：合并后的切片行（含 ADR-114 的 `onBranch`）；
    *   - **版本分支**：`onBranch === true` 的片数。
    *
@@ -1120,19 +1120,42 @@ export class WebApi {
     const slices = await this.listSlices();
     const byId = new Map(slices.map((s) => [s.id, s]));
 
-    // 版本计划：仓库根 + 每个版本目录，按计划 id 取「最近更新的那份」。
+    // ── 版本计划：仓库根是真源，版本目录里的只是同步副本（ADR-110 / ADR-112）──
+    //
+    // 同一个 plan id 在多处出现时**只报一份**，仓库根那份优先。
+    //
+    // 为什么不能把各处都当成独立的计划并排报出来：
+    //
+    //   版本目录里的 `versions/` 是**同步副本**，不是真源（ADR-110 双写、
+    //   ADR-112 边界：「不做版本目录里的需求/设计/版本计划的分散读取」）。
+    //   副本可能过时 —— 实测 nimrtc-v14（ADR-127 修完归属之后）：
+    //
+    //     仓库根那份：  v1 = 3 片 / v3 = 12 片（已按规格归属修正）
+    //     v5 目录那份：  v1 = 10 片 / v3 = 5 片（修正前的旧副本）
+    //
+    //   两份**并排当成两个计划**报出来，页面上就同时出现
+    //   「v1 有 3 片」和「v1 有 10 片」—— 一个来自真源、一个来自过期副本。
+    //   人看着只会以为「计划有两套」，而真相是「其中一套是旧的」。
+    //   这不是「多显示一点信息」，是**自相矛盾的展示**。
+    //
+    // 兜底：某个计划**只**存在于版本目录（从没同步回根）时，仍然报出来 ——
+    // 看不见它比看见一份旧副本更糟。只是它没有根上那份可优先。
     const candidates: Array<{ scope: CockpitScope; label: string | null; plan: VersionPlan }> = [];
-    const seenPlans = new Set<string>();
+    const byPlanId = new Map<string, (typeof candidates)[number]>();
     const planDirs: Array<{ scope: CockpitScope; label: string | null; zeltoDir: string }> = [
       { scope: 'root', label: null, zeltoDir: this.zeltoDir },
       ...this.workspaces.slice(1).map((ws) => ({ scope: ws.root.scope, label: ws.root.label, zeltoDir: ws.zeltoDir })),
     ];
     for (const d of planDirs) {
       for (const plan of readVersionPlans(join(d.zeltoDir, 'versions'))) {
-        const key = `${plan.id}\n${d.scope}\n${d.label ?? ''}`;
-        if (seenPlans.has(key)) continue;
-        seenPlans.add(key);
-        candidates.push({ scope: d.scope, label: d.label, plan });
+        const existing = byPlanId.get(plan.id);
+        if (existing) {
+          // 根上那份已经在了 —— 副本让位（不并排，不矛盾）
+          continue;
+        }
+        const entry = { scope: d.scope, label: d.label, plan };
+        byPlanId.set(plan.id, entry);
+        candidates.push(entry);
       }
     }
 
