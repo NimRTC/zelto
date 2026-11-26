@@ -2197,6 +2197,796 @@ zelto merge v1-rtcp-processor-collaborator --target version/v3
 
 ---
 
+---
+
+## 记录格式约定
+
+新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
+
+## ZD-026 新建 worktree 时，**生成的产物**不会跟过去 —— 门禁②在构建阶段炸，而罪魁在 setup 阶段
+
+**场景**：nimrtc-v14 的 `v3-n4-d6-connectivity` 切片，agent 跑完了（101 分钟），
+自动门禁②**红了**：
+
+```
+❌ build (10700ms, exit 1)
+  'vswhere.exe' 不是内部或外部命令
+❌ test (231929ms, exit 8)
+  Errors while running CTest
+Gate: ❌ Failed (518069ms)
+```
+
+`vswhere.exe` 那行是**噪声** —— v2-ice 那轮门禁也有同样的 stderr，
+但 `exit 0` 通过了（说明 VS 环境本身是好的）。真正的错误被埋在后面几百行里：
+
+```
+error MSB3073: "cmake.exe" -E copy_if_different
+  .../src/third_party/wolfssl/src/certs/ecc-key.pem
+  .../build/tests/Debug/certs/
+Error copying file (if different) from ".../certs/ecc-key.pem"
+```
+
+**根因**：`ecc-key.pem` 是**生成的**，不是签入的。
+
+```
+$ cd src/third_party/wolfssl/src
+$ git check-ignore -v certs/ecc-key.pem
+.gitignore:109:ecc-key.pem   certs/ecc-key.pem
+```
+
+wolfssl 的 `.gitignore` 第 109 行明确忽略它。它由
+`scripts/build_dtls_cert.py` 生成（那个脚本把自签的 ECC 证书同时镜像到
+wolfssl 自己的 cert 树里，好让 CMake 的 `copy_if_different` 规则能捡到）。
+
+而 CMake 的 `nimrtc_copy_wolfssl_certs()`（`cmake/NimRTCTest.cmake`）
+**无条件** `copy_if_different` 这两个文件 —— 源文件不在，POST_BUILD 就炸，
+连带整个测试目标构建失败。
+
+**为什么主仓没事、worktree 有事**：主仓的 `src/third_party/wolfssl/src/certs/`
+里**有** `ecc-key.pem` —— 一个**未被跟踪的**文件。新建 worktree 时
+git 只带**被跟踪**的内容，这个文件不带过去。
+
+于是主仓能构建、任何新 worktree 不能 —— **差异不在代码，在工作区的历史**。
+
+> **更正（2026-11-22 二次实测）**：本节最初断言主仓那份
+> `ecc-key.pem` 是「跑过一次 `build_dtls_cert.py` 留下的残留」。**这是错的**。
+>
+> 判据是**格式** —— 脚本写的是 PKCS8（`BEGIN PRIVATE KEY`），
+> 主仓那份是 `ASN1 OID: prime256v1` + `BEGIN EC PRIVATE KEY`，
+> 是 **wolfSSL 自己的 keygen 工具**的输出。
+> 同样地，主仓的 `server-ecc.pem` 是 `CN=www.wolfssl.com`、**无 SAN**
+> 的 **wolfSSL 上游自带**证书（它在 wolfssl 子模块里被 git 跟踪）。
+>
+> 所以真实情况是：**主仓从来没成功跑过那个脚本**。主仓能构建，
+> 靠的是上游自带的那份证书 —— 而它**构建期不需要**（证书只在
+> Chrome 互操作的**运行期**才被用到）。
+>
+> 这不改变本条的结论，但改变了「怎么修」的说法：不是「把主仓那份拷过去就行」
+> （那份连 SAN 都没有，拷过去也过不了 Chrome 的 DTLS 握手），
+> 而是**必须重新生成**。这正是下面选「生成」而非「拷贝」的理由之一。
+
+> **再更正（2026-11-22 三次实测）：主仓为什么也构建失败？**
+>
+> 上面的更正解释了「主仓那份证书不是脚本产的」，但没解释
+> **为什么主仓自己构建也会炸**。答案查到了，而且要往上游追一层：
+>
+> ```
+> 上游 wolfSSL v5.9.2-stable (commit ac01707)  certs/ 有 161 项，含 ecc-key.pem  ← CI 用这份
+> 本地主仓的子模块           (commit da2d676)  certs/ 有 159 项，缺 ecc-key.pem  ← "carbon copy"
+> 差集正好两个：certs/ecc-key.pem、certs/ecc-key.der
+> ```
+>
+> CI 日志（run `44688171635`）里明明白白：
+>
+> ```
+> Submodule path 'src/third_party/wolfssl/src': checked out 'ac01707552c611fbd135cc723b2682b3e7f80f2'
+> ```
+>
+> CI 拿到的就是上游那份，带着 `certs/ecc-key.pem`，
+> POST_BUILD 拷贝成功，2310 个测试全绿。
+> 而**本地主仓的 wolfSSL 是一份「carbon copy」**（提交信息原话），
+> 相对上游**少了两个证书文件** —— 所以本地拷贝 `ecc-key.pem` 必然失败。
+>
+> 所以本条的真实根因链是：
+> **本地 vendored 副本与上游不一致 → 缺 `ecc-key.pem` → POST_BUILD 无条件拷贝 → 构建炸。**
+>
+> **这条怎么改变了「怎么修」：**
+> 修复点不在「把缺失的证书补回去」—— 补回去只能补一份**上游的无 SAN 旧证书**，
+> 运行期要的是带 SAN 的新证书；
+> 修复点在「让构建期产物由项目自己的脚本生成，且不落在别人的仓库里」。
+>
+> 顺带查出另一条：**「生成物写进 vendored 子模块的跟踪文件」这个做法本身要淘汰。**
+> `server-ecc.pem` 在子模块里是**被跟踪**的，脚本覆盖它会让子模块长期显示 `-dirty`。
+> nimrtc 侧已改：脚本只写 `tests/wolfssl_dtls/certs/`（该目录被 `.gitignore:227` 忽略），
+> CMake 从那里取，CI 显式加一步生成证书（6 个 workflow / 14 个 job）。
+>
+> 详见 **ADR-095 §2.4.3 / §7.3–§7.6**。
+
+
+**为什么这是个真缺陷（而不只是「环境没配好」）**：
+
+1. worktree 是 zelto **自己**造的（`core/worktree/`），不是人手工建的。
+   zelto 造出来的 worktree 应当是**可构建的** —— 否则门禁②必然红，
+   而红的理由跟切片内容毫无关系。
+2. 门禁②的失败信息**指向了错的地方**。人看到「build 失败」，
+   第一反应是「agent 把代码写坏了」—— 但 agent 一个字节都没碰证书。
+3. 更糟的是：门禁②红了之后，agent 已经烧掉的 101 分钟无法复用，
+   而**人无法从门禁输出里推出真正的原因**（`MSB3073` 那一坨
+   `if %errorlevel% neq 0 goto :cmEnd` 没有任何可读信息）。
+
+**还有一条同源的**：`version/v3` 的树钉住了较老的子模块 commit
+（googletest `15460959`、libopus `22244de5`），而本地 module 仓库里
+只有较新的「carbon copy」commit。zelto 的 `alignSubmodulesToMainRepo`
+按 C3（确定性、不触网）用 `git checkout --force <pin> --no-fetch` ——
+pinned commit 在本地**不存在**时**静默失败**，worktree 的子模块目录于是
+**是空的**。
+
+现象几乎一样（构建缺东西），但成因不同、修法也不同。
+
+**修复**：已修（2026-11-22），见 **ADR-095**
+（`docs/adr-095-worktree-build-prerequisites.md`）。分两处：
+
+**其一（子模块）：钉死的 commit 本地不存在 → 明确报错，不静默**
+
+判据是 `git cat-file -e <sha>` —— 只读本地对象库，不触网（C3），
+且是确定性的。
+
+关键点：**这个检查必须放在 `submodule update` 之前**。
+原来的失败发生在 update 阶段（被记成一条警告），
+而 `alignSubmodulesToMainRepo` 在 update **之后** —— update 失败，
+align 根本没机会跑。所以「commit 存在性」的判据必须前置。
+
+另外还有一个坑：`git submodule add` 只把 gitlink **暂存**进 index，
+**不提交**。而 worktree 是从 **HEAD** 建出来的 ——
+worktree 的 index 里于是**没有**那个 gitlink。
+所以「钉死的 commit」要从**主仓的 index** 读，不是 worktree 的。
+（这个坑是写集成测试时才发现的：判据写对了但永远读到空。）
+
+报错信息带**三种可执行的修法**（成因不同，修法不同）：
+
+```
+本地 module git 目录里没有 index 记录的 commit 15460959（submodule: src/third_party/googletest/src）
+
+这个 worktree 的 vendor 目录会是空的 —— 门禁②的 build 阶段必然失败，
+而且报错会指向「找不到头文件」，与真正的原因无关。所以在这里就停下。
+
+三种修法，按适用场景选：
+  1) 该 commit 在远程仓库里（推荐）：
+     git -C "<主仓>/src/third_party/googletest/src" fetch origin 15460959
+  2) 该 commit 只在别的本地副本里：
+     git -C "<主仓>/src/third_party/googletest/src" fetch <那个副本的路径> 15460959
+  3) 主仓 index 记录的 commit 本来就是错的（少见）：
+     在主仓里 git submodule update --init 修正后重新建 worktree
+```
+
+**为什么是「抛错」而不是「警告」**：worktree 建出来是**坏的**，
+门禁②**必然**失败。让它在**建 worktree 的时候**失败（早几分钟、
+信息直达），比在**门禁的时候**失败（信息被几千行编译输出淹没）好得多。
+与 C9 同一原则：**依赖缺失时的正确动作是停下**，不是带着缺口继续跑。
+
+**其二（生成物）：新增 `worktree.prepare` 配置节 —— 建 worktree 时跑前置脚本**
+
+```yaml
+worktree:
+  prepare:
+    commands:
+      - run: python scripts/build_dtls_cert.py
+        timeoutSec: 60
+```
+
+**为什么是「生成」而不是「拷贝」**：拷贝旧的生成物可能带来**过期**的
+内容（过期的证书、过期的 protobuf），而重新生成保证产物与当前代码一致。
+
+**为什么放 config.yaml 而不是 policy.yaml**：policy 是**策略**
+（谁能写什么、什么必须拦），`worktree.prepare` 是**环境准备**。
+policy 的规则会被 gate/sched 消费，混进「要跑什么脚本」会让策略层
+变成脚本执行器。
+
+**为什么不复用 `gate.commands`**：`gate.commands` 是**判定**用的
+（跑测试、验契约），它的失败是「门禁红」；
+这里是**准备**用的（生成产物），它的失败是「worktree 不可用」。
+时机也不同：准备在 agent 开跑**之前**，判定在 agent 跑完**之后**。
+混在一起的话，准备失败会被报成「门禁红」—— 人会去查 agent 的代码，
+而问题在准备阶段（就是本条的老毛病：报错指向错的地方）。
+
+**准备阶段的失败 → 不放行到 agent**（fail closed）。
+fail fast：前一条失败就不跑后一条 —— 后一条大概率也依赖前一条的产物，
+且连着跑一串注定失败的命令，报错会指向最后一条（又是「报错指错地方」）。
+每条命令有超时（默认 120 秒），挂死的命令不能无限等。
+
+**没配这一节 = 不做任何准备 = 不产生行为变化**。
+
+**回归测试**：
+
+- `tests/adr095-worktree-build-prerequisites.test.ts`（13 个用例）——
+  单元层：判据、报错信息含三种修法、命令在 worktree 目录里跑、
+  产物是重新生成而非拷贝、失败不放行、fail fast、超时、空清单不跑、
+  配置解析（含 `run:` 为空被跳过、`worktree.prepare` 的 `run:`
+  不被 gate 的命令解析吃掉）。
+- `tests/adr095-submodule-missing-commit.test.ts`（4 个用例）——
+  集成层：**真的 submodule**。本地有 pinned commit → 对齐成功，vendor 有内容；
+  本地没有 → 抛错，信息带三种修法 + 点名真正的原因 + 说清后果 + 带短 sha。
+
+**踩坑记录（两条，都值得记）**：
+
+1. **造不出「本地缺 commit」这个状态**。以为 `gc --prune=now` 能把旧 commit
+   删掉 —— 实测 expire reflog + gc + repack 之后那个 commit **仍然可读**
+   （git 对近期对象有宽限期）。最后改成「把 `.git/modules/<name>` 换成一个
+   **无关**的仓库」—— 这反而**更真实**（本地副本与上游脱节本来就是更常见的
+   故障形态：有人重新 clone 过、module 仓库被换掉了）。
+2. **判据写对了但永远读到空**。`pinnedCommitOf` 最初读 worktree 的 index，
+   而 worktree 是从 HEAD 建的，HEAD 里没有 submodule 的 gitlink
+   （`git submodule add` 不提交）→ 永远读到 null → 判据形同虚设。
+   改成读**主仓**的 index 才对。
+
+（这两条都是**测试逼出来的**，不是想出来的 —— 集成测试的价值就在这儿。）
+
+**剩余问题**（未做）：
+
+1. 子模块的「自动修复」没做：现在只报错并给三种修法，
+   不自动 `git fetch` —— 因为自动 fetch **触网**（C3 的地盘），
+   且「fetch 哪个 URL」需要项目知识。
+2. `worktree.prepare` 没有「校验产物在位」的能力。命令跑完，
+   但产物可能在（脚本静默失败、输出到别处）。要严格得再声明一份产物清单。
+3. 准备阶段的耗时没进任何统计 —— `zelto status` 里看不出来。
+
+**已落实**：
+
+- nimrtc 侧已配 `worktree.prepare`（`.zelto/config.yaml`）：
+  `python scripts/build_dtls_cert.py`（60 秒超时），
+  以后建 worktree 不用再手工绕。
+- 端到端验证（2026-11-22）：在 nimrtc 主仓用 `WorktreeManager.create()`
+  造了**真实**的新 worktree —— prepare 前没有 `ecc-key.pem`，
+  prepare 后**有**了，且是**新生成的** PKCS8 格式（241 字节），
+  `server-ecc.pem` 解析出 `CN=localhost` + SAN（`DNS:localhost` /
+  `IP:127.0.0.1` / 本机各网卡 IP）—— Chrome/BoringSSL 能认的那份。
+- **根因收敛（2026-11-22 三次实测）**：本地主仓的 wolfSSL 是一份
+  相对上游**少两个证书文件**的「carbon copy」（`da2d676` vs 上游 `ac01707`，
+  缺 `certs/ecc-key.pem` 与 `certs/ecc-key.der`）。CI 用的是上游那份，
+  所以 CI 绿；本地构建必然炸。详见上面的「再更正」与 ADR-095 §2.4.3。
+- **nimrtc 侧修复已落地（2026-11-22）**：
+  1. `build_dtls_cert.py` 不再写 vendored 子模块，只写
+     `tests/wolfssl_dtls/certs/`（该目录被 `.gitignore:227` 忽略）；
+  2. CMake 4 处取证书路径改到新位置，**并移除**运行期查找候选表里的
+     wolfSSL 子模块路径（留着它，上游那份无 SAN 的旧证书会在某些 CWD 下
+     赢过新证书，Chrome 随即以 alert 46 拒绝握手）；
+  3. CI 显式生成证书 —— 6 个 workflow / 14 个 job；
+  4. 实测新 worktree 走完 prepare 后，主仓与 worktree 的
+     `git submodule status` **都不带 `-dirty`**。
+- **未修（留在 nimrtc 侧）**：本地那份碳拷贝与上游的 2 文件差异本身没动。
+  修掉之后本地与 CI 的子模块内容一致，构建期就不再依赖
+  「本地缺不缺那两个文件」这件偶然的事。
+
+## ZD-027 门禁失败时，真正失败的用例被截掉了 —— agent 只拿到「2333 个里错了，错哪个不知道」
+
+**场景**：用 nimrtc-v14 的真实事件流做效率复盘时发现，5 个切片、14 次门禁，
+每次全量跑 2316–2387 个用例、250~400 秒。门禁失败时，`gate.result` 事件里
+存下来的 stdout 只有 **500 字符**，而那恰好是**排在最前面、通过了**的用例：
+
+```
+Test project D:/MyOpen/nimrtc-v14/.zelto/worktrees/v1-device-policy/build
+          Start    1: BwePluginSeam.RegisterDefaultPluginsRegistersAimd
+   1/2333 Test    #1: ...  Passed    0.01 sec
+```
+
+真正失败的那个用例在中间段（第 300~2000 号之间），**被截掉了**。
+stderr 只剩一句 `Errors while running CTest`。
+
+**根因**：`executor.ts` 写 `gate.result` 时是 `stdout: r.stdout.slice(0, 500)`
+—— 只存**头部**。测试运行器的失败用例几乎从不排在开头（开头的总是先跑的
+一批普通用例），所以这个截断**系统性地**丢掉了最该被看到的那几行。
+`feedback.ts` 又只能从 stderr 捞，于是 agent 拿到的失败证据是空的。
+
+**后果**：agent 重跑修 bug 时拿不到「上次为什么失败」，只能从头摸一遍；
+人只能自己进 worktree 重跑一遍全量测试去找失败用例 —— 每次 250~400 秒。
+这是 nimrtc 开发「经常停下来」的一个直接来源。
+
+**修复（2026-11-23）**：
+1. 新建 `src/core/gate/diagnostics.ts`（纯计算，C3）：从测试输出里抽
+   `{ test, message, location }[]` 失败用例清单 + 断言尾部，覆盖
+   **CTest / node --test（TAP + spec）/ vitest / jest / gtest**。
+   抽不出时返回空清单 —— 空不等于通过，只表示没抽到。
+2. `GateResult` 增 `failures` / `reportedFailureCount` / `runner` 字段；
+   `executor.ts` 在命令失败时补上诊断，`gate.result` 事件随之带上结构化
+   失败清单；stdout 失败时改存**尾部**（断言通常在末尾）。
+3. `feedback.ts` 优先把失败用例清单作为给 agent 的 `reason`，并渲染完整清单；
+   抽到的条数少于运行器声明的总数时明说「还有 N 条没抽到」。
+4. CLI（`zelto gate`）与 `autoGateAfterRun` 的失败呈现都先列失败用例名与断言。
+5. 新增 `zelto gate <id> --rerun-failed`：读上一次 `gate.result` 的失败 CTest
+   用例名，把 ctest 命令收窄成 `ctest -R "^(?:失败1|失败2)$"`（整名精确匹配、
+   元字符转义），只重跑上次失败的用例。没有历史 / 识别不出 / 非 ctest /
+   已带 `-R` 时**一律退回全量** —— 宁可慢，不漏跑。
+
+**回归测试**：`tests/zd027-gate-failure-diagnostics.test.ts`（28 项）。
+
+**剩余问题**：`--rerun-failed` 依赖上一轮是本版本诊断写出的失败清单（老版本
+二进制写的 `gate.result` 没有 `failures` 字段），首次使用退回全量、后续生效。
+C++ 侧的「只构建受影响的目标」属于增量门禁（阶段 3），需改配置契约、单独写 ADR。
+
+**顺带查清的 nimrtc 环境问题**（不是 zelto 的缺陷，但挡住了验证）：
+
+`build_dtls_cert.py` 一开始直接崩：
+
+```
+ImportError: DLL load failed while importing _rust: 找不到指定的程序。
+```
+
+第一直觉是「用错 python 环境」。**实测排除了这个可能**：
+
+- `where python` 只有 `D:\ProgramData\Miniconda3\python.exe`（3.9.1）；
+  另有两个 pyenv / uv 的解释器，但**都没装** `cryptography`；
+- conda 的包缓存里装的是 **`cryptography-3.3.1-py39hcd4344a_0`**
+  （纯 C 实现）—— 它**本来是好的**；
+- 但 site-packages 里却是 **`cryptography 42.0.8`** —— 某次 `pip install`
+  把它升到了 Rust 实现。
+
+**42.0.8 的 PyPI wheel 不带 `cryptography_rust.dll`**（实测 41.0.7 / 42.0.7 /
+42.0.8 / 43.0.3 四个 wheel 全都只有 `_rust.pyd`），而 `_rust.pyd` 静态依赖它
+—— 于是 `import cryptography` 直接失败。**只有 conda-forge 的构建才会把那个
+dll 打包进去。**
+
+修法：卸掉 pip 装的 42.0.8，把 conda 缓存里的 3.3.1 拷回去
+（注意 `_rust.pyd` 可能被别的进程占着 —— 本次是一个 uvicorn 服务占的，
+要先停掉才能删）。之后脚本正常。
+
+**这条印证了 ADR-095 的一个设计选择**：`worktree.prepare` 依赖项目自己的
+脚本能跑 —— 如果脚本本身跑不起来，准备阶段会**明确报错**并**不放行**到 agent，
+而不是让 agent 在缺产物的目录里跑一小时再在门禁②炸掉。
+
+
+---
+
+## ZD-028 门禁重试是全量重跑 —— 810 秒花在「再确认同一个失败」上
+
+**场景**：ZD-027 落地后复盘 nimrtc-v14 的事件流，发现门禁的**内部重试**
+（`gate.retry`）跑的是**完全相同的命令** —— 对 `test` 命令而言，
+就是再跑一遍全部 2333 个用例。
+
+实测统计（`.zelto/events` 全量）：
+
+| 门禁命令 | 次数 | 总耗时 | 占比 |
+| --- | --- | --- | --- |
+| `test` | 15 | **4055s** | **90%** |
+| `build` | 15 | 439s | 10% |
+
+门禁墙钟合计 4494s（约 1.25 小时），**九成在 `test` 上**。
+
+重试的明细：
+
+```
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v1-device-policy        cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v3-n4-d6-connectivity   cmd=build  attempt=1/1 prevExit=1
+RETRY slice=v3-n4-d6-connectivity   cmd=test   attempt=1/1 prevExit=8
+RETRY slice=v3-n4-d6-connectivity   cmd=test   attempt=1/1 prevExit=8
+```
+
+**根因**：重试的语义本该是「再试一次，看是不是偶发」。但实现上重试跑的是
+**同一条命令**的全量 —— 于是「偶发」这个语义退化成了「再跑一遍，再确认一次
+同样的失败」。
+
+`v1-device-policy` 一片光 `test` 就花了 1254.6s（5 次全量），其中 3 次是
+**纯浪费**（同样的用例、同样的断言，失败是确定性的）。每次约 270s，
+合计约 **810s**。
+
+**顺带查出的三个真 bug**（都在 ZD-027 的 `--rerun-failed` 里，都是
+**在 nimrtc 上不工作**的）：
+
+1. **`isCtestCommand` 认不出被 `cmd /c` 包起来的 ctest**。旧判据
+   `[\s&|;(]` 不含 `"`，于是 nimrtc 的真实命令
+   `cmd /c "ctest --test-dir build ..."` 判为**不是** ctest 命令 ——
+   收窄逻辑恰好在它被开发出来的那个项目上完全失效。
+2. **`-R` 的正则里 `|` 在 Windows cmd 下是管道符**。实测
+   `cmd /c "ctest -R "^(?:A|B)$" ..."` 直接把命令打崩（exit 255，
+   `'B)$' 不是内部或外部命令`）—— 门禁报的是一个与被测代码毫不相干的错。
+3. **`--tests-from-file` 有假绿陷阱**：没匹配到任何用例时 ctest 退出码是
+   **0**（stderr 打印 `No tests were found!!!`）。照搬过来会让「筛选用例名
+   写错」表现成**门禁假绿**。
+
+**修复（2026-11-23，ADR-096）**：
+
+1. 过滤条件改用 **`--tests-from-file`（精确用例名清单文件）**，不用 `-R` 正则 ——
+   用例名本来就是精确串，不需要正则；也就彻底避开了 `|` `(` `)` `.`
+   等元字符的 Windows 引号/管道符陷阱。
+2. 清单文件写在**门禁工作目录**下（固定名 + 切片 id，避免并行切片互相覆盖），
+   跑完即删。命令行里只多一个相对路径，避开 Windows 绝对路径的空格与引号。
+3. **假绿堵死**：收窄那一轮若退出码为 0，但输出里看不到任何被筛选用例名
+   （或出现 `No tests were found`），判为**失败**并说清「收窄条件可能已过期」。
+4. **`isCtestCommand` 放宽**：认 `ctest` **词元**（含扩展名），卡前后边界；
+   路径形态按**扩展名**判是不是可执行工具（`exe`/`cmd`/`bat`/`com`/`sh`
+   算，`cjs`/`js`/`py` 不算 —— 那是别的工具的脚本）。
+5. **门禁内部重试自动收窄**：重试时若上一轮失败且能识别出失败用例，
+   把命令收窄成「只跑那些失败用例」。第一轮已全量跑过，覆盖没丢，
+   只是把重试的边际成本从 O(全量) 降到 O(失败用例数)。
+
+**预计收益**：nimrtc 的 6 次重试从 6 × 270s 降到 6 × ~5s，省约 **1590s（约 26 分钟）**。
+
+**回归测试**：`tests/adr096-gate-rerun-narrowing.test.ts`（21 项）
++ `tests/zd027-gate-failure-diagnostics.test.ts` 新增 3 项（executor 级端到端：
+重试确实只跑失败用例、事件留痕、清单跑完即删）。
+
+**ADR**：`docs/adr-096-gate-rerun-failed-narrowing.md`。
+
+**剩余问题**：「只构建受影响的目标」仍属增量门禁（阶段 3b）——
+推导规则藏在项目的 CMake 宏里，工具猜不得（ADR-051 已就同类问题否决）；
+要推进必须由**项目侧显式声明**「模块 → 用例」的映射。
+
+
+---
+
+## ZD-030 门禁第一轮就跑全量 —— 2387 个用例里 2300 个与本片无关
+
+**场景**：ZD-028 修好了「重试」这一轮，但**第一轮**门禁仍然是全量的。
+复盘 nimrtc-v14 的事件流：
+
+| 切片 | 门禁次数 | 每次用例数 | 每次耗时 |
+| --- | --- | --- | --- |
+| v1-device-policy | 5 | 2333 | ~270s |
+| v3-n4-d6-connectivity | 3 | 2387 | ~290s |
+
+而 `v2-ice` 的**写集**只有：
+
+```
+src/modules/ice/**
+src/modules/sdp/**
+```
+
+`v2-ice` 只碰了 ice 与 sdp 两个模块，却要跑**全部 2387 个用例** ——
+其中 audio、video、webrtc、dtls 的用例**一个都没被这次改动影响**。
+
+**根因**：门禁不知道「这次改动影响哪些用例」。它只有一个「跑哪些命令」
+的抽象，命令是**项目级**的（跑全部用例），与**切片级**的写集之间没有连接。
+
+三条已有的路都走不通（详见 ADR-097 的「背景」段）：
+
+1. **`spec.gateCommands`（ADR-051）** —— 让人**手写**本片的门禁命令。
+   有效，但要求人知道 CMake 目标名（`nimrtc_add_test` 宏会做
+   `string(REPLACE "/tests/" "_test_")` 再拼源文件名，**猜不出来**），
+   而且每片都要写一遍。
+2. **`--rerun-failed`（ADR-096）** —— 只在**已经失败过**之后收窄。
+   救的是「重试的边际成本」，救不了「第一轮就跑全量」。
+3. **CTest `-R` 正则** —— nimrtc 的用例名（`test_ice_test.IceCandidateBuild`）
+   **不含模块路径**（实测），「从用例名反推源目录」这条路根本不成立。
+
+**后果不只是慢，是信号被稀释**：2337 个用例的通过记录里，agent 找不到
+「哪个用例跟我有关」；而且门禁跑全量制造了一个**危险错觉** ——
+「门禁过了 = 整个项目都好了」。收窄后这个错觉消失，
+门禁过了意味着「**我这片的改动是好的**」—— 这才是我们要的。
+
+**修复（2026-11-23，ADR-097）**：
+
+新增配置段 `gate.scope`，由**项目侧显式声明**「写集路径模式 → 作用域标签」：
+
+```yaml
+gate:
+  scope:
+    rules:
+      - match: "src/modules/ice/**"
+        labels: ["ice"]
+      - match: "src/modules/sdp/**"
+        labels: ["sdp"]
+    fallback: full
+```
+
+工具做的：把切片的写集按规则匹配成标签集合 → 用
+`ctest --show-only=json-v1` 枚举出**带这些标签的精确用例名** →
+写清单文件 → 用 `--tests-from-file` 只跑它们。
+**工具不推导目标名、不推断依赖、不猜**（ADR-051 的教训）。
+
+关键安全约束：
+
+- **匹配不到任何用例 → 门禁判失败**（不是「跑 0 个用例判通过」——
+  ctest 在没匹配到时退出码是 **0**，那是假绿）；
+- **写集没命中任何规则 → 退回全量**（`scopeSource: "fallback-full"`）；
+- **没配 `gate.scope` → 跑全量**（老项目零变化）；
+- **收窄跑完验真**：输出里必须看得到被筛选用例名，否则判失败
+  （复用 ADR-096 的 `verifyNarrowedTestsRan`）；
+- **留痕**：`gate.executed` / `gate.result` 记 `scoped` / `scopeLabels` /
+  `scopeTestCount` / `scopeTotalTestCount` / `scopeSource`；
+- **人的出口**：`zelto gate <id> --full` 强制跑全量
+  （规则可能漏 —— 收窄是工具的判断，全量是人的判断）。
+
+**与 ADR-096 的关系**：两者共用同一套机制（`--tests-from-file` 清单文件）、
+同一个坑（Windows 管道符）、同一道假绿防线。ADR-096 治「重试」，
+ADR-097 治「第一轮」。
+
+**预计收益**：`v2-ice` 一类切片门禁从 2387 个用例降到 ~200 个，
+单次省 200~250s；一片 5 次门禁从 1254s 降到 ~400s。
+
+**回归测试**：`tests/adr097-scoped-gate.test.ts`（22 项）
++ `tests/config-loading.test.ts` 新增 2 项（`gate.scope` 必须被解析出来、
+`scope:` 段不能吞掉 `gate:` 的其它键）。
+
+**ADR**：`docs/adr-097-gate-scope-by-write-set.md`。
+
+**剩余问题**：
+1. **nimrtc 当前没有给用例打标签** —— `cmake/NimRTCTest.cmake` 的
+   `nimrtc_add_test` 只调 `add_test(NAME ...)`，没有
+   `set_tests_properties(... LABELS ...)`。要用上这个能力，
+   必须**先在项目侧加标签**。这是「能力是协作出来的」——
+   工具不猜，但会明确告诉你「标签一个都没匹配到」。
+2. ~~**签字判据还没认作用域**~~ —— ✅ **已补（2026-11-24，ADR-104）**：
+   签字复查的第②项确认（验收真跑过本片）现在**看得见**收窄
+   （标签 + 「全量 N 个里选了 M 个」），且事件流里有留痕。
+   **判据本身没变** —— 收窄的 fail closed 已经在门禁侧承担，
+   签字侧再判一次是重复。详见 §ZD-035。
+
+---
+
+## ZD-044：「15 片全完成」说的是磁盘，不是分支 —— 驾驶舱里没有「分支证据」，计划也没和盘上并排过
+
+### 场景
+
+2026-11-25，用 zelto 给 nimrtc-v14 规划 v1.4.x 收尾（13 个待做项）。打开驾驶舱看 v3 目录：15 片全 `completed`。同一时刻在命令行核对：
+
+```
+git ls-tree --name-only version/v3 .zelto/slices/
+.zelto/slices/v0-cmake.json
+.zelto/slices/v0-src-log.json
+.zelto/slices/v1-cmake.json        ← 只有 3 片基线
+```
+
+另外 12 片的「完成」只在 `.zelto/version-worktrees/v3/.zelto/slices/` 里 —— `.zelto/` 在 `.gitignore` 中，**换台机器、换一个 worktree 就查不到**。而版本计划里那 16 项全是 `draft`，与盘上也没并排显示过。
+
+### 根因
+
+驾驶舱（ADR-112 之后已能看见版本目录）只把盘上的 `state` 当事实：
+「完成」没有区分「盘上完成」与「**在版本分支里完成**」；
+版本计划（`.zelto/versions`）和盘上状态是两个数据源，界面从没把它们放进同一张表。
+
+### 后果
+
+- 人看到「15 片全完成」，以为是这一版的全部 —— 基于错误事实做决定；
+- 12 片的完成证据不在分支上，事后审计（换机器重跑驾驶舱）看不到；
+- 「计划过期」与「分支缺失」是两种完全不同的处置，界面不区分，人无从下手。
+
+### 修复
+
+- **ADR-114**：切片行带 `onBranch`（true / false / null 三态）+ `committedState`；判据按**这一行所在的根**问 git（`ls-files --error-unmatch` + `diff --quiet HEAD`），纯 git 事实；
+- `/api/plan-coverage`：计划 / 盘上 / 分支**分开数**（`planned / onDisk / completed / onBranch`），逐片给出计划状态与盘上状态；前端总览加「版本计划」表（「N 片仅在盘上」徽标），切片列表加「计划」「分支证据」两列，详情页加分支证据一行；
+- **ADR-115**：`zelto plan version` 从钉死的切片清单确定性建整版，顺手修 `plan patch` 只写真源、不更新被跟踪副本的问题（ADR-110 双写缺口）。
+
+### 回归测试
+
+`tests/web-branch-evidence.test.ts`（三态 + 按根问 git + 计划对照计数）、`tests/plan-version-deterministic.test.ts`（六类校验 + 双写 + 事件）、`tests/web-multi-root-cockpit.test.ts`（回归）。
+
+### 现场验证
+
+nimrtc-v14 驾驶舱（2026-11-25）：扫到 `root(15) / v1(0) / v2(0) / v3(8) / v4(0)` 五个根；计划对照显示 v1–v6 六版，v3 的「盘上完成 / 分支上完成」分开计数，已完成的片全部标「仅在盘上」。
+
+### 剩余问题
+
+1. **「仅在盘上」的完成片怎么进分支**：现状是要人显式提交状态文件（`.zelto/` 在 gitignore 里，需要 `git add -f` 或改 ignore 策略）。这是一个策略决定，不在本缺陷的修复范围；
+2. **切片级合入明细**：现在只给计数，版本分支上「已合入哪几片」仍需 `git ls-tree` 自查。
+
+---
+
+## ZD-039：同一条守卫，merge 放行、ship 拦下 —— 口径分叉把人引去做错事
+
+### 场景
+
+nimrtc-v14 v3 收尾，`zelto version ship v3` 被拦下：
+
+```
+⚠️  主仓工作区有未提交改动，已跳过 ship：
+     M src/third_party/msquic
+     M src/third_party/wolfssl
+     ...（共 9 个 vendor submodule）
+     先提交或暂存这些改动，再重新跑 zelto version ship。
+```
+
+但这 9 个 `M` 是 **submodule 指针与 index 记录不一致**，不是人改的代码。同一份 `git status`，`zelto merge` 早就豁免了（ZD-021），报「ℹ️ 与本次合并无关」后照常合并。
+
+### 根因
+
+`zelto merge` 与 `zelto version ship` 是**同一道守卫的两个入口**，但 ship 的那份没有接 `isSubmoduleOnlyDirty` / `isSubmodulePointerMismatch` 两个判据。
+
+### 后果
+
+人按提示 `git checkout` 那 9 个 vendor 目录 → 指针被 reset 成 index 的旧值 → **版本分支里原本能构建的 vendor 布局被改坏**。误报不是「多拦一次」，而是「照做反而更坏」。
+
+### 修复
+
+`shipBranch` 的守卫接上与 merge 相同的两条豁免，且**只降级为提示、不放过真脏**：指针错位 / 仅内部脏标记 → 打一行 ℹ️ 继续 ship；普通文件真被改 → 仍然拦。
+
+### 回归测试
+
+`tests/zd039-ship-submodule-pointer-guard.test.ts`：①仅指针错位 → ship 成功；②仅内部脏 → 不拦；③普通文件被改 → 仍拦；④两者并存 → 拦且清单只列普通文件。
+
+### 剩余问题
+
+无。
+
+---
+
+## ZD-040：多版本链里 `baseCommit` 不是分叉点 —— 每次 ship 都误报「主干历史被改写」
+
+### 场景
+
+同一次 v3 ship，放下 ZD-039 之后又撞上：
+
+```
+⚠️  版本分支与主干**已分叉**（主干历史被改写过，不是单纯的主干前进）。
+     版本基点：dd396cd5
+     共同祖先：ff9d64b0
+```
+
+提示建议 `git rebase --onto feat/v14-turn-tls ff9d64b0 version/v3`。
+
+### 根因
+
+版本链是 v1 → v2 → v3。`version.start` 给 v3 记的 `baseCommit` 是**依赖版本 v2 的 tip**，而 v2 永远不会进主干。原判据「`baseCommit` 是否是主干 HEAD 的祖先」于是恒为假 → 每次都报分叉。
+
+真实的分叉证据是 `git merge-base HEAD version/v3`，它给出的共同祖先与 `baseCommit` 是两个不同的提交。
+
+### 后果
+
+人按提示 rebase 一条本来就干净的历史 → 106 个提交逐个重放、vendor 子模块指针大面积错位。**误报比不报更坏**：不报只是撞一次冲突，误报会让人亲手把历史改坏。
+
+### 修复
+
+判据改为两条同时成立才算「主干已前进」：
+
+1. `baseCommit` 仍是**版本分支**的祖先（版本分支没被 rebase / 改写）；
+2. 共同祖先（`merge-base HEAD versionBranch`）等于 `baseCommit`，或是它的祖先（历史线性，主干只是在分叉点之后前进）。
+
+反例仍判分叉：共同祖先为空（主干被 squash 成新根）、共同祖先与 `baseCommit` 无可比关系（版本分支被改写）、`baseCommit` 不在版本分支历史里。
+
+### 回归测试
+
+`tests/zd040-ship-multiversion-base-not-forkpoint.test.ts`：①多版本链不报分叉；②版本分支被 rebase → 仍报；③D-70 真场景（主干 squash 成新根）+ 版本链 → 仍报。
+
+### 剩余问题
+
+「分叉」提示里给出的 `rebase --onto` 建议，在判分叉成立时是否总是最优解，仍需要更多现场数据。
+
+---
+
+## ZD-045：分支证据用同步 spawn 问 git —— 整个驾驶舱被卡在「加载中…」
+
+### 场景
+
+ZD-044 修好、推送前的核对：用新构建的 `zelto web` 打开 nimrtc-v14，页面**一直停在「加载中…」**，等一分钟也不出来。实测各端点：
+
+```
+/api/slices         93 秒
+/api/plan-coverage  28 秒
+/api/summary        > 60 秒
+```
+
+同一时刻 `/api/health` 也超时 —— 不是某个端点慢，是**整个服务不再应答**。
+
+### 根因
+
+ADR-114 的分支证据用 `execFileSync('git', …)`：每行切片 3 次调用（`rev-parse` / `ls-files` / `diff`），列表里 24 行 × 2 个根 = 上百次**同步** spawn。
+
+每次同步 spawn 期间事件循环完全停摆 —— 换页、静态资源、`/api/health` 全部排队。更糟的是这台机器上 git 进程启动开销是 **30–200ms 且会抖**（偶发 4 秒），所以总阻塞时间随行数线性膨胀到分钟级。
+
+对照实验（同机同时刻）：
+
+| 方式 | 15 次调用 |
+|---|---|
+| `execFileSync` 串行 | 几千毫秒，且越跑越慢 |
+| 异步 `spawn` 串行 | 954ms |
+| 异步 `spawn` 并发 | 138ms |
+
+**慢的不是 git，是我们拿主线程去等它。**
+
+### 后果
+
+- 驾驶舱在「刚打开」这个最该起作用的时刻完全不可用；
+- 前端每 30 秒轮询一次，后端的同步阻塞让每次轮询都排在上一次后面，积压越滚越大；
+- 任何自动化调 `/api/health` 的对端（外部监控 / 看门狗）也一起被拖死。
+
+### 修复
+
+1. **异步探针**：新增 `annotateBranchEvidenceAsync`，判据与同步版逐字相同（C3：只读文件、纯计算），只是不阻塞事件循环。驾驶舱的 `listSlices` / `getSlice` 改走异步版；
+2. **每个根两个进程**：`ls-files -z -- <paths>` 回答「哪些被跟踪」、`diff --name-only -z HEAD -- <paths>` 回答「哪些与 HEAD 不一致」；被跟踪且不在后者里 = `onBranch`。HEAD 内容用 `cat-file --batch` 一次读 N 个；
+3. **按行指纹缓存**：键 = `scope|label|id|state|updatedAt`。任何一行变了整批重算——**只缓存 git 进程，不缓存盘上事实**。
+
+结果（同一台机器）：
+
+| 端点 | 修前 | 修后（冷） | 修后（热） |
+|---|---|---|---|
+| `/api/slices` | 93 000ms | 255ms | 39ms |
+| `/api/plan-coverage` | 28 000ms | — | 30ms |
+| `/api/summary` | >60 000ms | — | 34ms |
+
+### 回归测试
+
+- `tests/zd045-cockpit-event-loop-blocking.test.ts`：慢请求进行中时 `/api/health` 必须在 3 秒内应答；
+- `tests/web-branch-evidence.test.ts` 新增「异步探针与同步探针给出同一份证据」（假表逐条比对）+「探针抛错 → 不知道」。
+
+### 剩余问题
+
+1. **git 启动开销本身没有变**：冷启动首屏仍有约 1.2 秒。要再往下压，需要长期驻留的 `git cat-file --batch` 管道进程——但那是**常驻状态**，与 C1「无驻留进程」冲突，必须先写 ADR 讨论；
+2. **缓存没有 TTL**：指纹只盯状态文件与 `updatedAt`。若有人 `git commit` 了状态文件而切片文件本身没动，缓存会短暂显示旧证据（下次任一状态变更即刷新）。
+
+---
+
+## ZD-046：版本工作目录里 merge 的归属解析兜底成「合主干」，`target` 标签与实际落点对不上
+
+### 场景
+
+nimrtc-v14（2026-11-26）核对 v1.4 全部 10 个 v1 切片的分支归属时，发现「计划说 v1、分支说 v3、事件说 main」三方对不上。
+
+追事件的 `merge.planned` / `merge.completed`，`target` 字段的值取决于 **merge 命令是从哪个目录跑的**：
+
+| 切片 | merge 跑的目录 | 事件里的 `target` |
+|---|---|---|
+| `v1-device-policy` / `v1-audio-p2` / `v1-n5-turn-server` | 仓库根（那儿有 `.zelto/versions/plan-1795166129234.json`） | `version/v1` ✅ |
+| `v1-audio-device-engine` / `v1-call-state-surface` / `v1-ice-recovery` / `v1-install-tree-module-closure` / `v1-install-tree-video-deps` / `v1-macos-install-proof` / `v1-path-change-report` / `v1-sdk-sample` / `v1-turn-credentials` / `v1-turn-tls-trust` / `v1-video-render-engine` / `v6-writeset-slice-boundary` | `.zelto/version-worktrees/v3/`（那儿 `.zelto/versions/` 是空的） | **`main`** ❌ |
+
+共 12 条 `merge.completed` 带 `target=main`（在 `.zelto/version-worktrees/v3/.zelto/events/` 里）。
+
+### 根因
+
+`resolveSliceOwnership`（`core/version/branch.ts`）四级回退：
+
+1. `--target` 显式指定
+2. 版本计划成员扫描 —— 读 `.zelto/versions/`
+3. 规格 frontmatter 的 `version:` 字段
+4. **兜底：合入主干当前分支**
+
+第 2 级读的是**当前目录**下的 `.zelto/versions/`。版本工作目录里的那个目录**永远是空的** —— `version start` 建 worktree 时从不复制计划文件进去：
+
+```
+$ dir .zelto/version-worktrees/{v1,v2,v3,v4}/.zelto/versions
+（四个都是 0 个文件）
+```
+
+第 2 级落空、第 3 级规格里也没写 `version:` → **第 4 级兜底生效**。
+
+### 后果：**落点碰巧没错，错的是归属**
+
+这一点必须说准，否则会得出过头的结论。
+
+兜底返回 `kind: 'main'`，`resolveTarget(null)` 据此取 `dir = process.cwd()` —— 而 `process.cwd()` 就是**版本工作目录**，它检出的分支正是 `version/<label>`。所以产物**全都落在版本分支上**：
+
+```
+8abb815a  origin/main=False  version/v3=True  version/v1=False
+85f142c9  origin/main=False  version/v3=True  version/v1=False
+18775f73  origin/main=False  version/v3=True  version/v1=False
+b4aa77ec  origin/main=False  version/v3=True  version/v1=False
+657941be  origin/main=False  version/v3=True  version/v1=False
+3529b44a  origin/main=False  version/v3=True  version/v1=False
+c40dd463  origin/main=False  version/v3=True  version/v1=False
+```
+
+**主干没有被污染** —— `origin/main` 上一个切片提交都没有。
+
+但兜底绕过了三件事，造成真实伤害：
+
+1. **事件流说谎**（C4 的追溯价值受损）：`merge.completed` 记 `target=main`，实际分支是 `version/v3`。事后按 `target` 审计「这版做完了没有」会得出假结论。
+2. **版本归属被跳过**：走兜底 = 跳过第 2 级「计划成员扫描」与第 3 级「规格 frontmatter」。计划里 **v1 的 10 个切片有 7 个从未合进 `version/v1`**（实测 `version/v1` 只含 `v1-device-policy` / `v1-audio-p2` / `v1-n5-turn-server` 三片；另 7 片只在 `version/v3` 上）。这 7 片在计划里属于 **v1**，却落在 **v3** 的分支上。
+3. **版本状态同步被跳过**：不走版本整合路径，`version.integrated` 之类的事件不产生 —— `version/v1` 上**一个 `Merge slice` 提交都没有**（tip 停在 `628df8c9`，`origin/main...version/v1` = ahead 8 / behind 41）。
+
+一句话：**代码没丢、落点没错，但「哪片属于哪一版」这条追溯链断了**。
+
+### 修复
+
+ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两处都改：
+
+1. **让解析能成功**：`version start` 建工作目录时，把 `.zelto/versions/<plan-id>.json` 复制进 `<worktree>/.zelto/versions/`。复制的是**整个计划文件**（不是这一版的片段）—— 归属解析要知道「这个切片属于哪个版本」，而切片可能跨版本被引用。复制失败**不阻塞** `version start`（副本是派生的，缺了它可以在 merge 那一刻说清楚）。
+2. **让它不许瞎猜**：`resolveSliceOwnership` 新增 `versionContext` 选项。在版本上下文里第 4 级兜底**不再生效**，改为抛 `UnresolvedOwnershipError`。判据是 **git 事实**（当前检出分支是 `version/<label>`），不看目录路径 —— worktree 可能被人挪过。
+3. **显式 `--target` 反查不到计划时仍然用它**：分支名本身是权威的。「合哪儿」是明确的，不该因为「这分支属于哪份计划」不知道就改主意。
+4. **基点解析同样不许兜底**（ADR-067）：基点错到主干比停下来更坏 —— agent 会在错误的基础上重写代码。所以 `resolveSliceBaseCommit` 也接受 `versionContext`，解析不出归属时抛错，不退回 HEAD。
+
+老项目（不在版本上下文，无版本计划）行为不变 —— 这是 ADR-056 §3.2 的向后兼容承诺。
+
+### 回归测试
+
+- `tests/adr-121-version-context-ownership.test.ts`：14 条断言 —— 版本上下文里解析不出归属就抛错 / 老项目仍兜底合主干 / 显式 `--target` 不被兜底吞掉 / 计划复制后归属解析成功 / 歧义与「解析不出」是两种错。
+
+### 剩余问题
+
+1. **已投错的 12 个切片不重放**（fix-forward 决策）：重写版本分支历史的风险远大于收益。实情记在 `docs/v14-切片-分支对照.md`。
+2. **那 7 个「计划说 v1、实际在 v3」的切片暂不搬移**：正解是重新按归属合进 `version/v1`，但 `version/v1` 与 `version/v3` 已分叉 104 个提交，且重做合并会撞 spec 冲突。**留作后续决定，本次只修机制 + 记录实情。**
+3. **`VersionSlice.state` 从不回写**：计划里的片级状态始终是 `draft`。这是另一个问题（ADR-114 已把「计划态」与「盘上事实」分开呈现），本次没动。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
