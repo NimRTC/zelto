@@ -16,6 +16,7 @@ import { join } from 'node:path';
 
 import { Scheduler } from '../../core/sched/engine.js';
 import { listFilesUnder } from '../../core/sched/audit.js';
+import { makeRunId } from '../../core/sched/run-id.js';
 import { pathInWriteSet } from '../../core/pathspec/index.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { classifyStall } from '../../core/stall/classifier.js';
@@ -550,11 +551,15 @@ export async function executeSlicesParallel(
     }
   } catch { /* ignore */ }
 
+  // ADR-129：每片这一轮的起跑时刻 —— 第 i 片的事件流里 runId 用它算
+  const runStartedAts: string[] = new Array(ids.length).fill('');
   for (let i = 0; i < ids.length; i++) {
     const st = states[i];
     const slice = slices[i];
 
     await scheduler.startRun(st.id);
+    // ADR-129：起跑时刻 —— 必须在 agent 起跑**之前**取（与单片 D-49 同理）
+    runStartedAts[i] = new Date().toISOString();
     // 记下「这一轮已经 startRun 过」—— 中止时要把它连同后面几片一起退回 frozen。
     //
     // 为什么不能只退失败的那一片（D-64）：并行批次里，第 2 片装守卫失败时，
@@ -641,6 +646,8 @@ export async function executeSlicesParallel(
       worktree: st.worktreePath ? worktreeManager().relativePathFor(st.id) : null,
       affinityGroup,
       previousSlices: affinityPrev,
+      // ADR-129 一：并行路径与单片用同一口径算 runId
+      runId: makeRunId(st.id, runStartedAts[i], 0),
     });
   }
 
@@ -885,7 +892,11 @@ export async function executeSlicesParallel(
 
         // 不再重试 —— 最终失败
         if (!stalled) {
-          await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
+          await events.append(st.id, 'run.aborted', 'zelto', {
+            sliceId: st.id,
+            runId: makeRunId(st.id, runStartedAts[i], attempt + 1),
+            exitCode: exitCode.exitCode,
+          });
           // 停机标记（ADR-047）：并行路径原本**完全不写停机** ——
           // 只有单片路径写。于是并行批次里失败的切片既没有停机分类，
           // 也没有退回 frozen：人看不见它卡住了，而它还占着写集，
@@ -1070,7 +1081,12 @@ export async function executeSlicesParallel(
       ? await settleRunCost(st.id, adapter, sessionId)
       : { costUsd: null, exhausted: false, spent: 0, limit: Number.POSITIVE_INFINITY };
     await events.append(st.id, 'run.finished', 'zelto', {
-      sliceId: st.id, exitCode: 0, costUsd: cost.costUsd, affinityGroup: finishedAffinity,
+      sliceId: st.id,
+      exitCode: 0,
+      costUsd: cost.costUsd,
+      affinityGroup: finishedAffinity,
+      // ADR-129：并行路径没有 CLI 层重试，attempt 恒为 0
+      runId: makeRunId(st.id, runStartedAts[idx >= 0 ? idx : 0] ?? '', 0),
     });
     console.log(`✅ ${st.id}: completed (${st.elapsedSec}s)`);
 

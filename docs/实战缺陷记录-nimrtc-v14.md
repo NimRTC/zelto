@@ -2744,15 +2744,27 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 「它已经不管了」。与 ADR-123 同一个病灶，只是这次说谎的是 **detach 主管**。
 这一轮实际是我人工核实「主管与被拉起的 agent 都已不在」之后，才敢按人工接管处理。
 
-**修复**（待做）：
 
-1. detach 主管**运行期心跳**（写事件或心跳文件）；驾驶舱 / `zelto status` 发现
-   「主管 pid 不在、任务仍 running」→ 落 `run.finished`（`phase=supervisor`）并退回 `frozen`。
-2. `run.aborted` 的 pid 拆成 `supervisorPid` / `agentPid`，两者都在日志里打印。
+**修复（已落地，2026-11-26，ADR-129）**：
 
-**回归测试**：待修复落地时补 —— kill 主管后 30s 内必须出现收尾事件，且 `pid` 字段是主管 pid。
+1. **detach 主管运行期心跳**：主管每 30s 写 `.zelto/supervisor/<taskId>.heartbeat`
+   （`{ pid, runId, agentPid, sessionId, at }` 状态快照，整份覆盖）。心跳**不参与判定** ——
+   「有没有结论」只看事件流。
+2. **看门狗接管收尾**：`maybeRecoverDeadTask`（`src/cli/commands/task-watchdog.ts`）新增一条判据 ——
+   「任务 `running`、`task.runId` 那一轮在事件流里既无 `run.finished` 也无 `run.aborted`、
+   主管 pid 不在」→ 先写一条 `run.aborted`（actor=`watchdog`、`phase=supervisor`、
+   带 `runId` 与 `supervisorPid`），再走原有的「退回 frozen + 上报」。
+3. **pid 拆开**：`run.started` / 收尾事件里同时有 `supervisorPid` 与 `agentPid`；
+   主管日志两行都打（`supervisor pid=…` / `agent pid=…`）。
 
-**剩余问题**：detach 主管的运行期心跳 / 看门狗与 `run.aborted` 的 pid 拆分**都还没做**（见 ZD-050，三者一起落）—— 否则「主管半路死了」仍然无人可见。动的是收尾事件与事件 payload，要先写 ADR。
+**回归测试**：`tests/zd049-supervisor-takeover.test.ts` —— 主管活着不接管；主管不在且无结论 →
+写一条 `phase=supervisor` 的结论、切片退回 frozen；已有结论的一轮不再写第二条。
+`tests/adr-129-run-identity.test.ts` —— 心跳读写、收尾顺序与 pid 拆分的源码契约。
+
+**剩余问题**：看门狗是**被动**的 —— 要有人跑 `zelto status` / `task list` / 驾驶舱才会触发单步处置。
+没有常驻 daemon（C1），也不打算加；但如果一整天没人看，接管收尾就推迟到第一次有人看时。
+
+---
 
 
 ## ZD-050：没跑完的 post-run 让 worktree 裸奔 —— 「结果不明」的一轮被当成了「新的一轮」，同一片被跑了两遍
@@ -2779,15 +2791,23 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 - 事后回顾：真正的写集守卫是在**人都以为没人跑**的时候失效的 —— 这是 C9 意义上的
   最坏时刻，而它之所以没造成更大破坏，纯属运气。
 
-**修复**（待做）：收尾与预约释放**先落事实、后释放**，并把落盘顺序写进 ADR：
-`run.finished`（或 `run.aborted`）必须在 `reservation.released` **之前**；
-主管在两者之间崩溃时，下次准入用「事件流里有无本轮收尾」而不是「会话文件状态」
-判定这一轮是否结束。
 
-**回归测试**：待修复落地时补 —— kill 主管进程后，事件流里**必须有**收尾事件，
-**且**它为 release 之前；`zelto run` 对「running 但没有收尾事件、主管不在」的切片**拒绝**并提示 `zelto resume`。
+**修复（已落地，2026-11-26，ADR-129 二）**：落盘顺序固定为
+① `run.finished` / `run.aborted` → ② 任务文件 status + completedAt → ③ 释放写集预约（+ 撤钩子），
+写进 ADR-129 作为契约。主管的 `finally` 已按此重排（`supervisor.ts`：`stopHeartbeat` →
+`patchTask` → `guard.release()`）。「这一轮是否结束」的判定改为**只读事件流**
+（`core/sched/run-conclusion.ts` 的 `findRunConclusion`），不再看会话文件状态；
+历史路径写的、不带 `runId` 的结论也按其时间位置认（`findTaskRunConclusion` 的兼容分支）。
 
-**剩余问题**：「先落事实、后释放」是**契约变化**（`run.finished` 与 `reservation.released` 的落盘顺序），按 AGENTS.md 要先写 ADR —— **尚未写**。与 ZD-049 / ZD-051 同批。
+**回归测试**：`tests/adr-129-run-identity.test.ts` —— finally 内三步顺序的源码契约；
+`findRunConclusion` 精确匹配 / 取最后一条 / 无结论返回 null。
+
+**剩余问题**：`zelto run` 准入时对「running 但没有结论、主管不在」的切片**拒绝并提示 resume**
+这一条依赖看门狗先写接管结论（上一项）；准入侧本身仍是既有守卫
+（`judgeDuplicateAgent`），没有把「无结论」单独作为拒绝理由 —— 这需要另一个口径决定，
+尚未做。
+
+---
 
 
 ## ZD-051：同一天五轮运行，事件流里只有两轮有「结束」—— 会话文件名、任务 pid、事件三者没有一条引用链
@@ -2813,14 +2833,19 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 **后果**：事后审计能数出「5 次」，但**答不出「17:30 那轮是怎么结束的」** —— 这正是
 「可追溯」在这一片上的缺口。
 
-**修复**（待做）：每次运行带 `runId`（`sliceId + startedAt + attempt`），写进
-`run.started` / `run.finished` / `run.aborted` 与 gotchas 相关的钩子事件；`task` 只记**当前轮**的 `runId`。
-**禁止**用「最新文件」推断「当前轮」。
 
-**回归测试**：待修复落地时补 —— 连续 retry 两次后三段 `runId` 互不相同；按 `runId` 聚时，
-每一轮都有起跑与结束两端（或显式 `unknown`）。
+**修复（已落地，2026-11-26，ADR-129 一）**：`runId = <sliceId>#<ISO 秒>[/r<attempt>]`
+（`core/sched/run-id.ts`，确定性、可离线重算，不用随机 UUID）。起跑方（前台 / start /
+parallel / detach 主进程）在**开跑前**算好，写进 `run.started` 与任务文件 `task.runId`；
+收尾方（`finishRun`、看门狗、主管异常、并行收尾）用同一个 `(runStartedAt, attempt)` 重算后写回。
+**禁止**用「最新会话文件」推断当前轮；任务文件只记**当前这一轮**的 `runId`。
 
-**剩余问题**：`runId` 要贯穿 `run.started` / `run.finished` / `run.aborted` 与任务文件，是**契约变化**（事件 payload + `task` 文件格式），先写 ADR。与 ZD-049 / ZD-050 同批。
+**回归测试**：`tests/adr-129-run-identity.test.ts` —— 同输入同 id、attempt 区分、毫秒不影响、
+`r1` 与 `r10` 精确区分；源码锚点断言各条 `run.aborted` 的 `runId` 都由 `makeRunId` 派生。
+
+**剩余问题**：hook 事件（PreToolUse 判定）尚未带 `runId` —— 它们靠会话 id 归到轮次，
+在多轮交错时仍只能近似归属。事件流本身不做「配对完整性」检查（`zelto audit` 不报
+「某轮缺一端」），只是不再**假装**有结论。
 
 ---
 
@@ -2855,6 +2880,8 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 
 **剩余问题**：写集判定区分「工作区文件」与「运行期一次性产物」动的是 **policy 判定口径**（C5 保护域不动），要先写 ADR 并过 policy 锁；「收尾报告列出增删行数」可以独立先做。
 
+---
+
 
 ## ZD-053：验收文件里的断言**与规格条目没有编号对应** —— 门禁只问「有没有真断言」
 
@@ -2882,6 +2909,8 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 非测试条目未在摘要里出现 → 视为摘要失败。
 
 **剩余问题**：验收标准编号（`AC-01 …`）进的是**规格格式**（schema 级变化），要先写 ADR；编号核对可以先做成门禁的**附加检查**。
+
+---
 
 
 ## ZD-054：规格点 2（「`engine_media.cpp` 中皆无具体 `rtp::` RTCP 类型」）与实现存在**口径分叉**，需要 owner 裁决

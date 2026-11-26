@@ -65,8 +65,12 @@ import {
   MAX_AUTO_RECOVERIES,
 } from '../../core/activity/index.js';
 import { isProcessAlive, isProcessTreeAlive } from '../../core/sched/index.js';
+import { maybeRecoverDeadTask, taskLivenessOf } from './task-watchdog.js';
 import {
   decideRunWatchdog,
+  findRunConclusion,
+  makeRunId,
+  type RunConclusion,
   type RunWatchdogAction,
 } from '../../core/sched/index.js';
 import { type WorktreeInfo } from '../../core/worktree/index.js';
@@ -325,6 +329,8 @@ export interface RunWaitResult {
   spentUsd?: number;
   /** 拦截时的上限（美元） */
   limitUsd?: number;
+  /** ADR-129：这一轮的 runId（原样带回，收尾时写进结论事件） */
+  runId?: string | null;
 }
 
 /**
@@ -357,6 +363,8 @@ export async function waitForExitWithWatchdog(opts: {
    * 传了就每 `RUN_WATCHDOG_INTERVAL_MS` 查一次，超了当场叫停。
    */
   budgetGuard?: RuntimeBudgetGuard;
+  /** ADR-129：这一轮的 runId —— 看门狗收走时原样带回，收尾端据此写结论 */
+  runId?: string | null;
 }): Promise<RunWaitResult> {
   const { sliceId, sessionId, adapter, runStartedAt, maxRetries } = opts;
   const exitPromise = adapter.waitForExit(sessionId).then((code) => ({ exitCode: code, watchdogReaped: false }));
@@ -514,7 +522,7 @@ export async function waitForExitWithWatchdog(opts: {
       if (action.action === 'escalate') {
         console.error('     看门狗自动恢复次数已达上限 —— 请人看现场后 zelto resume ' + sliceId);
       }
-      resolve({ exitCode: null, watchdogReaped: true });
+      resolve({ exitCode: null, watchdogReaped: true, runId: opts.runId ?? null });
     }, RUN_WATCHDOG_INTERVAL_MS);
   });
   // 看门狗定时器不能让进程退不出去
@@ -1773,14 +1781,19 @@ register('run', async (args) => {
     // 谁装守卫谁放守卫，才不会漏（C9）。
     if (isDetach) {
       const taskId = `task-${id}-${Date.now()}`;
+      const startedAtIso = new Date().toISOString();
+      // ADR-129 一：这一轮的 identity —— 主进程算好，任务文件与主管共用同一个值。
+      // 「这一轮有没有结论」之后一律按它去事件流里找。
+      const detachRunId = makeRunId(id, startedAtIso, 0);
       const taskInfo: TaskInfo = {
         taskId,
         sliceId: id,
         // 监督进程会起自己的会话 —— 这里先占位，等监督进程写回
         sessionId: '',
         agentName,
-        startedAt: new Date().toISOString(),
+        startedAt: startedAtIso,
         status: 'running' as const,
+        runId: detachRunId,
       };
 
       // 任务文件**先写后拉**监督进程：
@@ -1809,6 +1822,8 @@ register('run', async (args) => {
         timeoutMs: (agentTimeout ?? loadConfig().agent.timeout ?? 1800) * 1000,
         isHotfix,
         adapterType,
+        // ADR-129：两端同源 —— 主管用同一个 runId 写 run.started / run.finished
+        runId: detachRunId,
       });
 
       if (!launch.ok) {
@@ -1881,6 +1896,8 @@ register('run', async (args) => {
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
       worktree: worktree?.relativePath ?? null,
+      // ADR-129 一：这一轮的 identity —— 收尾端必须精确写回同一个值
+      runId: makeRunId(id, runStartedAt, 0),
       // ADR-124 修法二：这一轮是在「上一轮残留记录没有 pid 可查」的情况下
       // 放行起跑的。写进事件流，事后审计能看出「这一轮为什么被放行」。
       ...(staleNoPidRecord
@@ -1931,6 +1948,8 @@ register('run', async (args) => {
         adapter,
         runStartedAt,
         maxRetries,
+        // ADR-129：看门狗收走时把这一轮的 identity 带回收尾端
+        runId: makeRunId(id, runStartedAt, 0),
         ...(budgetGuard ? { budgetGuard } : {}),
       });
       const exitCode = waited.exitCode;
@@ -2031,7 +2050,13 @@ register('run', async (args) => {
       }
 
       // Agent failed — try auto-retry at CLI level
-      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      await events.append(id, 'run.aborted', 'zelto', {
+        sliceId: id,
+        // ADR-129：这一条是第 attempt+1 段的结论（第 1 段起跑时 attempt=0）——
+        // 用同一个 attempt 重算 runId，两端才对得上。
+        runId: makeRunId(id, runStartedAt, attempt + 1),
+        exitCode,
+      });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`\n❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
@@ -2136,6 +2161,8 @@ register('run', async (args) => {
       isHotfix,
       alreadyRecorded: true, // 上面已经记过账
       alreadyStalled,       // 重试预算耗尽时 handleAgentFailure 已经停过一次
+      // ADR-129：这一轮的 identity，收尾原样写回（与起跑端 **同一个** 值）
+      runId: makeRunId(id, runStartedAt, 0),
     });
 
     if (!finished.ok && finalExitCode !== 0) {
@@ -2480,6 +2507,8 @@ register('start', async (args) => {
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
+      // ADR-129 一：这一轮的 identity（与前台 run 同一口径）
+      runId: makeRunId(id, runStartedAt, 0),
       // ADR-124 修法二：放行起跑的证据（见 `zelto run` 路径的同名字段）。
       ...(startStaleNoPid
         ? {
@@ -2492,6 +2521,8 @@ register('start', async (args) => {
 
     // Show progress
     let startTime = Date.now();
+    // ADR-129：这一轮的 identity 由 runStartedAt 派生（makeRunId），
+    // 起跑端 / 收尾端各自用**同一个** (runStartedAt, attempt) 重算，值必相同。
     let progressTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       const mins = Math.floor(elapsed / 60);
@@ -2522,6 +2553,8 @@ register('start', async (args) => {
         adapter,
         runStartedAt,
         maxRetries,
+        // ADR-129：看门狗收走时把这一轮的 identity 带回收尾端
+        runId: makeRunId(id, runStartedAt, 0),
         ...(budgetGuard ? { budgetGuard } : {}),
       });
       const exitCode = waited.exitCode;
@@ -2585,7 +2618,12 @@ register('start', async (args) => {
       }
 
       // Failed — try auto-retry
-      await events.append(id, 'run.aborted', 'zelto', { sliceId: id, exitCode });
+      await events.append(id, 'run.aborted', 'zelto', {
+        sliceId: id,
+        // ADR-129：第 attempt+1 段的结论（见前台片路径的同名说明）
+        runId: makeRunId(id, runStartedAt, attempt + 1),
+        exitCode,
+      });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`  ❌ Agent exited with code ${exitCode} (${elapsed}s)`);
 
@@ -2657,7 +2695,13 @@ register('start', async (args) => {
       await store.transit(id, 'RUN_FINISH');
       // 花费结算（ADR-035）：先记账，再复判预算；超预算则不进 gate。
       const cost = await settleRunCost(id, adapter, sessionId);
-      await events.append(id, 'run.finished', 'zelto', { sliceId: id, exitCode: 0, costUsd: cost.costUsd });
+      await events.append(id, 'run.finished', 'zelto', {
+        sliceId: id,
+        // ADR-129：成功那段的 identity（与起跑端同 attempt 口径）
+        runId: makeRunId(id, runStartedAt, attempt + 1),
+        exitCode: 0,
+        costUsd: cost.costUsd,
+      });
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`✅ Agent completed successfully (${elapsed}s)`);
 
@@ -2707,19 +2751,11 @@ register('start', async (args) => {
  *
  * 判据要跟 `core/activity/liveness.ts` 一致：`agentPid ?? pid`。
  */
-function taskLiveRecord(task: TaskInfo): import('../../core/activity/index.js').LivenessRecord {
-  let session: import('../../core/activity/index.js').LivenessRecord | null = null;
-  try {
-    session = readSessionLiveness(process.cwd(), task.sessionId);
-  } catch { /* 会话文件读不到就用任务文件本身 */ }
-  return mergeSessionLiveness(task, session);
-}
-
-function taskLiveness(task: TaskInfo): import('../../core/activity/index.js').LivenessInfo {
-  return classifyLiveness(taskLiveRecord(task), { isProcessAlive });
-}
-
-/** 把会话文件的新心跳同步回任务文件 —— 后续查询不用再回读会话。 */
+/**
+ * 把会话文件的新心跳同步回任务文件 —— 后续查询不用再回读会话。
+ *
+ * ADR-129 三：任务文件里也带 `runId` —— 这一轮是谁，什么时候起跑。
+ */
 async function syncTaskHeartbeat(task: TaskInfo): Promise<TaskInfo> {
   try {
     const sess = readSessionLiveness(process.cwd(), task.sessionId);
@@ -2739,46 +2775,14 @@ async function syncTaskHeartbeat(task: TaskInfo): Promise<TaskInfo> {
 }
 
 /**
- * 看门狗单步处置（D-30）：`dead` 的 running 任务自动恢复，超预算则上报。
+ * 看门狗单步处置 / 活性判定 —— 实现搬到 `task-watchdog.ts`（ADR-129 三）。
  *
- * - recover：任务文件置 failed + 切片 running→frozen + 计数 + 事件（可重跑）
- * - escalate：不再默默恢复 —— 任务保持 running，写 run.stalled 上报等人看
- *
- * 返回处置结果；非 dead 或已非 running 返回 `{ acted: false }`。
+ * 为什么搬走：`maybeRecoverDeadTask` 要能被单独测（它现在管「主管半路死了的
+ * 接管收尾」），而本文件是 CLI 注册表 —— import 它就会拉起整张命令表。
+ * 两处只留一份实现（同一个问题两处判定必然走偏，ADR-106 §5）。
  */
-async function maybeRecoverDeadTask(task: TaskInfo): Promise<{ acted: boolean; action?: 'recover' | 'escalate' }> {
-  if (task.status !== 'running') return { acted: false };
-  const live = taskLiveness(task);
-  if (live.state !== 'dead') return { acted: false };
-  const rec = readRecoveries(process.cwd(), task.sliceId);
-  const decision = decideRecovery(rec);
-  if (decision.action === 'recover') {
-    task.status = 'failed';
-    task.completedAt = new Date().toISOString();
-    if (live.lastActivityAt) task.lastActivityAt = live.lastActivityAt;
-    await saveTask(task);
-    recordRecovery(process.cwd(), task.sliceId, live.reason);
-    try {
-      const s = await store.read(task.sliceId).catch(() => null);
-      if (s && s.state === 'running') await store.transit(task.sliceId, 'RUN_FINISH');
-    } catch { /* 切片不在 running 就不强掰 */ }
-    await events.append(task.sliceId, 'run.aborted', 'watchdog', {
-      sliceId: task.sliceId, taskId: task.taskId, reason: `看门狗自动恢复：${live.reason}`,
-      recoveries: rec.count + 1, maxAutoRecoveries: MAX_AUTO_RECOVERIES,
-    });
-    return { acted: true, action: 'recover' };
-  }
-  recordEscalation(process.cwd(), task.sliceId);
-  await events.append(task.sliceId, 'run.stalled', 'watchdog', {
-    sliceId: task.sliceId, taskId: task.taskId,
-    reason: `同一切片假死 ${rec.count} 次已达上限（${MAX_AUTO_RECOVERIES}），不再自动恢复，请人看现场：${live.reason}`,
-    escalated: true, recoveries: rec.count,
-  });
-  return { acted: true, action: 'escalate' };
-}
-
 function taskLiveBadge(task: TaskInfo): string {
-  const live = taskLiveness(task);
+  const live = taskLivenessOf(task);
   if (live.state === 'active') return `🔄 active（${formatIdle(live.idleMs ?? 0)}前有动静）`;
   if (live.state === 'stale') return `⚠️ stale（${formatIdle(live.idleMs ?? 0)}没动静）`;
   if (live.state === 'dead') return `💀 dead（${live.reason}）`;
@@ -2812,7 +2816,8 @@ register('tasks', async (args) => {
     }
     const live = task.status === 'running' ? ` · ${taskLiveBadge(task)}` : '';
     const rec = task.status !== 'running' ? '' : (() => { try { const r = readRecoveries(process.cwd(), task.sliceId); return r.count > 0 ? ` · 自愈${r.count}次${r.escalated ? '(已上报)' : ''}` : ''; } catch { return ''; } })();
-    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? (taskLiveness(task).state === 'dead' ? '💀' : taskLiveness(task).state === 'stale' ? '⚠️' : '🔄') : '❌';
+    const liveState = task.status === 'running' ? taskLivenessOf(task).state : null;
+    const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? (liveState === 'dead' ? '💀' : liveState === 'stale' ? '⚠️' : '🔄') : '❌';
     const elapsed = task.elapsedSec ? `${task.elapsedSec}s` : '—';
     console.log(`  ${icon} ${task.taskId.padEnd(30)} ${task.status.padEnd(10)} ${elapsed}${live}${rec}`);
   }
@@ -2867,7 +2872,7 @@ register('task-status', async (args) => {
         console.log(`  🤖 看门狗处置：${acted.action === 'recover' ? `自动恢复（running→failed，切片可重跑）` : `已上报（假死超${MAX_AUTO_RECOVERIES}次，请人看现场）`}`);
       }
     }
-    const live = taskLiveness(task);
+    const live = taskLivenessOf(task);
     const icon = task.status === 'completed' ? '✅' : task.status === 'running' ? (live.state === 'dead' ? '💀' : live.state === 'stale' ? '⚠️' : '🔄') : '❌';
     console.log(`  ${icon} ${task.taskId}`);
     console.log(`    Slice:    ${task.sliceId}`);
@@ -2934,7 +2939,7 @@ register('wait', async (args) => {
         }
         break;
       }
-      const live = taskLiveness(task);
+      const live = taskLivenessOf(task);
       if (live.state === 'stale') {
         process.stdout.write(`\r  ⚠️  Waiting... ${Math.floor((Date.now() - startTime) / 1000)}s · ${formatIdle(live.idleMs ?? 0)}没动静（可疑）  `);
         continue;

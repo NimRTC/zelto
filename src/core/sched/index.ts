@@ -66,3 +66,5 @@ export {
   selectGenerationRecords,
   toWatchdogDecision,
 } from './watchdog-policy.js';
+export { runIdStamp, makeRunId, sliceIdFromRunId, looksLikeRunId } from './run-id.js';
+export { type RunConclusion, findRunConclusion } from './run-conclusion.js';

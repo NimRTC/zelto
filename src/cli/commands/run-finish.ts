@@ -100,6 +100,19 @@ export interface FinishRunOptions {
    */
   alreadyStalled?: boolean;
   /**
+   * 本轮运行的 runId（ADR-129 一）。
+   *
+   * 由**起跑方**在开跑前算好并贯穿：`run.started` 写、任务文件 `task.runId` 写、
+   * 收尾时原样写进 `run.finished` / `run.aborted`。收尾方**不许**自己重新算
+   * （重新算的时刻不是起跑时刻，算出来是另一个 id —— 两端就对不上了）。
+   */
+  runId?: string | null;
+  /**
+   * detach 主管的 pid（ADR-129 三）。与 `agentPid` 一起写进收尾事件 ——
+   * 「杀错了人」的前提是「事件里只有会话 pid，没有主管 pid」。
+   */
+  supervisorPid?: number | null;
+  /**
    * 输出到哪去。
    *
    * 前台运行 → stdout（人看着）；
@@ -198,8 +211,15 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
     alreadyStalled = false,
     outcomeUnknown = false,
     runPhase = 'foreground',
+    runId = null,
+    supervisorPid = null,
   } = options;
   const write = options.write ?? ((line: string) => console.log(line));
+  /** 本轮身份与 pid 拆分 —— 每条收尾事件都带上（ADR-129 一 / 三）。 */
+  const runIdentity: Record<string, unknown> = {
+    ...(runId ? { runId } : {}),
+    ...(typeof supervisorPid === 'number' ? { supervisorPid } : {}),
+  };
 
   // ── 1. 记账（ADR-041 §3.1 / ADR-092）─────────────────────────────────
   if (!alreadyRecorded) {
@@ -259,6 +279,7 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
       try {
         await events.append(sliceId, 'run.aborted', 'zelto', {
           sliceId,
+          ...runIdentity,
           exitCode,
           // 「做成了什么」—— 事件流是追溯的唯一载体（ADR-004），
           // 所以这一项不能只留在终端输出里。
@@ -387,6 +408,7 @@ export async function finishRun(options: FinishRunOptions): Promise<FinishRunRes
   const cost = await settleRunCost(sliceId, adapter, sessionId);
   await events.append(sliceId, 'run.finished', 'zelto', {
     sliceId,
+    ...runIdentity,
     exitCode: 0,
     costUsd: cost.costUsd,
     // 「做成了什么」—— 成功的那轮同样要留痕，

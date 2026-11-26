@@ -36,7 +36,8 @@ const WRITE_SET = [
 const KNOWN_HARNESS_PATHS = new Set([
   'specs/slices/v2-adr-trace.md',
   'src/cli/commands/design-patch.ts',
-]);
+
+  ]);
 
 // ─── 三份 ADR 的期望映射（ADR-102/103/104 ↔ 三批直推 main 的修复）────────
 const ADR_FILES = [
@@ -420,7 +421,22 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'src/adapters/cursor-agent/index.ts',
     'src/cli/commands/supervisor-entry.ts',
     'tests/adr-125-supervisor-exit.test.ts',
-  ]);
+    // ADR-129（runId 贯穿 + 收尾先落事实后释放 + 主管运行期心跳）—— 并行会话落点
+    'docs/adr/adr-129-run-identity-and-teardown-order.md',
+    'src/core/sched/run-id.ts',
+    'src/core/sched/run-conclusion.ts',
+    'src/core/sched/index.ts',
+    'src/cli/commands/task-watchdog.ts',
+    'src/cli/commands/supervisor-heartbeat.ts',
+    'src/cli/commands/core-slice.ts',
+    'src/cli/commands/supervisor.ts',
+    'src/cli/commands/supervisor-entry.ts',
+    'src/cli/commands/run-finish.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'src/cli/commands/task-store.ts',
+    'tests/adr-129-run-identity.test.ts',
+    'tests/zd049-supervisor-takeover.test.ts',
+    ]);
 
   const offenders = [];
   for (const p of changedPaths()) {

@@ -89,11 +89,15 @@ runSupervisor(args)
   .catch(async (err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[zelto-supervisor] 监督进程异常退出：${message}`);
-    // 收尾失败也要留痕 —— 现场比「干净地退出」重要（C4）
+    // 收尾失败也要留痕 —— 现场比「干净地退出」重要（C4）。
+    // ADR-129：带 runId 与 pid 拆分，否则这一轮又是「无结论」，看门狗也无从接管。
     try {
       const { events } = await import('./shared.js');
       await events.append(args.sliceId, 'run.aborted', 'zelto', {
         sliceId: args.sliceId,
+        ...(args.runId ? { runId: args.runId } : {}),
+        supervisorPid: process.pid,
+        phase: 'supervisor',
         reason: `supervisor crashed: ${message}`,
         supervisor: true,
       });

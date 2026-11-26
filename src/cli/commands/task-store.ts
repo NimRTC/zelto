@@ -36,8 +36,16 @@ export interface TaskInfo {
    * 它不在了 = 没人收尾 = 这一轮是空壳。
    */
   supervisorPid?: number;
-  /** 监督进程日志路径（相对项目根）—— 出问题时人要看的那份现场 */
+  /**
+   * 监督进程日志路径（相对项目根）—— 出问题时人要看的那份现场 */
   supervisorLog?: string;
+  /**
+   * 这一轮运行的 runId（ADR-129 一）。
+   *
+   * 起跑方在**开跑前**算好写进来；主管收尾时写回同一个值。
+   * 「这一轮有没有结论」一律按它去事件流里找 —— 不许用「最新会话文件」推断。
+   */
+  runId?: string;
 }
 
 export function tasksDir(): string {

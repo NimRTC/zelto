@@ -48,6 +48,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadTask, patchTask, saveTask, type TaskInfo } from './task-store.js';
+import { makeRunId } from '../../core/sched/run-id.js';
+import { startSupervisorHeartbeat } from './supervisor-heartbeat.js';
 
 /** 监督进程日志的目录（相对项目根）。 */
 export const SUPERVISOR_LOG_DIR = join('.zelto', 'supervisor');
@@ -94,6 +96,12 @@ export interface SupervisorArgs {
    * 监督进程要**用同一个适配器**起 agent —— 换适配器就换了行为。
    */
   adapterType?: string;
+  /**
+   * 这一轮的 runId（ADR-129 一）—— 由起跑方算好传下来。
+   * 缺省时主管自己算（`makeRunId(sliceId, 启动时刻)`），但两端就对不上 ——
+   * 只有旧调用方 / 测试才会走这条路。
+   */
+  runId?: string;
 }
 
 /**
@@ -133,6 +141,10 @@ export async function spawnSupervisor(args: SupervisorArgs): Promise<SupervisorL
     return { ok: false, reason: `监督进程入口不存在：${entry}` };
   }
 
+  // ADR-129：runId 由**起跑方**算好传下去 —— 两端（主进程写的任务文件、
+  // 主管写的 run.started / run.finished）必须用同一个值，不能各算各的。
+  const runId = args.runId ?? makeRunId(args.sliceId, new Date().toISOString(), 0);
+
   const projectRoot = resolve(args.projectRoot);
   const logPath = supervisorLogPath(projectRoot, args.taskId);
   mkdirSync(dirname(logPath), { recursive: true });
@@ -153,6 +165,7 @@ export async function spawnSupervisor(args: SupervisorArgs): Promise<SupervisorL
     '--work-dir', resolve(args.workDir),
     '--timeout-ms', String(args.timeoutMs),
     '--log-file', logPath,
+    '--run-id', runId,
   ];
   if (args.isHotfix) argv.push('--hotfix');
   if (args.adapterType) argv.push('--adapter-type', args.adapterType);
@@ -265,6 +278,7 @@ export function parseSupervisorArgs(argv: string[]): SupervisorArgs | null {
     isHotfix: argv.includes('--hotfix'),
     logFile: get('--log-file'),
     adapterType: get('--adapter-type'),
+    runId: get('--run-id'),
   };
 }
 
@@ -283,8 +297,26 @@ export function parseSupervisorArgs(argv: string[]): SupervisorArgs | null {
 export async function runSupervisor(args: SupervisorArgs): Promise<number> {
   const log = makeLogger(args.logFile);
   const startedAt = Date.now();
+  // ADR-129 一：这一轮的 identity。正常情况下由起跑方传入；旧调用方缺省时自算。
+  const runId = args.runId ?? makeRunId(args.sliceId, new Date(startedAt).toISOString(), 0);
+  const supervisorPid = process.pid;
 
-  log(`监督进程启动 pid=${process.pid} task=${args.taskId} slice=${args.sliceId}`);
+  log(`监督进程启动 pid=${supervisorPid} task=${args.taskId} slice=${args.sliceId} runId=${runId}`);
+
+  // ── 0. 运行期心跳（ADR-129 三）────────────────────────────────────────
+  //
+  // ZD-049：主管原先只有「启动时」被确认活着，运行期没有任何可见性 ——
+  // 半路死了就是一个「三处状态同时说在跑」的壳子。心跳让人（watchdog /
+  // `zelto status`）能回答「主管最后一次露面是什么时候」。
+  //
+  // 心跳文件是**状态快照**（整份覆盖）；「有没有结论」仍只看事件流。
+  let heartbeatSessionId: string | null = null;
+  let heartbeatAgentPid: number | null = null;
+  const stopHeartbeat = startSupervisorHeartbeat(args.projectRoot, args.taskId, () => ({
+    runId,
+    agentPid: heartbeatAgentPid,
+    sessionId: heartbeatSessionId,
+  }));
 
   // ── 1. 起 agent ────────────────────────────────────────────────────────
   //
@@ -347,6 +379,18 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     const started = await adapter.start({ sliceId: args.sliceId, prompt: bundlePath });
     sessionId = started.sessionId;
     log(`agent 已启动 session=${sessionId}`);
+    heartbeatSessionId = sessionId;
+    {
+      // ADR-129 三：agent 的 pid 也写进心跳 —— 日志里两行都打，
+      // 「杀错了对象」的前提是事件里只有会话 pid、没有主管 pid。
+      const rec = (await import('../../core/activity/index.js')).readSessionLiveness(
+        args.projectRoot,
+        sessionId,
+      );
+      heartbeatAgentPid = rec?.agentPid ?? rec?.pid ?? null;
+      log(`supervisor pid=${supervisorPid}`);
+      log(`agent pid=${heartbeatAgentPid ?? 'null'}（会话 ${sessionId}）`);
+    }
 
     // 把会话 id 写回任务文件 —— 界面上的「Session」这一栏要能看到真的那一个，
     // 否则人看到的还是主进程留的空占位（D-53）。
@@ -362,6 +406,11 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
 
     await events.append(args.sliceId, 'run.started', 'zelto', {
       sliceId: args.sliceId,
+      // ADR-129 一：与主进程写的 task.runId 是同一个值
+      runId,
+      // ADR-129 三：主管与 agent 的 pid 分开 —— 事件里要看得见「谁在管这一轮」
+      supervisorPid,
+      agentPid: heartbeatAgentPid,
       agent: args.agentCommand,
       bundlePath,
       writes: slice?.writes ?? [],
@@ -505,6 +554,9 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       // D-59：退出码没落盘 = 结果不明，不是「失败」。
       // 收尾要如实说「不知道成没成」，而不是编一个失败。
       outcomeUnknown: exitCode === null && !processAlive,
+      // ADR-129：identity 与 pid 拆分 —— 收尾事件必须写得回同一个 runId
+      runId,
+      supervisorPid,
       write: log,
     });
     log(`收尾完成：ok=${result.ok} state=${result.state} violated=${result.violated}`);
@@ -514,12 +566,41 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     try {
       await events.append(args.sliceId, 'run.aborted', 'zelto', {
         sliceId: args.sliceId,
+        // ADR-129：主管自身异常的结论也带 runId —— 否则这一轮又是「无结论」。
+        runId,
+        supervisorPid,
+        agentPid: heartbeatAgentPid,
+        // ADR-129 三：主管自身异常的结论用 phase=supervisor 标出
+        phase: 'supervisor',
         reason: `supervisor failed: ${message}`,
         supervisor: true,
       });
     } catch { /* 连事件都写不上就算了 */ }
   } finally {
-    // ── 释放写集预约 + 撤钩子 ────────────────────────────────────────────
+    // ── 收尾落盘顺序（ADR-129 二）：「先落事实、后释放」───────────────
+    //
+    //   1. run.finished / run.aborted   ← 上面的 try 里
+    //   2. 任务文件 status + completedAt
+    //   3. reservation.released（+ 撤钩子）
+    //
+    // 这个顺序是**契约**：反过来的话，主管在两步之间被杀，事件流里就只剩
+    // `run.started` —— 之后的人只看到「好像还在跑」（ZD-050 的病灶）。
+    stopHeartbeat();
+
+    // 2. 任务文件收尾 —— 这是界面上最先看到的那条事实
+    //
+    // 用 `patchTask`：主进程与监督进程共享同一个任务文件（D-53），
+    // 整份覆盖会互相冲掉对方写的字段。
+    const completedAt = new Date().toISOString();
+    patchTask(args.taskId, {
+      status: exitCode === 0 ? 'completed' : 'failed',
+      exitCode: exitCode ?? undefined,
+      elapsedSec: Math.floor((Date.now() - startedAt) / 1000),
+      completedAt,
+      lastActivityAt: completedAt,
+    });
+
+    // 3. 释放写集预约 + 撤钩子
     //
     // 预约不释放 → 下一片撞写集冲突 → 整个队列卡住。
     // 钩子也要摘掉：留在 worktree 里的话，agent 原样再起时会被一个
@@ -532,19 +613,6 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
         /* 释放失败不阻断 —— 残留的预约会被 `zelto reservation reap` 清理 */
       }
     }
-
-    // 任务文件收尾 —— 这是界面上最先看到的那条事实
-    //
-    // 用 `patchTask`：主进程与监督进程共享同一个任务文件（D-53），
-    // 整份覆盖会互相冲掉对方写的字段。
-    const completedAt = new Date().toISOString();
-    patchTask(args.taskId, {
-      status: exitCode === 0 ? 'completed' : 'failed',
-      exitCode: exitCode ?? undefined,
-      elapsedSec: Math.floor((Date.now() - startedAt) / 1000),
-      completedAt,
-      lastActivityAt: completedAt,
-    });
   }
 
   log(`监督进程退出，agent 退出码 ${exitCode ?? 'signal'}`);

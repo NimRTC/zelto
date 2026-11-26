@@ -120,7 +120,8 @@ const AFTER_V4_PATHS = new Set([
   'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
   // 本文件自己（后续补的排除项）—— 它 old 版已在 v4 写集外，按「后续工作」计
   'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
-]);
+
+  ]);
 
 /** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
 function decodePorcelainPath(p) {
@@ -242,7 +243,22 @@ const PENDING_BEFORE_V4 = new Set([
   'tests/adr-127-plan-patch-state.test.ts',
   'tests/d62-untracked-spec-blocks-merge.test.ts',
   'tests/path-escape-guard.test.ts',
-]);
+    // ADR-129（runId 贯穿 + 收尾先落事实后释放 + 主管运行期心跳）—— 并行会话落点
+    'docs/adr/adr-129-run-identity-and-teardown-order.md',
+    'src/core/sched/run-id.ts',
+    'src/core/sched/run-conclusion.ts',
+    'src/core/sched/index.ts',
+    'src/cli/commands/task-watchdog.ts',
+    'src/cli/commands/supervisor-heartbeat.ts',
+    'src/cli/commands/core-slice.ts',
+    'src/cli/commands/supervisor.ts',
+    'src/cli/commands/supervisor-entry.ts',
+    'src/cli/commands/run-finish.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'src/cli/commands/task-store.ts',
+    'tests/adr-129-run-identity.test.ts',
+    'tests/zd049-supervisor-takeover.test.ts',
+  ]);
 
 /** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {
   const res = spawnSync(process.execPath, [TAG_SCRIPT, ...args], {

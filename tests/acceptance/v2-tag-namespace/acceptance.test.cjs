@@ -164,7 +164,23 @@ const AFTER_V4_PATHS = new Set([
   'tests/plan-version-deterministic.test.ts',
   'tests/scheduler.test.ts',
   'tests/web-worktree-map.test.ts',
-]);
+
+    // ADR-129（runId 贯穿 + 收尾先落事实后释放 + 主管运行期心跳）—— 并行会话落点
+    'docs/adr/adr-129-run-identity-and-teardown-order.md',
+    'src/core/sched/run-id.ts',
+    'src/core/sched/run-conclusion.ts',
+    'src/core/sched/index.ts',
+    'src/cli/commands/task-watchdog.ts',
+    'src/cli/commands/supervisor-heartbeat.ts',
+    'src/cli/commands/core-slice.ts',
+    'src/cli/commands/supervisor.ts',
+    'src/cli/commands/supervisor-entry.ts',
+    'src/cli/commands/run-finish.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'src/cli/commands/task-store.ts',
+    'tests/adr-129-run-identity.test.ts',
+    'tests/zd049-supervisor-takeover.test.ts',
+  ]);
 
 /** 后来被删掉的文件（删动作本身也是「后来落的」）。 */
 const DELETED_AFTER_V4 = new Set([
