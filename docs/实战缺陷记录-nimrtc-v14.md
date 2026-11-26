@@ -1934,275 +1934,6 @@ tag 命名空间改为**按计划寻址** —— `plan-<planId>/v<n>`，
 
 ---
 
-## ZD-049：detach 主管「半转一圈」就没了 —— 状态、任务 pid、写集预约三处同时说谎，事件流里一条都没有
-
-**场景**：`v1-rtcp-processor-collaborator`（nimrtc-v14 `version/v3`）从上午跑到晚上，
-人的感受是「卡住很久了」。逐个查下去，是**几段「没人管」的时间叠在一起**：
-
-| 时刻（本地） | 事实 | 记录 |
-| --- | --- | --- |
-| 13:10 | detach 主管 pid 39800 起 agent | 主管日志正常 |
-| 16:24 | pid 39800 消失（谁杀的无从得知） | 切片仍是 `running`；预约锁 `pid=39800` 永不过期 |
-| 17:24 | 看门狗自动恢复把状态退回 `frozen` | 事件写「进程 **28600** 已经不在了」（会话里的 pid，**不是主管 pid**） |
-| 17:45 | 前台那一轮 agent 退出 | `status=failed`，**`run.finished` 没写** |
-| 17:56 | 主管几秒内又起一个 agent 然后**自己也退了** | 无事件、无收尾，状态停在 `running` |
-
-**根因**：
-
-1. **detach 路径只有启动时的存活确认，没有运行期看门狗**。前台 `zelto run` 有活进程
-   看门狗（ADR-074），主管没有 —— 它半路退出时，写集审计 / 收尾 / 任务状态 / 预约释放
-   **一个都没跑**，而没有任何地方能看见这件事。
-2. **看门狗报错了对象**：`run.aborted` 里的 pid 取自会话文件，不是主管的 pid；
-   拿着日志去 kill 的那个人会以为「杀的就是看门狗说死的那个」。
-3. **`run.aborted` 与 `task` 的 pid 不在一条引用链上**（会话 → 事件 → 任务三者各说各的）。
-
-**后果**：最坏的一条是「running 是假的」—— 三处状态同时说谎，事件流里却没有一条
-「它已经不管了」。与 ADR-123 同一个病灶，只是这次说谎的是 **detach 主管**。
-这一轮实际是我人工核实「主管与被拉起的 agent 都已不在」之后，才敢按人工接管处理。
-
-**修复**（待做）：
-
-1. detach 主管**运行期心跳**（写事件或心跳文件）；驾驶舱 / `zelto status` 发现
-   「主管 pid 不在、任务仍 running」→ 落 `run.finished`（`phase=supervisor`）并退回 `frozen`。
-2. `run.aborted` 的 pid 拆成 `supervisorPid` / `agentPid`，两者都在日志里打印。
-
-**回归测试**：待修复落地时补 —— kill 主管后 30s 内必须出现收尾事件，且 `pid` 字段是主管 pid。
-
-## ZD-050：没跑完的 post-run 让 worktree 裸奔 —— 「结果不明」的一轮被当成了「新的一轮」，同一片被跑了两遍
-
-**场景**：同一片。17:30Z 那一轮（前台）：会话 17:57Z 记 `failed`，**`run.finished` /
-`run.aborted` 一条都没有**；进程全部消失后，状态与预约锁仍停在 `running`。
-磁盘上的 claude 原生会话有三个（17:26 / 17:30 / 17:45），**其中两段运行时间重叠**，
-都在改同一个 worktree。
-
-**根因**：
-
-1. **post-run 不是原子的**：`run.finished` 落在收尾的**最后**、预约释放之前；主管 / CLI
-   在收尾中途消失时，**「这一轮结束了」这个事实本身丢了** —— 之后的人只能看到
-   `run.started`，好像这一轮**还在跑**。
-2. **「结果不明」没有参与者**：`exitCode=null && !processAlive` 本应走到收尾，
-   但收尾没跑完 → 下一轮准入时看到的是「running」，**没有任何东西判定它已经没人管**。
-3. **后起的那一轮又丢了**（见 ZD-049）。
-
-**后果**：
-
-- 同一个 worktree 上**两个 agent 共享同一个 `.claude/settings.local.json` 钩子** ——
-  钩子指向**先死的那个**进程，后来的 agent 从此被「指向死进程的钩子」挡住（或绕过，
-  取决于 harness 对钩子失败的处理），**这正是「守卫在不在」变得不可知的时刻**。
-- 事后回顾：真正的写集守卫是在**人都以为没人跑**的时候失效的 —— 这是 C9 意义上的
-  最坏时刻，而它之所以没造成更大破坏，纯属运气。
-
-**修复**（待做）：收尾与预约释放**先落事实、后释放**，并把落盘顺序写进 ADR：
-`run.finished`（或 `run.aborted`）必须在 `reservation.released` **之前**；
-主管在两者之间崩溃时，下次准入用「事件流里有无本轮收尾」而不是「会话文件状态」
-判定这一轮是否结束。
-
-**回归测试**：待修复落地时补 —— kill 主管进程后，事件流里**必须有**收尾事件，
-**且**它为 release 之前；`zelto run` 对「running 但没有收尾事件、主管不在」的切片**拒绝**并提示 `zelto resume`。
-
-## ZD-051：同一天五轮运行，事件流里只有两轮有「结束」—— 会话文件名、任务 pid、事件三者没有一条引用链
-
-**场景**：同一片一天里被拉起 5 次：
-
-| 起跑（本地） | 方式 | 事件流 |
-| --- | --- | --- |
-| 10:58 | detach | `run.started` → watchdog `run.aborted` |
-| 13:38 | detach | `run.started` → `run.finished`（ok） |
-| 14:05 | detach | `run.started`，**无结束事件** |
-| 17:30 | 前台 | `run.started`，**无结束事件** |
-| 17:45 | 前台 retry-1 | **无事件**（会话记录里才有 `retryCount=1`） |
-
-**根因**：
-
-1. **会话文件名的数字是「启动时刻」**，retry 会话靠后缀 `-retry-1` 区分；
-   但**取「当前那轮」的逻辑**（看门狗、`status`）用的是「最新文件」——
-   retry 的文件可能比主会话**先落盘**，于是「最新」指向的是**已经死掉的那一轮**。
-2. **事件流里没有「第几轮」这个维度**：`run.started` 与 `run.finished` 只能靠时间戳配对；
-   缺一端就是「没有结论」，而**门禁 / 驾驶舱都把「缺一端」当成了「还在跑」或「没跑完」**。
-
-**后果**：事后审计能数出「5 次」，但**答不出「17:30 那轮是怎么结束的」** —— 这正是
-「可追溯」在这一片上的缺口。
-
-**修复**（待做）：每次运行带 `runId`（`sliceId + startedAt + attempt`），写进
-`run.started` / `run.finished` / `run.aborted` 与 gotchas 相关的钩子事件；`task` 只记**当前轮**的 `runId`。
-**禁止**用「最新文件」推断「当前轮」。
-
-**回归测试**：待修复落地时补 —— 连续 retry 两次后三段 `runId` 互不相同；按 `runId` 聚时，
-每一轮都有起跑与结束两端（或显式 `unknown`）。
-
----
-
-## ZD-052：写集守卫挡住了 `build/` 里的日志、挡不住写集内的「大削」—— 被拦的往往是无害的那一下
-
-**场景**：同一片。agent 在前几轮里：
-
-1. 想 `cmake --build` 并把日志落到 `/tmp/nimrtc_configure.log` 或 `build/configure.log` ——
-   被判「越界写入」，理由是「不在写集里」；
-2. 随后**转向大改工作区文件**（`engine_media.cpp` 被大段重写、`engine_media.cpp` 里某个
-   分发分支被削到只剩骨架），这些**都在写集里**，钩子照常放行。
-
-**根因**（口径，不是 bug 本身）：
-
-- 写集的语义是「防止 agent 动**别人的文件**」，但实现上它同时**挡住了构建 / 日志这类
-  「一次运行自己的一次性产物」**。结果是 agent 不得不在「没有日志」和「不许构建」之间二选一 ——
-  逼着它把调试信息丢进工作区里**合法但危险**的文件。
-- 写集内的**大规模改写**没有「可见度」：门禁只问「构建过不过、测试绿不绿」；
-  「一个文件被删掉 40% 行数」在摘要里**不出现**。
-
-**后果**：这一片最危险的一次改写（`handle_rtcp` 从约 243 行被压成 10 行的一次中间态）
-**全程合法**；而真正被拦下的是「写日志」。**守卫拦住的不是有害动作。**
-
-**修复**（待做）：
-
-1. 写集判定区分「工作区文件」与「运行期一次性产物」：`build/`、`/tmp/`、
-   agent 的临时输出**显式 allow**，并让 `policy.decision` 带上**被判定的是同一个目标**；
-2. 收尾报告**列出写集内每个文件的增删行数**（不是拦，是让人第一眼看到「哪里有异常削除」）。
-
-**回归测试**：待修复落地时补 —— `tee /tmp/x.log` 与 `build/` 下的日志 allow 且带目标；
-写集之外的真实仓库文件仍 deny。
-
-## ZD-053：验收文件里的断言**与规格条目没有编号对应** —— 门禁只问「有没有真断言」
-
-**场景**：同一片。验收文件 `tests/acceptance/v1-rtcp-processor-collaborator/acceptance.test.cjs`
-由 agent 写（todo 已替换为真断言）。但规格的验收标准是**四节若干条**：
-协作类纪律、行为不变、守则、公共头未动、文档。其中「`engine_impl.hpp` ≤ 400 行」、
-「公共头 diff 为空」、「CHANGELOG 有条目」**不是测试能表达的**；门禁的验收环节
-只验「有没有非 todo 的断言」，**不验「规格里的每一条是否都被验到」**。
-
-**根因**：验收标准的「条目」与验收文件「断言」之间**没有任何编号或标记关联**。
-同一件事、两种载体，**没有核对机制**。
-
-**后果**：门禁绿 ≠ 规格达成。这一片之所以能放心签，是因为我**逐条手工量过**
-（行数 371 ✅、公共头无 diff ✅、`handle_rtcp` 恰 60 行 ✅）。
-下一次如果没有这次那样逐条量，**「门禁绿、人以为全验了」会成为默认路径**。
-
-**修复**（待做）：
-
-- 规格验收点**必须编号**（`AC-01 …`），验收断言名带同一编号；
-  门禁核对「规格编号集合 ⊆ 验收文件编号集合」，缺一即 failed；
-- 非测试可表达的条目，规格里写明**谁验**（checker / gate / 人），
-  门禁摘要里逐条输出 `verified` / `unverified`，**不许省略**。
-
-**回归测试**：待修复落地时补 —— 故意删掉一个编号断言 → 门禁 failed；
-非测试条目未在摘要里出现 → 视为摘要失败。
-
-## ZD-054：规格点 2（「`engine_media.cpp` 中皆无具体 `rtp::` RTCP 类型」）与实现存在**口径分叉**，需要 owner 裁决
-
-**场景**：同一片签字前的逐条核对。结果是：
-
-- 规格验收点 2 字面要求：`engine_media.cpp` **中皆无** `rtp::RrBuilder` /
-  `rtp::demux_rtcp` / `rtp::RtcpBlock` / `rtp::ReportBlock`；
-- 实现：这四个**确实都没有** ✅，但 `engine_media.cpp` 里**仍然**有一个
-  `feed_timeline_sr(rtp::SenderReportTracker&, …)` 会重建 `rtp::SenderReport`
-  （`engine_media.cpp` 中 `rtp::` 出现 8 处，其中 4 处是注释、4 处在 `feed_timeline_sr` 里）；
-- checker 的守则（`tools/check_engine_layering.py`）**是绿的** —— 它的符号清单
-  与规格点 2 的符号清单**不是同一份**，`SenderReport` 不在任何一方的「禁止清单」里。
-
-**根因**：**同一个架构约束被写了两份**：一份在规格验收点、一份在 checker 规则里。
-两份清单靠人同步，**没有自动对齐**。于是「checker 绿」与「规格点满足」不是同一句话。
-
-**后果**：这一片**没有因此被拦下**（门禁绿、人核过），但「行为不变 / 类型收口」的
-证明里**混进了一个例外**，而例外**没有被任何一方登记**。下一次同类切片会继承这个
-「隐蔽的绿」。
-
-**需要 owner 裁决**（三选一，**不替 owner 选**）：
-
-1. 把 `feed_timeline_sr` 搬进 `rtcp_processor.cpp`（`engine_media.cpp` 彻底清零 `rtp::`）；
-2. 规格点 2 增加与 `engine_scratch.hpp × rtp::RtcpBlock` 同形的窄豁免
-   （`engine_media.cpp × rtp::SenderReport`）；
-3. 修改 checker 规则，把 `SenderReport` 纳入 / 显式排除，并**让规格引用 checker 的清单**。
-
-**修复方向（机制层面，与裁决无关）**：架构约束的判据**只写一处**；规格的验收点**引用它**，
-由工具核对「checker 的例外表」与「规格的窄豁免」**完全一致**，不一致就红。
-
-**回归测试**：待修复落地时补 —— 给 checker 加一条例外而规格没加 → 门禁 failed（反向亦然）。
-
----
-
-## ZD-055：人在版本工作目录里，`zelto merge --target version/<同一版>` 永远「找不到工作目录」—— 版本目录在**外层**
-
-**场景**：`v1-rtcp-processor-collaborator` 签字后，人在 `version-worktrees/v3`
-（版本工作目录，检出 `version/v3`）里跑两条命令：
-
-```
-zelto merge v1-rtcp-processor-collaborator
-  → ❌ 解析不出归属：版本工作目录里没有版本计划文件（.zelto/versions/ 是空的）
-zelto merge v1-rtcp-processor-collaborator --target version/v3
-  → ❌ 版本 "v3" 的工作目录不存在：.zelto\version-worktrees\v3
-    先跑 zelto version start v3
-```
-
-而那个目录**就是脚下这一层**。
-
-**根因**：`WorktreeManager.versionPathFor(label)` 固定按
-`<repoRoot>/.zelto/version-worktrees/<label>` 拼。切片 worktree 是**相对** repoRoot 的
-（在版本工作目录里跑 `zelto run` 时正确），但版本工作目录是**绝对**的 ——
-`zelto version start` 永远在仓库顶层建 `<顶层>/.zelto/version-worktrees/<label>/`。
-两边约定互相咬死：
-
-- 在版本工作目录里跑 → 版本目录拼成 `v3/.zelto/version-worktrees/v3`（不存在）；
-- 人手工 `cd` 到顶层跑 → 切片 worktree（`<顶层>/.zelto/worktrees/<id>`）又找不到。
-
-于是**「在版本分支上合并」这件事在 CLI 里几乎做不成**。
-
-**后果**：人只能手工 `git merge`（`zelto merge` 自己在失败时也是这么建议的）——
-而手工 merge **不走** zelto 的合并路径：不写 `merge.completed`、不做版本状态同步、
-不清理 worktree —— 正是 ADR-121 / ZD-048 那条「归属解析被绕过」的老路。
-
-**修复（已落地，2026-11-26）**：`versionWorktreeBaseDir()` —— 判据先看 **git 事实**
-（当前检出 `version/<label>`，与 ADR-121 一致），再从 repoRoot 的祖先目录逐级向上找
-`<祖先>/.zelto/version-worktrees/<label>`（**同名且存在**才算）。逃逸防护不变：
-`versionPathFor` 先按**子仓基准**做一次包含性判定，逃出 repoRoot 的 label 一律抛错。
-
-**回归测试**：`tests/path-escape-guard.test.ts` 新增「版本工作目录里 merge」用例；
-实测 `versionPathFor('v3')` 在 `version-worktrees/v3` 下返回真实目录（exists=true），
-`zelto merge … --target version/v3` 成功 fast-forward 并清理了 worktree 与切片分支。
-
----
-
-## ZD-056：`milestones` 之前的规格副本让 fast-forward 合并必失败，建议的修法又打死 next
-
-**场景**：同一片。`zelto merge --target version/v3` 走到最后一步：
-
-```
-⚠️ specs/slices/<id>.md：工作区副本与 refs/heads/slice/<id> 上的版本内容不同（保留工作区的）
-❌ 合并失败：error: The following untracked working tree files would be overwritten by merge
-   手动解决：git merge slice/<id>
-```
-
-**根因**：版本工作目录里的 `specs/slices/<id>.md` 是一份**未跟踪的工作区副本**，
-它与切片分支上提交的版本**内容不同**：
-
-- 切片分支那份**多出**「实施发现」一节（agent 在被丢弃的那一轮里补的 —— 规格点 12
-  要求的就是这一节）；
-- 工作区的副本是**较旧的**冻结版（14:02 落盘），**没有**这一节。
-
-合并逻辑对「规格副本与待合分支不一致」的处理是「**保留工作区的副本，请人确认**」——
-副本留在原地，`git merge` 于是被未跟踪文件挡住，**合并不可能成功**。
-而它给出的建议「手动 `git merge`」同上 ZD-055 —— 绕过 zelto。
-
-更糟：`zelto run` 每次开跑都会把版本工作目录里的规格**覆盖成冻结版**（D-47：
-顶层规格是「人的产出」，同步时覆盖是对的）—— 于是「agent 的实现在切片分支上、
-规格的实施发现在切片分支上、而工作区又把规格盖回旧版」这三件事会**再次**撞在一起。
-
-**后果**：**在任何「agent 改了规格副本」的切片上，ff 合并都要人工先手动对齐副本**；
-不一致时「保留工作区的」这个默认会让合并**必然失败**（不是偶发）。
-
-**修复（待做）**：合并前若「目标分支上已提交的规格」与「工作区未跟踪副本」不同，
-应**以分支上那份为准**（它是本切片的产物，且已由门禁签名覆盖），把工作区副本
-**先移走/备份**再合并；或直接拒绝并给出**可执行的**修复命令（`git checkout -f` 之类），
-而不是「保留 + 请人确认」这种**必然失败**的组合。
-
-本次实情：人工把分支版规格同步到工作区（内容完全一致）后再跑 merge 才成功。
-
----
-
----
-
-## 记录格式约定
-
-新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。
-
 ## ZD-026 新建 worktree 时，**生成的产物**不会跟过去 —— 门禁②在构建阶段炸，而罪魁在 setup 阶段
 
 **场景**：nimrtc-v14 的 `v3-n4-d6-connectivity` 切片，agent 跑完了（101 分钟），
@@ -2984,6 +2715,269 @@ ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两�
 1. **已投错的 12 个切片不重放**（fix-forward 决策）：重写版本分支历史的风险远大于收益。实情记在 `docs/v14-切片-分支对照.md`。
 2. **那 7 个「计划说 v1、实际在 v3」的切片暂不搬移**：正解是重新按归属合进 `version/v1`，但 `version/v1` 与 `version/v3` 已分叉 104 个提交，且重做合并会撞 spec 冲突。**留作后续决定，本次只修机制 + 记录实情。**
 3. **`VersionSlice.state` 从不回写**：计划里的片级状态始终是 `draft`。这是另一个问题（ADR-114 已把「计划态」与「盘上事实」分开呈现），本次没动。
+
+---
+
+## ZD-049：detach 主管「半转一圈」就没了 —— 状态、任务 pid、写集预约三处同时说谎，事件流里一条都没有
+
+**场景**：`v1-rtcp-processor-collaborator`（nimrtc-v14 `version/v3`）从上午跑到晚上，
+人的感受是「卡住很久了」。逐个查下去，是**几段「没人管」的时间叠在一起**：
+
+| 时刻（本地） | 事实 | 记录 |
+| --- | --- | --- |
+| 13:10 | detach 主管 pid 39800 起 agent | 主管日志正常 |
+| 16:24 | pid 39800 消失（谁杀的无从得知） | 切片仍是 `running`；预约锁 `pid=39800` 永不过期 |
+| 17:24 | 看门狗自动恢复把状态退回 `frozen` | 事件写「进程 **28600** 已经不在了」（会话里的 pid，**不是主管 pid**） |
+| 17:45 | 前台那一轮 agent 退出 | `status=failed`，**`run.finished` 没写** |
+| 17:56 | 主管几秒内又起一个 agent 然后**自己也退了** | 无事件、无收尾，状态停在 `running` |
+
+**根因**：
+
+1. **detach 路径只有启动时的存活确认，没有运行期看门狗**。前台 `zelto run` 有活进程
+   看门狗（ADR-074），主管没有 —— 它半路退出时，写集审计 / 收尾 / 任务状态 / 预约释放
+   **一个都没跑**，而没有任何地方能看见这件事。
+2. **看门狗报错了对象**：`run.aborted` 里的 pid 取自会话文件，不是主管的 pid；
+   拿着日志去 kill 的那个人会以为「杀的就是看门狗说死的那个」。
+3. **`run.aborted` 与 `task` 的 pid 不在一条引用链上**（会话 → 事件 → 任务三者各说各的）。
+
+**后果**：最坏的一条是「running 是假的」—— 三处状态同时说谎，事件流里却没有一条
+「它已经不管了」。与 ADR-123 同一个病灶，只是这次说谎的是 **detach 主管**。
+这一轮实际是我人工核实「主管与被拉起的 agent 都已不在」之后，才敢按人工接管处理。
+
+**修复**（待做）：
+
+1. detach 主管**运行期心跳**（写事件或心跳文件）；驾驶舱 / `zelto status` 发现
+   「主管 pid 不在、任务仍 running」→ 落 `run.finished`（`phase=supervisor`）并退回 `frozen`。
+2. `run.aborted` 的 pid 拆成 `supervisorPid` / `agentPid`，两者都在日志里打印。
+
+**回归测试**：待修复落地时补 —— kill 主管后 30s 内必须出现收尾事件，且 `pid` 字段是主管 pid。
+
+## ZD-050：没跑完的 post-run 让 worktree 裸奔 —— 「结果不明」的一轮被当成了「新的一轮」，同一片被跑了两遍
+
+**场景**：同一片。17:30Z 那一轮（前台）：会话 17:57Z 记 `failed`，**`run.finished` /
+`run.aborted` 一条都没有**；进程全部消失后，状态与预约锁仍停在 `running`。
+磁盘上的 claude 原生会话有三个（17:26 / 17:30 / 17:45），**其中两段运行时间重叠**，
+都在改同一个 worktree。
+
+**根因**：
+
+1. **post-run 不是原子的**：`run.finished` 落在收尾的**最后**、预约释放之前；主管 / CLI
+   在收尾中途消失时，**「这一轮结束了」这个事实本身丢了** —— 之后的人只能看到
+   `run.started`，好像这一轮**还在跑**。
+2. **「结果不明」没有参与者**：`exitCode=null && !processAlive` 本应走到收尾，
+   但收尾没跑完 → 下一轮准入时看到的是「running」，**没有任何东西判定它已经没人管**。
+3. **后起的那一轮又丢了**（见 ZD-049）。
+
+**后果**：
+
+- 同一个 worktree 上**两个 agent 共享同一个 `.claude/settings.local.json` 钩子** ——
+  钩子指向**先死的那个**进程，后来的 agent 从此被「指向死进程的钩子」挡住（或绕过，
+  取决于 harness 对钩子失败的处理），**这正是「守卫在不在」变得不可知的时刻**。
+- 事后回顾：真正的写集守卫是在**人都以为没人跑**的时候失效的 —— 这是 C9 意义上的
+  最坏时刻，而它之所以没造成更大破坏，纯属运气。
+
+**修复**（待做）：收尾与预约释放**先落事实、后释放**，并把落盘顺序写进 ADR：
+`run.finished`（或 `run.aborted`）必须在 `reservation.released` **之前**；
+主管在两者之间崩溃时，下次准入用「事件流里有无本轮收尾」而不是「会话文件状态」
+判定这一轮是否结束。
+
+**回归测试**：待修复落地时补 —— kill 主管进程后，事件流里**必须有**收尾事件，
+**且**它为 release 之前；`zelto run` 对「running 但没有收尾事件、主管不在」的切片**拒绝**并提示 `zelto resume`。
+
+## ZD-051：同一天五轮运行，事件流里只有两轮有「结束」—— 会话文件名、任务 pid、事件三者没有一条引用链
+
+**场景**：同一片一天里被拉起 5 次：
+
+| 起跑（本地） | 方式 | 事件流 |
+| --- | --- | --- |
+| 10:58 | detach | `run.started` → watchdog `run.aborted` |
+| 13:38 | detach | `run.started` → `run.finished`（ok） |
+| 14:05 | detach | `run.started`，**无结束事件** |
+| 17:30 | 前台 | `run.started`，**无结束事件** |
+| 17:45 | 前台 retry-1 | **无事件**（会话记录里才有 `retryCount=1`） |
+
+**根因**：
+
+1. **会话文件名的数字是「启动时刻」**，retry 会话靠后缀 `-retry-1` 区分；
+   但**取「当前那轮」的逻辑**（看门狗、`status`）用的是「最新文件」——
+   retry 的文件可能比主会话**先落盘**，于是「最新」指向的是**已经死掉的那一轮**。
+2. **事件流里没有「第几轮」这个维度**：`run.started` 与 `run.finished` 只能靠时间戳配对；
+   缺一端就是「没有结论」，而**门禁 / 驾驶舱都把「缺一端」当成了「还在跑」或「没跑完」**。
+
+**后果**：事后审计能数出「5 次」，但**答不出「17:30 那轮是怎么结束的」** —— 这正是
+「可追溯」在这一片上的缺口。
+
+**修复**（待做）：每次运行带 `runId`（`sliceId + startedAt + attempt`），写进
+`run.started` / `run.finished` / `run.aborted` 与 gotchas 相关的钩子事件；`task` 只记**当前轮**的 `runId`。
+**禁止**用「最新文件」推断「当前轮」。
+
+**回归测试**：待修复落地时补 —— 连续 retry 两次后三段 `runId` 互不相同；按 `runId` 聚时，
+每一轮都有起跑与结束两端（或显式 `unknown`）。
+
+---
+
+## ZD-052：写集守卫挡住了 `build/` 里的日志、挡不住写集内的「大削」—— 被拦的往往是无害的那一下
+
+**场景**：同一片。agent 在前几轮里：
+
+1. 想 `cmake --build` 并把日志落到 `/tmp/nimrtc_configure.log` 或 `build/configure.log` ——
+   被判「越界写入」，理由是「不在写集里」；
+2. 随后**转向大改工作区文件**（`engine_media.cpp` 被大段重写、`engine_media.cpp` 里某个
+   分发分支被削到只剩骨架），这些**都在写集里**，钩子照常放行。
+
+**根因**（口径，不是 bug 本身）：
+
+- 写集的语义是「防止 agent 动**别人的文件**」，但实现上它同时**挡住了构建 / 日志这类
+  「一次运行自己的一次性产物」**。结果是 agent 不得不在「没有日志」和「不许构建」之间二选一 ——
+  逼着它把调试信息丢进工作区里**合法但危险**的文件。
+- 写集内的**大规模改写**没有「可见度」：门禁只问「构建过不过、测试绿不绿」；
+  「一个文件被删掉 40% 行数」在摘要里**不出现**。
+
+**后果**：这一片最危险的一次改写（`handle_rtcp` 从约 243 行被压成 10 行的一次中间态）
+**全程合法**；而真正被拦下的是「写日志」。**守卫拦住的不是有害动作。**
+
+**修复**（待做）：
+
+1. 写集判定区分「工作区文件」与「运行期一次性产物」：`build/`、`/tmp/`、
+   agent 的临时输出**显式 allow**，并让 `policy.decision` 带上**被判定的是同一个目标**；
+2. 收尾报告**列出写集内每个文件的增删行数**（不是拦，是让人第一眼看到「哪里有异常削除」）。
+
+**回归测试**：待修复落地时补 —— `tee /tmp/x.log` 与 `build/` 下的日志 allow 且带目标；
+写集之外的真实仓库文件仍 deny。
+
+## ZD-053：验收文件里的断言**与规格条目没有编号对应** —— 门禁只问「有没有真断言」
+
+**场景**：同一片。验收文件 `tests/acceptance/v1-rtcp-processor-collaborator/acceptance.test.cjs`
+由 agent 写（todo 已替换为真断言）。但规格的验收标准是**四节若干条**：
+协作类纪律、行为不变、守则、公共头未动、文档。其中「`engine_impl.hpp` ≤ 400 行」、
+「公共头 diff 为空」、「CHANGELOG 有条目」**不是测试能表达的**；门禁的验收环节
+只验「有没有非 todo 的断言」，**不验「规格里的每一条是否都被验到」**。
+
+**根因**：验收标准的「条目」与验收文件「断言」之间**没有任何编号或标记关联**。
+同一件事、两种载体，**没有核对机制**。
+
+**后果**：门禁绿 ≠ 规格达成。这一片之所以能放心签，是因为我**逐条手工量过**
+（行数 371 ✅、公共头无 diff ✅、`handle_rtcp` 恰 60 行 ✅）。
+下一次如果没有这次那样逐条量，**「门禁绿、人以为全验了」会成为默认路径**。
+
+**修复**（待做）：
+
+- 规格验收点**必须编号**（`AC-01 …`），验收断言名带同一编号；
+  门禁核对「规格编号集合 ⊆ 验收文件编号集合」，缺一即 failed；
+- 非测试可表达的条目，规格里写明**谁验**（checker / gate / 人），
+  门禁摘要里逐条输出 `verified` / `unverified`，**不许省略**。
+
+**回归测试**：待修复落地时补 —— 故意删掉一个编号断言 → 门禁 failed；
+非测试条目未在摘要里出现 → 视为摘要失败。
+
+## ZD-054：规格点 2（「`engine_media.cpp` 中皆无具体 `rtp::` RTCP 类型」）与实现存在**口径分叉**，需要 owner 裁决
+
+**场景**：同一片签字前的逐条核对。结果是：
+
+- 规格验收点 2 字面要求：`engine_media.cpp` **中皆无** `rtp::RrBuilder` /
+  `rtp::demux_rtcp` / `rtp::RtcpBlock` / `rtp::ReportBlock`；
+- 实现：这四个**确实都没有** ✅，但 `engine_media.cpp` 里**仍然**有一个
+  `feed_timeline_sr(rtp::SenderReportTracker&, …)` 会重建 `rtp::SenderReport`
+  （`engine_media.cpp` 中 `rtp::` 出现 8 处，其中 4 处是注释、4 处在 `feed_timeline_sr` 里）；
+- checker 的守则（`tools/check_engine_layering.py`）**是绿的** —— 它的符号清单
+  与规格点 2 的符号清单**不是同一份**，`SenderReport` 不在任何一方的「禁止清单」里。
+
+**根因**：**同一个架构约束被写了两份**：一份在规格验收点、一份在 checker 规则里。
+两份清单靠人同步，**没有自动对齐**。于是「checker 绿」与「规格点满足」不是同一句话。
+
+**后果**：这一片**没有因此被拦下**（门禁绿、人核过），但「行为不变 / 类型收口」的
+证明里**混进了一个例外**，而例外**没有被任何一方登记**。下一次同类切片会继承这个
+「隐蔽的绿」。
+
+**需要 owner 裁决**（三选一，**不替 owner 选**）：
+
+1. 把 `feed_timeline_sr` 搬进 `rtcp_processor.cpp`（`engine_media.cpp` 彻底清零 `rtp::`）；
+2. 规格点 2 增加与 `engine_scratch.hpp × rtp::RtcpBlock` 同形的窄豁免
+   （`engine_media.cpp × rtp::SenderReport`）；
+3. 修改 checker 规则，把 `SenderReport` 纳入 / 显式排除，并**让规格引用 checker 的清单**。
+
+**修复方向（机制层面，与裁决无关）**：架构约束的判据**只写一处**；规格的验收点**引用它**，
+由工具核对「checker 的例外表」与「规格的窄豁免」**完全一致**，不一致就红。
+
+**回归测试**：待修复落地时补 —— 给 checker 加一条例外而规格没加 → 门禁 failed（反向亦然）。
+
+---
+
+## ZD-055：人在版本工作目录里，`zelto merge --target version/<同一版>` 永远「找不到工作目录」—— 版本目录在**外层**
+
+**场景**：`v1-rtcp-processor-collaborator` 签字后，人在 `version-worktrees/v3`
+（版本工作目录，检出 `version/v3`）里跑两条命令：
+
+```
+zelto merge v1-rtcp-processor-collaborator
+  → ❌ 解析不出归属：版本工作目录里没有版本计划文件（.zelto/versions/ 是空的）
+zelto merge v1-rtcp-processor-collaborator --target version/v3
+  → ❌ 版本 "v3" 的工作目录不存在：.zelto\version-worktrees\v3
+    先跑 zelto version start v3
+```
+
+而那个目录**就是脚下这一层**。
+
+**根因**：`WorktreeManager.versionPathFor(label)` 固定按
+`<repoRoot>/.zelto/version-worktrees/<label>` 拼。切片 worktree 是**相对** repoRoot 的
+（在版本工作目录里跑 `zelto run` 时正确），但版本工作目录是**绝对**的 ——
+`zelto version start` 永远在仓库顶层建 `<顶层>/.zelto/version-worktrees/<label>/`。
+两边约定互相咬死：
+
+- 在版本工作目录里跑 → 版本目录拼成 `v3/.zelto/version-worktrees/v3`（不存在）；
+- 人手工 `cd` 到顶层跑 → 切片 worktree（`<顶层>/.zelto/worktrees/<id>`）又找不到。
+
+于是**「在版本分支上合并」这件事在 CLI 里几乎做不成**。
+
+**后果**：人只能手工 `git merge`（`zelto merge` 自己在失败时也是这么建议的）——
+而手工 merge **不走** zelto 的合并路径：不写 `merge.completed`、不做版本状态同步、
+不清理 worktree —— 正是 ADR-121 / ZD-048 那条「归属解析被绕过」的老路。
+
+**修复（已落地，2026-11-26）**：`versionWorktreeBaseDir()` —— 判据先看 **git 事实**
+（当前检出 `version/<label>`，与 ADR-121 一致），再从 repoRoot 的祖先目录逐级向上找
+`<祖先>/.zelto/version-worktrees/<label>`（**同名且存在**才算）。逃逸防护不变：
+`versionPathFor` 先按**子仓基准**做一次包含性判定，逃出 repoRoot 的 label 一律抛错。
+
+**回归测试**：`tests/path-escape-guard.test.ts` 新增「版本工作目录里 merge」用例；
+实测 `versionPathFor('v3')` 在 `version-worktrees/v3` 下返回真实目录（exists=true），
+`zelto merge … --target version/v3` 成功 fast-forward 并清理了 worktree 与切片分支。
+
+---
+
+## ZD-056：`milestones` 之前的规格副本让 fast-forward 合并必失败，建议的修法又打死 next
+
+**场景**：同一片。`zelto merge --target version/v3` 走到最后一步：
+
+```
+⚠️ specs/slices/<id>.md：工作区副本与 refs/heads/slice/<id> 上的版本内容不同（保留工作区的）
+❌ 合并失败：error: The following untracked working tree files would be overwritten by merge
+   手动解决：git merge slice/<id>
+```
+
+**根因**：版本工作目录里的 `specs/slices/<id>.md` 是一份**未跟踪的工作区副本**，
+它与切片分支上提交的版本**内容不同**：
+
+- 切片分支那份**多出**「实施发现」一节（agent 在被丢弃的那一轮里补的 —— 规格点 12
+  要求的就是这一节）；
+- 工作区的副本是**较旧的**冻结版（14:02 落盘），**没有**这一节。
+
+合并逻辑对「规格副本与待合分支不一致」的处理是「**保留工作区的副本，请人确认**」——
+副本留在原地，`git merge` 于是被未跟踪文件挡住，**合并不可能成功**。
+而它给出的建议「手动 `git merge`」同上 ZD-055 —— 绕过 zelto。
+
+更糟：`zelto run` 每次开跑都会把版本工作目录里的规格**覆盖成冻结版**（D-47：
+顶层规格是「人的产出」，同步时覆盖是对的）—— 于是「agent 的实现在切片分支上、
+规格的实施发现在切片分支上、而工作区又把规格盖回旧版」这三件事会**再次**撞在一起。
+
+**后果**：**在任何「agent 改了规格副本」的切片上，ff 合并都要人工先手动对齐副本**；
+不一致时「保留工作区的」这个默认会让合并**必然失败**（不是偶发）。
+
+**修复（待做）**：合并前若「目标分支上已提交的规格」与「工作区未跟踪副本」不同，
+应**以分支上那份为准**（它是本切片的产物，且已由门禁签名覆盖），把工作区副本
+**先移走/备份**再合并；或直接拒绝并给出**可执行的**修复命令（`git checkout -f` 之类），
+而不是「保留 + 请人确认」这种**必然失败**的组合。
+
+本次实情：人工把分支版规格同步到工作区（内容完全一致）后再跑 merge 才成功。
 
 ---
 
