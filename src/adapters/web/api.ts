@@ -50,6 +50,13 @@ import {
 } from '../../core/project/cockpit-roots.js';
 // ADR-114：分支可见性 —— 「完成」是在盘上完成，还是在版本分支里完成
 import { annotateBranchEvidenceAsync } from '../../core/project/branch-evidence.js';
+// 执行目录脉络：仓库根 / 版本目录 / 切片执行目录 / 额外工作区
+import {
+  discoverWorktrees,
+  normalizeDir,
+  readGitWorktrees,
+  type WorktreeEntry,
+} from '../../core/project/worktree-map.js';
 // ADR-086：驾驶舱的油门 —— freeze / gate / resume 直接调 core 编排，
 // run 拉起 CLI 进程。判定不分叉（C3）。
 import {
@@ -139,7 +146,7 @@ export interface SliceSummary {
   liveReason: string | null;
   idleMs: number | null;
   lastActivityAt: string | null;
-  /** 看门狗已自愈次数（.zelto/activity/recoveries/<id>.json） */
+  /** 看门狗已自愈次数（.zelto/activity/recoveries/<id>.jsonl，折叠计数） */
   recoveries: number;
   /** 是否已上报（超 3 次不再自救） */
   escalated: boolean;
@@ -320,8 +327,91 @@ export class WebApi {
     }));
   }
 
-  /** 按 scope + label 找根；找不到返回 null（不猜）。 */
-  private findWorkspace(loc: SliceLocation): SliceWorkspace | null {
+  /**
+   * 执行目录脉络 —— 「这场仗分成哪几条战线、每条各在哪」（驾驶舱工作区视图）。
+   *
+   * 与 `listRoots` 的区别：`listRoots` 只回答「驾驶舱读了哪些 `.zelto`」；
+   * 这里回答「**同一个仓库**在盘上有几份检出 —— 哪份是仓库根、
+   * 哪份是版本集成目录、哪份是切片执行目录、哪份是 git 额外工作区」，
+   * 并给每条战线附上属于它的切片行（scope/label 相同）。
+   *
+   * 切片状态只从 `.zelto` 根读（ADR-112 的边界不变）；
+   * 执行目录里的 `.zelto/slices/` 是基线快照，不当状态用 ——
+   * 只按 id 把「跑在这条战线上的那片」的状态**借自**它真正所在的根。
+   */
+  async worktreeMap(): Promise<{
+    repoRoot: string;
+    entries: Array<WorktreeEntry & { slices: SliceSummary[]; version: string | null }>;
+  }> {
+    const [gitWorktrees, slices, plans] = await Promise.all([
+      readGitWorktrees(this.repoRoot),
+      this.listSlices(),
+      Promise.resolve(readVersionPlans(join(this.zeltoDir, 'versions'))),
+    ]);
+    const entries = discoverWorktrees(this.repoRoot, gitWorktrees);
+
+    // 版本 label → 计划里的版本状态（只呈现，不判定）
+    const versionStatus = new Map<string, string>();
+    for (const plan of plans) for (const v of plan.versions) versionStatus.set(v.version, v.status);
+
+    const byRoot = new Map<string, SliceSummary[]>();
+    for (const row of slices) {
+      const key = `${row.scope}|${row.label ?? ''}`;
+      const list = byRoot.get(key) ?? [];
+      list.push(row);
+      byRoot.set(key, list);
+    }
+
+    // 切片执行目录 → 它的切片行：按 id 在全部根里找（执行目录不带自己的状态）
+    const sliceRowById = new Map<string, SliceSummary>();
+    for (const row of slices) if (!sliceRowById.has(row.id)) sliceRowById.set(row.id, row);
+
+    // 版本目录 → 计划里点名的切片 id（计划的 `slices` 字段）。
+    // 为什么需要：版本目录自己的 `.zelto/slices/` 是**基线快照** ——
+    // 实测 v4 的快照只有 v0/v1 三片基线，而 v4 真正要跑的是三条已冻结的切片。
+    // 而且版本目录里的切片调 `zelto set --label` 改 label 时，盘上的
+    // `.zelto/slices/<id>.json` 在**仓库根**（状态只从根读）—— 于是
+    // `scope|label` 分组里 v4 一行都落不到。计划是唯一写明了归属的地方。
+    const planSlices = new Map<string, string[]>();
+    for (const plan of plans) {
+      for (const v of plan.versions) {
+        const ids = (v.slices ?? [])
+          .map((s: unknown) => (typeof s === 'string' ? s : (s as { id?: unknown } | null)?.id))
+          .filter((id): id is string => typeof id === 'string' && id.length > 0);
+        if (ids.length > 0) planSlices.set(v.version, ids);
+      }
+    }
+    const rowFor = (id: string): SliceSummary | null => sliceRowById.get(id) ?? null;
+
+    return {
+      repoRoot: this.repoRoot,
+      entries: entries.map((entry) => {
+        let rows: SliceSummary[] = [];
+        if (entry.kind === 'root') rows = byRoot.get('root|') ?? [];
+        else if (entry.kind === 'version' && entry.label) {
+          rows = byRoot.get(`version|${entry.label}`) ?? [];
+          // 计划点名的切片不在 scope|label 分组里（label 没改 / 状态在根）→
+          // 按计划 id 补上，按计划顺序排前面。重复 id 不补。
+          const have = new Set(rows.map((r) => r.id));
+          const planned = (planSlices.get(entry.label) ?? [])
+            .filter((id) => !have.has(id))
+            .map(rowFor)
+            .filter((r): r is SliceSummary => r !== null);
+          rows = [...planned, ...rows];
+        } else if (entry.kind === 'slice' && entry.label) {
+          const hit = sliceRowById.get(entry.label);
+          rows = hit ? [hit] : [];
+        }
+        return {
+          ...entry,
+          slices: rows,
+          version: entry.kind === 'version' && entry.label ? versionStatus.get(entry.label) ?? null : null,
+        };
+      }),
+    };
+  }
+
+  /** 按 scope + label 找根；找不到返回 null（不猜）。 */  private findWorkspace(loc: SliceLocation): SliceWorkspace | null {
     if (isRootScope(loc.scope, loc.label)) return this.rootWs;
     return (
       this.workspaces.find(

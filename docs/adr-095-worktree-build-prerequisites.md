@@ -5,8 +5,8 @@
 **作者**: 系统架构
 **关联约束**: C1, C2, C3, C4, C9
 **关联文档**: `docs/adr-011-worktree-isolation.md`,
-`docs/adr-044-submodule-init.md`,
-`docs/adr-047-submodule-align-to-main-repo.md`,
+`docs/adr-044-worktree-submodule-init.md`,
+`docs/adr/adr-117-submodule-pointer-alignment.md`,
 `docs/实战缺陷记录-nimrtc-v14.md` §ZD-026
 
 ---

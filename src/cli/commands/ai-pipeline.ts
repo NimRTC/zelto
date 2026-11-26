@@ -716,7 +716,7 @@ async function planAddVersionDeterministic(args: string[]): Promise<number> {
   const id = args[0];
   const versionLabel = args[1];
   if (!id || id.startsWith('--') || !versionLabel || versionLabel.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan version <plan-id> <v> --description <text> [--depends-on <v>] [--slice <id> --slice-title <t> --slice-module <m> --write <p>...]');
+    f.error('USAGE', 'Usage: zelto plan version <plan-id> <v> --description <text> [--depends-on <v>] [--slice <id> --slice-title <t> --slice-module <m> --write <p>...] [--slices-file <json>]');
     return 1;
   }
 
@@ -749,12 +749,38 @@ async function planAddVersionDeterministic(args: string[]): Promise<number> {
     return 1;
   }
 
+  // 自用脚本要传的切片列表动辄十几条 —— 参数一长，调用方的参数转义/换行
+  // 都可能悄悄弄丢一段（实测：`--slice` 全丢 → 一路报「空版本」）。
+  // 给一个文件入口：JSON 数组，与 `--slice` 同形；给了就不再读命令行里的切片参数。
+  let slices = parseNewVersionSlices(args);
+  const slicesFile = optionValues('--slices-file')[0];
+  if (slicesFile) {
+    try {
+      const parsed = JSON.parse(readFileSync(slicesFile, 'utf-8')) as unknown;
+      if (!Array.isArray(parsed)) throw new Error('顶层必须是 JSON 数组');
+      slices = parsed.map((raw) => {
+        const s = raw as { id?: unknown; title?: unknown; module?: unknown; writes?: unknown; specPath?: unknown };
+        if (typeof s.id !== 'string' || !s.id) throw new Error('每一项都要有字符串 id');
+        return {
+          id: s.id,
+          title: typeof s.title === 'string' ? s.title : s.id,
+          module: typeof s.module === 'string' ? s.module : '未指定模块',
+          writes: Array.isArray(s.writes) ? s.writes.map(String) : [],
+          ...(typeof s.specPath === 'string' ? { specPath: s.specPath } : {}),
+        };
+      });
+    } catch (err) {
+      f.error('INVALID', `--slices-file 读不动：${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   const { createVersion } = await import('../../core/version/create.js');
   const { plan: next, version, problems } = createVersion(plan, {
     version: versionLabel,
     dependsOn: optionValues('--depends-on').flatMap((v) => v.split(',')).map((s) => s.trim()).filter(Boolean),
     description,
-    slices: parseNewVersionSlices(args),
+    slices,
   });
 
   if (!version) {

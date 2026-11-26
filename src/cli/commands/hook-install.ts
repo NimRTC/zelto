@@ -474,9 +474,15 @@ export interface HookScriptOptions {
  * 后者会在子 shell 里跑循环，循环里给 HAS_DENY 赋值传不回外层，
  * 于是「有文件被拒绝」永远传不到退出码上（这个 bug 让 pre-commit 形同虚设）。
  *
- * 拦截口径：**只有显式 deny 规则才拦**（matched_rule 不是 default）。
- * 「没有规则匹配」产生的 default deny 只告警放行 ——
- * 否则策略没覆盖到的文件会把整条提交堵死，钩子反而变成摆设。
+ * 拦截口径（ADR-119），三分支：
+ *
+ * - **判定没跑成**（没有 decision，或 deny 且 matched_rule 为 `null`）→ **拦截**。
+ *   hook 进程自己出错时输出 `matched_rule: null`；这不是「没有规则匹配」，
+ *   是守卫本身坏了 —— 静默放行会让人以为门禁还在（C9）。
+ * - **显式 deny**（matched_rule 是某条规则，含保护域 `protected:human` 以外的）→ 拦截；
+ * - **default deny**（matched_rule == "default"，「没有规则匹配」）→ 只告警放行 ——
+ *   否则策略没覆盖到的文件会把整条提交堵死，钩子反而变成摆设。运行时
+ *   PreToolUse 对 agent 写仍是 fail closed；这里只降级提交时刻的兜底档。
  */
 export function hookScript(name: string, condition: string, options: HookScriptOptions = {}): string {
   const binary = (options.binaryPath ?? '').replace(/\\/g, '/');
@@ -497,10 +503,10 @@ if [ ! -f "\$ZELTO_HOOK" ]; then
   fi
 fi
 if [ ! -f "\$ZELTO_HOOK" ]; then
-  echo "⚠️  zelto-hook: Binary not found at \$ZELTO_HOOK"
+  echo "❌ zelto-hook: Binary not found at \$ZELTO_HOOK"
   echo "   Rebuild zelto, then re-run 'zelto hook --install'."
   echo "   To skip zelto check: git commit --no-verify"
-  exit 0
+  exit 1
 fi
 
 # --- 策略所在的项目根 ---
@@ -547,13 +553,25 @@ if [ \$? -ne 0 ]; then
       RESULT=\$(echo "{\\"path\\":\\"$file\\",\\"operation\\":\\"write\\",\\"harness\\":\\"\$HARNESS\\"}" | "\$NODE_BIN" "\$ZELTO_HOOK" 2>/dev/null)
       DECISION=\$(echo "\$RESULT" | grep -o '"decision":"[^"]*"' | head -1 | cut -d'"' -f4)
       RULE=\$(echo "\$RESULT" | grep -o '"matched_rule":"[^"]*"' | head -1 | cut -d'"' -f4)
-      if [ "\$DECISION" = "deny" ] && [ "\$RULE" != "default" ]; then
+      BASIS=\$(echo "\$RESULT" | grep -o '"basis":"[^"]*"' | head -1 | cut -d'"' -f4)
+      if [ "\$DECISION" = "deny" ] && [ "\$RULE" = "null" ]; then
+        # 判定进程没给结论（崩溃 / 空输出 / 输入非法）—— fail closed（C9）。
+        echo "❌ zelto-hook: \$file 的策略判定未完成（no verdict）"
+        if [ -n "\$BASIS" ]; then echo "   Basis: \$BASIS"; fi
+        echo "   To skip zelto check: git commit --no-verify"
+        HAS_DENY=1
+      elif [ "\$DECISION" = "deny" ] && [ "\$RULE" = "default" ]; then
+        # 没有规则匹配 —— 只告警（ADR-119 决策一）
+        echo "⚠️  zelto-hook: \$file 不在策略允许范围内（默认拒绝）—— 提交放行，但请确认"
+      elif [ "\$DECISION" = "deny" ]; then
         echo "❌ zelto-hook: DENIED write to \$file"
-        BASIS=\$(echo "\$RESULT" | grep -o '"basis":"[^"]*"' | head -1 | cut -d'"' -f4)
         echo "   Basis: \$BASIS"
         HAS_DENY=1
-      elif [ "\$DECISION" = "deny" ]; then
-        echo "⚠️  zelto-hook: \$file 不在策略允许范围内（默认拒绝）—— 提交放行，但请确认"
+      elif [ "\$DECISION" != "allow" ]; then
+        # 既不是 deny 也不是 allow —— 守卫没跑成，按判定未完成处理
+        echo "❌ zelto-hook: \$file 的策略判定未完成（no verdict）"
+        echo "   To skip zelto check: git commit --no-verify"
+        HAS_DENY=1
       fi
     fi
   done < "\$FILE_LIST"

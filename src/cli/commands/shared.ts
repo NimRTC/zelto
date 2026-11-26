@@ -1,4 +1,4 @@
-// Shared utilities, types, and store instances for CLI commands
+﻿// Shared utilities, types, and store instances for CLI commands
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
@@ -25,6 +25,7 @@ import { pathInWriteSet } from '../../core/pathspec/index.js';
 import { WorktreeManager, type WorktreeInfo } from '../../core/worktree/index.js';
 import {
   resolveSliceOwnership,
+  UnresolvedOwnershipError,
   versionBranchTip,
   checkVersionLabel,
 } from '../../core/version/branch.js';
@@ -396,6 +397,32 @@ export function existingWorktreePath(sliceId: string): string | null {
 }
 
 /**
+ * 当前是不是**版本上下文**（人在版本分支或版本工作目录里）。
+ *
+ * 判据：当前检出的分支是 `version/<label>`。
+ *
+ * 为什么不看目录路径：worktree 的路径可能被人挪过、也可能被
+ * `git worktree` 登记在别处 —— 而「当前在哪个版本分支上」
+ * 是 git 事实，比路径可靠。
+ *
+ * ADR-121：版本上下文里**解析不出归属不许兜底**。
+ * 静默退回主干，比停下来更坏 —— 基点错到主干，
+ * agent 会在错误的基础上重写代码。
+ */
+export function inVersionContext(): boolean {
+  try {
+    const head = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf-8',
+      timeout: 15_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return head.startsWith('version/');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Remove a slice's worktree and write a `worktree.removed` event (C4).
  * Never swallows errors — the caller decides how to report them.
  */
@@ -449,6 +476,8 @@ export function resolveSliceBaseCommit(
     repoRoot?: string;
     versionsDir?: string;
     specPath?: string | null;
+    /** 处于版本上下文（版本工作目录）—— 解析不出归属就抛错，不退回主干（ADR-121） */
+    versionContext?: boolean;
   } = {},
 ): ResolvedBaseCommit {
   // 1. 显式覆盖
@@ -465,10 +494,22 @@ export function resolveSliceBaseCommit(
   const versionsDir = options.versionsDir ?? join(ZELTO_DIR, 'versions');
 
   // 3. 归属版本分支的 tip
+  //
+  // ADR-121：**版本上下文里不许兜底退回主干 HEAD**。
+  //
+  // 同一个病灶的另一面：版本工作目录里 `.zelto/versions/` 是空的 →
+  // 归属解析落空 → 基点退回主干 HEAD → 切片的 worktree 从**主干**建，
+  // 而不是从版本分支 tip 建 —— 于是 agent 看不到同版本前一片的产物，
+  // 被迫重新实现（ADR-067 D1 修的就是这个，但当时计划文件还在根目录）。
+  //
+  // 这里改成：版本上下文里解析不出归属 → **抛错**，让调用方明确说清
+  // 「这片属于哪个版本」。基点错到主干，比停下来更坏 ——
+  // 它会让 agent 在错误的基础上重写代码。
   try {
     const ownership = resolveSliceOwnership(sliceId, {
       versionsDir,
       specPath: options.specPath ?? null,
+      versionContext: options.versionContext ?? false,
     });
     if (ownership.kind === 'version') {
       const tip = versionBranchTip(ownership.branch, repoRoot, gitRefCommit);
@@ -484,6 +525,8 @@ export function resolveSliceBaseCommit(
       };
     }
   } catch (err) {
+    // 版本上下文里的「解析不出归属」—— **不兜底**（ADR-121）。
+    if (err instanceof UnresolvedOwnershipError) throw err;
     // 归属歧义 —— 不阻塞执行（D2），退回主干 HEAD 并留痕
     const message = err instanceof Error ? err.message : String(err);
     return {
@@ -560,10 +603,14 @@ export async function ensureWorktree(
   // 第 3 条是本 ADR 的核心：**单片路径也必须知道自己属于哪个版本**。
   // 不解析归属的话，同版本的第二片会从主干 HEAD 建 worktree，
   // 看不到前一片的产物 —— agent 被迫重新实现上一片（实测 D-28）。
+  //
+  // ADR-121：人在**版本工作目录**里跑时，解析不出归属**不许**退回主干 ——
+  // 基点错到主干，agent 会在错误的基础上重写代码。
   const base = resolveSliceBaseCommit(id, slice.baseCommit, {
     override: options.baseCommitOverride ?? null,
     repoRoot: process.cwd(),
     specPath: slice.spec.path,
+    versionContext: inVersionContext(),
   });
 
   if (base.note) {

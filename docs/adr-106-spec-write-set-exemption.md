@@ -22,7 +22,7 @@ nimrtc-v14 的 `v1-call-state-surface` 切片（D7，2026-11-24）：
 
 1. 规格（`specs/slices/v1-call-state-surface.md`）在写集里
    —— 与 v1.4 的其它片一样（`zelto create --writes` 时人显式列的）；
-2. agent 写了 ADR（`docs/adr/ADR-035-call-state-surface.md`），
+2. agent 写了 ADR（`docs/adr/ADR-035-….md`），
    顺手把规格里那行「架构决策在 ADR-035（**Proposed**，待签字）」
    改成「（**Accepted**，本片落地时签字）」；
 3. 运行结束，写集审计判 `tampered`：

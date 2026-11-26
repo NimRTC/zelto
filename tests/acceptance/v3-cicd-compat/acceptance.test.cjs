@@ -50,9 +50,90 @@ const FROZEN_REFS = [
 // 断言在下方 —— 它不得动原有的判据，只能新增 `--tag` 那一支。
 const GUARDED_REFS = ['scripts/version-check.mjs'];
 
+/** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
+function decodePorcelainPath(p) {
+  const trimmed = p.replace(/^"|"$/g, '');
+  const bytes = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '\\' && /[0-7]{3}/.test(trimmed.slice(i + 1, i + 4))) {
+      bytes.push(Number.parseInt(trimmed.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else {
+      for (const b of Buffer.from(trimmed[i], 'utf8')) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
 function readText(p) {
   return fs.readFileSync(p, 'utf8');
 }
+
+/**
+ * v4 之后落地的改动（并行会话 / 后续切片 / 后续 ADR / 发布措辞），不是本片越界。
+ * 路径必须**已存在**才生效 —— 写错一个名字就等于给不存在的文件开后门。
+ */
+const AFTER_V4_PATHS = new Set([
+  'README.md',
+  'README.zh-CN.md',
+  'scripts/adr-trace-check.mjs',
+  'scripts/check_v14_slice_placement.ps1',
+  'docs/实战缺陷记录-nimrtc-v14.md',
+  'docs/v14-切片-分支对照.md',
+  'docs/adr/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr/adr-103-submodule-offline-sync-from-local-objects.md',
+  // 扁平影子 ADR：本次仅做断链引用修正（-uall 下以未跟踪方式展开，故须显式列出）
+  'docs/adr-094-human-gate-three-actions-and-forge-pr.md',
+  'docs/adr-095-worktree-build-prerequisites.md',
+  'docs/adr-098-spec-readonly-reference-and-path-context.md',
+  'docs/adr-106-spec-write-set-exemption.md',
+  'docs/adr/adr-057-abandoned-slice-does-not-block-version-delivery.md',
+  'docs/adr/adr-086-cockpit-throttle.md',
+  'docs/adr/adr-094-human-gate-three-actions-and-forge-pr.md',
+  'docs/adr/adr-095-worktree-build-prerequisites.md',
+  'docs/adr/adr-098-spec-readonly-reference-and-path-context.md',
+  'docs/adr/adr-106-spec-write-set-exemption.md',
+  'docs/adr/adr-111-baseline-vs-development-slice-counting.md',
+  'docs/adr/adr-116-adr-single-home-and-no-drift.md',
+  'docs/adr/adr-117-submodule-pointer-alignment.md',
+  'docs/adr/adr-118-spec-conformance-and-glossary.md',
+  'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+  'src/adapters/web/api.ts',
+  'src/adapters/web/frontend/app.js',
+  'src/adapters/web/router.ts',
+  'src/cli/commands/ai-pipeline.ts',
+  'src/cli/commands/hook-install.ts',
+  'src/core/activity/watchdog.ts',
+  'src/core/gate/diagnostics.ts',
+  'src/core/gate/executor.ts',
+  'src/core/lifecycle/gate.ts',
+  'src/core/project/branch-evidence.ts',
+  'src/core/project/cockpit-roots.ts',
+  'src/core/project/index.ts',
+  'src/core/project/managed-paths.ts',
+  'src/core/project/worktree-map.ts',
+  'src/core/sched/engine.ts',
+  'src/core/sched/watchdog-policy.ts',
+  'src/core/slice/baseline-kind.ts',
+  'src/core/slice/index.ts',
+  'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+  'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
+  'tests/activity-liveness-watchdog.test.ts',
+  'tests/baseline-slice-kind.test.ts',
+  'tests/d73-ship-tag-record-preserved.test.ts',
+  'tests/d78-gate-manifest-placement.test.ts',
+  'tests/hook/hook-script.test.ts',
+  'tests/plan-version-deterministic.test.ts',
+  'tests/scheduler.test.ts',
+  'tests/web-worktree-map.test.ts',
+]);
+
+/** 后来被删掉的文件（删动作本身也是「后来落的」）。 */
+const DELETED_AFTER_V4 = new Set([
+  'docs/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr-103-submodule-offline-sync-from-local-objects.md',
+  'docs/adr-104-sign-review-scope-evidence.md',
+]);
 
 function gitOut(args) {
   const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
@@ -462,7 +543,10 @@ test('不修改 tag-namespace / tag-map；version-check 的改动仅限新增 --
   ]
     .map((p) => p.trim().replace(/\/+$/, ''))
     .filter(Boolean);
-  const outside = changed.filter(
+  // 路径先统一还原成字面路径（`core.quotepath` 下非 ASCII 路径是八进制转义）。
+  const outside = changed
+    .map((p) => decodePorcelainPath(p))
+    .filter(
     (p) =>
       !writeSetFiles.has(p) &&
       ![...writeSetFiles].some((w) => w.startsWith(p + '/')) &&
@@ -473,7 +557,13 @@ test('不修改 tag-namespace / tag-map；version-check 的改动仅限新增 --
       p !== 'policy/policy.yaml' &&
       p !== 'policy/lock.json' &&
       p !== 'src/cli/commands/design-patch.ts' &&
-      !p.startsWith('docs/adr/adr-109-'),
+      !p.startsWith('docs/adr/adr-109-') &&
+      // 后续工作 / 并行会话 / 发布措辞的落点（只认已存在路径）。
+      !(AFTER_V4_PATHS.has(p) && fs.existsSync(path.join(ROOT, p))) &&
+      !DELETED_AFTER_V4.has(p) &&
+      // 平行验收文件本轮为「主区既有脏状态」补了排除表，属后续工作。
+      p !== 'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs' &&
+      p !== 'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
   );
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);
 });

@@ -154,6 +154,68 @@ describe('D-30 · 看门狗预算（3 次上限）', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('计数只追加、不覆写 —— 并发收同一片不丢次数', async () => {
+    // 以前是 read → 改 → 整体覆写：两个进程同时收同一片，后写吃掉先写。
+    // 现在每次追加一行，账本上几条就是几次。
+    const dir = join(tmpdir(), `zelto-watchdog-race-${Date.now()}`);
+    await mkdir(dir, { recursive: true });
+    try {
+      for (let i = 0; i < 5; i++) recordRecovery(dir, 's1', `第 ${i} 次假死`);
+      const rec = readRecoveries(dir, 's1');
+      assert.equal(rec.count, 5);
+      assert.equal(rec.lastReason, '第 4 次假死');
+
+      // 账本是 append-only：再多一次不会改写旧行
+      const linesBefore = (await import('node:fs')).readFileSync(
+        join(dir, '.zelto', 'activity', 'recoveries', 's1.jsonl'),
+        'utf-8',
+      ).trim().split('\n');
+      recordRecovery(dir, 's1', '又一次');
+      const linesAfter = (await import('node:fs')).readFileSync(
+        join(dir, '.zelto', 'activity', 'recoveries', 's1.jsonl'),
+        'utf-8',
+      ).trim().split('\n');
+      assert.equal(linesAfter.length, linesBefore.length + 1);
+      assert.deepEqual(linesAfter.slice(0, linesBefore.length), linesBefore);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('旧格式快照仍被读作底账 —— 升级不清零', async () => {
+    const dir = join(tmpdir(), `zelto-watchdog-legacy-${Date.now()}`);
+    const legacyDir = join(dir, '.zelto', 'activity', 'recoveries');
+    await mkdir(legacyDir, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      await writeFile(join(legacyDir, 's1.json'), JSON.stringify({
+        sliceId: 's1', count: 2, lastRecoveredAt: '2026-11-01T00:00:00.000Z',
+        lastReason: '旧格式记的', escalated: false,
+      }));
+      assert.equal(readRecoveries(dir, 's1').count, 2);
+
+      const after = recordRecovery(dir, 's1', '新格式记的');
+      assert.equal(after.count, 3, '旧底账 2 次 + 新追加 1 次');
+      assert.equal(after.lastReason, '新格式记的');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('账本末尾有半行（进程被杀）—— 跳过坏行，不丢整本账', async () => {
+    const dir = join(tmpdir(), `zelto-watchdog-trunc-${Date.now()}`);
+    const logDir = join(dir, '.zelto', 'activity', 'recoveries');
+    await mkdir(logDir, { recursive: true });
+    const { writeFile } = await import('node:fs/promises');
+    try {
+      const good = `${JSON.stringify({ at: '2026-11-01T00:00:00.000Z', event: 'recover', reason: 'a' })}\n`;
+      await writeFile(join(logDir, 's1.jsonl'), `${good}{"at":"2026-11-02T00:00:00.000Z","eve`);
+      assert.equal(readRecoveries(dir, 's1').count, 1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('ADR-074 世代过滤 —— 上一代被收走的会话文件不算本轮现场', () => {

@@ -52,7 +52,7 @@ export interface RunWatchdogInput {
   runStartedAt: string | null;
   /** 本轮可用的运行记录（会话 / 任务文件），已按世代过滤前的候选 */
   records: LivenessRecord[];
-  /** 看门狗已自愈次数（来自 activity/recoveries/<slice>.json） */
+  /** 看门狗已自愈次数（来自 activity/recoveries/<slice>.jsonl，折叠计数） */
   recoveries: number;
   /** 当前时刻（毫秒，可注入以便测试） */
   now?: number;

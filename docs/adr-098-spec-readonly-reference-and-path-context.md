@@ -42,7 +42,7 @@
 | 其它（如「写集路径不在 policy 允许范围内」） | 1 | 3% |
 
 v2-ice 那一次失败报了 11 条，其中 9 条是**只读参考文件**
-（`libjuice/src/ice.c`、`docs/adr/ADR-028-...md`、`raw_udp/src/udp_socket.cpp`…）
+（`libjuice/src/ice.c`、`docs/adr/ADR-028-….md`、`raw_udp/src/udp_socket.cpp`…）
 被当成了「要改的文件」。
 
 ### 根因：规格的**引用语义**与写集的**修改语义**对撞
@@ -51,7 +51,7 @@ v2-ice 那一次失败报了 11 条，其中 9 条是**只读参考文件**
 
 1. **要改它**（如 `src/modules/ice/src/tcp_socket.cpp`）→ 必须在写集里；
 2. **只读参考**（如 `只读 src/third_party/libjuice/src/src/ice.c`）→ **绝不能**在写集里；
-3. **指路**（如 `见 docs/adr/ADR-028-...md §5.1`）→ 不该在写集里。
+3. **指路**（如 `见 docs/adr/ADR-028-….md §5.1`）→ 不该在写集里。
 
 zelto 现有的判据是**看措辞**：反引号包裹 + 带已知扩展名 + 不在「只读参考」表里
 → 就算「要改它」。这个判据在**人写的规格**上大面积误判：
@@ -92,7 +92,7 @@ ZD-020（glob 写集下的裸文件名）、ZD-024（新建文件的裸文件名
 
 只读参考（**不得修改**）：
 - 只读 `src/third_party/libjuice/src/src/ice.c` —— libjuice 的 UDP-only 事实
-- 只读 `docs/adr/ADR-028-ice-over-tcp-nimrtc-side.md` —— 本片的设计依据
+- 只读 `docs/adr/ADR-028-….md` —— 本片的设计依据
 ```
 
 「只读」前缀的条目**一律不进**「要改」集合 —— 不论它长得像不像路径、
@@ -252,7 +252,7 @@ v2-ice 的规格把三类条目混在**同一个「范围」章节**里。
 的写法不再误报），但漏掉了**一个条目里写了多个路径**的写法：
 
 ```markdown
-- 只读 `src/third_party/libjuice/src/src/ice.c` 与 `docs/adr/ADR-028.md` —— 参考
+- 只读 `src/third_party/libjuice/src/src/ice.c` 与 `docs/adr/ADR-028-….md` —— 参考
 ```
 
 人写这句话时两个**都是**只读参考，但「紧邻」只认第一个。

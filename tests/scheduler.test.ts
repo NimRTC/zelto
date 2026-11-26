@@ -214,4 +214,37 @@ describe('Scheduler — startRun 清停机分类', () => {
     assert.equal(evts.filter((e) => e.type === 'run.resumed').length, 0);
     assert.equal((await store.read('clean-run')).state, 'running');
   });
+
+  it('transit 失败时什么都不落地 —— 事件不写、分类不清（账本与状态脱钩）', async () => {
+    // 「状态被别处改过」的具体形态：读快照之后、transit 之前，有别处把它
+    // 改成了终态。终态不能 RUN_START —— transit 会抛 Invalid transition。
+    const slice = store.create('conflict-run', 'Conflict run');
+    slice.state = 'frozen';
+    slice.spec.frozenHash = 'abc';
+    slice.stall.class = 'human_halt';
+    await store.write(slice);
+
+    const realRead = store.read.bind(store);
+    let reads = 0;
+    store.read = async (id: string) => {
+      // 第一次 read 是 startRun 的快照；之后（transit 内部）把它换成 abandoned = 被别处改过
+      reads += 1;
+      if (reads > 1) {
+        const fresh = await realRead(id);
+        return { ...fresh, state: 'abandoned' as const };
+      }
+      return realRead(id);
+    };
+
+    try {
+      await assert.rejects(() => scheduler.startRun('conflict-run'));
+    } finally {
+      store.read = realRead;
+    }
+
+    // 读回来会触发终态自愈（abandoned 不该带停机分类），所以只断言：
+    // 账本上没有「续跑」—— 迁移没成，事件就不能有。
+    const evts = await events.read('conflict-run');
+    assert.equal(evts.filter((e) => e.type === 'run.resumed').length, 0, '迁移失败时不能留下续跑事件');
+  });
 });

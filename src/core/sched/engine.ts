@@ -339,9 +339,19 @@ export class Scheduler {
    * 为什么必须在这里清：`zelto next` 会把停机切片排在最前面。
    * 如果开跑不清，下次 `zelto next` 还是指着这个已经跑过的切片 ——
    * 人会陷入「resume → run → next 还在说 resume」的死循环。
+   *
+   * **顺序不能换（照 `resume()` 的范式）**：先 `transit` 再清场。
+   * 反过来（先写事件、清分类、落盘，最后才 transit）一旦 transit 抛错
+   * （状态被别处改过），账本上已经记了一次「续跑」、停机分类已经没了，
+   * 切片却根本没开跑 —— 账本与状态脱钩，人再也看不到「这片为什么停下」。
+   * 先迁移：迁不过去就整件事没发生，分类还在，切片仍标记为「待人处理」。
    */
   async startRun(sliceId: string, actor: string = 'zelto'): Promise<SliceData> {
     const slice = await this.store.read(sliceId);
+
+    // 迁移内部自己 read 一份最新快照再写回，所以这里读到的
+    // `slice.stall.class` 只是「迁移前」的判断依据。
+    const started = await this.store.transit(sliceId, 'RUN_START', actor);
 
     if (slice.stall.class !== null) {
       const previousStallClass = slice.stall.class;
@@ -349,11 +359,15 @@ export class Scheduler {
         resolution: 'run_restart',
         previousStallClass,
       });
-      slice.stall.class = null;
-      await this.store.write(slice);
+      // 必须重新读再写 —— `slice` 是迁移前的快照，直接写回去会把
+      // 刚迁好的 `running` 改回 `frozen`，正好把这次开跑抵消掉。
+      const current = await this.store.read(sliceId);
+      current.stall.class = null;
+      await this.store.write(current);
+      return current;
     }
 
-    return this.store.transit(sliceId, 'RUN_START', actor);
+    return started;
   }
 
   /**

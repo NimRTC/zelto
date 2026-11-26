@@ -421,7 +421,7 @@ CLI 侧读规格用的是 `slice.spec.path` **相对 cwd**；Web 侧的 `repoRoo
 > 两端各自渲染。若两端各写一句文案，那又是一次「同一个东西两份实现」。
 >
 > 唯一被**明确保住**的是退出码契约 —— 见 §实施记录 7。
-- `docs/adr/adr-072-web-ui-adapter.md`（已移入 `docs/adr/`）
+- `docs/adr/adr-072-web-cockpit-readonly-plus-sign.md`（已移入 `docs/adr/`）
 - `src/cli/commands/core-slice.ts` —— `freeze` 改为调 `core/lifecycle/freeze.ts`
 - `src/cli/commands/gate-sign.ts` —— `gate` 改为调 `core/lifecycle/gate.ts`
 - `src/cli/commands/info-help.ts` —— `resume` 改为调 `core/lifecycle/resume.ts`

@@ -12,8 +12,8 @@ English | [简体中文](README.zh-CN.md)
 > **Status: v0.7.1 — pre-1.0.** CLI flags, config schema, and event format may change
 > without migration. Pin a commit if you need stability.
 >
-> The v0.7.1 working tree is **not yet on npm** — the last published version is
-> `0.6.0`. Install from source for now (see Quick start).
+> Install from npm: `npm i -g zelto@0.7.1` (or `npx zelto@0.7.1`). The `0.7.1` release
+> supersedes `0.6.0`, whose README mistakenly said "not yet on npm".
 
 zelto is a local-first cockpit for AI coding agents. You write a slice spec, approve it,
 and zelto runs the agent unattended — then refuses to merge anything that doesn't pass
@@ -36,7 +36,7 @@ the acceptance checks frozen alongside that spec.
 ## Quick start
 
 ```bash
-# 从源码装（开发用）—— v0.7.1 还没发到 npm
+# 从源码装（开发用）
 git clone https://github.com/NimRTC/zelto && cd zelto
 pnpm install && pnpm build && pnpm link --global
 zelto init
@@ -117,9 +117,9 @@ Protected paths are hard-coded outside policy reach, and `core/` has zero third-
 - **Two executors, default included.** `claude-agent` (CLI spawn) is the default; `claude-agent-sdk`
   is opt-in via `--adapter claude-agent-sdk`. The policy/gate layer is harness-agnostic,
   but claiming more harnesses before the adapters exist would be a lie.
-- **Not yet on npm for this version.** The last published release is `0.6.0`
-  (install it from the npm registry — that gives you the `0.6.0` CLI). The current
-  `v0.7.1` working tree is **not published** — install it from source:
+- **Install from npm.** `npm i -g zelto@0.7.1` gives you this version's CLI.
+  `0.6.0` is superseded (its README wrongly said "not yet on npm"). For development,
+  install from source:
 
   ```bash
   git clone https://github.com/NimRTC/zelto && cd zelto

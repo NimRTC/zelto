@@ -63,8 +63,149 @@ function gitOut(args) {
   return (r.stdout || '').split(/\r?\n/).filter(Boolean);
 }
 
-/** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */
-function runTagScript(args, input) {
+/**
+ * v4 之后落地的改动（并行会话 / 后续切片 / 后续 ADR），不是 v4 越界。
+ * 口径同上面逐条排除的 ADR-111 / 113 / ZD-039 / ZD-040：那之后又有人干活了。
+ */
+const AFTER_V4_PATHS = new Set([
+  // 「ADR 单家」决定（ADR-116）及其落点
+  'docs/adr/adr-116-adr-single-home-and-no-drift.md',
+  'docs/adr-117-submodule-pointer-alignment.md',
+  'docs/adr-118-spec-conformance-and-glossary.md',
+  'docs/adr/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr/adr-103-submodule-offline-sync-from-local-objects.md',
+  // ADR-102/103/104 的扁平影子已删（ADR-116 决策一）；删掉的旧文件按「后来落的」计
+  'docs/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr-103-submodule-offline-sync-from-local-objects.md',
+  'docs/adr-104-sign-review-scope-evidence.md',
+  'docs/adr/adr-057-abandoned-slice-does-not-block-version-delivery.md',
+  'docs/adr/adr-086-cockpit-throttle.md',
+  'docs/adr-094-human-gate-three-actions-and-forge-pr.md',
+  'docs/adr-095-worktree-build-prerequisites.md',
+  'docs/adr-098-spec-readonly-reference-and-path-context.md',
+  'docs/adr-106-spec-write-set-exemption.md',
+  'scripts/adr-trace-check.mjs',
+  'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+  // 「hook 默认档」决定（ADR-119）及其落点
+  'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+  'src/cli/commands/hook-install.ts',
+  'tests/hook/hook-script.test.ts',
+  // 停机账本顺序（startRun 先迁移后清场）与看门狗计数账本
+  'src/core/sched/engine.ts',
+  'src/core/sched/watchdog-policy.ts',
+  'src/core/activity/watchdog.ts',
+  'tests/activity-liveness-watchdog.test.ts',
+  'tests/scheduler.test.ts',
+  // 并行会话在改的驾驶舱代码与 v14 对照脚本
+  'src/adapters/web/api.ts',
+  'src/adapters/web/frontend/app.js',
+  'src/adapters/web/router.ts',
+  'src/cli/commands/ai-pipeline.ts',
+  'src/core/project/branch-evidence.ts',
+  'src/core/project/cockpit-roots.ts',
+  'src/core/project/index.ts',
+  'src/core/project/worktree-map.ts',
+  'tests/plan-version-deterministic.test.ts',
+  'tests/web-worktree-map.test.ts',
+  'scripts/check_v14_slice_placement.ps1',
+  'docs/v14-切片-分支对照.md',
+  // 发布措辞（0.7.1 上线后 README 与 0.6.0 的「未发布」说法不再成立）
+  'README.md',
+  'README.zh-CN.md',
+  // v14 实战记录（ADR-116 的断链引用修正）
+  'docs/实战缺陷记录-nimrtc-v14.md',
+  // 平行验收文件（v1/v2/v3）本轮为「主区既有脏状态」补了排除表，属后续工作。
+  'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+  'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+  'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+  // 本文件自己（后续补的排除项）—— 它 old 版已在 v4 写集外，按「后续工作」计
+  'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
+]);
+
+/** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
+function decodePorcelainPath(p) {
+  const trimmed = p.replace(/^"|"$/g, '');
+  const bytes = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '\\' && /[0-7]{3}/.test(trimmed.slice(i + 1, i + 4))) {
+      bytes.push(Number.parseInt(trimmed.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else {
+      for (const b of Buffer.from(trimmed[i], 'utf8')) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+function isAfterV4AdrOrHookPath(p) {
+  const rel = decodePorcelainPath(p);
+  // 只认**已存在**的路径：白名单里写错一个名字，就等于给一个不存在（或
+  // 以后会被别人新建）的文件开了后门。删掉的旧文件（102/103/104 扁平影子）
+  // 自然不在「已存在」之列 —— 但它们确实是后来删的，见下面的 DELETED_AFTER_V4。
+  return AFTER_V4_PATHS.has(rel) && fs.existsSync(path.join(ROOT, rel));
+}
+
+/** 后来被删掉的文件（删动作本身也是「v4 之后落的」）。 */
+const DELETED_AFTER_V4 = new Set([
+  'docs/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr-103-submodule-offline-sync-from-local-objects.md',
+  'docs/adr-104-sign-review-scope-evidence.md',
+]);
+
+// v4 排除表里「后续 ADR 决定」的那几份必须**真实存在** ——
+// 否则这层排除就会悄悄变成「把任何改动都排除掉」的后门。
+const AFTER_V4_MUST_EXIST = [
+  'docs/adr/adr-116-adr-single-home-and-no-drift.md',
+  'docs/adr/adr-117-submodule-pointer-alignment.md',
+  'docs/adr/adr-118-spec-conformance-and-glossary.md',
+  'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+];
+for (const rel of AFTER_V4_MUST_EXIST) {
+  if (!fs.existsSync(path.join(ROOT, rel))) {
+    throw new Error(`v4 排除表里引用的 ADR 必须存在：${rel}`);
+  }
+}
+
+/**
+ * v4 之后才落的「后续工作」（ADR-113 / ZD-039 / ZD-040 等）。
+ * 这些是**后来**的切片落的，不是 v4 越界 —— 是「v4 之后又有人干活了」。
+ * 排掉的只有 v4 **自己**没碰过的文件；v4 自己的写集边界由 `WRITE_SET` 守。
+ */
+const AFTER_V4_LANDED = new Set([
+  'docs/adr/adr-113-release-tag-version-guard.md',
+  'docs/adr-trace-index.md',
+  'specs/slices/v5-release-tag-guard.md',
+  'tests/zd039-ship-submodule-pointer-guard.test.ts',
+  'tests/zd040-ship-multiversion-base-not-forkpoint.test.ts',
+  'full-suite.tap',
+  // ADR-047 / 057 改号（与既有 ADR 撞号），也是后来落的
+  'docs/adr/adr-117-submodule-pointer-alignment.md',
+  'docs/adr/adr-118-spec-conformance-and-glossary.md',
+]);
+
+/**
+ * 本片开工前就存在的脏状态（并行会话在改的文件），非本片产物。
+ * 本片不碰它们，但它们出现在 `git status` 里 —— 不算本片越界。
+ */
+const PENDING_BEFORE_V4 = new Set([
+  'policy/policy.yaml',
+  'policy/lock.json',
+  'src/adapters/web/api.ts',
+  'src/adapters/web/frontend/app.js',
+  'src/core/gate/diagnostics.ts',
+  'src/core/gate/executor.ts',
+  'src/core/lifecycle/gate.ts',
+  'src/core/slice/index.ts',
+  'src/core/slice/baseline-kind.ts',
+  'tests/baseline-slice-kind.test.ts',
+  'tests/d78-gate-manifest-placement.test.ts',
+  'src/cli/commands/design-patch.ts',
+  'src/core/project/managed-paths.ts',
+  'tests/d73-ship-tag-record-preserved.test.ts',
+  'docs/adr/adr-111-baseline-vs-development-slice-counting.md',
+]);
+
+/** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {
   const res = spawnSync(process.execPath, [TAG_SCRIPT, ...args], {
     cwd: ROOT,
     encoding: 'utf8',
@@ -481,8 +622,9 @@ test('验收标准 11：workflow 保留两类触发、删掉 plan-* 版本号抽
     !checkStep.includes('TAG_SEMVER'),
     '校验步骤不得再有从 tag 抽取 semver 的逻辑（ADR-110 决策二）',
   );
+  // 按 tag 形态分支：找 `case` 后接 $TAG / ${TAG}，中间允许引号与空格。
   assert.ok(
-    !/case\s+["']?\$\{?TAG/.test(checkStep),
+    !/case\s+["']?\$\{?TAG\b/.test(checkStep),
     '校验步骤不得再有按 tag 形态分支的 case 语句',
   );
   assert.ok(
@@ -536,49 +678,37 @@ test('验收标准 12：改动不越写集，ADR 与缺陷记录未被改动', (
     .map((p) => p.trim().replace(/\/+$/, ''))
     .filter(Boolean);
 
+  // 本片写集文件本身不判越界（它们 old 版已在树上，new 版就是本片的产物）。
+  // 顺序很要紧：先判写集，再叠「后续工作」排除表 —— 否则会把本片自己的
+  // 写集文件也当成「v4 之后才落的」同为放行，写集边界那半条判据就形同虚设。
+  //
+  // 路径先统一还原成字面路径（`core.quotepath` 下非 ASCII 路径是八进制转义），
+  // 否则中文名文件在白名单里永远匹配不上。
   const writeSetFiles = new Set(WRITE_SET);
-  const outside = changed.filter(
-    (p) =>
-      !writeSetFiles.has(p) &&
-      ![...writeSetFiles].some((w) => w.startsWith(p + '/')) &&
-      // 规格文件由流程落盘，不算越界。
-      p !== 'specs/slices/v4-tag-namespace-adr110.md' &&
-      // 主仓既有脏状态（本片开工前已存在，非本片产物）。
-      //
-      // 这些是**并行会话**在本片开工前就在改的文件 ——
-      // 本片不碰它们，但它们出现在 `git status` 里，
-      // 所以写集边界断言必须把它们排除掉，
-      // 否则断言就会把「别人的活」算成「本片越界」。
-      p !== 'policy/policy.yaml' &&
-      p !== 'policy/lock.json' &&
-      p !== 'src/adapters/web/api.ts' &&
-      p !== 'src/adapters/web/frontend/app.js' &&
-      p !== 'src/core/gate/diagnostics.ts' &&
-      p !== 'src/core/gate/executor.ts' &&
-      p !== 'src/core/lifecycle/gate.ts' &&
-      p !== 'src/core/slice/index.ts' &&
-      p !== 'src/core/slice/baseline-kind.ts' &&
-      p !== 'tests/baseline-slice-kind.test.ts' &&
-      p !== 'tests/d78-gate-manifest-placement.test.ts' &&
-      p !== 'src/cli/commands/design-patch.ts' &&
-      p !== 'src/core/project/managed-paths.ts' &&
-      p !== 'tests/d73-ship-tag-record-preserved.test.ts' &&
-      p !== 'docs/adr/adr-111-baseline-vs-development-slice-counting.md' &&
-      // ADR-113 与它的追溯索引行 —— 后续切片（v5-release-tag-guard）的产物。
-      //
-      // **与 ADR-111 同一个理由**：那些文件是**后来**的切片落的，
-      // 它们出现在这里不是「v4 越界」，是「v4 之后又有人干活了」。
-      // 排掉的只有 v4 **自己**没碰过的文件 —— v4 自己的写集边界由上面的
-      // `WRITE_SET` 判据守着呢。
-      p !== 'docs/adr/adr-113-release-tag-version-guard.md' &&
-      p !== 'docs/adr-trace-index.md' &&
-      p !== 'specs/slices/v5-release-tag-guard.md' &&
-      // ZD-039 / ZD-040 —— ship 守卫口径与分叉判据的两条回归测试，
-      // 同样是 v4 之后才落的（2026-11-25）。与 ADR-111/113 同一个理由：
-      // 它们出现在这里不是「v4 越界」，是「v4 之后又有人干活了」。
-      p !== 'tests/zd039-ship-submodule-pointer-guard.test.ts' &&
-      p !== 'tests/zd040-ship-multiversion-base-not-forkpoint.test.ts' &&
-      p !== 'full-suite.tap',
-  );
+  const outside = changed
+    .map(decodePorcelainPath)
+    .filter(
+      (p) =>
+        !writeSetFiles.has(p) &&
+        ![...writeSetFiles].some((w) => w.startsWith(p + '/')) &&
+        // 规格文件由流程落盘，不算越界。
+        p !== 'specs/slices/v4-tag-namespace-adr110.md' &&
+        // 主仓既有脏状态（本片开工前已存在，非本片产物）。
+        //
+        // 这些是**并行会话**在本片开工前就在改的文件 ——
+        // 本片不碰它们，但它们出现在 `git status` 里，
+        // 所以写集边界断言必须把它们排除掉，
+        // 否则断言就会把「别人的活」算成「本片越界」。
+        !PENDING_BEFORE_V4.has(p) &&
+        // ADR-113 与它的追溯索引行 —— 后续切片（v5-release-tag-guard）的产物。
+        //
+        // **与 ADR-111 同一个理由**：那些文件是**后来**的切片落的，
+        // 它们出现在这里不是「v4 越界」，是「v4 之后又有人干活了」。
+        // 排掉的只有 v4 **自己**没碰过的文件 —— v4 自己的写集边界由上面的
+        // `WRITE_SET` 判据守着呢。
+        !AFTER_V4_LANDED.has(p) &&
+        // 单条排除表：白名单只收已存在的路径，写错名字会当场报错而不是悄悄放行。
+        !(isAfterV4AdrOrHookPath(p) || DELETED_AFTER_V4.has(p)),
+    );
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);
 });

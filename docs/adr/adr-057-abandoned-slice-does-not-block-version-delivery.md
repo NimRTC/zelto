@@ -4,7 +4,7 @@
 **日期**: 2026-11-15
 **作者**: 系统架构
 **关联约束**: C1, C4
-**关联文档**: `docs/adr/adr-056-version-level-branches.md`（§3.4 `version deliver` 重写）,
+**关联文档**: `docs/adr-056-version-level-branches.md`（§3.4 `version deliver` 重写）,
 `src/cli/commands/ai-pipeline.ts`（`version deliver` 前置条件判据）
 
 ---

@@ -4,8 +4,8 @@
 **日期**: 2026-11-23
 **作者**: 系统架构
 **关联约束**: C1, C2, C3, C4
-**关联文档**: `docs/adr-044-submodule-init.md`,
-`docs/adr-047-submodule-align-to-main-repo.md`,
+**关联文档**: `docs/adr-044-worktree-submodule-init.md`,
+`docs/adr/adr-117-submodule-pointer-alignment.md`,
 `docs/adr-095-worktree-build-prerequisites.md`,
 `docs/实战缺陷记录-nimrtc-v14.md`
 

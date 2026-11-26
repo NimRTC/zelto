@@ -18,6 +18,8 @@
 //   GET  /api/policy       （策略规则）
 //   GET  /api/budget       （预算概览）
 //   GET  /api/pipeline     （需求→设计→版本→切片 全链状态）
+//   GET  /api/plan-coverage（ADR-114：计划 vs 盘上 vs 分支）
+//   GET  /api/worktrees    （执行目录脉络：仓库根 / 版本目录 / 执行目录 / 额外工作区）
 //   POST /api/sign-requests/:id/approve
 //
 // ADR-084 把驾驶舱从「只读 + 一个签字动作」扩成「可接管」，
@@ -246,6 +248,13 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       // 浏览器里签完字，人很容易以为「完事了」。
       nextStep: `签字不等于合并：合入主干需另跑 zelto merge ${(result.request as { sliceId: string }).sliceId}`,
     });
+    return;
+  }
+
+  // ── GET /api/worktrees ───────────────────────────────────────────
+  // 执行目录脉络：仓库根 / 版本集成目录 / 切片执行目录 / git 额外工作区
+  if (method === 'GET' && path === '/api/worktrees') {
+    sendJson(res, 200, await api.worktreeMap());
     return;
   }
 

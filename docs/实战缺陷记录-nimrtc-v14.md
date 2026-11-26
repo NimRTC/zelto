@@ -1,4 +1,4 @@
-# Zelto 实战缺陷记录（nimrtc v1.4 演练）
+﻿# Zelto 实战缺陷记录（nimrtc v1.4 演练）
 
 > 每条都附一条可复现的回归测试。跑：`npm test -- --filter <测试文件>`
 
@@ -1365,12 +1365,12 @@ v2-ice 那种「一行一个只读条目」的写法不再误报。
 而「紧邻」判据漏掉了**一个条目里写了多个路径**的写法：
 
 ```markdown
-- 只读 `src/third_party/libjuice/src/src/ice.c` 与 `docs/adr/ADR-028.md` —— 参考
+- 只读 `src/third_party/libjuice/src/src/ice.c` 与 `docs/adr/ADR-028-….md` —— 参考
 ```
 
 人写这句话时，`ice.c` 与 `ADR-028.md` **都是**只读参考。
 但「紧邻」判据只认第一个 —— `ADR-028.md` 没被豁免
-→ D-4 报「规格提到 docs/adr/ADR-028.md，但它不在写集里」
+→ D-4 报「规格提到 docs/adr/ADR-028-….md，但它不在写集里」
 → 人回去改写集 → 一次几小时的往返。
 
 **实测确认**（用 `parseReferencedPaths` 直接跑真实规格形态）：
@@ -2637,6 +2637,88 @@ ADR-114 的分支证据用 `execFileSync('git', …)`：每行切片 3 次调用
 
 1. **git 启动开销本身没有变**：冷启动首屏仍有约 1.2 秒。要再往下压，需要长期驻留的 `git cat-file --batch` 管道进程——但那是**常驻状态**，与 C1「无驻留进程」冲突，必须先写 ADR 讨论；
 2. **缓存没有 TTL**：指纹只盯状态文件与 `updatedAt`。若有人 `git commit` 了状态文件而切片文件本身没动，缓存会短暂显示旧证据（下次任一状态变更即刷新）。
+
+---
+
+## ZD-046：版本工作目录里 merge 的归属解析兜底成「合主干」，`target` 标签与实际落点对不上
+
+### 场景
+
+nimrtc-v14（2026-11-26）核对 v1.4 全部 10 个 v1 切片的分支归属时，发现「计划说 v1、分支说 v3、事件说 main」三方对不上。
+
+追事件的 `merge.planned` / `merge.completed`，`target` 字段的值取决于 **merge 命令是从哪个目录跑的**：
+
+| 切片 | merge 跑的目录 | 事件里的 `target` |
+|---|---|---|
+| `v1-device-policy` / `v1-audio-p2` / `v1-n5-turn-server` | 仓库根（那儿有 `.zelto/versions/plan-1795166129234.json`） | `version/v1` ✅ |
+| `v1-audio-device-engine` / `v1-call-state-surface` / `v1-ice-recovery` / `v1-install-tree-module-closure` / `v1-install-tree-video-deps` / `v1-macos-install-proof` / `v1-path-change-report` / `v1-sdk-sample` / `v1-turn-credentials` / `v1-turn-tls-trust` / `v1-video-render-engine` / `v6-writeset-slice-boundary` | `.zelto/version-worktrees/v3/`（那儿 `.zelto/versions/` 是空的） | **`main`** ❌ |
+
+共 12 条 `merge.completed` 带 `target=main`（在 `.zelto/version-worktrees/v3/.zelto/events/` 里）。
+
+### 根因
+
+`resolveSliceOwnership`（`core/version/branch.ts`）四级回退：
+
+1. `--target` 显式指定
+2. 版本计划成员扫描 —— 读 `.zelto/versions/`
+3. 规格 frontmatter 的 `version:` 字段
+4. **兜底：合入主干当前分支**
+
+第 2 级读的是**当前目录**下的 `.zelto/versions/`。版本工作目录里的那个目录**永远是空的** —— `version start` 建 worktree 时从不复制计划文件进去：
+
+```
+$ dir .zelto/version-worktrees/{v1,v2,v3,v4}/.zelto/versions
+（四个都是 0 个文件）
+```
+
+第 2 级落空、第 3 级规格里也没写 `version:` → **第 4 级兜底生效**。
+
+### 后果：**落点碰巧没错，错的是归属**
+
+这一点必须说准，否则会得出过头的结论。
+
+兜底返回 `kind: 'main'`，`resolveTarget(null)` 据此取 `dir = process.cwd()` —— 而 `process.cwd()` 就是**版本工作目录**，它检出的分支正是 `version/<label>`。所以产物**全都落在版本分支上**：
+
+```
+8abb815a  origin/main=False  version/v3=True  version/v1=False
+85f142c9  origin/main=False  version/v3=True  version/v1=False
+18775f73  origin/main=False  version/v3=True  version/v1=False
+b4aa77ec  origin/main=False  version/v3=True  version/v1=False
+657941be  origin/main=False  version/v3=True  version/v1=False
+3529b44a  origin/main=False  version/v3=True  version/v1=False
+c40dd463  origin/main=False  version/v3=True  version/v1=False
+```
+
+**主干没有被污染** —— `origin/main` 上一个切片提交都没有。
+
+但兜底绕过了三件事，造成真实伤害：
+
+1. **事件流说谎**（C4 的追溯价值受损）：`merge.completed` 记 `target=main`，实际分支是 `version/v3`。事后按 `target` 审计「这版做完了没有」会得出假结论。
+2. **版本归属被跳过**：走兜底 = 跳过第 2 级「计划成员扫描」与第 3 级「规格 frontmatter」。计划里 **v1 的 10 个切片有 7 个从未合进 `version/v1`**（实测 `version/v1` 只含 `v1-device-policy` / `v1-audio-p2` / `v1-n5-turn-server` 三片；另 7 片只在 `version/v3` 上）。这 7 片在计划里属于 **v1**，却落在 **v3** 的分支上。
+3. **版本状态同步被跳过**：不走版本整合路径，`version.integrated` 之类的事件不产生 —— `version/v1` 上**一个 `Merge slice` 提交都没有**（tip 停在 `628df8c9`，`origin/main...version/v1` = ahead 8 / behind 41）。
+
+一句话：**代码没丢、落点没错，但「哪片属于哪一版」这条追溯链断了**。
+
+### 修复
+
+ADR-121（`docs/adr/adr-121-version-context-ownership-fail-closed.md`），两处都改：
+
+1. **让解析能成功**：`version start` 建工作目录时，把 `.zelto/versions/<plan-id>.json` 复制进 `<worktree>/.zelto/versions/`。复制的是**整个计划文件**（不是这一版的片段）—— 归属解析要知道「这个切片属于哪个版本」，而切片可能跨版本被引用。复制失败**不阻塞** `version start`（副本是派生的，缺了它可以在 merge 那一刻说清楚）。
+2. **让它不许瞎猜**：`resolveSliceOwnership` 新增 `versionContext` 选项。在版本上下文里第 4 级兜底**不再生效**，改为抛 `UnresolvedOwnershipError`。判据是 **git 事实**（当前检出分支是 `version/<label>`），不看目录路径 —— worktree 可能被人挪过。
+3. **显式 `--target` 反查不到计划时仍然用它**：分支名本身是权威的。「合哪儿」是明确的，不该因为「这分支属于哪份计划」不知道就改主意。
+4. **基点解析同样不许兜底**（ADR-067）：基点错到主干比停下来更坏 —— agent 会在错误的基础上重写代码。所以 `resolveSliceBaseCommit` 也接受 `versionContext`，解析不出归属时抛错，不退回 HEAD。
+
+老项目（不在版本上下文，无版本计划）行为不变 —— 这是 ADR-056 §3.2 的向后兼容承诺。
+
+### 回归测试
+
+- `tests/adr-121-version-context-ownership.test.ts`：14 条断言 —— 版本上下文里解析不出归属就抛错 / 老项目仍兜底合主干 / 显式 `--target` 不被兜底吞掉 / 计划复制后归属解析成功 / 歧义与「解析不出」是两种错。
+
+### 剩余问题
+
+1. **已投错的 12 个切片不重放**（fix-forward 决策）：重写版本分支历史的风险远大于收益。实情记在 `docs/v14-切片-分支对照.md`。
+2. **那 7 个「计划说 v1、实际在 v3」的切片暂不搬移**：正解是重新按归属合进 `version/v1`，但 `version/v1` 与 `version/v3` 已分叉 104 个提交，且重做合并会撞 spec 冲突。**留作后续决定，本次只修机制 + 记录实情。**
+3. **`VersionSlice.state` 从不回写**：计划里的片级状态始终是 `draft`。这是另一个问题（ADR-114 已把「计划态」与「盘上事实」分开呈现），本次没动。
 
 ---
 

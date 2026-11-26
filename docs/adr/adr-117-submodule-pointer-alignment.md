@@ -1,4 +1,7 @@
-# ADR-047：worktree 里的 submodule 必须对齐到主仓记录的指针
+# ADR-117：worktree 里的 submodule 必须对齐到主仓记录的指针
+
+> **原编号 ADR-047**。与 `docs/adr-047-agent-failure-unsticks-slice.md` 同号
+> （两份是不同的决定），按 ADR-116 决策一改号为 117。
 
 - 状态：已接受
 - 日期：2026-11-11

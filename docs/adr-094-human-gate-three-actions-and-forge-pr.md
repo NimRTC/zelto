@@ -10,8 +10,8 @@
 `docs/adr-018-no-auto-merge-on-sign.md`,
 `docs/adr-021-sign-revoke.md`,
 `docs/adr-037-violation-recovery-and-refreeze.md`,
-`docs/adr-070-section-header-detection-and-silent-failure-guard.md`,
-`docs/adr-072-web-cockpit-readonly-plus-sign.md`,
+`docs/adr/adr-070-section-header-detection-and-silent-failure-guard.md`,
+`docs/adr/adr-072-web-cockpit-readonly-plus-sign.md`,
 `docs/adr/adr-086-cockpit-throttle.md`
 
 ---
@@ -743,7 +743,7 @@ try {
 - **B**：设上限（如 3 次），超过要 `--force`。
 - **C**：超过上限自动升级为「退回上游」（`spec revise`）。
 
-**建议**：先按 A 跑。理由与 ADR-057 §D8 同源 —— **闸门的阻断语义要稳**，
+**建议**：先按 A 跑。理由与 ADR-118 §D8 同源 —— **闸门的阻断语义要稳**，
 在真实项目上跑过之前设阈值容易误报。B/C 会带来「人只想再试一次
 却被工具拦住」的挫败感。
 
@@ -779,7 +779,7 @@ zelto 原本有签字门 —— 人能说「不」。但人**不能带话说**�
 LoopForge 的 Human Gate 三动作直接对应 zelto 的缺口，形态照抄没问题。
 但它的 PR 是**评审主体**（GitHub 上 approve 就完事），
 zelto 的 PR 只能是**追溯链的载体** —— 批准权单点留在 zelto（ADR-018）。
-照抄形态、审查信任模型，跟 ADR-057 学 mattpocock 双轴 review 时
+照抄形态、审查信任模型，跟 ADR-118 学 mattpocock 双轴 review 时
 用的是同一把尺子。
 
 **半成品比缺失更危险。**

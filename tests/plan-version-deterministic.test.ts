@@ -185,8 +185,30 @@ describe('zelto plan version：CLI 端到端', () => {
     assert.match(events, /"addedVersion":"v4"/);
   });
 
-  it('重复加同一版本 → 非零退出，计划不变', async () => {
-    let code = 0;
+  it('--slices-file：切片清单从 JSON 文件读（长清单不必挤在命令行里）', async () => {
+    const f = join(REPO, 'slices-v6.json');
+    await writeFile(
+      f,
+      JSON.stringify([
+        { id: 'v6-a', title: 'A 片', module: 'engine', writes: ['src/a/**', 'src\\a/**'] },
+        { id: 'v6-b' },
+      ]),
+      'utf-8',
+    );
+    execFileSync(
+      process.execPath,
+      [CLI, 'plan', 'version', 'plan-test', 'v6', '--description', '文件入口', '--depends-on', 'v4', '--slices-file', f],
+      { cwd: REPO, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const runtime = JSON.parse(await readFile(join(REPO, '.zelto', 'versions', 'plan-test.json'), 'utf-8')) as VersionPlan;
+    const v6 = runtime.versions.find((v) => v.version === 'v6');
+    assert.ok(v6);
+    assert.deepEqual(v6.slices.map((s) => s.id), ['v6-a', 'v6-b']);
+    assert.deepEqual(v6.slices[0].writes, ['src/a/**'], '写集照样归一化');
+    assert.equal(v6.slices[1].title, 'v6-b', '缺标题时不编，用 id');
+  });
+
+  it('重复加同一版本 → 非零退出，计划不变', async () => {    let code = 0;
     try {
       execFileSync(
         process.execPath,

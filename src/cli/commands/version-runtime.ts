@@ -1,4 +1,4 @@
-// Version runtime — 版本工作目录、基点、依赖与跨版本冲突
+﻿// Version runtime — 版本工作目录、基点、依赖与跨版本冲突
 //
 // ADR-056：版本成为 git 的一等分支实体。
 //
@@ -14,6 +14,7 @@
 // C6: cli/ 层，不涉及 core/ 的依赖方向
 
 import { execFileSync } from 'node:child_process';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Version, VersionPlan } from '../../core/version/types.js';
 import {
@@ -284,7 +285,71 @@ export async function prepareVersionWorkspace(
     dependencyNote = `依赖：${dep.reason}`;
   }
 
+  // 计划文件复制进版本工作目录（ADR-121）
+  //
+  // 病灶（实测 nimrtc-v14，2026-11-26）：版本工作目录里
+  // `.zelto/versions/` 是**空的** —— 版本计划从不复制进 worktree。
+  // 于是在这个目录里跑 `zelto merge` 时，归属解析读不到计划 →
+  // 解析落空 → 兜底「合主干」。
+  //
+  // 注意落点其实**碰巧没错**：兜底取 `dir = process.cwd()`，
+  // 在版本工作目录里那就是版本分支本身（实测 12 个切片全在 `version/v3` 上，
+  // `origin/main` 上一个都没有）。**错的是归属**：
+  //   - 事件流写 `target=main`，实际分支是 `version/v3` —— 追溯链说谎
+  //   - 计划里 v1 的 7 个切片落在 `version/v3` 上 —— 版本归属被跳过
+  //   - 版本状态同步被跳过 —— `version/v1` 上一个 Merge slice 都没有
+  //
+  // 计划文件必须**跟着版本走**：版本工作目录是「这一版的真源」，
+  // 计划就在那里；仓库根那份是建版时的副本。
+  const planNote = copyPlanIntoVersionWorkspace(plan, worktree.path, options.repoRoot);
+  if (planNote) {
+    dependencyNote = dependencyNote ? `${dependencyNote}\n${planNote}` : planNote;
+  }
+
   return { worktree, baseCommit: commit, baseSource: source, dependencyNote, error: null };
+}
+
+/**
+ * 把版本计划复制进版本工作目录的 `.zelto/versions/`（ADR-121）。
+ *
+ * 为什么必须复制（而不是在解析时回头去仓库根找）：
+ * - 归属解析读的是**当前目录**下的 `.zelto/versions/`；
+ *   在 worktree 里跑 merge 时，那儿是空的。
+ * - 计划文件是**这一版的真源**（ADR-056）；仓库根那份是建版时的副本。
+ *   版本工作目录后来可能独立演化（它有自己的分支与提交），
+ *   根目录那份会落后。
+ *
+ * 复制的是**整个计划文件**，不是这一版的片段 ——
+ * 归属解析要知道「这个切片属于哪个版本」，
+ * 而切片可能跨版本被引用（同一片进多个版本的计划）。
+ *
+ * 复制失败**不阻塞**建目录：副本是派生的，缺了它会让后续 merge 停下，
+ * 但那可以在 merge 那一刻说清楚 —— 不该在这里把整个 version start 拦死。
+ */
+function copyPlanIntoVersionWorkspace(
+  plan: VersionPlan,
+  worktreePath: string,
+  repoRoot: string,
+): string | null {
+  const src = join(repoRoot, '.zelto', 'versions', `${plan.id}.json`);
+  const destDir = join(worktreePath, '.zelto', 'versions');
+  const dest = join(destDir, `${plan.id}.json`);
+  try {
+    if (!existsSync(src)) return null;
+    mkdirSync(destDir, { recursive: true });
+    // 内容一致就不重写 —— 免得每次 version start 都动一次 mtime
+    let same = false;
+    try {
+      same = readFileSync(dest, 'utf-8') === readFileSync(src, 'utf-8');
+    } catch {
+      same = false;
+    }
+    if (!same) copyFileSync(src, dest);
+    return `计划：${plan.id}.json 已复制进版本工作目录（归属解析靠它）`;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return `⚠️  计划文件复制进版本工作目录失败（${msg}）—— 在这个目录里跑 merge 时归属会解析不出来`;
+  }
 }
 
 /**

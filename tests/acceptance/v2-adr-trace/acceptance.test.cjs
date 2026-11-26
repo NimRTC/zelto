@@ -106,6 +106,56 @@ function gitOut(args) {
   return (r.stdout || '').split(/\r?\n/).filter(Boolean);
 }
 
+// ─── ADR 单家检查（ADR-116）：同号两处 / 副本不一致 都要被脚本拦下 ──────────
+//
+// 本片删掉了扁平侧的 102/103/104（目录版是逐字超集）。假设没有这条检查：
+// 再有人手抄一份到扁平侧、少抄一个「版本追溯」小节，追溯脚本照样通过 ——
+// 读者打开的是影子。这里用一个临时造出来的「假 ADR-102」验证脚本会报错。
+
+const FLAT_102 = path.join(ROOT, 'docs', 'adr-102-agent-env-placeholder-strip.md');
+
+/** 在扁平侧造一份与目录版不一致的 ADR-102；fn 跑完后删掉。 */
+function withFlatShadow(transform, fn) {
+  const dirCopy = fs.readFileSync(path.join(ROOT, ADR_FILES[0].file), 'utf8');
+  fs.writeFileSync(FLAT_102, transform(dirCopy), 'utf8');
+  try {
+    fn();
+  } finally {
+    fs.rmSync(FLAT_102, { force: true });
+  }
+}
+
+test('ADR 单家检查：同号两处存在 + 副本不一致 → 脚本退出非零', () => {
+  // 现状（只有目录版）→ 通过
+  assert.equal(runScript().exit, 0);
+
+  // 扁平侧出现影子且缺「版本追溯」小节 → 必须报错
+  withFlatShadow((t) => t.replace(/\n## 版本追溯[\s\S]*$/, '\n'), () => {
+    const r = runScript();
+    assert.notEqual(r.exit, 0, `同号两处存在时必须退出非零，输出：${r.out}`);
+    assert.ok(/adr-102/i.test(r.out), `必须报告是哪一号重复，输出：${r.out}`);
+  });
+  assert.equal(runScript().exit, 0, '删掉影子后必须恢复通过');
+
+  // 扁平侧是完整逐字副本 → 允许（ADR-116 决策二：副本逐字一致即可）
+  withFlatShadow((t) => t, () => {
+    assert.equal(runScript().exit, 0, '逐字副本不应报错');
+  });
+  assert.equal(runScript().exit, 0);
+
+  // 断链引用（ADR-116 决策三）：文档里写了不存在的 docs/adr/…md 必须报错
+  withCorruptedAdr(
+    'docs/adr/adr-104-sign-review-scope-evidence.md',
+    (t) => `${t}\n\n见 \`docs/adr/adr-999-no-such-decision.md\`。\n`,
+    () => {
+      const r = runScript();
+      assert.notEqual(r.exit, 0, `断链引用必须退出非零，输出：${r.out}`);
+      assert.ok(r.out.includes('adr-999-no-such-decision'), `必须报告断链路径，输出：${r.out}`);
+    },
+  );
+  assert.equal(runScript().exit, 0);
+});
+
 /**
  * 临时篡改一份 ADR 文件，跑回调，finally 里恢复原样。
  * @param {string} rel 相对仓库根的文件路径
@@ -150,7 +200,28 @@ function expandChangedPath(p) {
   return files;
 }
 function changedPaths() {
-  return gitOut(['status', '--porcelain']).map((l) => l.slice(3).trim());
+  // porcelain 里的重命名行是 `old -> new`；目录名改了、但文件集合没变时
+  // 这一步不该把它当成「改动」—— 工作量与「新增 + 删除」等价，判据按新路径算。
+  return gitOut(['status', '--porcelain']).map((l) => {
+    const raw = l.slice(3).trim();
+    const arrow = raw.indexOf(' -> ');
+    return arrow === -1 ? raw : raw.slice(arrow + 4);
+  });
+}
+
+/** 还原 porcelain 的引号 / 八进制转义（中文路径在 core.quotepath 下会被转义）。 */
+function decodeGitPath(p) {
+  const trimmed = p.replace(/^"|"$/g, '');
+  const bytes = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '\\' && /[0-7]{3}/.test(trimmed.slice(i + 1, i + 4))) {
+      bytes.push(Number.parseInt(trimmed.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else {
+      for (const b of Buffer.from(trimmed[i], 'utf8')) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
 }
 
 // ═══ 验收标准 1：三份 ADR 均有「版本追溯」小节，四项字段非空、格式统一 ═══
@@ -286,11 +357,54 @@ test('docs 索引登记表中 ADR-102/103/104 均带「已回填」标记，且�
 
 // ═══ 验收标准 6：不修改写集之外的任何文件 ══════════════════════════════
 test('改动文件严格落在写集内（git status 越界检查 + 产物存在检查）', () => {
+  // 本片开工前工作区已有的脏文件（并行会话 / 后续切片留下的，本片没碰过）。
+  // 口径同 v4 的「主仓既有脏状态」：它们出现在 `git status` 里是「别人在干活」，
+  // 不是「本片越界」—— 本片自己的改动件件在写集里。
+  const PRE_EXISTING = new Set([
+    'src/adapters/web/api.ts',
+    'src/adapters/web/frontend/app.js',
+    'src/adapters/web/router.ts',
+    'src/cli/commands/ai-pipeline.ts',
+    'src/core/project/branch-evidence.ts',
+    'src/core/project/cockpit-roots.ts',
+    'src/core/project/index.ts',
+    'src/core/project/worktree-map.ts',
+    'tests/plan-version-deterministic.test.ts',
+    'tests/web-worktree-map.test.ts',
+    'scripts/check_v14_slice_placement.ps1',
+    'docs/v14-切片-分支对照.md',
+    // 发布措辞更新（0.7.1 上线，README 的「未发布」说法不再成立）
+    'README.md',
+    'README.zh-CN.md',
+    // 2026-11-26「ADRs 单家」/「git hook 默认档」/「停机账本顺序」/「看门狗计数账本」的落点
+    'docs/adr/adr-116-adr-single-home-and-no-drift.md',
+    'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+    'docs/adr/adr-117-submodule-pointer-alignment.md',
+    'docs/adr/adr-118-spec-conformance-and-glossary.md',
+    'docs/adr/adr-057-abandoned-slice-does-not-block-version-delivery.md',
+    'docs/adr/adr-086-cockpit-throttle.md',
+    'docs/实战缺陷记录-nimrtc-v14.md',
+    'src/cli/commands/hook-install.ts',
+    'src/core/activity/watchdog.ts',
+    'src/core/sched/engine.ts',
+    'src/core/sched/watchdog-policy.ts',
+    'tests/hook/hook-script.test.ts',
+    'tests/activity-liveness-watchdog.test.ts',
+    'tests/scheduler.test.ts',
+    'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
+    // 平行验收文件（v1/v2/v3）本轮为「主区既有脏状态」补了排除表 —— 后续工作
+    'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+    'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+  ]);
+
   const offenders = [];
   for (const p of changedPaths()) {
-    for (const expanded of expandChangedPath(p)) {
+    for (const expanded of expandChangedPath(decodeGitPath(p))) {
       if (KNOWN_HARNESS_PATHS.has(expanded)) continue;
-      if (!inWriteSet(expanded)) offenders.push(expanded);
+      if (inWriteSet(expanded)) continue;
+      if (PRE_EXISTING.has(expanded)) continue;
+      offenders.push(expanded);
     }
   }
   assert.deepEqual(

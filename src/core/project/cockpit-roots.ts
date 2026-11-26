@@ -47,6 +47,16 @@ export interface CockpitRoot {
 /** 版本集成目录的父目录（相对仓库根）—— 与 `core/worktree/manager.ts` 同源。 */
 export const VERSION_WORKTREES_REL = join('.zelto', 'version-worktrees');
 
+/**
+ * 切片执行目录的父目录（相对仓库根）—— 与 `core/worktree/manager.ts` 的
+ * `WORKTREE_BASE_DIR` 同源。
+ *
+ * 这里**只列出、不扫描成根**：执行目录里的 `.zelto/slices/` 是基线快照
+ * （见上面的说明）。驾驶舱用它在「执行目录」那一层展示「哪几条战线在跑」，
+ * 不用它读切片状态。
+ */
+export const WORKTREES_REL = join('.zelto', 'worktrees');
+
 /** 一个目录里存不存在「zelto 状态」（`.zelto/slices` 或 `.zelto/events`）。 */
 function hasZeltoState(dir: string): boolean {
   const zeltoDir = join(dir, '.zelto');

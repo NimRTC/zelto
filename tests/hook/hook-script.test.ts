@@ -126,6 +126,22 @@ describe('hookScript', () => {
       'the harness must not be hard-coded to "git"',
     );
   });
+
+  // ─── ADR-119：default deny vs 判定没跑成 ────────────────────────────────
+  it('default deny 只告警放行，但「判定没跑成」必须拦截（C9 fail closed）', () => {
+    const script = hookScript('pre-commit', 'git diff --cached --quiet --exit-code');
+    // 显式 deny 排除 default —— 保持原口径
+    assert.ok(script.includes('"$RULE" = "default"'), 'default deny 不应拦截');
+    // 没有 matched_rule（判进程坏了）不能落进「放行」分支
+    assert.ok(script.includes('"$RULE" = "null"'), 'matched_rule 为 null 时必须拦截');
+    assert.ok(script.includes('no verdict'), '无判定结论时要有明确报错');
+    // 二进制缺失不能再静默放行
+    const missingBinaryBlock = script.slice(script.indexOf('Binary not found'));
+    assert.ok(
+      missingBinaryBlock.slice(0, 200).includes('exit 1'),
+      'hook 二进制缺失时必须 exit 1，不能静默放行',
+    );
+  });
 });
 
 describe('installed git hook on a non-ASCII path', { concurrency: false }, () => {
@@ -189,6 +205,9 @@ describe('installed git hook on a non-ASCII path', { concurrency: false }, () =>
     const result = spawnSync(shell, [posixPath(join(repo, '.git', 'hooks', 'pre-commit'))], {
       cwd: repo,
       encoding: 'utf-8',
+      // 父进程（测试运行器 / agent）可能带着 agent 标记；不清掉的话
+      // 脚本会把「人改策略」误判成 agent 提交而拦下 —— 测的就不是本组要看的事了。
+      env: { ...process.env, ZELTO_SLICE_ID: '', ZELTO_SESSION_ID: '', ZELTO_AGENT_SESSION_ID: '' },
     });
 
     assert.notEqual(
@@ -220,10 +239,10 @@ describe('installed git hook on a protected path', { concurrency: false }, () =>
       join(repo, 'policy', 'policy.yaml'),
       [
         'rules:',
-        '  - id: allow-docs',
-        '    match: { path: "docs/**", operation: "write" }',
+        '  - id: allow-policy',
+        '    match: { path: "policy/**", operation: "write" }',
         '    action: allow',
-        '    basis: "policy.yaml#allow-docs"',
+        '    basis: "policy.yaml#allow-policy"',
         '',
       ].join('\n'),
       'utf-8',
@@ -240,7 +259,7 @@ describe('installed git hook on a protected path', { concurrency: false }, () =>
       // 与上一组 describe 同理：钉死 node 路径，避免 shell 选中 PATH 里的坏 stub
       hookScript('pre-commit', 'git diff --cached --quiet --exit-code', { nodePath: process.execPath }),
       'utf-8',
-    );
+  );
 
     // 改一个保护域文件并暂存
     writeFileSync(join(repo, 'policy', 'policy.yaml'), 'rules: []\n', 'utf-8');

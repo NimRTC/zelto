@@ -1,4 +1,4 @@
-// zelto merge — 显式合并：签字之后的唯一归并路径
+﻿// zelto merge — 显式合并：签字之后的唯一归并路径
 //
 // ADR-018：签字只改状态，合并必须显式执行。
 // 这里承接原先住在签字路径里的全部合并职责——提交 worktree 产物、
@@ -11,7 +11,16 @@
 import { join } from 'node:path';
 import { formatMergePlan } from '../../core/sched/merge.js';
 import { parseDependsOnArgs } from '../../core/sched/depgraph.js';
-import { register, store, events, resolveSpecDir, ZELTO_DIR, worktreeManager, validateVersionLabelArg } from './shared.js';
+import {
+  register,
+  store,
+  events,
+  resolveSpecDir,
+  ZELTO_DIR,
+  worktreeManager,
+  validateVersionLabelArg,
+  inVersionContext,
+} from './shared.js';
 import { SignManager } from '../../core/gate/sign.js';
 import { buildMergePlan } from './merge-plan.js';
 import { executeMergePlan, branchExists, verifyArtifactsInRef, type MergeSliceInfo } from './merge-executor.js';
@@ -24,6 +33,7 @@ import {
 import {
   resolveSliceOwnership,
   AmbiguousOwnershipError,
+  UnresolvedOwnershipError,
   type SliceOwnership,
 } from '../../core/version/branch.js';
 
@@ -108,7 +118,14 @@ register('merge', async (args) => {
   //   2. 版本计划成员扫描
   //   3. 规格 frontmatter 的 `version:` 字段
   //   4. 兜底：合进主仓当前分支（= 改造前的行为，老项目无感）
+  //
+  // **版本上下文里第 4 条不生效**（ADR-121）：人在版本工作目录里跑 merge、
+  // 版本分支明明存在，解析不出归属却静默合主干 —— 那会让
+  // 「这一版做完了」变成一句谎话（实测 nimrtc-v14，2026-11-26：
+  // 7 个 v1 的切片 + 6 个 v3 的切片就是这样绕过版本分支进的主干）。
   const manager = worktreeManager();
+
+  const versionContext = inVersionContext();
 
   /**
    * 解析一个切片的归属。显式 `--target` 时直接用它。
@@ -120,6 +137,7 @@ register('merge', async (args) => {
       specPath: slice?.spec.path ?? null,
       planId: planArg,
       targetBranch: targetOverride,
+      versionContext,
     });
   };
 
@@ -261,6 +279,26 @@ register('merge', async (args) => {
     } catch (err) {
       if (err instanceof AmbiguousOwnershipError) {
         console.error(`❌ ${err.message}`);
+        return 1;
+      }
+      if (err instanceof UnresolvedOwnershipError) {
+        // 版本上下文里解析不出归属 —— **停下**（ADR-121）。
+        //
+        // 旧行为是兜底合主干：解析不出归属时 `kind='main'`，
+        // 而 `resolveTarget(null)` 取 `dir = process.cwd()` ——
+        // 在版本工作目录里那就是版本分支本身。
+        //
+        // 所以**落点碰巧没错**（实测 nimrtc-v14：12 个切片的产物全在
+        // `version/v3` 上），**错的是归属**：
+        //   - 事件流写 `target=main`，而实际分支是 `version/v3` —— 追溯链说谎
+        //   - 计划里 v1 的 7 个切片落在 `version/v3` 上 —— 版本归属被跳过
+        //   - 版本状态同步被跳过 —— `version/v1` 上一个 Merge slice 都没有
+        //
+        // 兜底让这三件事同时「看起来正常」。停下才能让人把归属说清楚。
+        console.error(`❌ ${err.message}`);
+        console.error('');
+        console.error('   这是 ADR-121 的 fail closed：版本上下文里解析不出归属就停下，');
+        console.error('   不再静默兜底（那会让「这版做完了」与分支事实对不上）。');
         return 1;
       }
       throw err;

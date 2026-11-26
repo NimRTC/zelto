@@ -212,8 +212,29 @@ function table(headers, rows) {
   return t;
 }
 
-function stateBadge(state) {
-  return el('span', 'badge state-' + state, state);
+/**
+ * 状态徽标。
+ *
+ * 第二参 `slice` 可选：传进来时，若这片**停机过**（`stalled`）就在状态
+ * 徽标后追加一个「⚠ 停机(分类)」标记。
+ *
+ * 为什么必须标：停机（stall）与状态（state）是**两件事** ——
+ * `run.aborted` 之后切片回到 `frozen`（可重跑），但 `stall` 仍记着
+ * 「上次跑挂了」这一事实（ADR-047）。只显示 `frozen` 而不说停机，
+ * 人会以为「这片还没开始跑」，实际是「跑了、挂了、可重跑」。
+ * 实测（2026-11-26，v1-rtcp-processor-collaborator）：agent 因未登录
+ * exit 1，列表行只显示 `frozen` + 活性「—」，看不出它跑挂过。
+ */
+function stateBadge(state, slice) {
+  var wrap = el('span');
+  wrap.appendChild(el('span', 'badge state-' + state, state));
+  if (slice && slice.stalled) {
+    var s = el('span', 'badge live-stale', '⚠ 停机');
+    s.title = '上次运行被停机（' + (slice.stallClass || '原因未分类') + '）—— 可重跑 / 续跑，不是「还没跑」';
+    wrap.appendChild(document.createTextNode(' '));
+    wrap.appendChild(s);
+  }
+  return wrap;
 }
 
 /**
@@ -416,8 +437,89 @@ function branchCountCell(onBranch, gap) {
   return box;
 }
 
-async function viewOverview(target) {
-  const s = await apiGet('/api/summary');
+/**
+ * 执行目录脉络（多工作区进展）—— 总览页的一节。
+ *
+ * 为什么要有它：ADR-112 只让人看见「仓库根 + 版本集成目录」这两种根；
+ * 但同一个仓库在盘上常常还有**别的检出**——
+ *
+ *   - `.zelto/worktrees/<sliceId>/`：`zelto run` 建的切片执行目录规；
+ *   - `git worktree list` 里那些**不是 zelto 建的**工作区
+ *     （实测 nimrtc-v14：`D:/MyOpen/_wt_v14_code`、`D:/MyOpen/_wt_v14_docs`）。
+ *
+ * 看不见它们 = 人在那条工作区里做的事情，驾驶舱一个字也不会提。
+ * 这一节只**摆事实**（种类 / 路径 / 分支 / HEAD / 它名下的切片），
+ * 不判定「哪条好、哪条该收」。
+ */
+function renderWorktreeMap(target, map) {
+  if (!map || !Array.isArray(map.entries) || map.entries.length === 0) return;
+  const kindName = {
+    root: '仓库根',
+    version: '版本集成目录',
+    slice: '切片执行目录',
+    extra: '额外工作区'
+  };
+  target.appendChild(el('h2', null, '执行目录脉络（' + map.entries.length + '）'));
+  target.appendChild(el('p', 'muted small',
+    '同一个仓库在盘上有几份检出 —— 仓库根、版本集成目录（version/<v>）、' +
+    '切片执行目录（slice/<id>，zelto run 建的）、以及 git 记录的额外工作区。' +
+    '切片状态只从 .zelto 根读；执行目录里的是基线快照，不当状态用。'));
+  target.appendChild(table(
+    ['种类', '路径', '分支 / HEAD', '本目录状态', '本片位置'],
+    map.entries.map(function (e) {
+      const kindCell = el('span', 'badge', kindName[e.kind] || e.kind);
+      const bh = el('span');
+      if (e.branch) bh.appendChild(el('code', null, e.branch));
+      else bh.appendChild(el('span', 'muted', e.head ? 'detached' : '未知'));
+      if (e.head) bh.appendChild(el('span', 'muted small', ' @' + String(e.head).slice(0, 8)));
+      // 「这条战线的活是否已在主干里」—— 只是 git 祖先关系（HEAD ⊆ 主干），
+      // 不是版本交付状态。全列出来的时候 v1/v2/v3 早就合进主干，
+      // 不标的话人会把「5 条版本战线」读成「5 个版本在并行」。
+      if (e.kind === 'version') {
+        if (e.mergedIntoTrunk === true) {
+          bh.appendChild(el('span', 'badge', ' 已并入主干'));
+        } else if (e.mergedIntoTrunk === false) {
+          bh.appendChild(el('span', 'badge live-stale', ' 有未合并提交'));
+        }
+      }
+      const stateCell = el('span', 'muted small', e.hasZeltoState ? '有 .zelto 状态' : '无');
+      const sliceCell = el('span');
+      if (!e.slices || e.slices.length === 0) {
+        sliceCell.textContent = '—';
+      } else if (e.kind === 'slice') {
+        const s = e.slices[0];
+        sliceCell.appendChild(stateBadge(s.state, s));
+        sliceCell.appendChild(el('span', null, ' ' + s.id));
+        // 执行目录自己的 .zelto 只是基线快照 —— 状态借自它真正所在的根
+        sliceCell.appendChild(el('span', 'muted small',
+          '（状态取自' + rootName(s.scope, s.label) + '）'));
+      } else {
+        sliceCell.appendChild(el('span', null, e.slices.length + ' 片 · ' +
+          e.slices.filter(function (s) { return s.state === 'completed'; }).length + ' 完成'));
+        // 状态分布：一眼看出这条战线卡在哪一段（frozen = 待跑，running = 在跑）
+        const dist = {};
+        e.slices.forEach(function (s) { dist[s.state] = (dist[s.state] || 0) + 1; });
+        const parts = Object.keys(dist).map(function (k) { return k + ' ' + dist[k]; });
+        if (parts.length > 0) {
+          const line = el('div', 'muted small', parts.join(' · '));
+          sliceCell.appendChild(line);
+        }
+      }
+      const row = {
+        cells: [kindCell, el('code', null, e.dir), bh, stateCell, sliceCell]
+      };
+      if (e.slices && e.slices.length > 0) {
+        row.onClick = function () {
+          const s = e.slices[0];
+          showSliceDetail(s.id, false, { scope: s.scope, label: s.label });
+        };
+      }
+      return row;
+    })
+  ));
+}
+
+async function viewOverview(target) {  const s = await apiGet('/api/summary');
   // ADR-114：计划对照表 —— 拿不到就整节不显示（不编一份计划出来）
   let coverage = null;
   try {
@@ -463,6 +565,20 @@ async function viewOverview(target) {
   cards.appendChild(baseCard);
 
   target.appendChild(cards);
+
+  // ── 执行目录脉络（多工作区进展）─────────────────────────────────
+  //
+  // 「同一个仓库在盘上有几份检出、每份各在哪、各承担什么」——
+  // 之前列表里只有「仓库根 / 版本目录」，人在 D:/_wt_v14_code 这种
+  // 手工并行工作区里签过的字，驾驶舱一个字也不会提。
+  // 拿不到就整节不显示（不编）。
+  var worktreeMap = null;
+  try {
+    worktreeMap = await apiGet('/api/worktrees');
+  } catch (err) {
+    worktreeMap = null;
+  }
+  renderWorktreeMap(target, worktreeMap);
 
   // ── 扫了哪些根（ADR-112）─────────────────────────────────────────
   //
@@ -635,6 +751,20 @@ async function viewSlices(target) {
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
 
+  // ── 执行目录脉络（多工作区进展）─────────────────────────────────
+  //
+  // 切片表只分「仓库根 / 版本目录」两类根；同一仓库在盘上还有别的工作区
+  // （zelto run 建的执行目录、git 额外工作区）。先把「几条战线」摆出来，
+  // 每条战线附上它名下的切片与分支/HEAD —— 再往下才是逐片明细。
+  // 拿不到就整节不显示（不编）。
+  var worktreeMap = null;
+  try {
+    worktreeMap = await apiGet('/api/worktrees');
+  } catch (err) {
+    worktreeMap = null;
+  }
+  renderWorktreeMap(target, worktreeMap);
+
   // ── ADR-112：按「根」分组 ────────────────────────────────────────
   //
   // 合并后的总数会让人以为「都在一个地方」。实际上 v3 集成目录里的
@@ -686,7 +816,7 @@ async function viewSlices(target) {
           var cells = [
             s.id,
             s.title,
-            stateBadge(s.state)
+            stateBadge(s.state, s)
           ];
           if (planIndex) cells.push(planCell(planIndex, s.id));
           cells.push(
@@ -718,7 +848,7 @@ async function viewSlices(target) {
             cells: [
               s.id,
               s.title,
-              stateBadge(s.state),
+              stateBadge(s.state, s),
               traceCounts(s.trace),
               String(s.writeCount),
               new Date(s.updatedAt).toLocaleString()
@@ -741,6 +871,18 @@ async function viewSlices(target) {
 function livenessCell(s) {
   var box = el('span');
   if (s.state !== 'running') {
+    // 非 running 片一般没有活性概念（显示「—」）。但**停机过**的片例外：
+    // 它不是「没在运行」这么简单，而是「上次跑挂了、等人处理」。
+    // 只显示「—」会让人误以为这片还没跑过（实测 2026-11-26）。
+    if (s.stalled) {
+      var warn = el('span', 'badge live-stale', '停机');
+      warn.title = (s.stallClass || '原因未分类') + ' —— 可重跑 / 续跑';
+      box.appendChild(warn);
+      if (s.lastRunOk === false && typeof s.runCount === 'number') {
+        box.appendChild(el('div', 'muted small', '上次运行失败（共 ' + s.runCount + ' 次）'));
+      }
+      return box;
+    }
     box.appendChild(el('span', 'muted', '—'));
     return box;
   }
@@ -1485,6 +1627,14 @@ function renderLiveBox(box, summary) {
   const row = el('div', 'check');
   row.appendChild(el('span', 'label', '状态'));
   row.appendChild(el('span', null, summary.state));
+  // 停机是独立于 state 的事实（ADR-047）：state 回到 frozen 可重跑，
+  // stall 仍记着上次跑挂了。详情页要说出来，否则「frozen」会被读成「没跑过」。
+  if (summary.stalled) {
+    row.appendChild(document.createTextNode(' '));
+    const w = el('span', 'badge live-stale', '⚠ 停机');
+    w.title = '上次运行被停机（' + (summary.stallClass || '原因未分类') + '）—— 可重跑 / 续跑';
+    row.appendChild(w);
+  }
   // liveBadge / costCell / progressCell 返回的是**节点**，不是文本 ——
   // 必须 appendChild。传给 el() 的 text 会被 String() 成 "[object HTMLSpanElement]"
   // （2026-11-19 实测：详情页那一块真的显示了这串东西）。

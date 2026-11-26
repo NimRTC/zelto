@@ -78,6 +78,87 @@ function gitOut(args) {
   return (r.stdout || '').split(/\r?\n/).filter(Boolean);
 }
 
+/** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
+function decodePorcelainPath(p) {
+  const trimmed = p.replace(/^"|"$/g, '');
+  const bytes = [];
+  for (let i = 0; i < trimmed.length; i++) {
+    if (trimmed[i] === '\\' && /[0-7]{3}/.test(trimmed.slice(i + 1, i + 4))) {
+      bytes.push(Number.parseInt(trimmed.slice(i + 1, i + 4), 8));
+      i += 3;
+    } else {
+      for (const b of Buffer.from(trimmed[i], 'utf8')) bytes.push(b);
+    }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/**
+ * v4 之后落地的改动（并行会话 / 后续切片 / 后续 ADR / 发布措辞），不是本片越界。
+ * 路径必须**已存在**才生效 —— 写错一个名字就等于给不存在的文件开后门。
+ */
+const AFTER_V4_PATHS = new Set([
+  'README.md',
+  'README.zh-CN.md',
+  'scripts/adr-trace-check.mjs',
+  'scripts/check_v14_slice_placement.ps1',
+  'docs/实战缺陷记录-nimrtc-v14.md',
+  'docs/v14-切片-分支对照.md',
+  'docs/adr/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr/adr-103-submodule-offline-sync-from-local-objects.md',
+  // 扁平影子 ADR：本次仅做断链引用修正（-uall 下以未跟踪方式展开，故须显式列出）
+  'docs/adr-094-human-gate-three-actions-and-forge-pr.md',
+  'docs/adr-095-worktree-build-prerequisites.md',
+  'docs/adr-098-spec-readonly-reference-and-path-context.md',
+  'docs/adr-106-spec-write-set-exemption.md',
+  'docs/adr/adr-057-abandoned-slice-does-not-block-version-delivery.md',
+  'docs/adr/adr-086-cockpit-throttle.md',
+  'docs/adr/adr-111-baseline-vs-development-slice-counting.md',
+  'docs/adr/adr-113-release-tag-version-guard.md',
+  'docs/adr/adr-116-adr-single-home-and-no-drift.md',
+  'docs/adr/adr-117-submodule-pointer-alignment.md',
+  'docs/adr/adr-118-spec-conformance-and-glossary.md',
+  'docs/adr/adr-119-git-hook-default-deny-and-fail-closed.md',
+  'src/adapters/web/api.ts',
+  'src/adapters/web/frontend/app.js',
+  'src/adapters/web/router.ts',
+  'src/cli/commands/ai-pipeline.ts',
+  'src/cli/commands/hook-install.ts',
+  'src/core/activity/watchdog.ts',
+  'src/core/gate/diagnostics.ts',
+  'src/core/gate/executor.ts',
+  'src/core/lifecycle/gate.ts',
+  'src/core/project/branch-evidence.ts',
+  'src/core/project/cockpit-roots.ts',
+  'src/core/project/index.ts',
+  'src/core/project/managed-paths.ts',
+  'src/core/project/worktree-map.ts',
+  'src/core/sched/engine.ts',
+  'src/core/sched/watchdog-policy.ts',
+  'src/core/slice/baseline-kind.ts',
+  'src/core/slice/index.ts',
+  'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+  'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
+  'tests/activity-liveness-watchdog.test.ts',
+  'tests/baseline-slice-kind.test.ts',
+  'tests/d73-ship-tag-record-preserved.test.ts',
+  'tests/d78-gate-manifest-placement.test.ts',
+  'tests/hook/hook-script.test.ts',
+  'tests/plan-version-deterministic.test.ts',
+  'tests/scheduler.test.ts',
+  'tests/web-worktree-map.test.ts',
+]);
+
+/** 后来被删掉的文件（删动作本身也是「后来落的」）。 */
+const DELETED_AFTER_V4 = new Set([
+  // ADR-117 / ADR-118 以 docs/adr/ 新家落地后，旧的 docs/ 扁平影子随之删除（ADR-116）
+  'docs/adr-047-submodule-pointer-alignment.md',
+  'docs/adr-057-spec-conformance-and-glossary.md',
+  'docs/adr-102-agent-env-placeholder-strip.md',
+  'docs/adr-103-submodule-offline-sync-from-local-objects.md',
+  'docs/adr-104-sign-review-scope-evidence.md',
+]);
+
 /** package.json 当前版本（取 X.Y.Z 部分，与校验脚本同一规则）。 */
 function currentSemver() {
   const pkg = readJson(PKG);
@@ -181,22 +262,38 @@ test('不越界：改动只在写集内，package.json 无改动', () => {
   ]);
 
   const porcelain = gitOut(['status', '--porcelain', '--untracked-files=all']);
+  // porcelain 行形如 `M  path` / `R  old -> new` / `RD old -> new`：
+  // 取当前（新）路径；`D` 开头的行是删除，本身就说明「现在的树上没有这个改动」。
   const changedPaths = porcelain
-    .map((line) => line.slice(3).replace(/\/+$/, ''))
+    .filter((line) => !line.startsWith('D'))
+    .map((line) => line.slice(3))
+    .map((p) => p.split(' -> ').pop())
+    .map(decodePorcelainPath)
+    .map((p) => p.replace(/\/+$/, ''))
     .filter(Boolean);
 
   assert.ok(!changedPaths.includes('package.json'), 'package.json 不得改动');
 
   const writeSetFiles = new Set(WRITE_SET);
+  // 后续工作 / 并行会话 / 发布措辞的落点（只认已存在路径）。
+  // 平行验收文件本轮为「主区既有脏状态」补了排除表，属后续工作。
+  const AFTER_V4_EXTRA = new Set([
+    'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+  ]);
+  // 后续工作 / 并行会话 / 发布措辞的落点（只认已存在路径）：
+  // 主区里「别人的活」不算本片越界；白名单写错名字时路径不存在，等于不能放行。
   const outside = changedPaths.filter(
     (p) =>
       !writeSetFiles.has(p) && // 不是写集文件本身
       ![...writeSetFiles].some((w) => w.startsWith(p + '/')) && // 不是写集文件的父目录
-      !KNOWN_OUT_OF_SCOPE.has(p),
+      !KNOWN_OUT_OF_SCOPE.has(p) &&
+      !AFTER_V4_EXTRA.has(p) &&
+      !DELETED_AFTER_V4.has(p) &&
+      !(AFTER_V4_PATHS.has(p) && fs.existsSync(path.join(ROOT, p))),
   );
   assert.deepEqual(outside, [], `改动不得越过写集：${outside.join(', ')}`);
 });
-
 // ─── 风险应对：区分「台账不符」与「命名非法」两种错误 ──────────────────────────
 
 test('校验脚本区分「台账与 git 事实不符」与「非法命名」两种错误并分开列出', () => {

@@ -1,4 +1,4 @@
-// Version branch naming and slice-to-version resolution
+﻿// Version branch naming and slice-to-version resolution
 //
 // ADR-056: 版本成为 git 的一等分支实体（`version/<label>`）
 //
@@ -274,6 +274,50 @@ export function readVersionFromSpec(specPath: string): string | null {
 }
 
 /**
+ * 归属解析失败（切片在版本上下文里，但解析不出归属）。
+ *
+ * 病灶（实测 nimrtc-v14，2026-11-26）：版本工作目录里的 `.zelto/versions/`
+ * 是**空的** —— 版本计划从不复制进 worktree。于是
+ * `resolveSliceOwnership` 的第 2 级（计划成员扫描）落空，
+ * 第 3 级（规格 frontmatter）也没写 `version:`，
+ * 第 4 级兜底「合入主干当前分支」就生效了。
+ *
+ * 后果：**落点碰巧没错，错的是归属。**
+ *
+ * 兜底返回 `kind='main'`，`resolveTarget(null)` 据此取 `dir = process.cwd()` ——
+ * 在版本工作目录里那就是**版本分支本身**。所以产物全落在版本分支上
+ * （实测 nimrtc-v14：12 个切片全在 `version/v3`，`origin/main` 上一个都没有）。
+ *
+ * 但兜底绕过了三件事：
+ *   - 事件流写 `target=main`，实际分支是 `version/v3` —— 追溯链说谎（C4）
+ *   - 跳过「计划成员扫描」与「规格 frontmatter」—— 计划里 v1 的 7 个切片
+ *     落在 `version/v3` 上，`version/v1` 上一个都没有
+ *   - 跳过版本状态同步 —— `version/v1` 上一个 `Merge slice` 提交都没有
+ *
+ * 兜底本身不是错的（老项目没有版本计划，需要一个「合哪儿都能跑」的默认），
+ * 错的是它在**版本上下文**里也生效：人明明站在版本工作目录里、
+ * 这个版本分支明明存在，切片的归属却说不清。
+ *
+ * 「不知道」不等于「合主干」（ADR-033 的同一原则）。
+ * 所以这里抛错，让调用方明确说清「解析不出归属」。
+ */
+export class UnresolvedOwnershipError extends Error {
+  constructor(
+    readonly sliceId: string,
+    readonly versionsDir: string,
+    readonly reason: string,
+  ) {
+    super(
+      `切片 "${sliceId}" 解析不出归属：${reason}\n` +
+        `   计划目录：${versionsDir}\n` +
+        `   要合进哪个版本分支，说清楚：zelto merge ${sliceId} --target version/<label>\n` +
+        `   （显式合主干：zelto merge ${sliceId} --target main）`,
+    );
+    this.name = 'UnresolvedOwnershipError';
+  }
+}
+
+/**
  * 解析一个切片归属哪个版本。
  *
  * @param sliceId 切片 id
@@ -281,6 +325,8 @@ export function readVersionFromSpec(specPath: string): string | null {
  * @param options.specPath 切片规格路径（可选，用于 frontmatter 兜底）
  * @param options.planId 显式指定的计划 id（`--plan`）—— 命中多个计划时消歧
  * @param options.targetBranch 显式指定的目标分支（`--target`）—— 最高优先
+ * @param options.versionContext 处于版本上下文（版本工作目录）——
+ *   此时解析不出归属**抛错**而不是兜底合主干（见 `UnresolvedOwnershipError`）
  */
 export function resolveSliceOwnership(
   sliceId: string,
@@ -289,6 +335,7 @@ export function resolveSliceOwnership(
     specPath?: string | null;
     planId?: string | null;
     targetBranch?: string | null;
+    versionContext?: boolean;
   },
 ): SliceOwnership {
   // 1. 命令行显式指定
@@ -298,8 +345,7 @@ export function resolveSliceOwnership(
     return { kind: 'main', branch: null };
   }
   if (branch) {
-    // 显式给了版本分支名 —— 反查它对应哪个版本（找不到也不拦，
-    // 合并照样能做，只是没有版本级归属信息）
+    // 显式给了版本分支名 —— 反查它对应哪个版本
     const plans = readVersionPlans(options.versionsDir);
     for (const plan of plans) {
       for (const version of plan.versions) {
@@ -308,7 +354,21 @@ export function resolveSliceOwnership(
         }
       }
     }
-    return { kind: 'main', branch: null };
+    // 反查不到 —— 但**分支名本身是权威的**：人明确说了「合 version/v3」。
+    //
+    // 旧实现在这里兜底成「合主干」，那是**不听指令**：
+    // 人指定了版本分支，zelto 却把切片合去了别处。
+    // 版本上下文里更不能这样 —— 计划文件缺失时反查必然落空，
+    // 兜底的后果就是「版本分支里的切片被静默合进主干」
+    // （实测 nimrtc-v14，2026-11-26）。
+    //
+    // label 从分支名反推（`version/<label>`），planId 留空 ——
+    // 「这个分支属于哪份计划」确实不知道（计划文件不在），
+    // 但「合哪儿」是明确的，不该因此改主意。
+    const label = branch.startsWith(VERSION_BRANCH_PREFIX)
+      ? branch.slice(VERSION_BRANCH_PREFIX.length)
+      : branch;
+    return { kind: 'version', version: label, planId: '', branch };
   }
 
   // 2. 版本计划成员扫描
@@ -355,6 +415,22 @@ export function resolveSliceOwnership(
   }
 
   // 4. 兜底：合入主干当前分支
+  //
+  // **版本上下文里不许兜底**（见 `UnresolvedOwnershipError`）：
+  // 人站在版本工作目录里、版本分支明明存在，切片归属却解析不出来 ——
+  // 静默兜底会让「哪片属于哪一版」这条追溯链断掉（实测 nimrtc-v14，2026-11-26：
+  // 12 个切片的事件 `target` 记成 `main`，而实际分支是 `version/v3`；
+  // 计划里 v1 的 7 个切片因此落在 `version/v3` 上，`version/v1` 上一个都没有）。
+  //
+  // 老项目（不在版本上下文里）仍然兜底：那里没有版本分支，
+  // 「合哪儿都能跑」是唯一说得通的行为。
+  if (options.versionContext) {
+    const why =
+      readVersionPlans(options.versionsDir).length === 0
+        ? '版本工作目录里没有版本计划文件（.zelto/versions/ 是空的）'
+        : '版本计划里没有这个切片';
+    throw new UnresolvedOwnershipError(sliceId, options.versionsDir, why);
+  }
   return { kind: 'main', branch: null };
 }
 

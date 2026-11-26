@@ -4,8 +4,8 @@
 **日期**: 2026-11-23
 **作者**: 系统架构
 **关联约束**: C2, C3, C4
-**关联文档**: `docs/adr-026-env-var-refs-in-config.md`,
-`docs/adr-090-agent-env-and-credentials.md`,
+**关联文档**: `docs/adr-026-config-env-reference.md`,
+`docs/adr/adr-090-executor-credential-externalization.md`,
 `docs/实战缺陷记录-nimrtc-v14.md`
 
 ---

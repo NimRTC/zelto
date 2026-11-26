@@ -1,4 +1,10 @@
-# ADR-057: 规格符合性检查与领域词汇表 —— 补上「出处说了什么，代码真的做了」
+# ADR-118：规格符合性检查与领域词汇表 —— 补上「出处说了什么，代码真的做了」
+
+> **原编号 ADR-057**。与 `docs/adr/adr-057-abandoned-slice-does-not-block-version-delivery.md`
+> 同号（两份是不同的决定），按 ADR-116 决策一改号为 118。
+> 历史上 `ADR-057` 的引用混指两份：`zelto spec-check` / `zelto glossary` 及其
+> `spec.*` 事件见 `src/core/events/stream.ts` 的接线，属本文件；「放弃的切片
+> 不阻塞交付」属 057。
 
 **状态**: 部分实现（§5 已落地），§6 待决策
 **日期**: 2026-11-22
