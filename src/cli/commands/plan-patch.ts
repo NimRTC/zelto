@@ -25,6 +25,10 @@
 import { createInterface } from 'node:readline';
 import { VersionStore } from '../../core/version/store.js';
 import {
+  formatPlanCopyRefresh,
+  refreshPlanCopiesIntoAllVersionWorkspaces,
+} from '../../core/version/plan-copy.js';
+import {
   applyPlanPatch,
   findDuplicateSliceIds,
   type PlanPatch,
@@ -386,6 +390,34 @@ export async function planPatch(args: string[]): Promise<number> {
     const msg = err instanceof Error ? err.message : String(err);
     f.error('WRITE_FAILED', `写入版本计划失败：${msg}`);
     return 1;
+  }
+
+  // ── 版本工作目录里的计划副本保鲜（ZD-064）────────────────────────
+  //
+  // 病灶（实测 nimrtc-v14，2026-11-27）：版本工作目录
+  // `.zelto/version-worktrees/<label>/.zelto/versions/<id>.json`
+  // 是建版那一刻复制进去的**副本**，之后**再也不会更新**。
+  //
+  // 后果不是「多显示一点旧信息」，是**归属解析被污染**：
+  // `resolveSliceOwnership` 读的是**当前目录**下的 `.zelto/versions/`。
+  // 在版本目录里跑 merge 时读到的就是那份陈旧副本 —— 实测 ADR-127 修完归属后：
+  //
+  //   切片 v1-ice-recovery
+  //     根真源归属：v3   ← 规格自己写明归 v3
+  //     v5 副本归属：v1   ← 陈旧副本说的
+  //
+  // 于是基点从哪个版本分支 tip 起、该合到哪条分支，全按**错的归属**算。
+  //
+  // 为什么在「改计划」这一刻同步，而不是「读计划」那一刻：
+  //   - 读的时候同步 → 每个读点都得记得同步 → 漏一个就错一个；
+  //   - 改的时候同步 → 一次写，所有副本同时跟上 → 不可能漏。
+  //
+  // 副本同步失败**不阻塞**这次修正（真源已落盘）——
+  // 但必须**说出来**，否则就是「悄悄留了个坑」。
+  const repoRoot = process.cwd();
+  const refreshResults = refreshPlanCopiesIntoAllVersionWorkspaces(repoRoot, id);
+  for (const line of formatPlanCopyRefresh(refreshResults)) {
+    f.out(`   ${line}`);
   }
 
   // C4：每次修正都写 append-only 事件

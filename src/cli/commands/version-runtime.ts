@@ -14,7 +14,6 @@
 // C6: cli/ 层，不涉及 core/ 的依赖方向
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Version, VersionPlan } from '../../core/version/types.js';
 import {
@@ -23,6 +22,7 @@ import {
   versionTagName,
   versionWorktreeRelativePath,
 } from '../../core/version/branch.js';
+import { refreshPlanCopyIntoVersionWorkspace } from '../../core/version/plan-copy.js';
 import {
   detectCrossVersionConflicts,
   type CrossVersionConflict,
@@ -325,31 +325,28 @@ export async function prepareVersionWorkspace(
  *
  * 复制失败**不阻塞**建目录：副本是派生的，缺了它会让后续 merge 停下，
  * 但那可以在 merge 那一刻说清楚 —— 不该在这里把整个 version start 拦死。
+ *
+ * ── 与「副本保鲜」的关系（ZD-064）────────────────────────────────
+ *
+ * 这里只负责**建版那一刻**把副本放进去。
+ * 之后的保鲜（真源改了要让副本跟上）由 `core/version/plan-copy.ts` 负责，
+ * `zelto plan patch` 会调它 —— 这里是「建版时放一份」，
+ * 那里是「改计划时同步」。
+ *
+ * 为什么不合成一处：建版只关心**这一个**版本目录，
+ * 而保鲜要扫**所有**已存在的版本目录（改一份计划影响全部副本）。
  */
 function copyPlanIntoVersionWorkspace(
   plan: VersionPlan,
   worktreePath: string,
   repoRoot: string,
 ): string | null {
-  const src = join(repoRoot, '.zelto', 'versions', `${plan.id}.json`);
-  const destDir = join(worktreePath, '.zelto', 'versions');
-  const dest = join(destDir, `${plan.id}.json`);
-  try {
-    if (!existsSync(src)) return null;
-    mkdirSync(destDir, { recursive: true });
-    // 内容一致就不重写 —— 免得每次 version start 都动一次 mtime
-    let same = false;
-    try {
-      same = readFileSync(dest, 'utf-8') === readFileSync(src, 'utf-8');
-    } catch {
-      same = false;
-    }
-    if (!same) copyFileSync(src, dest);
-    return `计划：${plan.id}.json 已复制进版本工作目录（归属解析靠它）`;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return `⚠️  计划文件复制进版本工作目录失败（${msg}）—— 在这个目录里跑 merge 时归属会解析不出来`;
+  const res = refreshPlanCopyIntoVersionWorkspace(repoRoot, worktreePath, plan.id);
+  if (!res.synced) {
+    if (res.reason?.startsWith('真源不存在')) return null;
+    return `⚠️  计划文件复制进版本工作目录失败（${res.reason}）—— 在这个目录里跑 merge 时归属会解析不出来`;
   }
+  return `计划：${plan.id}.json 已复制进版本工作目录（归属解析靠它）`;
 }
 
 /**

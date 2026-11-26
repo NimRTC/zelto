@@ -404,6 +404,17 @@ stdout: {"decision":"allow","decision_id":"hook-...","basis":"...","policy_versi
 **版本状态机**：`planned → in_progress → integrated → delivered`
 （ADR-017 新增 `integrated` 中间态：版本级验收通过但尚未交付）。
 
+**计划副本保鲜**（ADR-132）：`.zelto/versions/<id>.json` 是**运行时真源**；
+版本工作目录里的 `.zelto/version-worktrees/<label>/.zelto/versions/<id>.json`
+是它的**副本**。副本必须**保鲜** —— 真源一改（`zelto plan patch`），
+所有已存在的版本工作目录里的副本就同步（`core/version/plan-copy.ts`）。
+
+为什么必须保鲜：归属解析（`resolveSliceOwnership`）读的是**当前目录**下的
+`.zelto/versions/` —— 在版本目录里跑 merge 时读到的就是那份副本。
+副本陈旧 = 归属按错的版本算 = 基点与合并目标都错。
+真源必须唯一（副本不能反过来当权威），同步在**改计划**那一刻做而非**读**那一刻做。
+副本同步失败不阻塞修正，但必须点名哪个版本目录没跟上。
+
 **草稿评审**（ADR-023）：`core/review/` 是纯计算层——
 `diff.ts`（行级 LCS diff）、`decision-points.ts`（决策点抽取）、
 `review.ts`（`buildDraftReview`）、`revisions.ts`（快照存储）。
