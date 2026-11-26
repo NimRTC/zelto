@@ -319,6 +319,21 @@ export async function classifyLivenessAsync(
 }
 
 /**
+ * 一条运行记录里「有没有 pid 可查」。
+ *
+ * 「有 pid」= 有具体的进程可以问进程表 —— 活性判定**确定**；
+ * 「没有 pid」= 只能靠时间推断（老会话文件 / 被覆盖写坏的现场）。
+ *
+ * ADR-124 修法二要用它区分两种 stale：
+ *   - stale **且有** pid → 可能只是长时间构建，不下死手（拒绝起跑）；
+ *   - stale **且无** pid → 没有任何东西能证明它还活着，放行（让人能重跑）。
+ */
+export function hasPidOf(record: LivenessRecord | null | undefined): boolean {
+  if (!record) return false;
+  return typeof record.pid === 'number' || typeof record.agentPid === 'number';
+}
+
+/**
  * 最后活动时间 —— 心跳优先，其次输出时间，最后启动时间。
  *
  * 顺序有讲究：**心跳是「进程还管着这件事」的证据**，输出只是副产品。

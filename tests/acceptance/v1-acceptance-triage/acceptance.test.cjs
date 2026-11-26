@@ -82,6 +82,18 @@ const AFTER_V4_PATHS = new Set([
   'tests/plan-version-deterministic.test.ts',
   'tests/scheduler.test.ts',
   'tests/web-worktree-map.test.ts',
+  // ADR-124（孤立记录可见可收 + 重复 agent 守卫修法二）是并行会话的落点
+  'docs/adr/adr-124-orphan-records-must-be-visible-and-reapable.md',
+  'docs/adr/adr-125-supervisor-must-not-hang-on-exit.md',
+  'src/cli/commands/orphan-records.ts',
+  'src/cli/commands/core-slice.ts',
+  'src/cli/commands/info-help.ts',
+  'src/core/activity/liveness.ts',
+  'src/core/activity/index.ts',
+  'src/core/stall/reap.ts',
+  'tests/adr-053-dead-slice-reap.test.ts',
+  'tests/d065-stuck-running-shell.test.ts',
+  'tests/adr-124-duplicate-agent-guard.test.ts',
 ]);
 
 /** 后来被删掉的文件（删动作本身也是「后来落的」）。 */

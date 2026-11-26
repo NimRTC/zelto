@@ -23,7 +23,6 @@ import type { SliceData, SliceStore } from '../slice/store.js';
 import {
   classifyLiveness,
   readRecoveries,
-  readSliceLivenessRecord,
   readSliceLivenessRecords,
   type LivenessInfo,
 } from '../activity/index.js';
@@ -172,15 +171,45 @@ export function classifyOrphanShell(
   isProcessAlive?: (pid: number) => boolean,
 ): LivenessInfo | null {
   try {
-    const rec = readSliceLivenessRecord(projectRoot, sliceId);
-    if (rec !== null) {
-      // 有 running 记录 → 可能是活着的 agent。活性判定说了算
-      // （active → 不算空壳；stale/dead → 算）。
-      return classifyLiveness(rec, { isProcessAlive });
+    // ADR-124：**两个目录合并判定**，而不是「会话优先、读到一条就收工」。
+    //
+    // 病灶（实测 nimrtc-v14 v4-d5-audio-dtx，2026-11-26）：
+    //   监督进程无收尾死亡 → 任务文件停在 running（有 lastActivityAt、有
+    //   supervisorPid，没有 pid）；适配器覆盖写把会话文件写成了 0 字节。
+    //   旧口径读会话目录 → null → 退到任务目录 → 看到那条 running 记录 →
+    //   判 active → `stall --reap` 看不见这片。而驾驶舱（读的是同一条记录）
+    //   判 stale —— 两处对同一现场给出相反结论。
+    //
+    // 新口径：**汇总两个目录的全部记录，任何一条 running 记录活性为
+    // active 就不是空壳**；否则（全部 stale/dead，或根本没有 running 记录）
+    // 就是空壳。安全边界是「宁可漏不可误」：只要有一条记录看起来还活着，
+    // 这片就不动。
+    const anyRecord = readSliceLivenessRecords(projectRoot, sliceId);
+    const running = anyRecord.filter((r) => r.status === undefined || r.status === 'running');
+
+    if (running.length > 0) {
+      const judged = running.map((r) => classifyLiveness(r, { isProcessAlive }));
+      const alive = judged.find((l) => l.state === 'active');
+      if (alive) return null; // 有人管这一轮 —— 不算空壳
+
+      // 全部 stale/dead → 空壳。reason 写清每条记录的判据，
+      // 人不用再翻一遍盘就知道为什么清它。
+      const details = judged.map((l) => l.reason).join('；');
+      const anyHasPid = running.some(
+        (r) => typeof r.pid === 'number' || typeof r.agentPid === 'number',
+      );
+      return {
+        state: judged.some((l) => l.state === 'dead') ? 'dead' : 'stale',
+        lastActivityAt: judged[0]?.lastActivityAt ?? null,
+        idleMs: judged[0]?.idleMs ?? null,
+        pid: judged.find((l) => l.pid !== null)?.pid ?? null,
+        reason:
+          `${running.length} 条运行记录都没有人在管（${details}）` +
+          (anyHasPid ? '' : '；这些记录都没有 pid 可查'),
+      };
     }
 
-    // `readSliceLivenessRecord` 只返回 status==='running' 的记录，所以
-    // rec===null 有**两种**可能，必须分开：
+    // 走到这里 = 两个目录里**一条 running 记录都没有**。必须区分：
     //
     //   (a) 盘上**一条记录都没有** → agent 从来没起过（准备阶段就挂了）
     //   (b) 有记录但都不是 running → 那一轮**已经收尾**了
@@ -203,12 +232,7 @@ export function classifyOrphanShell(
     //
     // 为什么不看「记录有多旧」：记录时间不是判据 —— 判据是
     // 「现在还有没有人在管这一轮」。没有 running 记录 = 没人管。
-    // 有 running 记录时绝不能碰（那可能是 agent 还活着）——
-    // 上面 `rec !== null` 分支已经处理了那种情况。
-    const anyRecord = readSliceLivenessRecords(projectRoot, sliceId);
-    const hasRunning = anyRecord.some((r) => r.status === undefined || r.status === 'running');
-    if (hasRunning) return null;
-
+    // 有 running 记录时看活性（上面那段，ADR-124）；只要有一条活着就不碰。
     const statuses = anyRecord.map((r) => r.status ?? 'running').join(', ');
     return {
       state: 'dead',

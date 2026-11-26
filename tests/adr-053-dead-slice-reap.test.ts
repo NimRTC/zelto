@@ -291,4 +291,67 @@ describe('D-30 · 空壳切片（running 但无停机分类、现场无人在管
     assert.equal(results.length, 0);
     assert.equal((await store.read('shell-live-2')).state, 'running');
   });
+
+  // ─── ADR-124 · 两个目录合并判定 ──────────────────────────────────────────
+  //
+  // 实测（nimrtc-v14 v4-d5-audio-dtx，2026-11-26）：监督进程无收尾死亡后，
+  // 任务文件停在 running（有 lastActivityAt、有 supervisorPid，但没有 pid），
+  // 会话文件被覆盖写成 0 字节。旧判据「会话优先、读到一条就收工」读会话
+  // 目录得 null → 退到任务目录 → 看到 running 记录 → 判 active → 看不见这片。
+
+  it('会话文件为空、任务文件是没人管的 running 记录 = 空壳（ADR-124）', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await mkdir(join(ROOT, '.zelto', 'tasks'), { recursive: true });
+    const slice = makeSlice(store, 'shell-two-dirs', 'running', null);
+    await store.write(slice);
+    // 会话文件 0 字节（覆盖写被中断的现场）
+    await writeFile(join(SESSIONS, 'claude-agent-shell-two-dirs.json'), '', 'utf-8');
+    // 任务文件：running、两小时没动、有 supervisorPid 但没有 pid
+    await writeFile(
+      join(ROOT, '.zelto', 'tasks', 'task-shell-two-dirs.json'),
+      JSON.stringify({
+        taskId: 'task-shell-two-dirs',
+        sliceId: 'shell-two-dirs',
+        status: 'running',
+        startedAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+        lastActivityAt: new Date(Date.now() - 2 * 3600_000).toISOString(),
+        supervisorPid: 999999,
+      }),
+      'utf-8',
+    );
+
+    const shells = findOrphanShells([slice], ROOT, () => false);
+    assert.equal(shells.length, 1, '两个目录合并看：任务文件里的 running 记录没人管 = 空壳');
+    assert.equal(shells[0].liveness.state, 'stale');
+    assert.match(shells[0].liveness.reason, /没有人在管/);
+  });
+
+  it('会话文件判 dead、任务文件里还有一条新鲜的 running = **不是**空壳（宁可漏不可误）', async () => {
+    const { writeFile } = await import('node:fs/promises');
+    await mkdir(join(ROOT, '.zelto', 'tasks'), { recursive: true });
+    const slice = makeSlice(store, 'shell-mixed', 'running', null);
+    await store.write(slice);
+    await writeSession('shell-mixed', {
+      sliceId: 'shell-mixed', status: 'running', pid: 999999,
+      lastActivityAt: new Date().toISOString(),
+    });
+    await writeFile(
+      join(ROOT, '.zelto', 'tasks', 'task-shell-mixed.json'),
+      JSON.stringify({
+        taskId: 'task-shell-mixed',
+        sliceId: 'shell-mixed',
+        status: 'running',
+        startedAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        pid: 4242,
+      }),
+      'utf-8',
+    );
+
+    assert.equal(
+      findOrphanShells([slice], ROOT, () => true).length,
+      0,
+      '任何一条记录看起来还活着，这片就不动',
+    );
+  });
 });

@@ -6,6 +6,9 @@ import { Scheduler } from '../../core/sched/engine.js';
 // ADR-086：续跑编排下沉到 core —— CLI 与 Web 调同一份（C3：判定不许分叉）
 import { resumeSlice } from '../../core/lifecycle/resume.js';
 import { isSliceStalled, findDeadSlices, findOrphanShells, reapDeadSlices } from '../../core/stall/index.js';
+// ADR-124 修法三：`stall --reap` 收尾的是**两个目录**里全部 running 记录
+// （会话 + 任务）—— 守卫读的是同一份记录来源，两处不许分叉。
+import { closeRunningRecord, readRunningRecordFiles } from './orphan-records.js';
 import {
   classifyLivenessAsync,
   readSessionLiveness,
@@ -1003,8 +1006,8 @@ register('reservation', async (args) => {
  * 这条命令只把状态掰回「可跑」，不动停机分类，也不碰预约 ——
  * 停机这件事本身仍然成立，人还是得逐片 `zelto resume` 走正式流程。
  */
-async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean }): Promise<number> {
-  const allIds = await store.list();
+async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean; only?: string }): Promise<number> {
+  const allIds = options.only ? [options.only] : await store.list();
   const slices: SliceData[] = [];
   for (const sid of allIds) {
     const s = await store.read(sid).catch(() => null);
@@ -1032,7 +1035,16 @@ async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean
   }
 
   if (dead.length === 0 && orphans.length === 0) {
-    console.log('没有死切片（没有卡在 running 的停机切片或空壳）。');
+    if (options.only) {
+      const s = slices[0];
+      console.log(
+        s
+          ? `切片 ${options.only} 不是死切片（state=${s.state}，stall=${s.stall.class ?? 'null'}）—— 没有可清理的。`
+          : `找不到切片 ${options.only}。`,
+      );
+    } else {
+      console.log('没有死切片（没有卡在 running 的停机切片或空壳）。');
+    }
     return 0;
   }
 
@@ -1087,7 +1099,12 @@ async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean
 }
 
 /**
- * 把被清理切片名下还写着 `running` 的任务文件收尾成 `failed`。
+ * 把被清理切片名下还写着 `running` 的运行记录收尾成 `failed`。
+ *
+ * 会话文件与任务文件**都**收（ADR-124 修法三）：重复 agent 守卫读的是
+ * 两个目录的全部 running 记录 —— 只收任务目录的话，会话目录里那条残留
+ * 记录会挡住下一轮起跑（守卫把它判成 stale 且无 pid → 放行，但每次都
+ * 多一条告警）。
  *
  * 只改状态与时间戳 —— **不删文件**：空输出 / 空 exitCode 的现场本身就是
  * 「监视器被杀、没人收尾」的证据，删掉等于毁掉追溯（C4 的精神）。
@@ -1096,23 +1113,13 @@ async function reapDeadSlicesCommand(options: { isJson: boolean; dryRun: boolean
 function closeOrphanTasks(sliceIds: string[]): number {
   const wanted = new Set(sliceIds);
   if (wanted.size === 0) return 0;
-  const dir = join(ZELTO_DIR, 'tasks');
-  if (!existsSync(dir)) return 0;
   let closed = 0;
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.json')) continue;
-    const p = join(dir, f);
-    try {
-      const task = JSON.parse(readFileSync(p, 'utf-8')) as {
-        sliceId?: string; status?: string; completedAt?: string; reason?: string;
-      };
-      if (!task.sliceId || !wanted.has(task.sliceId) || task.status !== 'running') continue;
-      task.status = 'failed';
-      task.completedAt = new Date().toISOString();
-      task.reason = 'zelto stall --reap：切片已退回 frozen，任务不再在跑';
-      writeFileSync(p, JSON.stringify(task, null, 2), 'utf-8');
-      closed++;
-    } catch { /* 坏文件跳过 */ }
+  for (const sliceId of wanted) {
+    for (const rec of readRunningRecordFiles(process.cwd(), sliceId)) {
+      if (closeRunningRecord(rec, 'zelto stall --reap：切片已退回 frozen，任务不再在跑')) {
+        closed++;
+      }
+    }
   }
   return closed;
 }
@@ -1127,6 +1134,7 @@ register('stall', async (args) => {
   if (args.includes('--help') || args.includes('-h')) {
     console.log('Usage: zelto stall [id] [--auto-resolved] [--json]');
     console.log('       zelto stall --reap [--dry-run] [--json]   批量清理死切片（ADR-053）');
+    console.log('       zelto stall --reap <id>                    只清理这一片（ADR-124）');
     console.log('');
     console.log('死切片 = 状态卡在 running 且带停机分类（提问回路 agent_question 除外）。');
     console.log('空壳   = 状态卡在 running、无停机分类，但进程已死或心跳早过阈值（D-30）。');
@@ -1144,8 +1152,12 @@ register('stall', async (args) => {
   // 为什么不能塞进 `zelto halt --rollback`：那扫的是「持有预约的进程已死」
   // （批次崩了）。死切片**没有预约** —— agent 挂了，预约已释放。
   // 两个不同的问题，不该混在一条命令里。
+  // ADR-124：`stall --reap <id>` 只处理这一片 —— 语义与批量完全一致
+  // （同一份判据、同样退回 frozen、同样留 run.aborted 证据、同样收尾
+  // 名下的 running 任务文件），不另立分支。
   if (doReap) {
-    return reapDeadSlicesCommand({ isJson, dryRun });
+    const only = id && !id.startsWith('--') ? id : undefined;
+    return reapDeadSlicesCommand({ isJson, dryRun, ...(only ? { only } : {}) });
   }
 
   if (id && !id.startsWith('--')) {

@@ -111,6 +111,14 @@ import { finishRun } from './run-finish.js';
 import { SliceProgressProbe } from './progress-probe.js';
 import { collectSliceProgress } from './progress-collect.js';
 import { loadTask, mergeSessionLiveness, patchTask, saveTask, tasksDir, type TaskInfo } from './task-store.js';
+// ADR-124 修法二：重复 agent 守卫要读**两个目录**的全部 running 记录，
+// 并在放行前把「没有 pid 可查」的残留记录收尾。
+import {
+  closeRunningRecord,
+  judgeDuplicateAgent,
+  readRunningRecordFiles,
+  type RunningRecordFile,
+} from './orphan-records.js';
 
 // 供其它命令复用（ai-pipeline.ts / question.ts）
 export { autoGateAfterRun, handleAgentFailure } from './run-support.js';
@@ -1564,41 +1572,57 @@ register('run', async (args) => {
     //   判定却说是「死了」→ 重跑 → **同一个 worktree 上起了第二个 agent**，
     //   两个 agent 互相覆盖产出，谁的成果都留不下。
     //
-    // 判据：查会话文件里最新的那条，用「整棵进程树」判活。
-    // 树还活着 → 拒绝并说清是谁在跑。
-    {
-      const rec = readSliceLivenessRecord(process.cwd(), id);
-      if (rec) {
-        const live = await classifyLivenessAsync(rec, { isProcessAlive, isProcessTreeAlive });
-        if (live.state === 'active' || live.state === 'stale') {
-          const msg =
-            `切片 "${id}" 已经有一个 agent 在运行（${live.reason}）—— ` +
-            `拒绝再起一个（两个 agent 会抢同一个 worktree）。` +
-            `先确认它是否真的还活着：zelto status`;
-          if (isJson) {
-            console.log(JSON.stringify({ sliceId: id, decision: 'blocked', reason: msg }));
-          } else {
-            console.error(`zelto run ${id} — ❌ ${msg}`);
-          }
-          // 守卫拒绝时 agent **一个都没起** —— 切片必须退回 `frozen`（D-64/D-65）。
-          //
-          // 病灶（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
-          //   `startRun` 把切片推到 `running` → 重复 agent 守卫命中（上一轮
-          //   的遗留会话记录还在）→ 直接 `return 1`，**没退状态**。
-          //   于是这片卡在 `running`，而四条路全堵死：
-          //     - `run` 拒绝跑（准入只认 frozen / completed）
-          //     - `merge` 不收它（没签字）
-          //     - `stall --reap` 看不见它（这一轮**有**会话文件，
-          //       所以不是「一条记录都没有」的空壳；但那条记录的 status
-          //       已是 `completed` → 活性判定 `finished` → 也不算 stale/dead）
-          //     - `resume` 说它没停机（stall.class 是 null）
-          //   唯一出路是 `abandon` —— 整个切片作废，规格得重写。
-          //
-          // 也就是说「撞上一个假活记录」= 切片作废。这不是设计意图。
-          await revertRunAbortedBeforeStart(id, { reason: `重复 agent 守卫拒绝：${live.reason}` });
-          return 1;
-        }
+    // 判据（ADR-124 修法二）：看**两个目录里全部** running 记录
+    // （会话 + 任务），每条各自判活：
+    //   - `active`                        → 拒绝（原样保留）
+    //   - `stale` **且有** pid            → 拒绝（可能只是长时间构建，不下死手）
+    //   - `stale` **且无** pid            → 放行，并把这条残留记录收尾
+    //
+    // 为什么要分「有 pid / 无 pid」：
+    //   「有 pid」= 有具体进程可以问进程表 —— 判活**确定**，不下死手；
+    //   「无 pid」= 没有任何东西能证明它还活着，只能靠时间推断
+    //   （老会话文件，或现场被覆盖写坏）。
+    //
+    // 病灶（实测于 nimrtc-v14 `v4-d5-audio-dtx`，2026-11-26）：
+    //   监督进程无收尾死亡 → 任务文件停在 running（有 lastActivityAt、
+    //   有 supervisorPid，**没有 pid**）；会话文件被覆盖写成 0 字节。
+    //   旧口径读会话目录 → null → 退到任务目录 → 看到 running 记录 →
+    //   判 `active` → 拒绝起跑。人想重跑却被弹回去，而且每次都写一条
+    //   `run.aborted` —— 「人想重跑」和「agent 已死」被混成同一种痕迹。
+    //
+    // 放行时必须**收尾那条残留记录**（置 failed），否则下一轮守卫
+    // 又撞上同一条记录 —— 现场不收干净，重跑这条路永远是堵的。
+    const verdict = await judgeDuplicateAgent(process.cwd(), id);
+    const staleNoPidRecord = verdict.decision === 'pass' ? verdict.staleNoPid : null;
+    if (verdict.decision === 'blocked') {
+      if (isJson) {
+        console.log(JSON.stringify({ sliceId: id, decision: 'blocked', reason: verdict.reason }));
+      } else {
+        console.error(`zelto run ${id} — ❌ ${verdict.reason}`);
       }
+      // 守卫拒绝时 agent **一个都没起** —— 切片必须退回 `frozen`（D-64/D-65）。
+      //
+      // 病灶（实测于 nimrtc-v14 v1-n5-turn-server，2026-11-20）：
+      //   `startRun` 把切片推到 `running` → 重复 agent 守卫命中（上一轮
+      //   的遗留会话记录还在）→ 直接 `return 1`，**没退状态**。
+      //   于是这片卡在 `running`，而四条路全堵死：
+      //     - `run` 拒绝跑（准入只认 frozen / completed）
+      //     - `merge` 不收它（没签字）
+      //     - `stall --reap` 看不见它（这一轮**有**会话文件，
+      //       所以不是「一条记录都没有」的空壳；但那条记录的 status
+      //       已是 `completed` → 活性判定 `finished` → 也不算 stale/dead）
+      //     - `resume` 说它没停机（stall.class 是 null）
+      //   唯一出路是 `abandon` —— 整个切片作废，规格得重写。
+      //
+      // 也就是说「撞上一个假活记录」= 切片作废。这不是设计意图。
+      await revertRunAbortedBeforeStart(id, { reason: `重复 agent 守卫拒绝：${verdict.reason}` });
+      return 1;
+    }
+    if (staleNoPidRecord) {
+      console.error(
+        `  ⚠️  上一轮有一条残留记录没有 pid 可查、已无人在管（${staleNoPidRecord.file}）—— 已收尾，本轮放行。`,
+      );
+      console.error(`     事件流里会记 staleNoPid=true，便于事后审计。`);
     }
 
     // 上一轮的失败证据（ZD-013）：重跑时 agent 必须知道上次错在哪，
@@ -1857,6 +1881,15 @@ register('run', async (args) => {
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
       worktree: worktree?.relativePath ?? null,
+      // ADR-124 修法二：这一轮是在「上一轮残留记录没有 pid 可查」的情况下
+      // 放行起跑的。写进事件流，事后审计能看出「这一轮为什么被放行」。
+      ...(staleNoPidRecord
+        ? {
+            staleNoPid: true,
+            staleNoPidRecord: staleNoPidRecord.file,
+            staleNoPidLastActivityAt: staleNoPidRecord.record.lastActivityAt ?? null,
+          }
+        : {}),
     });
 
     // Start progress display
@@ -2376,6 +2409,21 @@ register('start', async (args) => {
 
     await scheduler.startRun(id);
 
+    // ── 重复 agent 守卫（ADR-124 修法二）──────────────────────────────
+    //
+    // `zelto start` 之前**没有**这道守卫 —— 它 create → freeze → run 一路走完，
+    // 于是「上一轮还留着一条没人管的 running 记录」在这里会被静默忽略，
+    // 直接起第二个 agent。判据与 `zelto run` **完全一致**（同一份
+    // `judgeDuplicateAgent`），两道门不许分叉。
+    const startVerdict = await judgeDuplicateAgent(process.cwd(), id);
+    if (startVerdict.decision === 'blocked') {
+      console.error(`  ❌ ${startVerdict.reason}`);
+      // 守卫拒绝时 agent 一个都没起 —— 退回 frozen（D-64/D-65 同款）。
+      await revertRunAbortedBeforeStart(id, { reason: `重复 agent 守卫拒绝：${startVerdict.reason}` });
+      return 1;
+    }
+    const startStaleNoPid = startVerdict.staleNoPid;
+
     const slice = await store.read(id);
     const bundle = scheduler.buildConstraints(
       slice,
@@ -2432,6 +2480,14 @@ register('start', async (args) => {
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
+      // ADR-124 修法二：放行起跑的证据（见 `zelto run` 路径的同名字段）。
+      ...(startStaleNoPid
+        ? {
+            staleNoPid: true,
+            staleNoPidRecord: startStaleNoPid.file,
+            staleNoPidLastActivityAt: startStaleNoPid.record.lastActivityAt ?? null,
+          }
+        : {}),
     });
 
     // Show progress

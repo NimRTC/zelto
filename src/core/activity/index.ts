@@ -6,6 +6,7 @@ export {
   DEFAULT_STALE_THRESHOLD_MS,
   classifyLiveness,
   classifyLivenessAsync,
+  hasPidOf,
   lastActivityOf,
   lastOutputLine,
   readEventProgress,

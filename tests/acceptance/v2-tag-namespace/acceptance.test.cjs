@@ -124,6 +124,18 @@ const AFTER_V4_PATHS = new Set([
   'docs/adr/adr-123-cockpit-watchdog-gave-up-is-not-running.md',
   // ADR-122（重新冻结改写集 + 作用域解析）是另一并行会话落地的 ADR，本会话没碰
   'docs/adr/adr-122-refreeze-rewrites-writeset-and-scope-parser.md',
+  // ADR-124（孤立记录可见可收 + 重复 agent 守卫修法二）是并行会话的落点
+  'docs/adr/adr-124-orphan-records-must-be-visible-and-reapable.md',
+  'docs/adr/adr-125-supervisor-must-not-hang-on-exit.md',
+  'src/cli/commands/orphan-records.ts',
+  'src/cli/commands/core-slice.ts',
+  'src/cli/commands/info-help.ts',
+  'src/core/activity/liveness.ts',
+  'src/core/activity/index.ts',
+  'src/core/stall/reap.ts',
+  'tests/adr-053-dead-slice-reap.test.ts',
+  'tests/d065-stuck-running-shell.test.ts',
+  'tests/adr-124-duplicate-agent-guard.test.ts',
   'src/adapters/web/api.ts',
   'src/adapters/web/frontend/app.js',
   'src/adapters/web/router.ts',

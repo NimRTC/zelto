@@ -127,7 +127,9 @@ describe('D-65 · 空壳判据：没有 running 记录 = 没人管这一轮', ()
     });
 
     assert.equal(findOrphanShells([slice], ROOT, () => true).length, 0);
-    assert.equal(classifyOrphanShell(ROOT, 'd065-live', () => true)?.state, 'active');
+    // ADR-124：判据改为「没有任何一条记录还活着」—— 活着时返回 null，
+    // 不再返回一个 `active` 的 LivenessInfo（调用方要的是「是不是空壳」）。
+    assert.equal(classifyOrphanShell(ROOT, 'd065-live', () => true), null);
   });
 
   it('running 记录 + completed 记录混在一起 → 仍算活着的（看 running 那条）', async () => {
