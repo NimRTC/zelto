@@ -78,4 +78,34 @@ describe('Scheduler — checkConflicts', () => {
     ]);
     assert.equal(conflicts.length, 3, '3 slices sharing same file should have 3 conflict pairs');
   });
+
+  it('ADR-107: shared append-only docs (CHANGELOG.md) are soft, not parallel conflicts', () => {
+    const scheduler = new Scheduler(
+      null as any, null as any,
+      { rules: [], protected: [] },
+    );
+
+    // Two slices each write CHANGELOG.md plus disjoint code — must NOT block.
+    const conflicts = scheduler.checkConflicts([
+      ['src/modules/srtp/include/nimrtc/srtp/srtp.hpp', 'CHANGELOG.md'],
+      ['src/engine/src/engine_transport.cpp', 'CHANGELOG.md'],
+    ]);
+    assert.equal(
+      conflicts.length,
+      0,
+      'sharing CHANGELOG.md (append-only doc) must not be a parallel conflict',
+    );
+  });
+
+  it('ADR-107: docs/ root-level md is also soft', () => {
+    const scheduler = new Scheduler(
+      null as any, null as any,
+      { rules: [], protected: [] },
+    );
+    const conflicts = scheduler.checkConflicts([
+      ['docs/plan/v1.4-plan.md', 'src/a.ts'],
+      ['docs/plan/v1.4-plan.md', 'src/b.ts'],
+    ]);
+    assert.equal(conflicts.length, 0, 'shared docs/ md must not block parallelism');
+  });
 });

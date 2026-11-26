@@ -8,7 +8,7 @@ import type { PolicyConfig, PolicyRule } from '../policy/types.js';
 import type { SchedResult, SchedBlock, SchedDecision, ConstraintBundle, AffinityContext, GateCommandSummary, GateScopeSummary, GateFeedback, HumanFeedback } from './types.js';
 import { QUESTION_INSTRUCTIONS } from '../question/index.js';
 import { blockingViolations, judgeTrace, traceCountsOf } from '../trace/index.js';
-import { pathMatches, writeSetsConflict, writeSetsOverlap } from './paths.js';
+import { pathMatches, writeSetsConflict } from './paths.js';
 import { readGateFeedback, renderGateFeedback } from '../gate/feedback.js';
 import { readHumanFeedback, renderHumanFeedback } from '../review/human-feedback.js';
 
@@ -506,6 +506,12 @@ export class Scheduler {
    * Check write-set conflicts between multiple slices.
    * Returns pairs of indices (into writesList) that conflict.
    * Useful for parallel admission: verify no two slices write the same files.
+   *
+   * ADR-107：只有**硬冲突**（共享代码路径）才算并行冲突；共享只追加文档
+   * （`CHANGELOG.md` / `docs/**` 下的根级 md）是软冲突，不拦 —— 与
+   * `admit()` / `evaluateBatchConflicts()` 同一口径。此前这里用严格的
+   * `writeSetsOverlap`，导致 `zelto run --parallel` 把两片共享 CHANGELOG
+   * 误判为硬冲突而拒跑。
    */
   checkConflicts(writesList: string[][]): Array<[number, number]> {
     const conflicts: Array<[number, number]> = [];
@@ -520,7 +526,8 @@ export class Scheduler {
   }
 
   private hasOverlap(a: string[], b: string[]): boolean {
-    return writeSetsOverlap(a, b);
+    // ADR-107：只追加文档的共享不算并行硬冲突。
+    return writeSetsConflict(a, b).hard.length > 0;
   }
 
   private buildInstructions(

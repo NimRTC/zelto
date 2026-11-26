@@ -2240,6 +2240,7 @@ async function runParallel(args: string[]): Promise<number> {
     eventKey: 'batch',
     affinity: plan.affinity,
     affinityPrevious: plan.affinityPrevious,
+    dryRun: args.includes('--dry-run'),
   });
 
   if (result.aborted) {

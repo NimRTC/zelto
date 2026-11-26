@@ -92,6 +92,14 @@ export interface ParallelExecutionOptions {
   /** 组内排在本片之前的切片 id（按执行序）；缺省为空 */
   affinityPrevious?: Map<string, string[]>;
   /**
+   * 只做准入 + 冲突 + 预算检查，不建 worktree、不 startRun、不起 agent。
+   *
+   * `zelto run --parallel ... --dry-run` 用。此前的并行路径完全忽略
+   * `--dry-run`，把 dry-run 当成了真跑 —— 会把切片推到 `running` 又因
+   * 非法状态跃迁崩溃，留下没人管的 orphan running（只能靠 `stall --reap` 回收）。
+   */
+  dryRun?: boolean;
+  /**
    * 切片基点覆盖（ADR-056 §3.3）。
    *
    * 版本里的切片基点来自**版本分支的 tip**，不是主仓 HEAD ——
@@ -532,6 +540,15 @@ export async function executeSlicesParallel(
   }
 
   // ── Phase 2: 隔离 worktree + 写集预约守卫 ─────────────────────────
+  //
+  // dry-run：准入 / 冲突 / 预算都已检查通过，到此为止。
+  // 不建 worktree、不 startRun（那会把切片推到 running）、不起 agent。
+  if (options.dryRun) {
+    console.log('');
+    console.log(`✅ dry-run：${ids.length} 个切片通过准入与冲突检查，未开工（未建 worktree、未改状态、未起 agent）。`);
+    return { ...empty(), ok: true };
+  }
+
   const { execSync } = await import('node:child_process');
   const adapterType = options.adapterType;
   const agentName =
