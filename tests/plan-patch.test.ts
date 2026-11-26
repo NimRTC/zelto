@@ -318,6 +318,118 @@ describe('版本计划的确定性修正（zelto plan patch）', () => {
     });
   });
 
+  describe('计划态的修正（ADR-127）', () => {
+    it('已完成的片搬进另一个版本后，计划态可以显式写成 completed', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', slices: [{ sliceId: 'v2-b', state: 'completed' }] }],
+      });
+      assert.equal(result.plan.versions[1].slices[0].state, 'completed');
+      const st = result.changed.find((c) => c.field === 'state');
+      assert.ok(st);
+      assert.equal(st.before, 'draft');
+      assert.equal(st.after, 'completed');
+    });
+
+    it('计划态没变时不产生改动记录（幂等）', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v1', slices: [{ sliceId: 'v1-a', state: 'completed' }] }],
+      });
+      assert.equal(result.changed.filter((c) => c.field === 'state').length, 0);
+    });
+
+    it('不传 state 时不动计划态', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', slices: [{ sliceId: 'v2-b', title: '只改标题' }] }],
+      });
+      assert.equal(result.plan.versions[1].slices[0].state, 'draft');
+    });
+  });
+
+  describe('搬切片到另一个版本（ADR-127）', () => {
+    it('搬：原样搬过去，字段一个不改（含 note）', () => {
+      const plan = makePlan();
+      (plan.versions[0].slices[0] as { note?: string }).note = 'ADR-031；version/v3 8abb815a';
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', moveSlices: [{ id: 'v1-a', from: 'v1' }] }],
+      });
+      assert.equal(result.changed.length, 1);
+      assert.equal(result.changed[0].field, 'moved');
+      assert.equal(result.changed[0].before, 'v1 / 切片A');
+      assert.equal(result.changed[0].after, 'v2 / 切片A');
+      // 源版本里没了，目标版本里有，且字段原封不动
+      assert.equal(result.plan.versions[0].slices.length, 0);
+      assert.equal(result.plan.versions[1].slices.length, 2);
+      const moved = result.plan.versions[1].slices.find((s) => s.id === 'v1-a');
+      assert.ok(moved);
+      assert.equal(moved.title, '切片A');
+      assert.equal(moved.module, '模块A');
+      assert.deepEqual(moved.writes, ['src/a.cpp']);
+      assert.equal(moved.specPath, 'specs/slices/v1-a.md');
+      assert.equal(moved.state, 'completed');
+      assert.equal(moved.note, 'ADR-031；version/v3 8abb815a');
+    });
+
+    it('搬：不改入参（原计划对象保持原样）', () => {
+      const plan = makePlan();
+      const before = JSON.stringify(plan);
+      applyPlanPatch(plan, {
+        versions: [{ version: 'v2', moveSlices: [{ id: 'v1-a', from: 'v1' }] }],
+      });
+      assert.equal(JSON.stringify(plan), before);
+    });
+
+    it('搬：源版本不存在 → 记入 missingVersions', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', moveSlices: [{ id: 'v1-a', from: 'v9' }] }],
+      });
+      assert.deepEqual(result.missingVersions, ['v9']);
+      assert.equal(result.changed.length, 0);
+    });
+
+    it('搬：源版本里没有这片 → 记入 missingSlices', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', moveSlices: [{ id: 'v1-不存在', from: 'v1' }] }],
+      });
+      assert.deepEqual(result.missingSlices, ['v1/v1-不存在']);
+      assert.equal(result.changed.length, 0);
+    });
+
+    it('搬：目标版本已有同 id 的片 → 拒绝（归属会歧义）', () => {
+      const plan = makePlan();
+      plan.versions[1].slices[0].id = 'v1-a';
+      const result = applyPlanPatch(plan, {
+        versions: [{ version: 'v2', moveSlices: [{ id: 'v1-a', from: 'v1' }] }],
+      });
+      assert.equal(result.changed.length, 0);
+      assert.equal(result.plan.versions[1].slices.length, 1);
+      assert.match(result.missingSlices[0], /目标版本已有同 id 的片/);
+    });
+
+    it('搬：note 修正独立生效，且不影响搬', () => {
+      const plan = makePlan();
+      const result = applyPlanPatch(plan, {
+        versions: [
+          {
+            version: 'v2',
+            moveSlices: [{ id: 'v1-a', from: 'v1' }],
+            slices: [{ sliceId: 'v1-a', note: '新备注' }],
+          },
+        ],
+      });
+      const moved = result.plan.versions[1].slices.find((s) => s.id === 'v1-a');
+      assert.equal(moved?.note, '新备注');
+      const noteChange = result.changed.find((c) => c.field === 'note');
+      assert.ok(noteChange);
+      assert.equal(noteChange.before, '(无)');
+      assert.equal(noteChange.after, '新备注');
+    });
+  });
+
   describe('normalizeWriteSet', () => {
     it('去空白、统一斜杠、去重、保序', () => {
       assert.deepEqual(

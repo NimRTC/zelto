@@ -102,15 +102,44 @@ ADR-121 当时的推测（重新合进 v1）方向反了。事实是：
 ### 二、处置：把 7 片的归属从 `v1` 移到 `v3`
 
 走 `zelto plan patch`（ADR-115 决策：**手改状态文件是追溯链上的谎言**，
-修正必须走确定性流程并写 `draft.revised` 事件，C4）：
+修正必须走确定性流程并写 `draft.revised` 事件，C4）。
+
+**先补工具**：当时 `plan patch` 只有「从 A 移除 + 往 B 添加」两条路，
+而这两条合起来是**有损**的 —— remove + add 会**重建**切片对象，
+把一切 CLI 没显式建模的字段弄丢。实测 nimrtc-v14 那 7 片的 `note` 里写着
+「ADR-031；version/v3 8abb815a」—— **那正是「这片归哪一版、依据是哪个 ADR」的人写下的凭据**，
+也正是「归属依据」在计划里的唯一可查记录。丢掉它，这次修正就只剩「工具说搬了」，
+没有「凭什么」。
+
+所以给 `plan patch` 补了一条**原样搬**的通道（ADR-127 的工具侧配套）：
 
 ```
-zelto plan patch plan-1795166129234 --version v1 --remove-slice <7 片>
-zelto plan patch plan-1795166129234 --version v3 --add-slice <片> \
-    --slice-title <t> --slice-module <m> --slice-spec <path> --write <p>...
+zelto plan patch <plan-id> --version <目标版本> --move-slice <片 id> --from <源版本> [--yes]
 ```
 
-（写集与规格路径按原值原样搬过去 —— 改写集是另一件事，不在本次范围。）
+- `--move-slice <id> --from <version>`：把片**原样**搬到目标版本 —— 字段一个不改，
+  只换它所属的版本。写集 / 标题 / 模块 / 规格路径 / `state` / `note` 全部保留。
+- `--slice-note <text>`：单独修正备注（不想搬、只想改备注时用）。
+- `--slice-state <s>`：单独修正计划态。
+
+**为什么不能只靠 remove + add**（两条路各有各的坏处）：
+
+| | remove + add | `--move-slice` |
+|---|---|---|
+| 未建模字段（`note`） | **丢** | 保留 |
+| 边界（写集/标题/模块/规格路径） | 要**全部重打一遍**，漏一项就静默改了片的边界 | 一个字不改 |
+| 审计痕迹 | 两条 `removed` + `added`，看不出是「搬」 | 一条 `moved`，before/after 写明「从哪到哪」 |
+
+ADR-063 的原则是「**只改人明确指定的那一处**」—— remove + add 要求人把片的边界
+整个重述一遍，每一处重述都是一次「可能打错」的机会。`--move-slice` 把这个风险消掉。
+
+配套的 `--slice-state` 是必需的另一半：`--add-slice` 固定写 `state: 'draft'`，
+若搬进来的 7 片被写成 draft，驾驶舱上会出现「分支上有产物 ✓ / 计划 draft」的自相矛盾。
+**这不是「让工具自动同步计划态」** —— 计划态的修正必须由人显式指定，
+每次都写 `draft.revised` 事件留痕（C4）。
+
+（这次落地时，7 片的写集同时按「合并提交实际带进 `version/v3` 的文件」逐片对账改正了 ——
+那是另一件事，见文末「落地」一节。）
 
 ### 三、修正后计划与分支事实**完全对齐**
 
@@ -192,3 +221,21 @@ v1 分支保留现在这 3 片。它的描述、它的产物、它的规格**本
   其中原写集里的 `docs/api/public_headers.manifest`（macos）在版本分支上**不存在**，
   `docs/api/engine_api.md`（video-deps / module-closure）在这两片的合并提交里**没被改过**
   —— 这正是「计划写着的东西没人去对账」的症状，工具层缺口另立 ADR 处理。
+
+## 工具侧落地（zelto 仓库）
+
+| 文件 | 改动 |
+|---|---|
+| `src/core/version/types.ts` | `VersionSlice` 增加 `note?: string`（备注是「归属依据」的可查凭据，必须能被建模） |
+| `src/core/version/patch.ts` | `VersionPatch` 增加 `moveSlices`；`SlicePatch` 增加 `state` / `note`；实现**原样搬** |
+| `src/cli/commands/plan-patch.ts` | `--move-slice <id> --from <version>` / `--slice-state <s>` / `--slice-note <text>` |
+| `tests/plan-patch.test.ts` | 搬片单测 6 例（字段原样保留 / 不改入参 / 源版本缺失 / 片缺失 / 目标同名拒绝 / note 独立修正） |
+| `tests/adr-127-plan-patch-state.test.ts` | E2E：`--move-slice` 走真 CLI，验 `note` 等字段一个不丢 |
+
+**不变式**：
+
+- C1（状态只在文件）不破 —— 计划仍只落在 `.zelto/versions/` + `versions/` 副本。
+- C3（判定确定性）不破 —— `applyPlanPatch` 仍是纯计算，不调模型、不触网。
+- C4（append-only 事件）不破 —— 每次搬都写 `draft.revised` 事件，含
+  `field: 'moved'`、before/after（「从哪版到哪版」）。
+- C2（`core/` 零第三方依赖、不 import `adapters/`）不破 —— 改动只在既有模块内。

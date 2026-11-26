@@ -9,6 +9,16 @@ export interface VersionSlice {
   writes: string[];
   specPath: string;
   state?: string;
+  /**
+   * 备注 —— 「这片归哪一版、依据是哪个 ADR、落在哪个提交」。
+   *
+   * 人写的自由文本（ADR-127）。
+   *
+   * 为什么要有：`note` 里常写着「ADR-031；version/v3 8abb815a」——
+   * 那正是「这片的归属依据」的可查凭据。任何**重建**切片对象的操作
+   * （如 remove + add）都会把它丢掉，所以必须有原样搬动的通道。
+   */
+  note?: string;
 }
 
 export interface Version {

@@ -81,7 +81,8 @@ function splitPatterns(values: string[]): string[] {
  *   [--base-commit <sha|none>] [--remove-version] \
  *   --add-slice <id> --slice-title <t> --slice-module <m> --slice-spec <path> --write <p>... \
  *   --remove-slice <id> \
- *   --slice <id> [--write <p>...] [--slice-title <t>] [--slice-module <m>] [--slice-spec <path>]
+ *   --slice <id> [--write <p>...] [--slice-title <t>] [--slice-module <m>] [--slice-spec <path>] \
+ *     [--slice-state <draft|frozen|running|completed|failed>]
  * ```
  *
  * `--add-slice` / `--remove-slice` / `--slice` 各自成组：
@@ -170,6 +171,29 @@ function parsePlanPatch(args: string[]): PlanPatch {
       continue;
     }
 
+    // ── 搬切片到另一个版本（ADR-127）──
+    //
+    // `--move-slice <id> --from <version>` —— 目标是 `--version <v>`。
+    //
+    // 为什么单独一条而不是「从 A 移除 + 往 B 添加」：remove + add 会**重建**
+    // 切片对象，丢掉一切没被 CLI 显式建模的字段（实测 nimrtc-v14 的 `note`：
+    // 「ADR-031；version/v3 8abb815a」—— 那正是「这片的归属依据」的人写下的凭据）。
+    if (arg === '--move-slice') {
+      const id = args[i + 1];
+      if (!id || id.startsWith('--')) continue;
+      // `--from` 紧跟其后
+      let from: string | undefined;
+      if (args[i + 2] === '--from' && args[i + 3] && !args[i + 3].startsWith('--')) {
+        from = args[i + 3];
+        i += 3;
+      } else {
+        i++;
+      }
+      if (!from) continue;
+      v.moveSlices = [...(v.moveSlices ?? []), { id, from }];
+      continue;
+    }
+
     if (!current) continue;
 
     if (arg === '--write') {
@@ -200,6 +224,25 @@ function parsePlanPatch(args: string[]): PlanPatch {
       i++;
       continue;
     }
+    if (arg === '--slice-state') {
+      // ADR-127：把一个「已做完的片」按真实归属搬进另一个版本时，计划态不能退回 draft
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) continue;
+      if (['draft', 'frozen', 'running', 'completed', 'failed'].includes(value)) {
+        current.patch.state = value as NonNullable<SlicePatch['state']>;
+      }
+      i++;
+      continue;
+    }
+    if (arg === '--slice-note') {
+      // ADR-127：备注里记着「ADR-031；version/v3 8abb815a」——
+      // 那正是「这片的归属依据」的可查凭据。
+      const value = args[i + 1];
+      if (!value || value.startsWith('--')) continue;
+      current.patch.note = value;
+      i++;
+      continue;
+    }
   }
 
   for (const seg of segments) {
@@ -217,6 +260,8 @@ function parsePlanPatch(args: string[]): PlanPatch {
         specPath,
         state: 'draft',
       };
+      // ADR-127：`note` 也要能带过来（`--add-slice` 也能指定备注）
+      if (seg.patch.note !== undefined) slice.note = seg.patch.note;
       v.addSlices = [...(v.addSlices ?? []), slice];
       continue;
     }
@@ -232,7 +277,7 @@ function parsePlanPatch(args: string[]): PlanPatch {
 export async function planPatch(args: string[]): Promise<number> {
   const id = args[0];
   if (!id || id.startsWith('--')) {
-    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--remove-version] [--slice <id> --write <p> ...] [--tag <name|none>] [--base-commit <sha|none>]');
+    f.error('USAGE', 'Usage: zelto plan patch <plan-id> --version <v> [--add-slice <id> ...] [--remove-slice <id>] [--move-slice <id> --from <version>] [--remove-version] [--slice <id> --write <p> ... --slice-state <s> --slice-note <text>] [--tag <name|none>] [--base-commit <sha|none>]');
     return 1;
   }
 
@@ -250,6 +295,13 @@ export async function planPatch(args: string[]): Promise<number> {
 
   const plan = await versionStore.read(id);
   const { plan: patched, changed, missingVersions, missingSlices } = applyPlanPatch(plan, patch);
+
+  // 「写入之前要不要问人」判定得比预演早 —— 预演本身不需要确认。
+  const interactive = !args.includes('--yes');
+  if (interactive && !args.includes('--info') && !process.stdin.isTTY) {
+    f.error('NOT_TTY', 'Not a TTY — cannot ask for confirmation. Re-run with --yes to apply without prompting.');
+    return 1;
+  }
 
   // `f.error` 直接把「错误」打到 stderr —— 它不抛。
 
@@ -287,15 +339,28 @@ export async function planPatch(args: string[]): Promise<number> {
     return 1;
   }
 
-  // ── 确认 ──
+  // ── 预演（ZD-059）──
+  //
+  // 为什么需要：`--yes` 是「确认执行」，**不是**「只看不做」。想在真正写盘前
+  // 看一遍「这次会改哪 14 处」的人，原来没有安全的途径 —— 要么直接写，要么
+  // 手工去算。`--info` 只展示改动，不写文件、不写事件（C4 的等价物是「没发生就不记」）。
+  if (args.includes('--info')) {
+    f.out(`\n计划 "${id}" 的修正（预演，未写入）：`);
+    for (const change of changed) {
+      const where = change.slice ? `${change.version} / ${change.slice}` : change.version;
+      f.out(`  ${where} · ${change.field}`);
+      f.out(`    旧：${formatValue(change.before)}`);
+      f.out(`    新：${formatValue(change.after)}`);
+    }
+    f.out(`\n共 ${changed.length} 处改动。去掉 --info 并加 --yes 才会写入。`);
+    return 0;
+  }
+
+  // ── 应用 ──
   //
   // 改的是**已确认**的计划 —— 这是治理动作，必须人点头。
   // `--yes` 跳过交互（供脚本用），但默认要人确认。
-  if (!args.includes('--yes')) {
-    if (!process.stdin.isTTY) {
-      f.error('NOT_TTY', 'Not a TTY — cannot ask for confirmation. Re-run with --yes to apply without prompting.');
-      return 1;
-    }
+  if (interactive) {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
     const answer = await new Promise<string>((resolve) => {
       rl.question('\n应用这些修正？[y/N] ', resolve);

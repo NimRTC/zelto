@@ -40,6 +40,26 @@ export interface SlicePatch {
   module?: string;
   /** 新规格路径 */
   specPath?: string;
+  /**
+   * 计划态的修正（ADR-127）。
+   *
+   * 为什么需要：`--add-slice` 固定写 `state: 'draft'`，于是「把一个**已经做完**的
+   * 片按自己的规格归属搬进它真正属于的版本」之后，计划会把它写成待办 ——
+   * 驾驶舱上「分支上有产物 ✓ / 计划 draft」自相矛盾（实测 nimrtc-v14 的 7 片）。
+   * `zelto plan patch` 不经 LLM、改完要人确认、写 `draft.revised` 事件（C4），
+   * 与「修正计划」的其它字段同一条确定性通道。
+   */
+  state?: VersionSlice['state'];
+  /**
+   * 备注（ADR-127）。
+   *
+   * 为什么需要：`--add-slice` 造出来的新切片**没有**备注，而备注里记着
+   * 「ADR-0xx；version/v3 <commit>」—— 那正是「这片归哪一版、依据是哪个 ADR」
+   * 的人写下的凭据。remove + add 的搬法会把它弄丢（实测 nimrtc-v14）。
+   *
+   * 不传 = 不改备注。
+   */
+  note?: string;
 }
 
 /** 一个版本层面的修正 */
@@ -52,6 +72,20 @@ export interface VersionPatch {
   removeSlices?: string[];
   /** 逐个切片的修正 */
   slices?: SlicePatch[];
+  /**
+   * 把切片**搬到另一个版本**（ADR-127）。
+   *
+   * 为什么要单独一条，而不是「从 A 移除 + 往 B 添加」：
+   *   - remove + add 会**重建**切片对象，丢掉一切没被 CLI 显式建模的字段
+   *     （实测 nimrtc-v14 的 `note`：「ADR-031；version/v3 8abb815a」
+   *     —— 那正是「这片的归属依据」的人写下的凭据）；
+   *   - remove + add 还得把写集、标题、模块、规格路径**全部重打一遍**，
+   *     漏一项就静默改了片的边界（ADR-063 的原则：只改人明确指定的那一处）。
+   *
+   * 搬 = **原样搬**：字段一个不改，只换它所属的版本。
+   * 搬完再想改字段，用 `--slice <id> --write …` 单独改。
+   */
+  moveSlices?: Array<{ id: string; from: string }>;
   /** 新描述 */
   description?: string;
   /** 新的依赖版本列表 */
@@ -178,6 +212,47 @@ export function applyPlanPatch(plan: VersionPlan, patch: PlanPatch): PlanPatchRe
         after: '(整个版本已移除)',
       });
       continue;
+    }
+
+    // ── 搬切片到另一个版本（ADR-127）──
+    //
+    // 「原样搬」：字段一个不改，只换它所属的版本。
+    //
+    // 为什么必须**原样**：
+    //   - 片的 `note` 里记着「ADR-031；version/v3 8abb815a」——
+    //     那正是「这片归哪一版、依据是哪个 ADR」的人写下的凭据。
+    //     remove + add 会把它弄丢（实测 nimrtc-v14）。
+    //   - 写集 / 标题 / 模块 / 规格路径都是**片的边界**。搬的过程中重打一遍，
+    //     漏一项就静默改了边界 —— ADR-063 的原则：只改人明确指定的那一处。
+    //
+    // 为什么**不**在这里顺手改字段：想改就用 `--slice <id> --write …` 单独改，
+    // 那条路径会逐项记进 `draft.revised` 事件。混在一起就分不清
+    // 「搬」和「改」了。
+    for (const mv of vPatch.moveSlices ?? []) {
+      const fromVersion = next.versions.find((v) => v.version === mv.from);
+      if (!fromVersion) {
+        missingVersions.push(mv.from);
+        continue;
+      }
+      const idx = fromVersion.slices.findIndex((s) => s.id === mv.id);
+      if (idx === -1) {
+        missingSlices.push(`${mv.from}/${mv.id}`);
+        continue;
+      }
+      // 目标版本里已经有同 id 的片 → 归属会歧义（`resolveSliceOwnership` 会抛）
+      if (version.slices.some((s) => s.id === mv.id)) {
+        missingSlices.push(`${version.version}/${mv.id}（目标版本已有同 id 的片）`);
+        continue;
+      }
+      const [moved] = fromVersion.slices.splice(idx, 1);
+      version.slices.push(moved);
+      changed.push({
+        version: vPatch.version,
+        slice: moved.id,
+        field: 'moved',
+        before: `${mv.from} / ${moved.title}`,
+        after: `${version.version} / ${moved.title}`,
+      });
     }
 
     // ── 版本层面的字段 ──
@@ -350,6 +425,28 @@ export function applyPlanPatch(plan: VersionPlan, patch: PlanPatch): PlanPatchRe
           after: sPatch.specPath,
         });
         target.specPath = sPatch.specPath;
+      }
+
+      if (sPatch.state !== undefined && target.state !== sPatch.state) {
+        changed.push({
+          version: vPatch.version,
+          slice: target.id,
+          field: 'state',
+          before: target.state ?? 'draft',
+          after: sPatch.state,
+        });
+        target.state = sPatch.state;
+      }
+
+      if (sPatch.note !== undefined && target.note !== sPatch.note) {
+        changed.push({
+          version: vPatch.version,
+          slice: target.id,
+          field: 'note',
+          before: target.note ?? '(无)',
+          after: sPatch.note,
+        });
+        target.note = sPatch.note;
       }
     }
   }

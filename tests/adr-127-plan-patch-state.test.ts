@@ -103,4 +103,44 @@ describe('ADR-127 / ZD-059：plan patch 的计划态与预演', () => {
     assert.equal(plan.versions[0].slices[0].title, '片 A（改名）', '合法改动要生效');
     assert.equal(plan.versions[0].slices[0].state, 'completed', '非法 state 不许覆盖原值');
   });
+
+  it('--move-slice 把片原样搬到目标版本（note 等字段一个不丢）', async () => {
+    // 先给 s-a 加一个 note —— 那是「归属依据」的凭据，remove+add 会把它弄丢
+    const r1 = zelto('plan', 'patch', 'plan-e2e', '--version', 'v1', '--slice', 's-a', '--slice-note', 'ADR-031；version/v3 8abb815a', '--yes');
+    assert.equal(r1.code, 0, r1.out);
+
+    // 目标版本 v2 还不存在 —— 先建它
+    const planPath = join(ROOT, '.zelto', 'versions', 'plan-e2e.json');
+    const plan = JSON.parse(await readFile(planPath, 'utf-8'));
+    plan.versions.push({
+      version: 'v2',
+      dependsOn: ['v1'],
+      description: '第二版',
+      integrationTestDir: 'tests/acceptance/v2/',
+      status: 'planned',
+      slices: [],
+    });
+    await writeFile(planPath, JSON.stringify(plan, null, 2), 'utf-8');
+
+    const r = zelto('plan', 'patch', 'plan-e2e', '--version', 'v2', '--move-slice', 's-a', '--from', 'v1', '--yes');
+    assert.equal(r.code, 0, r.out);
+
+    const after = JSON.parse(await readFile(planPath, 'utf-8'));
+    assert.equal(after.versions[0].slices.length, 0, '源版本里不该再有这片');
+    assert.equal(after.versions[1].slices.length, 1, '目标版本里该有这片');
+    const moved = after.versions[1].slices[0];
+    assert.equal(moved.id, 's-a');
+    assert.equal(moved.title, '片 A（改名）', 'title 原样搬');
+    assert.deepEqual(moved.writes, ['src/a.cpp'], 'writes 原样搬');
+    assert.equal(moved.specPath, 'specs/slices/s-a.md', 'specPath 原样搬');
+    assert.equal(moved.state, 'completed', 'state 原样搬');
+    assert.equal(moved.note, 'ADR-031；version/v3 8abb815a', 'note 必须原样保留');
+  });
+
+  it('--move-slice 写了 moved 变更记录（可追溯，C4）', async () => {
+    const r = zelto('plan', 'patch', 'plan-e2e', '--version', 'v1', '--move-slice', 's-x', '--from', 'v1', '--yes');
+    // s-x 不存在 → 应报错退出，不静默
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /s-x/);
+  });
 });

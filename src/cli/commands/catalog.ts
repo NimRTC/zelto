@@ -91,7 +91,7 @@ export const COMMAND_CATALOG: CommandInfo[] = [
   { name: 'require', group: 'AI 流水线', args: '<text>', summary: '用自然语言创建与细化需求文档', detail: 'list, show <id>, confirm <id>, refine <id> <text>' },
   { name: 'design', group: 'AI 流水线', args: '<req-id>', summary: '从需求生成与细化设计', detail: 'list, show <id>, confirm <id>, refine <id> <text>, patch <id> --module <name> --path <glob>' },
   { name: 'plan', group: 'AI 流水线', args: '<design-id>', summary: '从设计生成版本计划并创建切片规格', detail: 'list, show <id>, confirm <id>, add-version <id> <d>, patch <id> --version <v> [--add-slice <id> | --slice <id> --write <p>...]' },
-  { name: 'plan-patch', group: 'AI 流水线', args: '<plan-id>', summary: '确定性修正已确认版本计划的切片清单（不经 LLM）', detail: '--version, --add-slice, --remove-slice, --slice, --write, --yes' },
+  { name: 'plan-patch', group: 'AI 流水线', args: '<plan-id>', summary: '确定性修正已确认版本计划的切片清单（不经 LLM）', detail: '--version, --add-slice, --remove-slice, --move-slice <id> --from <v>, --slice, --write, --slice-state, --slice-note, --info, --yes' },
   { name: 'version', group: 'AI 流水线', args: '<subcommand>', summary: '查看与推进版本计划', detail: 'status, start <ver>, deliver <ver>, adopt <ver>（老版本补建分支）, ship <ver>, cleanup <ver>' },
   { name: 'spec', group: 'AI 流水线', args: '<subcommand> <slice-id>', summary: '切片规格的草稿与确认：生成草稿 → 人确认后写进正式规格', detail: 'draft, show, confirm, revise（退回上游改规格）' },
   { name: 'pipeline', group: 'AI 流水线', args: 'status', summary: '需求→设计→计划→版本→切片 全链一览' },
