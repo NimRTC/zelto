@@ -8,12 +8,12 @@
 
 **根因**：`src/llm/generators/design.ts` 的 `generateDesign` 只把需求文本喂给模型；它不知道仓库长什么样，只能凭需求文本猜目录和库。
 
-**后果**（比"文档不准"严重）：
+**后果**：（比"文档不准"严重）：
 - 设计的 `modules[].filePatterns` 是切片写集的来源 → 切片要求写不存在的路径
 - `arch check` 拿设计对照真实 import 图 → 立刻报「模块无文件」
 - 人审设计时目录和仓库对不上，只能整份重do
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - 新增 `src/llm/project-context.ts`：`summarizeProjectStructure` + `renderStructureSection`，从 `scanProject` 抽紧凑摘要（模块名 + 代表性文件 + 构建/测试命令），注入 design prompt
 - `DESIGN_PROMPT` 增加 `{{PROJECT_STRUCTURE}}` 占位符 + 两条额外约束（模块路径必须落在现有结构里、不能凭印象编库名）
 - `generateDesign` 接收可选的 `projectStructure` 参数
@@ -33,7 +33,7 @@
 1. `scanProject` 的 `files` 列表是**全量**，没有上限
 2. 设计摘要没有字符预算检查
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `summarizeProjectStructure` 加 `MAX_SUMMARY_CHARS = 12000` 字符预算
 - 超预算时从尾部分块丢模块（保留前 5 个顶层模块），丢弃的名单以 "(还有 N 个顶层模块因预算未展开: ...)" 写进摘要
 
@@ -59,7 +59,7 @@
 
 **后果**：版本分支从 main HEAD 长出 → 拉进来的代码不是 v1.4 想要的那份基线；而且是**静默**的 —— 分支建出来了，只是内容不对。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/version/patch.ts`：`VersionPatch` 新增 `baseCommit` 字段
 - `applyPlanPatch` 支持写/清 `baseCommit`，并记进 `changed`（事件留痕）
 - `cli/commands/plan-patch.ts`：新增 `--base-commit <sha|none>`
@@ -79,13 +79,13 @@
 
 而计划里 N5 的真实内容是「**部署** coturn 参考实现，带 `--require-tls` 拒绝明文 TCP」。**方向都反了** —— 一个是「实现服务器」，一个是「部署参考实现」。
 
-**根因**（两层）：
+**根因**：（两层）：
 1. `SliceSpecInput.requirements` 只有**需求条目的 id 列表**（`["N5"]`）。模型拿到 "N5" 这两个字，只能写通用套话。
 2. 更根本：**切片的 `trace.requirements` 是空的**。需求条目的正文在已确认的需求文档里，但从没被连到切片上 —— 追溯链在「需求 → 切片」这一环断了。
 
 **后果**：规格是套话 → 门禁②照着套话验收 → agent 照着套话实现 → 实现了「一个 TURN 服务器」，而人想要的是「一份 coturn 部署」。**整条链都在错，但每一步看起来都通过了**。这是可追溯性最强的反例：链是通的（每片都有规格、规格都有验收标准），但内容是空的。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - 新增 `core/requirements/criteria.ts`：`extractCriteria` 从需求文档的验收标准里按 id 取条目正文；取不到就如实标「找不到」，不编造
 - `SliceSpecInput` 新增 `requirementDetails`
 - `SLICE_SPEC_PROMPT` 新增 `{{REQUIREMENT_DETAILS}}` 占位符 + 明确约束（「需求说的是部署/配置/接入时，就不要写成『实现一个 X 服务器 / 库』」）
@@ -125,7 +125,7 @@
 
 **后果**：冻结被拦 → 人被引去改**正确的**规格（AGENTS.md：「闸门误报会把人引去改正确的规格」）。更糟的是没人在第一次看到误报时会怀疑闸门本身。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/spec/scope.ts` + `core/spec/reference.ts`：反引号内容**含空白** → 是命令行/短语，不是路径
 - `core/spec/write-set.ts`：`isInWriteSet` 增加 **basename 匹配**（写集里某非 glob 条目的 basename 与被提及路径相同 → 算覆盖）
 - `core/spec/scope.ts`：`KNOWN_EXTENSIONLESS_FILENAMES` 去掉 `install`（shell 动词；带路径的 `scripts/install.sh` 仍被识别）
@@ -319,7 +319,7 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：护栏拦得**对**（设计确实引用了没声明的模块），但 zelto 连「`ice` 就是 `网络适配层 (ice)`」这个最基础的对应关系都认不出来，于是把命名风格差异报成了架构问题。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/arch/resolve.ts`：新增 `moduleAliases` —— 取出模块名括号里的标识符（允许字母数字、`-`、`_`、`.`、`/`；**不含空白的散文不算**）
 - `resolveDependencyNames` 增加一条解析：**短名匹配优先于路径归属**（作者起了短名，比「某目录下正好有文件」更可信）
 - 短名**一对一**：两个模块抢同一个短名 → 判不出来（设计本身有歧义，解析层不替它选）
@@ -338,7 +338,7 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：想修只能手改 `.zelto/design/<id>.json` —— 手改 JSON 的坑是 **`body` 是真源、`modules` 是缓存快照**，只改一个就两者不一致（判定读 body，报告读 modules）。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/design/patch.ts`：`ModulePatch` 新增 `add` 字段（模块名 / 职责 / 文件路径 / 依赖）
 - `patchDesignBody` 支持新增段，**插在最后一个 `###` 段之后、下一个 `##` 之前**（插错位置会被 `findModuleSections` 算进别的段）
 - 新增的段**长成设计模板的样子**（职责 / 文件路径 / 依赖模块），否则解析层认不出它的字段 —— 加了等于没加
@@ -358,7 +358,7 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：重跑是盲跑。人在转述失败时只会说「测试没过」—— 而真正的关键（`0x113` 是 Allocate Error，不是「类型意外」）就转掉了。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - 新增 `src/core/gate/feedback.ts`：`readGateFeedback` 从事件流读出**最近一次**门禁/验收的失败，`renderGateFeedback` 渲染成给 agent 的段落
 - 读的是**事件流**（C4：追溯的唯一证据载体），不是切片状态文件 —— 门禁结论本来就只以事件形式存在
 - **原文，不加工**：失败输出逐字带上，不做摘要。人转述会把关键细节转掉
@@ -403,7 +403,7 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：一个本该 5 分钟修好的验收 bug，因为「撞上一个假活记录」变成了「整片作废」。这跟 D-64 是同一个病灶的**漏网路径** —— D-64 修了「装守卫失败」，没修「守卫拒绝」。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `cli/commands/core-slice.ts`：重复 agent 守卫拒绝时也调 `revertRunAbortedBeforeStart` —— agent **一个都没起**，切片必须退回 `frozen`
 
 **回归测试**：`tests/d065-stuck-running-shell.test.ts`（配合 ZD-015 的判据）
@@ -422,7 +422,7 @@ CMake Error at CMakeLists.txt:409 (add_subdirectory):
 
 **后果**：这类切片**永久卡死** —— 造它的那条路径（ZD-014）已经修了，但历史上已经造出来的、以及别的路径造出来的，仍然救不回来。而人看不出哪些切片属于这一类：`zelto status` 只显示「running · 没有运行记录」，那句话是**假的**（有记录，只是状态不是 running）。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/stall/reap.ts`：新增 `classifyOrphanShell` —— **唯一一份**空壳判据，`findOrphanShells` 与 `reapDeadSlices` 共用
 - 判据改为：**没有一条 `running` 记录 = 没人再管这一轮 = 空壳**
 - **有** `running` 记录时绝不能碰 —— 那可能是 agent 还活着（判错会导致「reap 收走 → 人重跑 → 同一 worktree 上起第二个 agent」）
@@ -455,7 +455,7 @@ fatal: '<path>' is not a working tree
 
 **后果**：人被困在「按建议做没用」的循环里，而真正的问题（目录被进程锁住）没有任何提示。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/worktree/manager.ts`：`remove()` 捕获「git 侧已注销」的**事实**后，改为 `git worktree prune` + 直接 `rmSync` 删目录（不再依赖 git 的登记）
 - `cli/commands/core-slice.ts` / `cli/commands/merge-runner.ts`：建议语补上 `rmdir /s /q "<path>"`，两条路都给
 
@@ -507,7 +507,7 @@ fatal: '<path>' is not a working tree
 
 **后果**：这类残留会**一直占着目录**，让下一个切片的 worktree 建不出来 —— 而 zelto 侧的报错只说「删除失败」，不会说「有进程蹲在这里」。
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `core/worktree/manager.ts`：`remove()` 在兜底删目录也失败时，调用 `diagnoseRemovalBlock()` 判定根因，错误消息里带上**对应的**排查步骤
   - **目录为空** → cwd 锁（ZD-017）→ 给 `handle.exe` / 读 PEB 的定位步骤
   - **目录非空** → 文件句柄被占 → 给「等几秒 / 关掉 MSBuild 再 rmdir」
@@ -541,7 +541,7 @@ detach 监督进程的重试回路（`supervisor.ts` 的 `waitForAgentExit`）�
 （实测的现场：agent 进程被杀掉后，监督进程还在用 `--resume` 无限重试，
 把切片一直钉在 `running`。）
 
-**修复**（v0.6.x）：
+**修复**：（v0.6.x）：
 - `cli/commands/core-slice.ts`：`waitForExitWithWatchdog` 的看门狗间隙里查 `haltStore.isHalted(haltScope)`，
   收到就**先 resolve 再 stop**（顺序反了的话，`adapter.stop()` 会让 `waitForExit` 的
   promise 先 resolve，`Promise.race` 抢在拉闸结果之前返回 —— 拿到的就是
@@ -1009,7 +1009,7 @@ if (halted) {
 - `tests/zd023-stale-halt-request.test.ts` 新增 3 个用例
   （新鲜的仍拦、过期的放行、过期的**仍在盘上**不被静默删除）
 
-**剩余问题**（未做）：
+**剩余问题**：（未做）：
 
 1. 事件流里的 `batch.halted` 没区分「人真的喊停」与「读到陈旧请求」。
    修完准入 + TTL 后这条路径基本不会误触发了，但记下 `requestedAt` 与
@@ -1136,7 +1136,7 @@ ZD-006 修的）**不进入** `backtickSegments`，所以它们的区间不在�
 - 反向：同一个裸名出现在两行、目录不同时，各自补到各自的目录
   （补齐结果按**段的起始位置**索引，不按文件名 —— 否则后一个会覆盖前一个）
 
-**剩余问题**（未做）：
+**剩余问题**：（未做）：
 
 1. 补齐只认「同一行」。跨行写法（「头文件在上一行、实现文件在下一行」）
    仍然不补 —— 那是规格排版的问题，不补是安全的（走 ZD-020 的同名文件判定）。
@@ -2152,7 +2152,7 @@ fail fast：前一条失败就不跑后一条 —— 后一条大概率也依赖
 
 （这两条都是**测试逼出来的**，不是想出来的 —— 集成测试的价值就在这儿。）
 
-**剩余问题**（未做）：
+**剩余问题**：（未做）：
 
 1. 子模块的「自动修复」没做：现在只报错并给三种修法，
    不自动 `git fetch` —— 因为自动 fetch **触网**（C3 的地盘），
@@ -2858,7 +2858,7 @@ parallel / detach 主进程）在**开跑前**算好，写进 `run.started` 与�
 2. 随后**转向大改工作区文件**（`engine_media.cpp` 被大段重写、`engine_media.cpp` 里某个
    分发分支被削到只剩骨架），这些**都在写集里**，钩子照常放行。
 
-**根因**（口径，不是 bug 本身）：
+**根因**：（口径，不是 bug 本身）：
 
 - 写集的语义是「防止 agent 动**别人的文件**」，但实现上它同时**挡住了构建 / 日志这类
   「一次运行自己的一次性产物」**。结果是 agent 不得不在「没有日志」和「不许构建」之间二选一 ——
@@ -2869,7 +2869,7 @@ parallel / detach 主进程）在**开跑前**算好，写进 `run.started` 与�
 **后果**：这一片最危险的一次改写（`handle_rtcp` 从约 243 行被压成 10 行的一次中间态）
 **全程合法**；而真正被拦下的是「写日志」。**守卫拦住的不是有害动作。**
 
-**修复**（待做）：
+**修复**：（待做）：
 
 1. 写集判定区分「工作区文件」与「运行期一次性产物」：`build/`、`/tmp/`、
    agent 的临时输出**显式 allow**，并让 `policy.decision` 带上**被判定的是同一个目标**；
@@ -2898,7 +2898,7 @@ parallel / detach 主进程）在**开跑前**算好，写进 `run.started` 与�
 （行数 371 ✅、公共头无 diff ✅、`handle_rtcp` 恰 60 行 ✅）。
 下一次如果没有这次那样逐条量，**「门禁绿、人以为全验了」会成为默认路径**。
 
-**修复**（待做）：
+**修复**：（待做）：
 
 - 规格验收点**必须编号**（`AC-01 …`），验收断言名带同一编号；
   门禁核对「规格编号集合 ⊆ 验收文件编号集合」，缺一即 failed；
@@ -3122,7 +3122,7 @@ ADR-125 第二节的 watchdog 未实现。
 `tests/adr-127-plan-patch-state.test.ts`（E2E：`--slice-state` 真写入并留下 `draft.revised`、
 `--info` 不写文件不写事件、非法 state 不覆盖原值）。
 
-**剩余问题**（两条）：
+**剩余问题**：（两条）：
 
 1. 计划修正的**批量**通道仍然是一次一调 —— 本次 nimrtc-v14 的修正是「一次 `plan patch`
    完成 7 片的搬移 + 写集改正 + 计划态」（参数由修正脚本从备份计划生成），
