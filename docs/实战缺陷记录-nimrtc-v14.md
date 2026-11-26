@@ -3252,6 +3252,84 @@ ADR-112 的边界也写明了「**不做**版本目录里的需求 / 设计 / �
 
 ---
 
+## ZD-063：测试进程**硬退**，在 Windows + Node≥23 上触发 libuv 断言 —— 红了但没有一个断言不通过（ADR-131）
+
+（本节记的是 **zelto 自身**的测试缺陷，混进 nimrtc 演练记录里是因为它是本轮全量测试里
+那 2~3 个红灯的根因。）
+
+**场景**：跑 `npm run test:unit`，偶发红 2~3 个**测试文件**。但点开看，
+**每一条断言都过了** —— 崩溃发生在**进程退出时**：
+
+```
+Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 94
+```
+
+节点测试报告里那几行是 `'test failed'`，没有断言消息、没有期望值、没有实际值。
+第一次遇到时很容易被误判成「测试写错了」或「环境抖了」。
+
+**根因**：`scripts/filter-tests.mjs` 恒定给 `node --test` 传 `--test-force-exit`。
+那个 flag 让测试跑完后**立刻 `process.exit()`**。
+
+而 Node 内置 `fetch` 走 **undici 的全局连接池**：跑过 **2 次及以上** fetch 后，
+池里就有一个 keep-alive 的 socket 还没被关。`process.exit()` 时 Node 调
+`uv_async_send` 去通知一个已被 `uv_close` 标记 `UV_HANDLE_CLOSING` 的句柄 →
+libuv 直接断言崩溃 → 进程以 `0xC0000409` 退出。
+
+这是 **Node 自身的 bug**，不是 zelto 的：[nodejs/node#56645](https://github.com/nodejs/node/issues/56645)
+（Windows + Node 23.x 起必现），修法在
+[nodejs/node#61999](https://github.com/nodejs/node/pull/61999)（2026-07-24 合入 main，
+**还没进任何已发布版本**）。
+
+**实测判据矩阵**（本机 Node 24.16.0 / Windows）：
+
+| 条件 | 结果 |
+|---|---|
+| 1 次 `fetch` + `process.exit()` | 不崩 |
+| **2 次** `fetch` + `process.exit()` | **崩** |
+| 2 次 `fetch` + `process.exit()` + `server.close()` | **仍崩** |
+| 2 次 `fetch` + 自然退出（不 `process.exit()`） | 不崩 |
+
+**排查中排除的干扰项**（写下来是为了不让下一个人重走一遍）：
+
+- 与 git 子进程无关 —— git 探针单独跑不崩；
+- 与 server 收没收停无关 —— `server.close()` 救不了，崩的是**客户端**连接池里的 socket；
+- 与并发无关 —— 两个**顺序** fetch 一样崩；
+- 与 zelto 的代码无关 —— **纯 `node:http` + 纯 `fetch`** 就能复现。
+
+前两条各花了一轮二分才排除（先怀疑 git 探针，后怀疑 keep-alive socket）。
+
+**后果**：全量测试**偶发红**，而红灯**不可信** —— 「红了但找不到哪条断言错了」。
+真正坏掉的东西会被当成「又是 Windows 上抖」而被放过（ZD-061、ZD-062 同属这一类：
+**红灯不可信比红灯更坏**）。
+
+**修复（已落地，2026-11-27）**：
+
+- 去掉 `--test-force-exit`，**让事件循环自然排空**；
+- 兜底换成 `--test-timeout=600000`（单个用例 10 分钟上限）——
+  原来「硬退」的职责是「别让测试进程吊死」，现在由「超时即失败」承担，
+  而且这个信号**更明确**：挂住的用例会报「超时」，而不是让整个进程无声地断掉；
+- 不按 Node 版本分支（那会让本地和 CI 走两套测试语义），判据统一成
+  **永远不硬退**。
+
+**回归测试**：`tests/zd063-no-force-exit-on-windows.test.ts` —— 三件事：
+
+1. **最小复现还在**（纯脚本 + 2 次 fetch + `process.exit()` 必须崩）。
+   Node 修好的那天这条会红 —— 那正是撤掉绕行方案的信号；
+   没有它，绕行会永远留着，没人知道为什么。
+2. **`filter-tests.mjs` 源码里没有 `--test-force-exit`** —— 判据读**源码**，
+   因为「跑一遍绿不绿」是概率，「源码里没有那个 flag」才是事实。
+3. **`--test-timeout` 在位** —— 兜底不能跟着绕行方案一起被删掉。
+
+**效果**：`npm run test:unit` 从「偶发红 2~3 个」变成 **3274 pass / 0 fail**；
+`node scripts/filter-tests.mjs --all`（全量 3415 个）**0 fail** 且不会吊死。
+
+**剩余问题**：本地 Node 是 24.16.0，CI pin 22 —— 两边跑的**不是同一个 Node**，
+所以「本地绿」不能直接推出「CI 绿」。CI 那边不受这个 bug 影响（bug 从 Node 23 起），
+但版本差本身仍是长期风险（同一个仓库在两个 Node 大版本上跑测试），
+尚未做统一（`engines` 写的是 `>=22.0.0`，没上界）。
+
+---
+
 ## 记录格式约定
 
 新增缺陷时按上方的「场景 / 根因 / 后果 / 修复 / 回归测试 / 剩余问题」六段写。不要只记「修了」—— 要说清楚**当时怎么踩到的**、**怎么复现**、**不修的话会在哪一步暴露**。

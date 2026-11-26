@@ -7,8 +7,38 @@
 //   --list-slow      print the slow test files and exit
 //   --list-hanging   print the hanging test files and exit
 //
-// `--test-force-exit` is always passed: without credentials the agent adapters
-// can leave handles open, and the test process would never terminate.
+// ── 为什么**不**用 `--test-force-exit`（2026-11-27，ZD-063）────────────
+//
+// 原来这里恒定传 `--test-force-exit`（理由：没有凭据时 agent 适配器会留下
+// 打开的句柄，测试进程永远不退出）。
+//
+// 但那个理由在 Windows + Node>=23 上**代价更大**：
+// `--test-force-exit` 会在测试跑完后立刻 `process.exit()`，
+// 而此时 undici 的连接池里可能还有 keep-alive 的 socket 没关。
+// Node 调 `uv_async_send` 去通知一个已被 `uv_close` 标记
+// `UV_HANDLE_CLOSING` 的句柄 → libuv 直接断言崩溃：
+//
+//     Assertion failed: !(handle->flags & UV_HANDLE_CLOSING),
+//     file src\win\async.c, line 94
+//
+// 后果是**整个测试文件被判失败**，哪怕里面每个用例都通过了 ——
+// 「测试红了，但没有一个断言不通过」。
+//
+// 这是 Node 自身的 bug，不是我们的：
+//   - nodejs/node#56645（Windows + Node 23.x 起必现）
+//   - nodejs/node#61999 已修，但**还没进任何已发布版本**
+//
+// 复现条件（实测，本机 Node 24.16.0）：
+//   1 次 fetch → 不崩；**2 次及以上 fetch** → 崩
+// 与 server 收没关无关，与 git 子进程无关 —— 就是 undici 的连接池。
+//
+// 修法：**让事件循环自然排空**，不硬退。
+// 兜底用 `--test-timeout`（单个用例超时即失败），
+// 这样「某个测试真的挂住」会被明确报成超时，而不是让整个进程吊死。
+//
+// 为什么 CI（Node 22）不受影响：那个 bug 从 Node 23 才开始有。
+// 但我们不按版本分支处理 —— 判据统一：**永远不硬退**。
+
 
 import { readdirSync, statSync } from 'node:fs';
 import { join, dirname, relative } from 'node:path';
@@ -144,10 +174,27 @@ if (selected.length === 0) {
 
 warnIfCliBuildIsStale();
 
+// ── 单个用例的超时上限（分钟）────────────────────────────────────────
+//
+// 用途：替代 `--test-force-exit` 兜底「某个测试挂住」。
+// 有了它，事件循环排空时若有用例真的吊死，会被明确报成
+// 「超时」而不是让整个进程无限期挂着。
+//
+// 为什么是 10 分钟：最慢的验收测试（真跑 CLI、真建 git 仓库）
+// 实测在 60s 量级；10 分钟给它们足够余量，同时不会让「真挂住」
+// 要等一小时才被发现。
+const TEST_TIMEOUT_MIN = 10;
+
 // Spawn node --test with the filtered file list (cross-platform)
-const result = spawnSync(process.execPath, ['--test', '--test-force-exit', ...selected], {
-  stdio: 'inherit',
-  cwd: join(__dirname, '..'),
-});
+//
+// 注意：**不传 `--test-force-exit`** —— 见文件头的说明（ZD-063）。
+const result = spawnSync(
+  process.execPath,
+  ['--test', `--test-timeout=${TEST_TIMEOUT_MIN * 60_000}`, ...selected],
+  {
+    stdio: 'inherit',
+    cwd: join(__dirname, '..'),
+  },
+);
 
 process.exit(result.status ?? 1);
