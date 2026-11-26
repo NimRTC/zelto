@@ -35,7 +35,40 @@ export function taskLivenessOf(task: TaskInfo): ReturnType<typeof classifyLivene
   try {
     session = readSessionLiveness(process.cwd(), task.sessionId);
   } catch { /* 会话文件读不到就用任务文件本身 */ }
-  return classifyLiveness(mergeSessionLiveness(task, session), { isProcessAlive });
+  const merged = mergeSessionLiveness(task, session);
+
+  // ADR-129 补强（实测 nimrtc-v14 A3，2026-11-26）：**主管已死就是硬证据**。
+  //
+  // 病灶：detach 任务的会话文件可能**一个字节都没写**（适配器在写 session
+  // 状态之前就死了 / 进程被外部带走）。这时 `readSessionLiveness` 返回 null，
+  // `merged.pid` 只剩任务文件里的 `task.pid` —— 而 detach 任务文件往往
+  // **只有 `supervisorPid`、没有 `pid`**。于是 `classifyLiveness` 拿不到任何
+  // 进程号，只能判 `stale`（「也许还活着」）—— **不是 `dead`**。
+  // `maybeRecoverDeadTask` 在 `live.state !== 'dead'` 处直接返回，
+  // 任务、切片、预约三处同时卡在 running，没人收。
+  //
+  // 判据：任务文件写了 `supervisorPid` 且那个进程已经不在 → 这一轮的
+  // 监督进程没了；再叠加「没有任何活着的 agent 进程号」（merged.pid 缺失
+  // 或已死）→ 就是 dead。主管的死亡是文件里的**确定事实**，不该被
+  // 「拿不到 agent pid」拖成 stale。
+  if (
+    task.status === 'running' &&
+    typeof task.supervisorPid === 'number' &&
+    task.supervisorPid > 0 &&
+    !isProcessAlive(task.supervisorPid) &&
+    (typeof merged.pid !== 'number' || !isProcessAlive(merged.pid)) &&
+    (typeof merged.agentPid !== 'number' || !isProcessAlive(merged.agentPid))
+  ) {
+    return {
+      state: 'dead',
+      reason: `主管进程 ${task.supervisorPid} 已不在，且没有活着的 agent 进程`,
+      lastActivityAt: merged.lastActivityAt ?? task.lastActivityAt ?? null,
+      idleMs: null,
+      pid: null,
+    };
+  }
+
+  return classifyLiveness(merged, { isProcessAlive });
 }
 
 /**

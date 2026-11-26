@@ -49,6 +49,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadTask, patchTask, saveTask, type TaskInfo } from './task-store.js';
 import { makeRunId } from '../../core/sched/run-id.js';
+import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { startSupervisorHeartbeat } from './supervisor-heartbeat.js';
 
 /** 监督进程日志的目录（相对项目根）。 */
@@ -323,7 +324,9 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
   // 适配器必须住在这个进程里：它负责写会话文件的 `exitCode` 与 `status`。
   // 主进程一退就没人记录了（见文件头的说明）。
   const { createExecutorAdapter, store, events, harnessForAdapter } = await import('./shared.js');
-  const adapter = createExecutorAdapter(
+  // 显式按接口类型持有 —— `start({ runId })` / `continueSession(…, { runId })`
+  // 是接口上的可选参数（ADR-130），具体类的推断签名上没有。
+  const adapter: ExecutorAdapter = createExecutorAdapter(
     args.adapterType,
     args.agentCommand,
     Math.floor(args.timeoutMs / 1000),
@@ -376,7 +379,12 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
     log(`写集预约已取得：${(slice?.writes ?? []).join(', ') || '(空)'}`);
 
     // 起 agent
-    const started = await adapter.start({ sliceId: args.sliceId, prompt: bundlePath });
+    const started = await adapter.start({
+      sliceId: args.sliceId,
+      prompt: bundlePath,
+      // ADR-130：本轮 runId 进 agent 环境 —— hook 判定据此归属到这一轮
+      ...(runId ? { runId } : {}),
+    });
     sessionId = started.sessionId;
     log(`agent 已启动 session=${sessionId}`);
     heartbeatSessionId = sessionId;
@@ -523,13 +531,15 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       log(`第 ${attempt} 次重试（上一轮退出码 ${exitCode}，类别 ${stallClass}）`);
 
       // 续跑优先：同一个 agent 会话接着做，不从头再来（ADR-055）
-      const resumed = await resumeAgentSession(adapter, sessionId, args.sliceId, log);
+      const resumed = await resumeAgentSession(adapter, sessionId, args.sliceId, log, runId);
       if (resumed) {
         sessionId = resumed;
       } else {
         const started = await adapter.start({
           sliceId: args.sliceId,
           prompt: bundlePath,
+          // ADR-130：续跑/重起都属本轮 —— runId 进 agent 环境
+          runId,
         });
         sessionId = started.sessionId;
         log(`agent 重新启动 session=${sessionId}`);
@@ -794,6 +804,7 @@ async function resumeAgentSession(
   previousSessionId: string,
   sliceId: string,
   log: (line: string) => void,
+  runId?: string | null,
 ): Promise<string | null> {
   if (!adapter.metadata.capabilities.resume) return null;
   if (typeof adapter.continueSession !== 'function') return null;
@@ -805,6 +816,8 @@ async function resumeAgentSession(
       '继续完成这个切片。上一次运行超时被中止了，' +
       '工作区里已经有你之前做出的改动 —— 先检查当前状态，' +
       '补完没做完的部分，不要从头重做已经做完的事。',
+      // ADR-130：续跑仍属同一轮 —— 本轮 runId 进 agent 环境
+      runId ? { runId } : undefined,
     );
     log(`↻ 续上同一个 agent 会话（${sliceId}）session=${sessionId}`);
     return sessionId;

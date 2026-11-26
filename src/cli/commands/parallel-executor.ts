@@ -22,6 +22,7 @@ import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import type { SliceData } from '../../core/slice/store.js';
 import type { WorktreeInfo } from '../../core/worktree/index.js';
+import type { ExecutorAdapter } from '../../core/ports/executor.js';
 
 import {
   ZELTO_DIR,
@@ -652,7 +653,10 @@ export async function executeSlicesParallel(
   }
 
   // ── Phase 3: 拉起 agent ────────────────────────────────────────────
-  const adapters = states.map((st, i) => {
+  // 显式标注为接口类型（而不是让每个具体适配器各自推断）——
+  // 调用点用的 `start({ runId })` / `continueSession(…, { runId })`（ADR-130）
+  // 是接口上的可选参数，具体类上不一定有，不标注就会被推断成窄签名。
+  const adapters: ExecutorAdapter[] = states.map((st, i) => {
     const timeout = slices[i]?.agentTimeout;
     return createExecutorAdapter(adapterType, agentName, timeout, st.worktreePath ?? process.cwd());
   });
@@ -704,7 +708,12 @@ export async function executeSlicesParallel(
 
     try {
       let sessionId: string | undefined;
-      ({ sessionId } = await adapter.start({ sliceId: st.id, prompt: bundlePath }));
+      ({ sessionId } = await adapter.start({
+        sliceId: st.id,
+        prompt: bundlePath,
+        // ADR-130：本轮 runId 进 agent 环境 —— hook 判定据此归属到这一轮
+        runId: makeRunId(st.id, runStartedAts[i], 0),
+      }));
       st.sessionId = sessionId;
       st.status = 'running';
     } catch (err) {
@@ -858,6 +867,9 @@ export async function executeSlicesParallel(
               st.worktreePath ?? process.cwd(),
             );
             const bundlePath = join(ZELTO_DIR, `${st.id}-bundle.json`);
+            // ADR-129 一 + ADR-130：重试是新的一轮 —— 与 run.aborted 写回的
+            // `attempt+1` 同一个 runId，并交给适配器注入 agent 环境。
+            const retryRunId = makeRunId(st.id, runStartedAts[i], attempt + 1);
             try {
               // 超时重试接着上一次跑，不从头再来（ADR-055）
               const previousSessionId: string | null = st.sessionId;
@@ -869,6 +881,7 @@ export async function executeSlicesParallel(
                     '继续完成这个切片。上一次运行超时被中止了，' +
                     '工作区里已经有你之前做出的改动 —— 先检查当前状态，' +
                     '补完没做完的部分，不要从头重做已经做完的事。',
+                    { runId: retryRunId },
                   );
                   resumedSessionId = resumed.sessionId;
                 } catch {
@@ -876,7 +889,11 @@ export async function executeSlicesParallel(
                 }
               }
               const sessionId: string = resumedSessionId
-                ?? (await adapters[i].start({ sliceId: st.id, prompt: bundlePath })).sessionId;
+                ?? (await adapters[i].start({
+                  sliceId: st.id,
+                  prompt: bundlePath,
+                  runId: retryRunId,
+                })).sessionId;
               st.sessionId = sessionId;
               st.status = 'running';
               continue; // 重试

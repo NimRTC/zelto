@@ -27,7 +27,7 @@
 //
 // 失败一律 fail closed：判定不了就拒绝写。
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
@@ -55,6 +55,14 @@ export interface PreToolContext {
   }> | null;
   /** 策略文件哈希 */
   policyVersion: string;
+  /**
+   * 任务文件里记录的「当前那一轮」runId（ADR-129 `task.runId`）。
+   *
+   * **不用于判定**，只用于在事件信封 `run` 字段上标 `derived:`（ADR-130）：
+   * 任务状态可能已指向别的一轮、也可能比实际更旧，所以绝不能伪装成本轮
+   * runId —— 有真 runId（`ZELTO_RUN_ID` / `--run-id`）时优先用真的。
+   */
+  taskRunId?: string | null;
 }
 
 export interface PreToolVerdict {
@@ -621,11 +629,17 @@ function nextRunSeq(eventFile: string): number {
 
 /**
  * 追加一条事件。写盘失败不影响判定结果 —— 判定已经做完了。
+ *
+ * @param runRef 本轮运行的引用（ADR-130）：真 runId 原样填；推导值带
+ *   `derived:` 前缀；null → 信封 `run` 留 null、payload 不带 `runId`。
+ *   有就同时写进信封 `run` 与 payload —— 前者给按轮聚合的消费者，
+ *   后者给不解包信封的消费者。
  */
 export function appendDecisionEvent(
   projectRoot: string,
   sliceId: string,
   payload: Record<string, unknown>,
+  runRef: string | null = null,
 ): void {
   try {
     const dir = join(projectRoot, '.zelto', 'events', sliceId);
@@ -635,10 +649,10 @@ export function appendDecisionEvent(
       ts: new Date().toISOString(),
       runSeq: nextRunSeq(eventFile),
       slice: sliceId,
-      run: null,
+      run: runRef,
       type: 'policy.decision',
       actor: 'hook',
-      payload,
+      payload: runRef ? { ...payload, runId: runRef } : payload,
     };
     appendFileSync(eventFile, `${JSON.stringify(envelope)}\n`, 'utf-8');
   } catch {
@@ -657,12 +671,22 @@ interface HookArgs {
   sliceId: string | null;
   /** 哪个 harness 触发的这次判定（ADR-083） */
   harness: HarnessName;
+  /**
+   * 本轮的 runId（ADR-129 / ADR-130）。
+   *
+   * 由**运行进程**（前台 / 主管 / 并行 / 续跑）在拉起 agent 时经环境变量
+   * `ZELTO_RUN_ID` 传入；hook 进程**不自己推断**「当前是哪一轮」
+   * （不读任务文件、不看最新会话文件 —— ADR-129 明令禁止）。
+   * 取不到就是 null：如实留空，不猜。
+   */
+  runId: string | null;
 }
 
 export function parseArgs(argv: string[]): HookArgs {
   let projectRoot = process.env.ZELTO_PROJECT_ROOT ?? process.cwd();
   let worktreeRoot = '';
   let sliceId: string | null = process.env.ZELTO_SLICE_ID ?? null;
+  let runId: string | null = process.env.ZELTO_RUN_ID || null;
   // 默认 Claude Code —— 保持旧调用方式（不带 --harness）的行为不变。
   let harness: HarnessName = 'claude-code';
 
@@ -671,6 +695,8 @@ export function parseArgs(argv: string[]): HookArgs {
     if (arg === '--project-root' && argv[i + 1]) projectRoot = argv[++i];
     else if (arg === '--worktree' && argv[i + 1]) worktreeRoot = argv[++i];
     else if (arg === '--slice' && argv[i + 1]) sliceId = argv[++i];
+    // 显式命令行覆盖环境变量（调试 / 测试用）
+    else if (arg === '--run-id' && argv[i + 1]) runId = argv[++i] || null;
     else if (arg === '--harness' && argv[i + 1]) {
       const value = argv[++i];
       if (value === 'cursor' || value === 'codex' || value === 'claude-code') {
@@ -685,6 +711,7 @@ export function parseArgs(argv: string[]): HookArgs {
     worktreeRoot: worktreeRoot ? resolve(worktreeRoot) : root,
     sliceId,
     harness,
+    runId,
   };
 }
 
@@ -828,7 +855,41 @@ export function buildContext(args: HookArgs): PreToolContext {
     writes: loadWrites(args.projectRoot, args.sliceId),
     rules,
     policyVersion: version,
+    // 任务文件里的「当前那一轮」（ADR-129 `task.runId`）—— 只用于事件上
+    // 标 `derived:`，不参与判定（见 PreToolContext.taskRunId）。
+    taskRunId: loadTaskRunId(args.projectRoot, args.sliceId),
   };
+}
+
+/**
+ * 任务文件里记录的**当前那一轮** runId（`task.runId`，ADR-129）。
+ *
+ * 读不到（无任务目录 / 不是 running / 字段缺失）→ null。
+ * 只读，不判定 —— 判定确定性（C3）不受影响。
+ */
+function loadTaskRunId(projectRoot: string, sliceId: string | null): string | null {
+  if (!sliceId) return null;
+  let files: string[];
+  try {
+    files = readdirSync(join(projectRoot, '.zelto', 'tasks')).filter((f) => f.endsWith('.json'));
+  } catch {
+    return null;
+  }
+  let latest: { runId: string; at: string } | null = null;
+  for (const f of files) {
+    try {
+      const parsed = JSON.parse(
+        readFileSync(join(projectRoot, '.zelto', 'tasks', f), 'utf-8'),
+      ) as { sliceId?: unknown; runId?: unknown; status?: unknown; writtenAt?: unknown };
+      if (parsed.sliceId !== sliceId || parsed.status !== 'running') continue;
+      if (typeof parsed.runId !== 'string' || parsed.runId.length === 0) continue;
+      const at = typeof parsed.writtenAt === 'string' ? parsed.writtenAt : '';
+      if (!latest || at > latest.at) latest = { runId: parsed.runId, at };
+    } catch {
+      /* 单份损坏不影响其它候选 */
+    }
+  }
+  return latest?.runId ?? null;
 }
 
 function readStdin(): Promise<string> {
@@ -885,6 +946,12 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
   const verdict = judgeWriteTargets(targets, ctx);
 
   const eventSlice = ctx.sliceId ?? POLICY_ONLY_SLICE;
+  // 本轮 runId 的来源（ADR-130）：
+  //   1. 运行进程显式传入（`ZELTO_RUN_ID` / `--run-id`）—— 与 `run.started` 同一个值；
+  //   2. 否则取任务文件的 `task.runId`，但**标明是推导值**（`derived:` 前缀）——
+  //      任务状态可能已指向别的一轮，不许伪装成本轮；
+  //   3. 都没有 → null（如实留空，不按时间补）。
+  const runRef = args.runId ?? (ctx.taskRunId ? `derived:${ctx.taskRunId}` : null);
   appendDecisionEvent(ctx.projectRoot, eventSlice, {
     decision: verdict.decision,
     ruleId: verdict.ruleId,
@@ -898,7 +965,7 @@ export async function runPreTool(argv: string[]): Promise<HookResponse> {
     // 追溯链要能回答「这次判定是哪个 agent 触发的」。
     harness: args.harness,
     sliceId: ctx.sliceId,
-  });
+  }, runRef);
 
   return {
     decision: verdict.decision,

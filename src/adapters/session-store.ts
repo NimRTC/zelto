@@ -56,6 +56,14 @@ export interface PersistentSessionData {
   cwd: string;
   /** 本会话续的是哪个 zelto 会话（null = 全新开始） */
   resumedFrom: string | null;
+  /**
+   * 本轮的运行身份（ADR-129 / ADR-130）；zelto 之外起的会话没有它。
+   *
+   * 续跑（`resume` / `continueSession`）从会话文件读回它 → 同一轮里
+   * agent 产生的 `policy.decision` 才能全部归到同一个 `runId`，
+   * 追溯链在续跑那一段不断。
+   */
+  runId?: string | null;
 }
 
 /** 会话文件路径（相对项目根）。 */

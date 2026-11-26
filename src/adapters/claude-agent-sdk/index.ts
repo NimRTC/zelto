@@ -211,12 +211,13 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     sliceId: string;
     prompt: string;
     model?: string;
+    runId?: string;
   }): Promise<{ sessionId: string }> {
     return this.startWithRetry(spec, 0);
   }
 
   private async startWithRetry(
-    spec: { sliceId: string; prompt: string; model?: string },
+    spec: { sliceId: string; prompt: string; model?: string; runId?: string },
     retryCount: number,
   ): Promise<{ sessionId: string }> {
     const sessionId = `sdk-${spec.sliceId}-${Date.now()}${retryCount > 0 ? `-retry-${retryCount}` : ''}`;
@@ -245,6 +246,11 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
 
     if (this.env) {
       sdkOptions.env = this.env;
+    }
+    // ADR-130：本轮身份交给 agent 的子进程环境 —— PreToolUse 钩子据此
+    // 把 `policy.decision` 归属到这一轮。不碰判定本身（C3/C5 不变）。
+    if (spec.runId) {
+      sdkOptions.env = { ...(this.env ?? {}), ZELTO_RUN_ID: spec.runId };
     }
 
     const abortController = new AbortController();
@@ -481,7 +487,11 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     }
   }
 
-  async resume(_sessionId: string, _patch: string): Promise<{ sessionId: string }> {
+  async resume(
+    _sessionId: string,
+    _patch: string,
+    _opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     // Read the session's event history to rebuild context
     const existingEvents = this.sessionEvents.get(_sessionId);
     const contextSummary =
@@ -501,6 +511,8 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
         // Same as start(): the controller is what actually stops the child
         // process, so it has to reach the SDK.
         abortController,
+        // ADR-130：续跑仍属同一轮，runId 照样交给 agent 环境。
+        ...(_opts?.runId ? { env: { ...(this.env ?? {}), ZELTO_RUN_ID: _opts.runId } } : {}),
       },
     });
 
@@ -530,7 +542,11 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
    * 提示词里带上上一轮的事件摘要，让 agent 知道「上次做到哪儿了」。
    * 这比从头跑强：至少不用重新摸索已经摸清的东西。
    */
-  async continueSession(sessionId: string, instructions: string): Promise<{ sessionId: string }> {
+  async continueSession(
+    sessionId: string,
+    instructions: string,
+    _opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     const existingEvents = this.sessionEvents.get(sessionId);
     const contextSummary =
       existingEvents && existingEvents.length > 0
@@ -540,11 +556,16 @@ export class ClaudeAgentSdkAdapter implements ExecutorAdapter {
     const combinedPrompt = `${contextSummary}\n\n${instructions}`;
 
     const abortController = new AbortController();
+    // ADR-130：续跑仍属同一轮 —— 调用方给了 runId 就注入 agent 环境。
+    const envForRun = _opts?.runId
+      ? { env: { ...(this.env ?? {}), ZELTO_RUN_ID: _opts.runId } }
+      : {};
     const warm = await startup({
       options: {
         cwd: this.cwd,
         permissionMode: this.permissionMode,
         abortController,
+        ...envForRun,
       },
     });
 

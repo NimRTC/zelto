@@ -319,12 +319,17 @@ export class CursorAgentAdapter implements ExecutorAdapter {
 
   // ─── 启动 ────────────────────────────────────────────────────────────────
 
-  async start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }> {
+  async start(spec: {
+    sliceId: string;
+    prompt: string;
+    model?: string;
+    runId?: string;
+  }): Promise<{ sessionId: string }> {
     return this.startWithRetry(spec, 0);
   }
 
   private async startWithRetry(
-    spec: { sliceId: string; prompt: string; model?: string },
+    spec: { sliceId: string; prompt: string; model?: string; runId?: string },
     retryCount: number,
   ): Promise<{ sessionId: string }> {
     const sessionId = `cursor-agent-${spec.sliceId}-${Date.now()}${
@@ -343,6 +348,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
       model,
       resumeAgentSessionId: null,
       resumedFromZelto: null,
+      // ADR-130：本轮身份原样传下去，hook 事件据此归属轮次
+      runId: spec.runId ?? null,
     });
   }
 
@@ -375,6 +382,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
     resumedFromZelto: string | null;
     cwd?: string;
     agentCommand?: string;
+    /** 本轮 runId（ADR-130）；null → 不注入 `ZELTO_RUN_ID`。 */
+    runId?: string | null;
   }): { sessionId: string } {
     const { sessionId, sliceId, instructions, bundlePath, retryCount } = opts;
     const workDir = opts.cwd ?? this.cwd;
@@ -409,6 +418,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
       agentSessionId: opts.resumeAgentSessionId,
       cwd: workDir,
       resumedFrom: opts.resumedFromZelto,
+      // ADR-130：本轮身份随会话落盘，续跑时读回。
+      runId: opts.runId ?? null,
     };
     saveSession(sessionData);
     this.sessionData.set(sessionId, sessionData);
@@ -435,6 +446,8 @@ export class CursorAgentAdapter implements ExecutorAdapter {
         ZELTO_PROJECT_ROOT: workDir,
         ZELTO_SESSION_ID: sessionId,
         ZELTO_AGENT_SESSION_ID: opts.resumeAgentSessionId ?? '',
+        // ADR-130：本轮 runId 进 agent 环境 —— hook 判定据此归属到这一轮
+        ...(opts.runId ? { ZELTO_RUN_ID: opts.runId } : {}),
       },
     });
 
@@ -786,7 +799,11 @@ export class CursorAgentAdapter implements ExecutorAdapter {
    * 这里宁可抛错，也不静默开一个新会话：
    * 静默开新会话 = 上下文清零 = agent 已经做掉的事全作废（ADR-013 §3.4）。
    */
-  async resume(sessionId: string, patch: string): Promise<{ sessionId: string }> {
+  async resume(
+    sessionId: string,
+    patch: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (!data) throw new Error(`Session "${sessionId}" not found — cannot resume`);
 
@@ -819,11 +836,17 @@ export class CursorAgentAdapter implements ExecutorAdapter {
       resumedFromZelto: sessionId,
       cwd: data.cwd || this.cwd,
       agentCommand: data.agentCommand || this.agentCommand,
+      // ADR-130：续跑仍属同一轮 —— 调用方确认过就用它，否则沿用会话记录的那个。
+      runId: opts?.runId ?? data.runId ?? null,
     });
   }
 
   /** 续同一个会话，但提示词是任意的（超时重试：「接着上次做」）。 */
-  async continueSession(sessionId: string, instructions: string): Promise<{ sessionId: string }> {
+  async continueSession(
+    sessionId: string,
+    instructions: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (!data) throw new Error(`Session "${sessionId}" not found — cannot continue`);
 
@@ -846,6 +869,9 @@ export class CursorAgentAdapter implements ExecutorAdapter {
       resumedFromZelto: sessionId,
       cwd: data.cwd || this.cwd,
       agentCommand: data.agentCommand || this.agentCommand,
+      // ADR-130：续跑仍属同一轮 —— 调用方显式给了 runId 就用它，
+      // 否则沿用会话文件里记的那一个；都没记录才不注入（不凭空造一个）。
+      runId: opts?.runId ?? data.runId ?? null,
     });
   }
 

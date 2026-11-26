@@ -160,6 +160,7 @@ async function resumeForRetry(
   previousSessionId: string,
   sliceId: string,
   bundlePath: string,
+  runId?: string,
 ): Promise<string | null> {
   if (!adapter.metadata.capabilities.resume) return null;
   if (typeof adapter.continueSession !== 'function') return null;
@@ -170,6 +171,8 @@ async function resumeForRetry(
       '继续完成这个切片。上一次运行超时被中止了，' +
       '工作区里已经有你之前做出的改动 —— 先检查当前状态，' +
       '补完没做完的部分，不要从头重做已经做完的事。',
+      // ADR-130：续跑期间的 `policy.decision` 也要归属到本轮 runId。
+      runId ? { runId } : undefined,
     );
     console.log(`  ↻ Continuing the same agent session (${sliceId})`);
     return sessionId;
@@ -1881,7 +1884,7 @@ register('run', async (args) => {
     guard = activeGuard;
     console.log(`  Reservation:   ${bundle.writes.join(', ') || '(空)'}`);
 
-    let adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
+    let adapter: ExecutorAdapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
 
     // 活进程看门狗（ADR-074）：记下本轮起跑时刻 —— 它把「本轮的现场」
     // 与「上一代被收走的尸体」分开（见 waitForExitWithWatchdog）
@@ -1890,14 +1893,18 @@ register('run', async (args) => {
     // 比这个时刻早，取晚了本轮记录会被世代过滤滤掉 → 看门狗误判「从没开跑」。
     let runStartedAt = new Date().toISOString();
     runGenStartedAt.set(id, runStartedAt);
+    // ADR-129 一 + ADR-130：这一轮的 identity **只算一次**。起跑注入（agent 的
+    // `ZELTO_RUN_ID`）、`run.started` 事件、重试续跑全都用这一个值 ——
+    // 不能各处各算一份（哪怕公式相同，一旦有人改了公式就会静默分叉）。
+    const runId = makeRunId(id, runStartedAt, 0);
 
-    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath, runId });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
       worktree: worktree?.relativePath ?? null,
       // ADR-129 一：这一轮的 identity —— 收尾端必须精确写回同一个值
-      runId: makeRunId(id, runStartedAt, 0),
+      runId,
       // ADR-124 修法二：这一轮是在「上一轮残留记录没有 pid 可查」的情况下
       // 放行起跑的。写进事件流，事后审计能看出「这一轮为什么被放行」。
       ...(staleNoPidRecord
@@ -2080,11 +2087,11 @@ register('run', async (args) => {
           // 世代过滤靠它切分本轮记录与上一代的尸体，取晚了本轮记录会被滤掉。
           runStartedAt = new Date().toISOString();
           runGenStartedAt.set(id, runStartedAt);
-          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
+          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath, runId);
           if (resumed) {
             sessionId = resumed;
           } else {
-            const started = await adapter.start({ sliceId: id, prompt: bundlePath });
+            const started = await adapter.start({ sliceId: id, prompt: bundlePath, runId });
             sessionId = started.sessionId;
           }
 
@@ -2162,7 +2169,7 @@ register('run', async (args) => {
       alreadyRecorded: true, // 上面已经记过账
       alreadyStalled,       // 重试预算耗尽时 handleAgentFailure 已经停过一次
       // ADR-129：这一轮的 identity，收尾原样写回（与起跑端 **同一个** 值）
-      runId: makeRunId(id, runStartedAt, 0),
+      runId,
     });
 
     if (!finished.ok && finalExitCode !== 0) {
@@ -2490,7 +2497,7 @@ register('start', async (args) => {
     }
 
     const sliceForTimeout = await store.read(id);
-    let adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
+    let adapter: ExecutorAdapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
     // 活进程看门狗（ADR-074）的「本轮起跑时刻」—— **必须在 start 之前**取。
     //
     // 世代过滤靠它切分「本轮的记录」与「上一代的尸体」：只有
@@ -2503,12 +2510,14 @@ register('start', async (args) => {
     // 于是每次重试都要么秒收一次、要么被上一代的尸体当成现场（D-49）。
     let runStartedAt = new Date().toISOString();
     runGenStartedAt.set(id, runStartedAt);
-    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath });
+    // ADR-129 一 + ADR-130：identity 只算一次，起跑注入 / 事件 / 重试续跑共用。
+    const runId = makeRunId(id, runStartedAt, 0);
+    let { sessionId } = await adapter.start({ sliceId: id, prompt: bundlePath, runId });
 
     await events.append(id, 'run.started', 'zelto', {
       sliceId: id, agent: agentName, bundlePath, writes: bundle.writes,
       // ADR-129 一：这一轮的 identity（与前台 run 同一口径）
-      runId: makeRunId(id, runStartedAt, 0),
+      runId,
       // ADR-124 修法二：放行起跑的证据（见 `zelto run` 路径的同名字段）。
       ...(startStaleNoPid
         ? {
@@ -2641,11 +2650,11 @@ register('start', async (args) => {
           // 世代过滤靠它切分本轮记录与上一代的尸体，取晚了本轮记录会被滤掉。
           runStartedAt = new Date().toISOString();
           runGenStartedAt.set(id, runStartedAt);
-          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath);
+          const resumed = await resumeForRetry(adapter, sessionId, id, bundlePath, runId);
           if (resumed) {
             sessionId = resumed;
           } else {
-            const started = await adapter.start({ sliceId: id, prompt: bundlePath });
+            const started = await adapter.start({ sliceId: id, prompt: bundlePath, runId });
             sessionId = started.sessionId;
           }
           progressTimer = setInterval(() => {

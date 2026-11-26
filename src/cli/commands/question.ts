@@ -6,8 +6,10 @@
 //
 // C1: 问题状态只落在文件里；C4: 每个动作写一条 append-only 事件。
 
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { QuestionStore, parseQuestion, type QuestionRecord } from '../../core/question/index.js';
+import { findRunConclusion } from '../../core/sched/index.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { register } from './shared.js';
 import {
@@ -24,6 +26,84 @@ const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
 
 function questionStore(): QuestionStore {
   return new QuestionStore({ baseDir: QUESTIONS_DIR });
+}
+
+/**
+ * 回答后续跑沿用哪个 runId（ADR-130）。
+ *
+ * runId 取自任务文件（ADR-129 的权威来源），但任务文件是「当前状态」不是历史，
+ * 必须先确认它说的那一轮**仍在等这次回答**：
+ *
+ *   - `status !== 'running'` / 没有 `runId` → 没有「本轮」可言，null；
+ *   - 事件流里它已有 `run.finished` / `run.aborted` → 那轮已结束，null；
+ *   - 事件流里它有 `run.started`，且之后停在 `agent_question` → 就是它。
+ *
+ * 确认不了 → null：适配器不注入 `ZELTO_RUN_ID`，hook 端退回 `derived:` 或如实留空
+ * （ADR-130 二）—— 绝不拿一个可能属于别轮的 id 冒充本轮。
+ *
+ * 事件列表由调用方**一次性读入**（纯计算，C3）：调用发生在写 `run.resumed`
+ * 之前，所以不存在「读到本次续跑自己刚写的事件」的循环。
+ */
+export function resumeRunIdForAnswer(sliceId: string, stream: ReadonlyArray<unknown>): string | null {
+  const task = loadRunningTask(sliceId);
+  if (!task?.runId) return null;
+  if (findRunConclusion(stream, task.runId)) return null;
+
+  let startedSeen = false;
+  let pendingQuestion = false;
+  for (const raw of stream) {
+    if (!raw || typeof raw !== 'object') continue;
+    const e = raw as { type?: unknown; payload?: unknown };
+    const p = (e.payload ?? {}) as Record<string, unknown>;
+    if (e.type === 'run.started' && p.runId === task.runId) {
+      startedSeen = true;
+      pendingQuestion = false; // 新一轮起跑：之前的提问不算这一轮的状态
+    } else if (e.type === 'stall.classified' && p.class === 'agent_question') {
+      // 只有**这一轮起跑之后**的提问才属于它：更早的提问属于更早的轮次，
+      // 不能因为「这个切片曾经停在提问上」就把任务文件的 runId 认作本轮。
+      pendingQuestion = startedSeen;
+    }
+  }
+  return startedSeen && pendingQuestion ? task.runId : null;
+}
+
+/**
+ * 本切片「还在跑」的那份任务文件。
+ *
+ * 任务文件名是 taskId，**不能**按文件名认切片（id 里可能带 `-`，
+ * `task-a-b-1` 与 `task-a-1` 无法从文件名区分）；一律读内容里的 `sliceId`。
+ * 多份同时 `running` 时取落盘最晚的一份（`writtenAt` —— 监督进程会
+ * 反复改写同一份文件，按文件名里的起跑时刻排会排错）。
+ */
+function loadRunningTask(sliceId: string): { runId?: string } | null {
+  let files: string[];
+  try {
+    files = readdirSync(join(ZELTO_DIR, 'tasks')).filter((f) => f.endsWith('.json'));
+  } catch {
+    return null; // 没有任务目录 = 前台跑的那一轮
+  }
+  let latest: ({ runId?: string } & { writtenAt?: string }) | null = null;
+  for (const f of files) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(ZELTO_DIR, 'tasks', f), 'utf-8')) as {
+        sliceId?: unknown;
+        runId?: unknown;
+        status?: unknown;
+        writtenAt?: unknown;
+      };
+      if (parsed.sliceId !== sliceId || parsed.status !== 'running') continue;
+      const writtenAt = typeof parsed.writtenAt === 'string' ? parsed.writtenAt : '';
+      if (!latest || writtenAt > (latest.writtenAt ?? '')) {
+        latest = {
+          ...(typeof parsed.runId === 'string' ? { runId: parsed.runId } : {}),
+          writtenAt,
+        };
+      }
+    } catch {
+      /* 单份损坏不影响其它候选 */
+    }
+  }
+  return latest;
 }
 
 // ─── 提问检测与挂起（供 run 流程复用） ──────────────────────────────────────
@@ -222,9 +302,19 @@ register('answer', async (args) => {
 
   console.log(`Answered ${questionId} — resuming slice "${sliceId}"...`);
 
+  // ADR-130：续跑仍属**同一轮**，agent 的 `policy.decision` 要能归属到它。
+  // runId 取自任务文件（ADR-129 的权威来源），只在那轮**仍在等这次回答**时沿用：
+  // 有结论 / 没有停在 `agent_question` 的证据 → 不注入。判定全部只读文件（C3），
+  // 单次读取快照 —— 读时 `run.resumed` 还没写，不存在「读到自己刚写的」。
+  const runId = resumeRunIdForAnswer(sliceId, await events.read(sliceId));
+
   let newSessionId: string;
   try {
-    const resumed = await adapter.resume(record.zeltoSessionId, answerText);
+    const resumed = await adapter.resume(
+      record.zeltoSessionId,
+      answerText,
+      runId ? { runId } : undefined,
+    );
     newSessionId = resumed.sessionId;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -241,7 +331,7 @@ register('answer', async (args) => {
   if (exitCode !== 0) {
     const elapsedNote = `exit ${exitCode ?? 'signal'}`;
     console.error(`❌ Agent exited with ${elapsedNote} after the answer.`);
-    await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode });
+    await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode, ...(runId ? { runId } : {}) });
     // 续跑失败同样要退回 frozen（ADR-047）：切片本来就在 running
     // （提问回路挂起时不迁状态），不退回就永远卡在 running ——
     // 准入只认 frozen / completed，人救不回来。
@@ -284,13 +374,13 @@ register('answer', async (args) => {
   try {
     await store.transit(sliceId, 'RUN_FINISH');
     cost = await settleRunCost(sliceId, adapter, newSessionId);
-    await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd });
+    await events.append(sliceId, 'run.finished', 'zelto', { sliceId, exitCode: 0, costUsd: cost.costUsd, ...(runId ? { runId } : {}) });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`❌ Could not finish the run for slice "${sliceId}": ${msg}`);
     console.error(`   The agent finished, but the slice state was not updated.`);
     console.error(`   Check with: zelto slice show ${sliceId}`);
-    await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode, reason: msg });
+    await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode, reason: msg, ...(runId ? { runId } : {}) });
     return 1;
   }
   console.log(`✅ Agent completed after the answer.`);

@@ -95,6 +95,14 @@ export interface PersistentSessionData {
   cwd: string;
   /** zelto session this one continues (null for a fresh start). */
   resumedFrom: string | null;
+  /**
+   * 本轮的运行身份（ADR-129 / ADR-130）。跑在 zelto 之外起的会话没有它 → null。
+   *
+   * 续跑（`resume` / `continueSession`）从这里读回 —— 一轮的 runId 整轮不变，
+   * 续跑出来的新会话仍得用同一个值注入 `ZELTO_RUN_ID`，否则续跑期间的
+   * `policy.decision` 全落成 `run: null`，追溯链在那一段断掉。
+   */
+  runId?: string | null;
 }
 
 function sessionPath(sessionId: string): string {
@@ -302,12 +310,17 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
 
   // ─── Start ─────────────────────────────────────────────────────────────────
 
-  async start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }> {
+  async start(spec: {
+    sliceId: string;
+    prompt: string;
+    model?: string;
+    runId?: string;
+  }): Promise<{ sessionId: string }> {
     return this.startWithRetry(spec, 0);
   }
 
   private async startWithRetry(
-    spec: { sliceId: string; prompt: string; model?: string },
+    spec: { sliceId: string; prompt: string; model?: string; runId?: string },
     retryCount: number,
   ): Promise<{ sessionId: string }> {
     const sessionId = `claude-agent-${spec.sliceId}-${Date.now()}${retryCount > 0 ? `-retry-${retryCount}` : ''}`;
@@ -336,6 +349,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       agentSessionId,
       resumeAgentSessionId: null,
       resumedFromZelto: null,
+      // ADR-130：本轮身份原样传下去，hook 事件据此归属轮次
+      runId: spec.runId ?? null,
     });
   }
 
@@ -358,6 +373,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
     resumeAgentSessionId: string | null;
     /** zelto session this one continues (null → fresh start). */
     resumedFromZelto: string | null;
+    /**
+     * 本轮 runId（ADR-130）；null / 缺省 → 不注入 `ZELTO_RUN_ID`
+     * （hook 事件如实留空，不凭空造一个）。
+     */
+    runId?: string | null;
     cwd?: string;
     agentCommand?: string;
   }): { sessionId: string } {
@@ -393,6 +413,9 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       agentSessionId,
       cwd: workDir,
       resumedFrom: opts.resumedFromZelto,
+      // ADR-130：本轮身份随会话落盘 —— 续跑（resume / continueSession）
+      // 从会话文件读回它，保证同一轮里所有判定事件归属同一个 runId。
+      runId: opts.runId ?? null,
     };
     saveSession(sessionData);
     // Keep the live object in memory so the output collected while running is
@@ -437,6 +460,8 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
           ZELTO_PROJECT_ROOT: workDir,
           ZELTO_SESSION_ID: sessionId,
           ZELTO_AGENT_SESSION_ID: agentSessionId,
+          // ADR-130：本轮身份交给 agent 的子进程（hook 从这里取）
+          ...(opts.runId ? { ZELTO_RUN_ID: opts.runId } : {}),
         },
       },
     );
@@ -859,7 +884,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
    * stays the slice's worktree, so the write-set reservation is unaffected
    * (C9).
    */
-  async resume(sessionId: string, patch: string): Promise<{ sessionId: string }> {
+  async resume(
+    sessionId: string,
+    patch: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (!data) {
       throw new Error(`Session "${sessionId}" not found — cannot resume`);
@@ -891,6 +920,10 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       resumedFromZelto: sessionId,
       cwd: data.cwd || this.cwd,
       agentCommand: data.agentCommand || this.agentCommand,
+      // ADR-130：续跑仍属同一轮 —— 调用方确认过就用它，否则从会话文件读回。
+      // `sessionData` 里那份可能是**运行期间刚建、还没带 runId 的旧对象**，
+      // 数据里没有时再读一次文件。
+      runId: opts?.runId ?? data.runId ?? loadSession(sessionId)?.runId ?? null,
     });
   }
 
@@ -905,7 +938,11 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
    * 续跑与从头跑的区别很大：超时被杀时 agent 已经做掉的工作留在
    * worktree 里，从头跑等于把那些工作重做一遍，还把上下文清零。
    */
-  async continueSession(sessionId: string, instructions: string): Promise<{ sessionId: string }> {
+  async continueSession(
+    sessionId: string,
+    instructions: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }> {
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (!data) {
       throw new Error(`Session "${sessionId}" not found — cannot continue`);
@@ -929,6 +966,9 @@ export class ClaudeAgentAdapter implements ExecutorAdapter {
       resumedFromZelto: sessionId,
       cwd: data.cwd || this.cwd,
       agentCommand: data.agentCommand || this.agentCommand,
+      // ADR-130：续跑仍属同一轮 —— 调用方显式给了 runId 就用它，
+      // 否则从会话文件读回（数据里没有就再读一次文件，见 resume() 的说明）。
+      runId: opts?.runId ?? data.runId ?? loadSession(sessionId)?.runId ?? null,
     });
   }
 

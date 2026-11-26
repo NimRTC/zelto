@@ -46,6 +46,14 @@ export interface TaskInfo {
    * 「这一轮有没有结论」一律按它去事件流里找 —— 不许用「最新会话文件」推断。
    */
   runId?: string;
+  /**
+   * 这个任务文件本身是什么时候写的（收尾动作用它判断「是不是过后才落盘」）。
+   *
+   * ADR-130：hook 在没有真 `ZELTO_RUN_ID` 时会退到 `task.runId` 并标 `derived:`。
+   * 但任务文件只是「当前状态」，不是历史 —— 它可能比本进程里正在跑的这一轮**旧**。
+   * 本进程自己收尾/续跑时拿它对照：`runId` 与自己做的那一轮不一致 → 不信它。
+   */
+  writtenAt?: string;
 }
 
 export function tasksDir(): string {
@@ -58,7 +66,9 @@ export function taskPath(taskId: string): string {
 
 export function saveTask(info: TaskInfo): void {
   if (!existsSync(tasksDir())) mkdirSync(tasksDir(), { recursive: true });
-  writeFileSync(taskPath(info.taskId), JSON.stringify(info, null, 2), 'utf-8');
+  // ADR-130：每次整份写都记下落盘时刻 —— 读方据此判断这份快照有多旧。
+  const stamped: TaskInfo = { ...info, writtenAt: new Date().toISOString() };
+  writeFileSync(taskPath(info.taskId), JSON.stringify(stamped, null, 2), 'utf-8');
 }
 
 export function loadTask(taskId: string): TaskInfo | null {

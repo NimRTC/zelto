@@ -135,4 +135,47 @@ describe('ZD-049 —— 看门狗接管「主管半路死了」的收尾', () =>
     );
     assert.equal(takeover.length, 0, '结论是事实，不重复执行');
   });
+
+  // ── 回归：旧 dist 写的 run.started **不带 runId**（实测 nimrtc-v14 A3，2026-11-26）
+  //
+  // 病灶：14:05 那轮的 `run.started` payload 只有 `{sliceId, agent}` —— 没有 runId。
+  // 于是 `findTaskRunConclusion` 第一行 `if (!task.runId) return {hasRun:false}`
+  // 直接短路，**接管收尾永远不会触发**。结果：任务卡 running、切片卡 running、
+  // 预约不释放，三处同时说谎，直到人手工回退。
+  //
+  // 判据：没有 runId 的旧任务照样要能被收走 —— 不能因为「缺 runId」就让
+  // 整个看门狗失明。退路是 D-30 的自动恢复（dead → running→frozen + run.aborted）。
+  it('旧 dist 的 run.started 不带 runId → 看门狗仍要收走（不得卡在 running）', async () => {
+    resetDirs();
+    const store = new SliceStore(join(ROOT, '.zelto', 'slices'));
+    const events = new EventStream(join(ROOT, '.zelto', 'events'));
+    // 旧 dist 的写法：有 run.started，但 payload 里没有 runId
+    const slice = store.create('slice-legacy', 'x');
+    slice.state = 'running';
+    await store.write(slice);
+    await events.append('slice-legacy', 'run.started', 'zelto', {
+      sliceId: 'slice-legacy',
+      agent: 'npx @anthropic-ai/claude-code',
+    });
+    // 旧任务文件：没有 runId 字段（旧 dist 不写它）
+    saveTask(
+      makeTask('task-legacy', {
+        sliceId: 'slice-legacy',
+        supervisorPid: 999_997,
+        lastActivityAt: OLD,
+      }),
+    );
+
+    await maybeRecoverDeadTask(loadTask('task-legacy')!);
+
+    const after = await store.read('slice-legacy');
+    assert.equal(after.state, 'frozen', '缺 runId 也不能让切片永远卡在 running');
+    const stream = await events.read('slice-legacy');
+    assert.ok(
+      stream.some((e) => e.type === 'run.aborted'),
+      '必须留下一条结论（run.aborted），三处状态不许同时说「在跑」',
+    );
+    const task = loadTask('task-legacy');
+    assert.equal(task?.status, 'failed', '任务文件也要收尾，不能停在 running');
+  });
 });

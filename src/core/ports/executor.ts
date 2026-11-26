@@ -51,9 +51,17 @@ export interface ExecutorAdapter {
    * @param spec.sliceId — The slice being executed
    * @param spec.prompt — The instruction bundle or prompt to send to the agent
    * @param spec.model — Optional model override
+   * @param spec.runId — 本轮运行身份（ADR-129 / ADR-130）。支持注入的适配器
+   *   把它交给 agent 子进程的 `ZELTO_RUN_ID`，hook 的 `policy.decision`
+   *   据此归属轮次。它只是**留痕维度**，不参与任何判定（C3/C9 不变）。
    * @returns A session identifier
    */
-  start(spec: { sliceId: string; prompt: string; model?: string }): Promise<{ sessionId: string }>;
+  start(spec: {
+    sliceId: string;
+    prompt: string;
+    model?: string;
+    runId?: string;
+  }): Promise<{ sessionId: string }>;
 
   /**
    * Resume an existing agent session with additional context.
@@ -64,9 +72,16 @@ export interface ExecutorAdapter {
    *
    * @param sessionId — The zelto session to resume
    * @param patch — Additional instructions or context to inject
+   * @param opts.runId — 续跑所属那一轮的 runId（ADR-130）。调用方确认过
+   *   「这一轮确实还在等这次回答」就传它；没传则适配器沿用会话文件里
+   *   记录的那个，都没有就不注入（hook 事件如实留空）。
    * @returns The zelto session id of the continued session
    */
-  resume(sessionId: string, patch: string): Promise<{ sessionId: string }>;
+  resume(
+    sessionId: string,
+    patch: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }>;
 
   /**
    * Continue the same agent conversation with **arbitrary** instructions.
@@ -78,8 +93,16 @@ export interface ExecutorAdapter {
    *
    * Optional: an adapter that cannot continue a conversation simply doesn't
    * implement it, and the caller falls back to starting fresh.
+   *
+   * @param opts.runId — 续跑所属那一轮的 runId（ADR-130）。传了就用它，
+   *   没传则由适配器沿用会话文件里记录的那个；两者都没有 → 不注入
+   *   （hook 事件如实留空，不凭空造一个）。
    */
-  continueSession?(sessionId: string, instructions: string): Promise<{ sessionId: string }>;
+  continueSession?(
+    sessionId: string,
+    instructions: string,
+    opts?: { runId?: string },
+  ): Promise<{ sessionId: string }>;
 
   /**
    * 报告「这一轮有进展」（D-55）。
