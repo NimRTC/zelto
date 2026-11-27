@@ -570,9 +570,88 @@ IDE 那条路（`cursor desktop`）见 **ADR-091**，闸门至今未开放，且
 - **ACP session 的 checkpoint 能力（若有）** 是否接入 zelto：
   **不在本 ADR 范围内**。当前 zelto 没有 checkpoint，只在切片层做回滚。后续如需接入，另开 ADR。
 
+## 落地期修正（2026-11-27，真实 agent 实测后）
+
+ADR 写于「还没跑过真实 ACP agent」的状态。落地时拿真实 `cursor-agent acp`
+（2026.09.18-9a7762b）实测，发现三件 ADR 没写的事。**都是补记，不是推翻**。
+
+### 修正一：cursor-agent 的 `request_permission` 里**没有 `rawInput`**
+
+读 bundle（`5072.index.js` 的 `requestApproval` / `formatOperation`）才看清：
+
+请求体只有 `toolCallId` / `title` / `kind` / `status` / `content` ——
+**没有 `rawInput`**。
+
+实测的完整 kind 映射：
+
+| 操作 | `title` | `kind` | `content` |
+|---|---|---|---|
+| Write | `` Write path`` / ``Edit `path` `` | `edit` | `[{type:"diff", path, oldText, newText}]` |
+| Delete | `` Delete `path` `` | **`edit`**（不是 `delete`） | — |
+| Shell | `` `command` `` | `execute` | — |
+| Mcp | `name: toolName` | `other` | `[{type:"content", content:{type:"text", text:"```json…```"}}]` |
+| 未知 | `Unknown operation` | `other` | — |
+
+**后果**：原实现只从 `rawInput` / `locations` 取路径 → 撞上 cursor-agent
+两个都取不到 → 判定层**拒绝** → 把每一次写都拒掉。安全，但**功能不可用**。
+
+**修复**：路径提取改成**四档兜底**（先可靠后模糊）：
+
+1. `rawInput` 的候选字段名（结构化）
+2. `content` 里的 `diff.path`（**实测 cursor-agent 在这儿**，结构化）
+3. `locations`（规范定义）
+4. `title`（**实测 cursor-agent 也在这儿**，最模糊）
+
+`title` 解析的**纪律**：只对写类 kind；**必须先命中白名单动词**
+（`edit`/`write`/`delete`/`remove`/`move`/`rename`）——
+反引号**不是**路径的充分证据，只是「取值范围」的界定。
+否则「Update the configuration file `config.yaml`」会被误当成路径。
+
+命令**单独一套解析** —— Shell 的 title **没有动词**
+（整个 title 就是反引号包裹的命令），套用动词闸门会把命令整个丢掉 →
+拒绝一切 Shell 操作。另需处理 agent 对命令里反引号的转义。
+
+### 修正二：鉴权是**独立于版本协商的第二道关卡**
+
+ADR 只写了版本协商 fail closed。实测发现还有一道：
+
+```
+Authentication required. Please run 'agent login' first,
+then call authenticate() with methodId 'cursor_login'.
+```
+
+**zelto 不代劳登录**（有意）：登录是浏览器授权流程，弹窗在 agent 子进程里，
+zelto 看不见也点不了；且那是替人做凭证授权（ADR-090 的凭证外部化精神）。
+
+落地为 `src/adapters/acp/auth.ts`：记下 `initialize` 回包里的 `authMethods`，
+失败时给出**可执行的修法**（登录方式 + agent 自己的说明）；
+认不出是鉴权问题 → **照原样报错，不猜**。
+
+这与 C9 的 fail closed 不冲突：鉴权失败时**根本进不了判定环节**。
+
+### 修正三：与 IDE 的登录态**不共用**
+
+实测（详见 **ADR-091** 的复核章节）：
+
+| | 位置 | 状态 |
+|---|---|---|
+| IDE | `%APPDATA%\Cursor\User\globalStorage\state.vscdb`，含 `cursorAuth` | 已登录 |
+| `cursor-agent` CLI | `%APPDATA%\Cursor\auth.json`（bundle 的 `getAuthFilePath`） | 不存在 → 未登录 |
+
+**Cursor 的 CLI 与 IDE 是两套登录态** —— 「ACP 用 IDE 的额度」不成立。
+这是 Cursor 自己的设计，不是 zelto 的问题。
+
 ## 参考
 
 - Agent Client Protocol 规范（Zed）：`https://agentclientprotocol.com/`
 - T3 Code `provider-acp`：`https://github.com/pingdotgg/t3code/tree/main/packages/provider-acp`
 - T3 Code 的 provider 纪律：`https://github.com/pingdotgg/t3code/blob/main/docs/internals/03_providers.md`
-- 本仓库：`docs/adr/adr-083-multi-harness-runtime-write-enforcement.md`、`src/hook/harness.ts`、`src/hook/pretool.ts`
+- T3 的 Cursor ACP spawn 参数与启动序列：`apps/server/src/provider/Layers/CursorProvider.ts`
+  （`args: [...(apiEndpoint ? ["-e", apiEndpoint] : []), "acp"]`）
+- T3 的 Cursor SDK 路线在 Linux 上的 ppid 校验 bug：
+  [t3code#41929](https://github.com/pingdotgg/t3code/issues/41929)、
+  [#43530](https://github.com/pingdotgg/t3code/issues/43530) ——
+  社区给出的绕法恰是「换到 ACP」
+- 本仓库：`docs/adr/adr-083-multi-harness-runtime-write-enforcement.md`、
+  `src/hook/harness.ts`、`src/hook/pretool.ts`、
+  `docs/adr/adr-091-cursor-desktop-bridge-executor.md`
