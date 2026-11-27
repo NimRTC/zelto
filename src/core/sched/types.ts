@@ -94,6 +94,17 @@ export interface ConstraintBundle {
 export interface GateCommandSummary {
   name: string;
   run: string;
+  /**
+   * 命令级超时（秒）。
+   *
+   * 为什么摘要里也要带它：**裁剪字段就是丢配置**。
+   * 这个类型在「配置 → 门禁」链路上被用过好几次，每一处都只取
+   * `{ name, run }` —— 命令级 timeoutSec 就这么被静默丢掉了，
+   * executor 只能退回全局超时（实测 2026-11-27）。
+   *
+   * 带上它之后，「从配置到执行器」的每一段都能原样传下去。
+   */
+  timeoutSec?: number;
 }
 
 /**

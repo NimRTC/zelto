@@ -136,7 +136,11 @@ register('gate', async (args) => {
       },
       id,
       {
-        commands: gateCommands.map((c) => ({ name: c.name, run: c.run })),
+        // 命令原样传下去 —— **不要在这里裁剪字段**。
+        // 只取 `{ name, run }` 会把命令级 `timeoutSec` 悄悄丢掉，
+        // 让它退回全局超时（实测 2026-11-27：全量测试要 ~650 秒，
+        // 全局 120 秒 → 门禁必红，且没有任何提示说超时被丢了）。
+        commands: gateCommands,
         profiles: gateProfiles,
         timeoutSec: config.gate.timeoutSec,
         retryMax: forceRetry >= 0 ? forceRetry : config.gate.retry.max,

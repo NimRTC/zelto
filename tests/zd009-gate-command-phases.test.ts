@@ -169,3 +169,56 @@ gate:
     );
   });
 });
+
+// ── 回归：命令级 timeoutSec 必须能活着走到执行器（2026-11-27 实测）──────
+//
+// 病灶：「配置 → 门禁」链路上有多处用 `{ name, run }` 重建命令对象，
+// 命令级 timeoutSec 被**静默丢掉** —— executor 只能退回全局 timeoutSec。
+// 后果：全量测试要 ~650 秒、全局 120 秒 → 门禁必红，且**没有任何提示**
+// 说「你配的命令级超时被丢了」。
+describe('门禁命令的 timeoutSec 解析', () => {
+  it('命令级 timeoutSec 能解析出来', () => {
+    const parsed = parseConfigYaml(`
+gate:
+  commands:
+    - name: test
+      run: pnpm test
+      timeoutSec: 1200
+    - name: lint
+      run: pnpm lint
+  timeoutSec: 120
+`);
+    assert.ok(parsed);
+    assert.equal(parsed.gate.commands[0].timeoutSec, 1200, '命令级超时必须解析出来');
+    assert.equal(parsed.gate.commands[1].timeoutSec, undefined, '没写就是没写');
+    assert.equal(parsed.gate.timeoutSec, 120, '全局超时不受影响');
+  });
+
+  it('全局 timeoutSec 仍是兜底（命令没写时用它）', () => {
+    const parsed = parseConfigYaml(`
+gate:
+  commands:
+    - name: test
+      run: pnpm test
+  timeoutSec: 300
+`);
+    assert.ok(parsed);
+    assert.equal(parsed.gate.timeoutSec, 300);
+  });
+
+  it('profile 里的命令也能带 timeoutSec', () => {
+    const parsed = parseConfigYaml(`
+gate:
+  commands:
+    - name: test
+      run: npm test
+  profiles:
+    code:
+      - name: build
+        run: cmake --build build
+        timeoutSec: 900
+`);
+    assert.ok(parsed);
+    assert.equal(parsed.gate.profiles?.code?.[0].timeoutSec, 900);
+  });
+});

@@ -38,6 +38,16 @@ import { VersionStore } from '../../core/version/store.js';
 import { DesignStore } from '../../core/design/store.js';
 import { RequirementStore } from '../../core/requirements/store.js';
 import { resolveSliceOwnership, branchOfVersion, readVersionPlans } from '../../core/version/branch.js';
+// 「眼下该做什么」—— 与 CLI 的 `zelto next` / `suggest` / `dashboard` 同一份判定
+import {
+  collectPendingFacts,
+  groupPending,
+  rankPending,
+  type PendingItem,
+  type PendingKind,
+  type PendingSource,
+} from '../../core/pending/index.js';
+import { buildBranchIndex } from '../../core/git/facts.js';
 // ADR-126：产物证据（`Refs-Slice:` trailer 在版本分支上）——
 // 补上 ADR-114 那列恒为 0 的「状态文件是否进分支」给不出的信息。
 import { defaultArtifactProbe } from '../../core/project/artifact-evidence.js';
@@ -952,6 +962,90 @@ export class WebApi {
   }
 
   /**
+   * ── 「眼下该做什么」—— 统一判定的对外出口 ──
+   *
+   * **这一份与 CLI 的 `zelto next` / `zelto suggest` / `zelto dashboard` 完全同源**
+   * （都调 `core/pending/` 的收集与排序）。
+   *
+   * 为什么值得单开一个端点：驾驶舱的首屏价值是「一眼看出该干什么」，
+   * 但原来首屏只有**状态**（在跑几片、待签几片、成本多少），
+   * 没有**动作** —— 人看到「3 片待签」还得自己回想该敲哪条命令。
+   *
+   * 现在首屏第一块就是这份清单，且它与终端里看到的是**同一个排序**。
+   *
+   * ADR-112：驾驶舱是**多根**的 —— 每个根各收一次事实再合并。
+   * 收法不同，但排序口径一致（同一份 `core/pending/rank.ts`）。
+   */
+  async pendingActions(): Promise<{
+    top: PendingItem | null;
+    items: PendingItem[];
+    groups: Array<{
+      kind: PendingKind;
+      label: string;
+      priority: number;
+      items: PendingItem[];
+    }>;
+    byRoot: Array<{
+      scope: CockpitScope;
+      label: string | null;
+      items: PendingItem[];
+    }>;
+  }> {
+    // 每个根各收一份事实 —— 合并时按「根」打标，不混在一起。
+    //
+    // 为什么不直接合成一份再排：版本目录里的片与根上的片是不同的活，
+    // 混排会让人以为「同一个队列」。分根呈现，前端折叠显示。
+    const perRoot = await Promise.all(
+      this.workspaces.map(async (ws) => {
+        const source = this.pendingSourceFor(ws);
+        const facts = await collectPendingFacts(source);
+        const items = rankPending(facts).map((item) => ({
+          ...item,
+          scope: ws.root.scope,
+          label: ws.root.label,
+        }));
+        return { scope: ws.root.scope, label: ws.root.label, items };
+      }),
+    );
+
+    // 仓库根那份是「主战场」—— 首屏的大号提示取它。
+    // 版本目录的待办另列（人得知道「那边也有活」）。
+    const primary = perRoot.find((r) => r.scope === 'root') ?? perRoot[0];
+    const items = primary?.items ?? [];
+
+    return {
+      top: items.length > 0 ? items[0] : null,
+      items,
+      groups: groupPending(items),
+      byRoot: perRoot,
+    };
+  }
+
+  /**
+   * 一个根对应的待办收集上下文。
+   *
+   * 与 CLI 侧 `collectPendingFactsCli()` 是**同一份契约**，
+   * 只是注入的 store / 路径不同（CLI 用全局单例，Web 用多根）。
+   */
+  private pendingSourceFor(ws: SliceWorkspace): PendingSource {
+    return {
+      store: ws.store,
+      events: ws.events,
+      repoRoot: ws.root.dir,
+      worktreePath: (sliceId: string) =>
+        ws.worktrees.exists(sliceId) ? ws.worktrees.pathFor(sliceId) : null,
+      branchFor: (sliceId: string) => ws.worktrees.branchFor(sliceId),
+      versionsDir: join(ws.zeltoDir, 'versions'),
+      zeltoDir: ws.zeltoDir,
+      listSliceIds: () => ws.store.list(),
+      readSlice: (id: string) => ws.store.read(id),
+      listSignRequests: () => ws.signs.list(),
+      // 分支事实**批量**问一次 —— 逐片问 git 会让这个接口超时。
+      branchFacts: async () => buildBranchIndex(ws.root.dir),
+    };
+  }
+
+  /**
    * 概况 —— 切片数 / 状态分布 / 待签字 / 成本。
    *
    * 成本部分（ADR-072 §6：「概况（切片数 / 状态分布 / 待签字数 / 成本）」）：
@@ -1452,6 +1546,111 @@ export class WebApi {
   }
 
   /**
+   * **退回重跑**（ADR-094 §5.1）—— 与 `zelto sign <id> --revise` 同一套实现。
+   *
+   * 人审出毛病但**方向是对的** —— 让片回 `frozen` 带着意见重跑。
+   *
+   * **为什么驾驶舱要能退回**：
+   * 签字队列是「人在被交还控制权的那一刻」看的页面。
+   * 只能签 / 只能拒，就等于「觉得不对但说不清哪儿不对」时只能把人赶回终端 ——
+   * 驾驶舱在最该起作用的时候失效。
+   *
+   * **意见是强制的**：不给意见就让人重跑 = 人自己也不清楚要改什么，
+   * 重跑必然白跑（agent 拿到的信息与上一轮完全等价）。
+   */
+  async reviseSign(
+    signId: string,
+    comment: string | null | undefined,
+    loc: SliceLocation = {},
+  ): Promise<
+    | { ok: true; request: unknown; revokedApproval: boolean; nextStep: string }
+    | { ok: false; reason: string }
+  > {
+    const text = (comment ?? '').trim();
+    if (!text) {
+      return { ok: false, reason: '退回重跑必须带意见 —— 没有意见，重跑必然白跑' };
+    }
+
+    const ws = await this.workspaceHoldingSign(signId, loc);
+    if (!ws) return { ok: false, reason: `签字请求不存在：${signId}` };
+
+    // D11：退 `approved` 的请求会**连带作废批准**。
+    // 「批准被作废了」这件事**必须在返回里明说** ——
+    // 人以为在退回，实际连带撤了批准，这件事不能悄悄做。
+    const request = await ws.signs.get(signId);
+    const revokedApproval = request.status === 'approved';
+
+    if (request.status !== 'pending' && request.status !== 'approved') {
+      return { ok: false, reason: `签字请求已是 ${request.status} 状态，不能再退回` };
+    }
+
+    try {
+      const revised = await ws.signs.reviseRequest(signId, 'human', text, 'web');
+      return {
+        ok: true,
+        request: revised,
+        revokedApproval,
+        nextStep: `切片回到 frozen：规格与写集不动，可以重跑。下一步：zelto run ${request.sliceId}`,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `退回重跑失败：${message}（没有退回：签字请求与切片状态都没动）` };
+    }
+  }
+
+  /**
+   * **退回上游**（ADR-094 §5.1）—— 与 `zelto spec revise <id>` 同一套实现。
+   *
+   * 人审出**方向**不对 —— 规格要改。片回 `draft`，
+   * 改完规格重新走门禁① + 冻结。
+   *
+   * 与退回重跑的区别在**回哪个状态**：
+   *   - 退回重跑 → `frozen`（规格不动，重跑即可）
+   *   - 退回上游 → `draft`（规格要改，得重新冻结）
+   *
+   * 回 `draft` 而不是 `frozen` 是 ADR-094 D5 的要点：
+   * 直接回 frozen 会**跳过门禁①**，而规格改了之后门禁①必须重跑。
+   */
+  async returnSign(
+    signId: string,
+    comment: string | null | undefined,
+    loc: SliceLocation = {},
+  ): Promise<
+    | { ok: true; request: unknown; revokedApproval: boolean; nextStep: string }
+    | { ok: false; reason: string }
+  > {
+    const text = (comment ?? '').trim();
+    if (!text) {
+      return { ok: false, reason: '退回上游必须带意见 —— 没有意见，agent 不知道方向哪儿不对' };
+    }
+
+    const ws = await this.workspaceHoldingSign(signId, loc);
+    if (!ws) return { ok: false, reason: `签字请求不存在：${signId}` };
+
+    const request = await ws.signs.get(signId);
+    const revokedApproval = request.status === 'approved';
+
+    if (request.status !== 'pending' && request.status !== 'approved') {
+      return { ok: false, reason: `签字请求已是 ${request.status} 状态，不能再退回` };
+    }
+
+    try {
+      const returned = await ws.signs.returnRequest(signId, 'human', text, 'web');
+      return {
+        ok: true,
+        request: returned,
+        revokedApproval,
+        nextStep:
+          `切片回到 draft：规格可以改了。下一步：` +
+          `zelto spec draft ${request.sliceId} → zelto spec confirm → zelto freeze ${request.sliceId}`,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `退回上游失败：${message}（没有退回：签字请求与切片状态都没动）` };
+    }
+  }
+
+  /**
    * **回答 agent 的提问** —— 只**记录**答案，**不续跑**（ADR-084 §1.1）。
    *
    * 为什么不在 Web 侧续跑：续跑要调 `adapter.resume()` 拉起 agent 会话，
@@ -1678,7 +1877,11 @@ export class WebApi {
       this.lifecycleContext(ws),
       sliceId,
       {
-        commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+        commands: config.gate.commands.map((c) => ({
+          name: c.name,
+          run: c.run,
+          ...(c.timeoutSec !== undefined ? { timeoutSec: c.timeoutSec } : {}),
+        })),
         ...(config.gate.profiles ? { profiles: config.gate.profiles } : {}),
         timeoutSec: config.gate.timeoutSec,
         retryMax: config.gate.retry.max,
