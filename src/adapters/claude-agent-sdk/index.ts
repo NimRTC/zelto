@@ -97,6 +97,8 @@ const ADAPTER_META: AdapterMeta = {
     resume: true,
     events: true,
     modelSelection: true,
+    // ADR-133：C9 主判定点在 agent 侧的 PreToolUse 钩子。
+    writeGuard: 'hook',
   },
 };
 

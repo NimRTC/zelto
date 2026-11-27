@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { LlmAdapter } from '../../core/ports/llm.js';
-import type { ExecutorAdapter } from '../../core/ports/executor.js';
+import type { ExecutorAdapter, WriteGuardKind } from '../../core/ports/executor.js';
 import { DeepSeekAdapter } from '../../adapters/llm/index.js';
 import { EventEmittingLlmAdapter, type PricingTable } from '../../adapters/llm/event-emitting-adapter.js';
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
@@ -787,6 +787,31 @@ export function harnessForAdapter(
       return 'codex';
     default:
       return 'claude-code';
+  }
+}
+
+/**
+ * 某个 adapter 的 **C9 主判定点**（ADR-133）。
+ *
+ * 与 `harnessForAdapter` 并列，但**不是**同一个维度：
+ *
+ * - `harnessForAdapter` —— 「agent 的钩子协议长什么样」（装成哪种信封）
+ * - `writeGuardForAdapter` —— 「写集预约在哪里被强制」（钩子还是 ACP 回调）
+ *
+ * 现有三个 adapter 全是 `'hook'`；ACP adapter 是 `'permission'`。
+ *
+ * **为什么是一张显式的表，而不是问 adapter 实例**：
+ * 装守卫发生在**起跑之前**，那时 adapter 实例还没建；
+ * 而这里要的是一条**静态事实**（这个 adapter 怎么实现 C9），不是运行时状态。
+ * 两边若不一致（一处说 hook、一处说 permission），就会出现「装了一个不生效的钩子」
+ * 或者「该装没装」—— 都要等到运行时才暴露。
+ */
+export function writeGuardForAdapter(adapterType: string | undefined): WriteGuardKind {
+  switch (adapterType) {
+    case 'acp':
+      return 'permission';
+    default:
+      return 'hook';
   }
 }
 

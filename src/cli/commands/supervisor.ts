@@ -323,7 +323,7 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
   //
   // 适配器必须住在这个进程里：它负责写会话文件的 `exitCode` 与 `status`。
   // 主进程一退就没人记录了（见文件头的说明）。
-  const { createExecutorAdapter, store, events, harnessForAdapter } = await import('./shared.js');
+  const { createExecutorAdapter, store, events, harnessForAdapter, writeGuardForAdapter } = await import('./shared.js');
   // 显式按接口类型持有 —— `start({ runId })` / `continueSession(…, { runId })`
   // 是接口上的可选参数（ADR-130），具体类的推断签名上没有。
   const adapter: ExecutorAdapter = createExecutorAdapter(
@@ -375,6 +375,8 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
         slice && worktreePath ? buildSpecIntegrity(worktreePath, slice) : null,
       // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
       harness: harnessForAdapter(args.adapterType),
+      // ADR-133：C9 的主判定点。ACP 路线**不装钩子**。
+      writeGuard: writeGuardForAdapter(args.adapterType),
     });
     log(`写集预约已取得：${(slice?.writes ?? []).join(', ') || '(空)'}`);
 

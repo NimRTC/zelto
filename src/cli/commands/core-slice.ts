@@ -88,7 +88,7 @@ import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { RuntimeBudgetGuard } from '../../core/budget/index.js';
 import { budgetInterceptionMessage } from '../../core/budget/runtime-guard.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict, buildSpecIntegrity } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, writeGuardForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict, buildSpecIntegrity } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -1870,6 +1870,9 @@ register('run', async (args) => {
         // harness 决定钩子的信封格式（ADR-083）。
         // 配错 = hook 读不懂载荷 = 判定静默失效。
         harness: harnessForAdapter(adapterType ?? cfg.agent.adapter),
+        // ADR-133：C9 的主判定点。ACP 路线**不装钩子** ——
+        // 判定在 `session/request_permission` 回调里做。
+        writeGuard: writeGuardForAdapter(adapterType ?? cfg.agent.adapter),
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

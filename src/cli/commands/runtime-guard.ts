@@ -28,6 +28,7 @@ import {
   listChangedPaths,
   LOCKS_DIR,
 } from '../../core/sched/index.js';
+import type { WriteGuardKind } from '../../core/ports/index.js';
 import { events } from './shared.js';
 import { handleWriteSetViolation } from './run-support.js';
 import {
@@ -167,6 +168,18 @@ export interface RuntimeGuardOptions {
    * 跟 Claude Code 的 `.claude/settings.local.json` 完全不同。
    */
   harness?: GuardHarness;
+  /**
+   * C9 的主判定点（ADR-133）。
+   *
+   * `'hook'`（默认）—— 往 agent 的目录里装钩子，agent 写文件前来问。
+   * `'permission'` —— **不装任何钩子**；agent 通过 ACP 的
+   * `session/request_permission` 来问，判定在 adapter 的回调里做。
+   *
+   * 为什么是「不装」而不是「装一个没用的」：
+   * ACP agent 不读某家 CLI 的 hooks 配置，装了等于「看起来装了、实际不生效」——
+   * 那是 ADR-083 里「假想工具名」那个坑的另一种形状。
+   */
+  writeGuard?: WriteGuardKind;
 }
 
 export interface RuntimeGuard {
@@ -272,8 +285,17 @@ export async function installRuntimeGuard(
 
   // 装钩子之前先留一份原始设置 —— 运行结束时要还原回去
   const harness: GuardHarness = options.harness ?? 'claude-code';
-  const originalSettings =
-    harness === 'claude-code' ? readOriginalSettings(hookRoot) : readOriginalCursorHooks(hookRoot);
+
+  // ADR-133：C9 的主判定点由 adapter 声明（`capabilities.writeGuard`）。
+  //
+  // `'permission'` 路线（ACP）**不装任何钩子** —— agent 通过
+  // `session/request_permission` 来问，判定在 adapter 的回调里做。
+  // 装了钩子也不会被 ACP agent 读到（它不读某家 CLI 的 hooks 配置），
+  // 那只是「看起来装了、实际不生效」—— ADR-083 里「假想工具名」的同形状坑。
+  //
+  // 注意：**预约照取不误**。预约是 C9 的判据来源，permission 回调读的
+  // 就是它；这里只是「谁来问」不同，不是「有没有判据」。
+  const writeGuard: WriteGuardKind = options.writeGuard ?? 'hook';
 
   const hookOptions: ClaudeHookOptions = {
     root: hookRoot,
@@ -281,26 +303,42 @@ export async function installRuntimeGuard(
     sliceId: options.sliceId,
     worktree: options.worktree,
   };
-  const installed =
-    harness === 'cursor'
-      ? installCursorHook(hookOptions)
-      : harness === 'codex'
-        ? installCodexHook(hookOptions)
-        : installClaudeCodeHook(hookOptions);
-  const exec = buildPreToolHookExec(hookOptions);
-  if (harness !== 'claude-code') {
-    // 判定内核靠 `--harness` 知道该按哪套信封解输入。
-    // Claude Code 是默认（不带 `--harness` 就是 claude-code），
-    // Cursor / Codex 必须显式带上 —— 否则 hook 会按 Claude 的格式去读
-    // Cursor 的载荷，读不到路径 → 判不出写入目标 → 判定失效。
-    exec.args.push('--harness', harness);
-  }
 
-  if (!installed.installed) {
-    // 钩子没装上 = 运行时拦不住越界写。运行后的审计还在，但过程里没人拦 ——
-    // 必须让人看见。
-    console.error(`  ⚠️  PreToolUse 钩子安装失败: ${installed.message}`);
-    console.error(`     运行期间不会有运行时拦截，只剩运行后的写集审计。`);
+  let installed: { installed: boolean; message: string; path?: string };
+  let originalSettings: string | null = null;
+  let exec: { command: string; args: string[] };
+
+  if (writeGuard === 'permission') {
+    // 不装钩子。`exec` 仍然要给出 —— SDK 适配器与 supervisor 用它做别的事，
+    // 但**不会**把它写进任何 hook 配置。
+    installed = { installed: false, message: 'permission 模式：不装钩子（ADR-133）' };
+    exec = buildPreToolHookExec(hookOptions);
+  } else {
+    originalSettings =
+      harness === 'claude-code'
+        ? readOriginalSettings(hookRoot)
+        : readOriginalCursorHooks(hookRoot);
+    installed =
+      harness === 'cursor'
+        ? installCursorHook(hookOptions)
+        : harness === 'codex'
+          ? installCodexHook(hookOptions)
+          : installClaudeCodeHook(hookOptions);
+    exec = buildPreToolHookExec(hookOptions);
+    if (harness !== 'claude-code') {
+      // 判定内核靠 `--harness` 知道该按哪套信封解输入。
+      // Claude Code 是默认（不带 `--harness` 就是 claude-code），
+      // Cursor / Codex 必须显式带上 —— 否则 hook 会按 Claude 的格式去读
+      // Cursor 的载荷，读不到路径 → 判不出写入目标 → 判定失效。
+      exec.args.push('--harness', harness);
+    }
+
+    if (!installed.installed) {
+      // 钩子没装上 = 运行时拦不住越界写。运行后的审计还在，但过程里没人拦 ——
+      // 必须让人看见。
+      console.error(`  ⚠️  PreToolUse 钩子安装失败: ${installed.message}`);
+      console.error(`     运行期间不会有运行时拦截，只剩运行后的写集审计。`);
+    }
   }
 
   // 托管文件的内容哈希：运行后比对，agent 改了这个文件就是关掉了门禁
@@ -324,6 +362,9 @@ export async function installRuntimeGuard(
     hookInstalled: installed.installed,
     hookCommand: exec.args.join(' '),
     baselineChanged,
+    // ADR-133：C9 的主判定点。追溯时能一眼看出「这一轮的写前判定
+    // 是靠钩子还是靠 ACP 的 permission 回调」。
+    writeGuard,
   });
 
   let released = false;
@@ -358,28 +399,33 @@ export async function installRuntimeGuard(
       released = true;
 
       // 撤钩子并还原原始设置
-      if (harness === 'cursor') removeCursorHook(hookRoot);
-      else if (harness === 'codex') removeCodexHook(hookRoot);
-      else removeClaudeCodeHook(hookRoot);
+      //
+      // ADR-133：permission 路线**没装过钩子**，所以这里既不撤也不还原 ——
+      // 去动一个自己没写过的文件才是风险（可能把用户自己的 hook 配置弄坏）。
+      if (writeGuard === 'hook') {
+        if (harness === 'cursor') removeCursorHook(hookRoot);
+        else if (harness === 'codex') removeCodexHook(hookRoot);
+        else removeClaudeCodeHook(hookRoot);
 
-      const settingsPath = join(hookRoot, managedHookPath(harness));
-      if (originalSettings !== null) {
-        try {
-          writeFileSync(settingsPath, originalSettings, 'utf-8');
-        } catch {
-          // 还原失败不阻断：钩子已经撤掉了
-        }
-      } else if (existsSync(settingsPath)) {
-        // 原本没有这个文件：把 zelto 留下的空壳删掉
-        try {
-          const raw = readFileSync(settingsPath, 'utf-8');
-          const parsed = JSON.parse(raw) as { hooks?: Record<string, unknown> };
-          const hooks = parsed.hooks ?? {};
-          if (Object.keys(hooks).length === 0) {
-            rmSync(settingsPath, { force: true });
+        const settingsPath = join(hookRoot, managedHookPath(harness));
+        if (originalSettings !== null) {
+          try {
+            writeFileSync(settingsPath, originalSettings, 'utf-8');
+          } catch {
+            // 还原失败不阻断：钩子已经撤掉了
           }
-        } catch {
-          // 解析不了就留着，别乱删
+        } else if (existsSync(settingsPath)) {
+          // 原本没有这个文件：把 zelto 留下的空壳删掉
+          try {
+            const raw = readFileSync(settingsPath, 'utf-8');
+            const parsed = JSON.parse(raw) as { hooks?: Record<string, unknown> };
+            const hooks = parsed.hooks ?? {};
+            if (Object.keys(hooks).length === 0) {
+              rmSync(settingsPath, { force: true });
+            }
+          } catch {
+            // 解析不了就留着，别乱删
+          }
         }
       }
 

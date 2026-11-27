@@ -3,7 +3,12 @@
 
 import type { EventEnvelope, EventType } from '../events/index.js';
 
-export { type ExecutorAdapter, type AdapterMeta, type AdapterUsage } from './executor.js';
+export {
+  type ExecutorAdapter,
+  type AdapterMeta,
+  type AdapterUsage,
+  type WriteGuardKind,
+} from './executor.js';
 export type { LlmAdapter, LlmMessage, LlmRequest, LlmResponse } from './llm.js';
 export type {
   ForgePort,

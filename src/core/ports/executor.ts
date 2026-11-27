@@ -13,8 +13,33 @@ export interface AdapterMeta {
     resume: boolean;
     events: boolean;
     modelSelection: boolean;
+    /**
+     * C9 的**主判定点**（ADR-133）。
+     *
+     * 「写集预约在哪里被强制」是**这个 adapter 怎么实现 C9** 的事实，
+     * 不是用户的偏好 —— 所以它是 adapter 声明的能力，**不是配置项**。
+     * 让用户去配「用哪套闸门」等于给「关掉闸门」开了一个口子。
+     *
+     * - `'hook'` —— agent 侧装钩子（`.claude/settings.local.json` /
+     *   `.cursor/hooks.json` / `.codex/hooks.json`），agent 每次写文件前
+     *   主动问 zelto 的 hook 进程。这是现有三个 adapter 的做法。
+     * - `'permission'` —— agent 通过 ACP 的 `session/request_permission`
+     *   向 zelto 请求授权，zelto 在回调里判定。这是 ACP adapter 的做法。
+     *
+     * 两种形态下判定内核都是同一个（`src/hook/` 的 `judgeWriteTargets`），
+     * 差别只在**协议层**（ADR-083 §1）。
+     */
+    writeGuard: WriteGuardKind;
   };
 }
+
+/**
+ * C9 主判定点的两种形态（ADR-133）。
+ *
+ * `'hook'` 与 `'permission'` **不是**二选一的配置，是**两种实现**；
+ * 调用方按这个声明决定「要不要往 agent 的目录里装 hook 配置」。
+ */
+export type WriteGuardKind = 'hook' | 'permission';
 
 /**
  * Token / cost usage of one agent session (ADR-035).

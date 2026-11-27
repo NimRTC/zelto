@@ -34,6 +34,7 @@ import {
   store,
   worktreeManager,
   harnessForAdapter,
+  writeGuardForAdapter,
   resolveAgentCommand,
   buildSpecIntegrity,
 } from './shared.js';
@@ -645,6 +646,8 @@ export async function executeSlicesParallel(
         specIntegrity: buildSpecIntegrity(st.worktreePath, slice),
         // 装哪种 harness 的钩子（ADR-083）—— adapter 决定跑的是谁。
         harness: harnessForAdapter(options.adapterType),
+        // ADR-133：C9 的主判定点。ACP 路线**不装钩子**。
+        writeGuard: writeGuardForAdapter(options.adapterType),
       });
       guards.set(st.id, g);
     } catch (err) {
