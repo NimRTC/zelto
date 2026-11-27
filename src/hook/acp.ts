@@ -30,7 +30,7 @@
 
 import type { NormalizedPayload } from './harness.js';
 import {
-  extractWriteTargets,
+  extractBashWriteTargets,
   judgeWriteTargets,
   type PreToolContext,
   type PreToolVerdict,
@@ -93,6 +93,23 @@ export interface AcpToolCall {
    */
   content?: unknown;
 }
+
+/**
+ * ACP 改动集里可能被改到的路径，三态（ADR-135）。
+ *
+ * | 值 | 含义 | 判定内核的反应 |
+ * |---|---|---|
+ * | `['src/a.ts']` | 完整读到了，**就这些** | 正常判定 |
+ * | `[]` | 完整读到了，**确实没有写目标** | 只读豁免 → 放行 |
+ * | `'unknown'` | **读不全** —— 可能还有别的写目标 | **拒绝**（fail closed） |
+ *
+ * `'unknown'` 与 `[]` 必须区分：把「没找到」当成「没有」，
+ * 会让一次越界尝试在追溯链上消失（ADR-135 决策一）。
+ */
+export type AcpChangedPaths = string[] | 'unknown';
+
+/** 路径数量上限（防 DoS 兜底）：超过 → 整体 `'unknown'`（ADR-135 决策二）。 */
+export const MAX_ACP_CHANGED_PATHS = 256;
 
 /**
  * ACP 的一个权限选项（agent 提供的候选）。
@@ -277,6 +294,129 @@ function pickPathFromContent(content: unknown): string | undefined {
     if (direct) return direct;
   }
   return undefined;
+}
+
+/**
+ * 从一次 ACP 工具调用里**收齐**所有写目标（三态，ADR-135）。
+ *
+ * 与 `pickPathFromContent()`（找到第一个就返回）相反：这里遍历**全部**
+ * 来源 —— `rawInput` 的路径字段、`locations[].path`、
+ * `content[].diff.path`、`content[].diff.changes[].path` / `.oldPath`、
+ * Bash 命令的静态写目标、`title` 兜底 —— 一个改动集可以有多个块，
+ * 每个块还能嵌套 `changes[]`，**每一个**路径都算写目标。
+ *
+ * **任何一块读不明白 → 整体变 `'unknown'`**（C9 fail closed，不是
+ * 「跳过坏块」）。跳过的语义是「可能有写目标 → 当成没有写目标」，
+ * 那正是今天的洞。
+ *
+ * 具体地，下面每一种情况都让整体变成 `'unknown'`：
+ * - `locations` 存在但不是数组；
+ * - `content` 存在但不是数组；
+ * - `content` 里有非 `diff` / `content` / `terminal` 的块；
+ * - `diff.changes` 存在但不是数组；
+ * - `change.operation` 不认识；
+ * - 收集到的路径数 > `MAX_ACP_CHANGED_PATHS`。
+ *
+ * `copy` 与 `move` 的区分（ADR-135 决策三）：
+ * - `move` → 源与目标**都**算写目标（源被移走 = 源也被改了）；
+ * - `copy` → **只有**目标算（源只被读）。
+ */
+export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpChangedPaths {
+  const kind = typeof toolCall?.kind === 'string' ? toolCall.kind : undefined;
+  const { tool, readOnly } = normalizeKind(kind);
+
+  // 只读工具：没有写目标。返回 `[]`（「完整读到，确实没有」）——
+  // 与 `'unknown'` 严格区分（ADR-135 决策一）。
+  if (readOnly) return [];
+
+  const raw = toolCall?.rawInput;
+  const input: Record<string, unknown> =
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+
+  const paths: string[] = [];
+  const push = (p: unknown): void => {
+    if (typeof p === 'string' && p) paths.push(p);
+  };
+
+  // 1. rawInput 的路径字段（结构化，最可靠）
+  push(pickPath(input));
+
+  // 2. locations（规范定义的字段）
+  const locations = toolCall?.locations;
+  if (locations !== undefined && locations !== null) {
+    if (!Array.isArray(locations)) return 'unknown';
+    for (const loc of locations) {
+      if (loc && typeof loc === 'object' && typeof loc.path === 'string' && loc.path) {
+        paths.push(loc.path);
+      }
+    }
+  }
+
+  // 3. content 的内容块（实测 cursor-agent 把写入路径放这儿）
+  const content = toolCall?.content;
+  if (content !== undefined && content !== null) {
+    if (!Array.isArray(content)) return 'unknown';
+    for (const block of content) {
+      if (!block || typeof block !== 'object' || Array.isArray(block)) return 'unknown';
+      const b = block as Record<string, unknown>;
+      if (b.type === 'diff') {
+        // 块级路径
+        push(pickPath(b));
+        // 块内嵌套的 changes[] —— 每个 change 带自己的路径
+        const changes = b.changes;
+        if (changes !== undefined && changes !== null) {
+          if (!Array.isArray(changes)) return 'unknown';
+          for (const change of changes) {
+            if (!change || typeof change !== 'object' || Array.isArray(change)) return 'unknown';
+            const c = change as Record<string, unknown>;
+            switch (c.operation) {
+              case 'move':
+                // 源被移走 = 源也被改了 → 源与目标都算写目标
+                push(c.oldPath);
+                push(c.path);
+                break;
+              case 'add':
+              case 'delete':
+              case 'modify':
+              case 'copy':
+                // copy 的源只被读 → 只有目标算写目标
+                push(c.path);
+                break;
+              default:
+                // 不认识的 operation：可能写字段没显示的地方 → 整体 unknown
+                return 'unknown';
+            }
+          }
+        }
+      } else if (b.type === 'content' || b.type === 'terminal') {
+        // 展示块，不含路径
+        continue;
+      } else {
+        // 非 diff / content / terminal 的块 —— 读不明白 → 整体 unknown
+        return 'unknown';
+      }
+    }
+  }
+
+  // 4. Bash 命令里的写目标（静态分析）
+  if (tool === 'Bash') {
+    const command = pickCommand(input) ?? pickCommandFromTitle(toolCall?.title, kind);
+    if (command) paths.push(...extractBashWriteTargets(command));
+  }
+
+  // 5. title 兜底 —— 只在结构化来源都没找到路径时才解析。
+  //
+  //    `title` 是「最后一档兜底」（ADR-133 落地补充）：实测 cursor-agent
+  //    把**唯一**路径放 title 里、rawInput 与 locations 都空。它不参与
+  //    「收齐」—— 否则自然语言标题会把别处的文件名也收进来造成误拒。
+  if (paths.length === 0) {
+    push(pickPathFromTitle(toolCall?.title, kind));
+  }
+
+  // 6. 数量上限（防 DoS 兜底）
+  if (paths.length > MAX_ACP_CHANGED_PATHS) return 'unknown';
+
+  return paths;
 }
 
 /**
@@ -519,6 +659,13 @@ export function renderAcpPermission(
  * —— 那不是 fail closed，是**不可用**。
  * fail closed 的正确含义是「**判不出来**才拒绝」，不是「**判出来是只读**也拒绝」。
  *
+ * ── 读不全的改动集（ADR-135）────────────────────────────────────────
+ *
+ * 路径提取是三态的（`extractAcpChangedPaths()`）：改动集**读不全**
+ * 时返回 `'unknown'` —— 它直接进 `judgeWriteTargets()` 判成拒绝
+ * （`acp:incomplete-targets`）。「读不全」绝不落入上面的「空目标」
+ * 分支，否则一次越界尝试会被读成「这次没写东西」。
+ *
  * @param toolCall — ACP 的 `toolCall`
  * @param ctx — 判定上下文（写集预约、保护域、策略、worktree 根）
  */
@@ -526,10 +673,12 @@ export function judgeAcpPermission(
   toolCall: AcpToolCall | undefined,
   ctx: PreToolContext,
 ): PreToolVerdict {
-  const payload = normalizeAcpToolCall(toolCall);
-  const targets = extractWriteTargets(payload);
+  const changed = extractAcpChangedPaths(toolCall);
 
-  if (targets.length === 0) {
+  // 「读不全」（`'unknown'`）不落入空目标分支 —— 它直接进判定内核，
+  // 由 `judgeWriteTargets()` 返回 `acp:incomplete-targets` 拒绝。
+  if (changed !== 'unknown' && changed.length === 0) {
+    const payload = normalizeAcpToolCall(toolCall);
     if (payload.read_only === true) {
       // 只读工具：没有写入目标 = 不必拦。
       return {
@@ -583,5 +732,5 @@ export function judgeAcpPermission(
     };
   }
 
-  return judgeWriteTargets(targets, ctx);
+  return judgeWriteTargets(changed, ctx);
 }

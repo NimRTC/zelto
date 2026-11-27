@@ -332,3 +332,13 @@ describe('judgeWriteTargets —— 符号链接感知（ADR-134 回归）', () =
     }
   });
 });
+
+describe('judgeWriteTargets —— 读不全的写目标（ADR-135）', () => {
+  it("入参是 'unknown' → 拒绝（acp:incomplete-targets），不得当「没写东西」", () => {
+    const verdict = judgeWriteTargets('unknown', ctx());
+    assert.equal(verdict.decision, 'deny');
+    assert.equal(verdict.basis, 'acp:incomplete-targets');
+    assert.equal(verdict.ruleId, 'acp:incomplete-targets');
+    assert.match(verdict.reason, /读不完整/);
+  });
+});
