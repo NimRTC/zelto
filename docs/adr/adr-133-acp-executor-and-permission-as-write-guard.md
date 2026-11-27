@@ -208,6 +208,69 @@ ACP request_permission ──▶ normalizeAcpToolCall() ──▶ 统一载荷 {
    `harness` 记为 `acp:<agentCommand>`（例如 `acp:cursor-agent`），**不是**硬编码成某一家
    （ADR-083 §6 的「写假账」同形状）。
 
+### 决策四之二：「以后都允许」的选择权交给用户（2026-11-27 补充）
+
+**用户诉求**：把 `allow_always` 的选择权交给用户 —— 缺省不开，
+不重要的模块用户可以打开。
+
+**先看清一件事实（实测，2026-11-27，`cursor-agent` 2026.09.18-9a7762b）**：
+
+agent 收到 `allow_always` 后的动作是 `InteractivePermissionsService.addToAllowList`：
+
+```js
+async addToAllowList(e, t, r) {
+  const n = `${t}(${r})`;
+  await this.permissionsProvider.updatePermissions((e) => {
+    const t = e.allow.includes(n) ? e.allow : [...e.allow, n];
+    return { ...e, allow: t };
+  });
+}
+```
+
+条目被写进 **agent 自己的 `.cursor/permissions.json`**（工作区级、持久化）。
+之后同类操作**根本不再问 zelto**：
+
+1. zelto 的**逐写判定**对该路径永久失效；
+2. 这份记忆**跨切片存活** —— 上一轮的「以后都允许」会变成下一轮的越界通道
+   （写集预约是**按切片**的）。
+
+**所以「把 `allow_always` 回给 agent」这条路被否决** ——
+它不是「用户的意图没实现」，是那个开关**一旦打开就再也关不上**。
+
+**采用的方案**：**zelto 自己记住「以后都允许」，但对 agent 始终回 `allow_once`。**
+
+| | 回给 agent | 记忆存在哪 | 逐写判定 | 跨切片 |
+|---|---|---|---|---|
+| 直接回 `allow_always`（否决） | `allow_always` | agent 的 `.cursor/permissions.json` | ❌ 被绕过 | ❌ 存活 |
+| **本方案** | **永远是 `allow_once`** | **zelto 的 `.zelto/locks/always-<sliceId>.json`** | ✅ 不被绕过 | ✅ 按切片失效 |
+
+- agent 的 allowlist 里**永远不会有** zelto 管理的路径 → 每次写仍然问 zelto；
+- 用户仍然得到「别再烦我」的体验 —— zelto 直接放行，不再提问；
+- 每次放行照常写 `policy.decision` 事件 → 审计链不丢；
+- 代价：agent 侧仍会反复请求权限，但 zelto 秒回，人看不到提示。
+
+**授权范围（用户拍板）**：**只对当前切片写集内的路径**放开。两条必须同时满足：
+
+1. 路径在**本次判定的写集内**（`ctx.writes`）—— 白名单**不能**放宽写集；
+2. 路径在**用户配置的白名单**里（`agent.acp.alwaysAllowPaths`）——
+   **缺省为空 = 关闭**，用户说「不重要的模块可以打开」就明确列出那些模块。
+
+判定在 `src/hook/acp-always.ts`（C3：纯计算、确定性）；
+adapter 只负责「问人」与「记账」（有 I/O，不进 hook 层）。
+
+**交互方式（用户拍板）**：zelto 在终端问人，三选一
+——「仅本次 / 以后都允许 / 拒绝」。
+
+**非 TTY 一律不放开**（用户拍板）：CI、后台跑时没有人能回答，
+提问只会挂死；而「不问就放开」等于把开关变成默认开启，
+与「缺省是关的」直接矛盾。所以非 TTY 下只走 `allow_once`。
+
+**授权记忆是确切路径，不是 glob** ——
+「允许写 `src/a.ts`」不能悄悄变成「允许写整个 `src/`」。
+
+**硬规则 1 一字未改**：对 agent 永远只回 `allow_once`。
+本节新增的是「zelto 侧的授权记忆」，不是「放开 `allow_always`」。
+
 ### 决策五：并列上线，**不改默认**
 
 - 新增 `'acp'` 作为 `agent.adapter` 的可选值；**默认仍是 `claude-agent`**；
@@ -236,6 +299,10 @@ ACP 规范的 `session/update` 种类是封闭集合；**不认识的 `sessionUp
    映射放 `src/hook/acp.ts`，与现有 `harness.ts` 并列。
 4. **允许 `allow_always` 以换「少打断」**：
    违反「逐写判定」。少打断 = 少追溯，这是 zelto 不做的交易。
+   （**2026-11-27 补充**：这条否决的**具体理由**已查明并写进决策四之二 ——
+   agent 收到 `allow_always` 会写进自己的 `.cursor/permissions.json`，
+   之后不再问 zelto，那个开关**一旦打开就再也关不上**。
+   用户要的「少打断」由 zelto 侧的授权记忆实现，代价只是 agent 多问几次。）
 
 ## 影响面
 
@@ -261,6 +328,15 @@ ACP 规范的 `session/update` 种类是封闭集合；**不认识的 `sessionUp
 | `tests/acp-write-guard.test.ts` | **permission 路线不装任何 hook**（验收 2） |
 | `tests/acp-command-resolution.test.ts` | 命令解析与 `--adapter` 取值校验 |
 | `tests/fixtures/mock-acp-agent.mjs` | mock ACP agent（端到端测试用，非生产代码） |
+
+**决策四之二新增的文件**（2026-11-27）：
+
+| 文件 | 作用 |
+|---|---|
+| `src/hook/acp-always.ts`（**新增**） | 「能不能放开」的**判定**（纯计算，C3）：写集内 + 白名单内 |
+| `src/adapters/acp/always-grants.ts`（**新增**） | 授权**记忆**（zelto 侧，按切片分文件） |
+| `src/adapters/acp/always-prompt.ts`（**新增**） | **问人**（非 TTY 不问、不放开） |
+| `tests/acp-always.test.ts`（**新增**） | 判定 + 记忆 + 配置解析（26 条） |
 
 **原计划的 `tests/adapters/acp/dependency-scope.test.ts` 落到了
 `tests/acp-adapter.test.ts`**（同一份文件里已经有依赖作用域那条断言）——

@@ -56,12 +56,16 @@ import {
   appendDecisionEvent,
   buildContext,
   type PreToolContext,
+  type PreToolVerdict,
 } from '../../hook/pretool.js';
 import { killProcessTreeGracefully } from '../process-tree.js';
 import { loadSession, saveSession, type PersistentSessionData } from '../session-store.js';
 import { PROTOCOL_VERSION, createAcpStream, isSupportedProtocolVersion, protocolVersionError } from './protocol.js';
 import { detectAuthRequired, extractAuthMethods, type AcpAuthMethod } from './auth.js';
 import { extractAcpCost, extractAcpText, isProgressUpdate } from './events.js';
+import { addGrant, hasGrant, loadGrants, type AlwaysGrant } from './always-grants.js';
+import { promptAlwaysAllow } from './always-prompt.js';
+import { judgeAlwaysGrant } from '../../hook/acp-always.js';
 
 /** ACP 适配器选项。 */
 export interface AcpAdapterOptions {
@@ -81,6 +85,13 @@ export interface AcpAdapterOptions {
   sliceId?: string | null;
   /** 本轮 runId（ADR-130）—— 判定事件据此归属轮次 */
   runId?: string | null;
+  /**
+   * 「以后都允许」的白名单（ADR-133 补充）。
+   *
+   * **缺省为空 = 关闭** —— 默认行为与之前完全一致（永不放开）。
+   * 用户要放开就明确列出那些路径/目录/glob。
+   */
+  alwaysAllowPaths?: string[];
   /** 实时输出回调 */
   onOutput?: (sessionId: string, text: string) => void;
   /** 进展回调 */
@@ -134,6 +145,7 @@ export class AcpAdapter implements ExecutorAdapter {
   private readonly maxRetries: number;
   private readonly projectRoot: string;
   private readonly sliceId: string | null;
+  private readonly alwaysAllowPaths: string[];
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
 
@@ -150,11 +162,103 @@ export class AcpAdapter implements ExecutorAdapter {
     this.maxRetries = options.maxRetries ?? 2;
     this.projectRoot = options.projectRoot ?? process.cwd();
     this.sliceId = options.sliceId ?? null;
+    this.alwaysAllowPaths = options.alwaysAllowPaths ?? [];
     this.onOutput = options.onOutput;
     this.onProgress = options.onProgress;
   }
 
   // ─── 启动 ────────────────────────────────────────────────────────────────
+
+  /**
+   * 「以后都允许」的授权流程（ADR-133 补充）。
+   *
+   * 三步：
+   *
+   *   1. **查已有的授权记忆** —— 有就直接放行，不再问人；
+   *   2. **问人能不能放开** —— 判定在 `src/hook/acp-always.ts`：
+   *      路径必须在**当前切片的写集内** + **用户配置的白名单内**
+   *      （白名单缺省为空 = 关闭）；
+   *   3. **人选了「以后都允许」就记账** —— 记在 **zelto 这边**
+   *      （`.zelto/locks/always-<sliceId>.json`），
+   *      **不是** agent 的 `.cursor/permissions.json`。
+   *
+   * **对 agent 始终回 `allow_once`** —— 见 `always-grants.ts` 的文件头：
+   * agent 收到 `allow_always` 会自己持久化，之后不再问 zelto，
+   * 逐写判定就被绕过了。
+   */
+  private async handleAlwaysGrant(
+    toolCall: AcpToolCall,
+    state: AcpSessionState,
+    options: AcpPermissionOption[],
+    verdict: PreToolVerdict,
+  ): Promise<{ verdict: PreToolVerdict; basis: string; reason: string }> {
+    // 1. 查已有的授权记忆。
+    //
+    // 只在**本次判定放行**的路径上查 —— 授权记忆记的是确切路径。
+    const sliceId = state.ctx.sliceId;
+    if (!sliceId) {
+      return { verdict, basis: verdict.basis, reason: verdict.reason };
+    }
+
+    const grants: AlwaysGrant[] = loadGrants(this.projectRoot, sliceId);
+    const targets = verdict.targets;
+    if (targets.length === 1 && hasGrant(grants, targets[0])) {
+      return {
+        verdict: {
+          ...verdict,
+          basis: 'acp:always-granted',
+          reason: `路径 "${targets[0]}" 已被授权「以后都允许」（本次切片内）。`,
+        },
+        basis: 'acp:always-granted',
+        reason: `路径 "${targets[0]}" 已被授权「以后都允许」（本次切片内）。`,
+      };
+    }
+
+    // 2. 问人能不能放开。
+    //
+    // 判定在 hook 层：写集内 + 白名单内才允许问。
+    // 白名单缺省为空 → `eligible: false` → 直接返回，**不打扰人**。
+    const decision = judgeAlwaysGrant(targets, state.ctx, this.alwaysAllowPaths);
+    if (!decision.eligible) {
+      return { verdict, basis: verdict.basis, reason: verdict.reason };
+    }
+
+    // 3. 问人。
+    //
+    // 非 TTY → `promptAlwaysAllow` 直接返回 'once'（不放开），
+    // 见 `always-prompt.ts` 的文件头。
+    const choice = await promptAlwaysAllow(decision.path);
+
+    if (choice === 'always') {
+      addGrant(this.projectRoot, sliceId, {
+        path: decision.path,
+        source: `acp:${this.agentCommand}`,
+      });
+      const reason = `路径 "${decision.path}" 已授权「以后都允许」（本次切片内）。`;
+      return {
+        verdict: { ...verdict, basis: 'acp:always-granted', reason },
+        basis: 'acp:always-granted',
+        reason,
+      };
+    }
+
+    if (choice === 'reject') {
+      return {
+        verdict: {
+          ...verdict,
+          decision: 'deny',
+          basis: 'acp:always-rejected',
+          ruleId: 'acp:always-rejected',
+          reason: `人拒绝了对路径 "${decision.path}" 的写入。`,
+        },
+        basis: 'acp:always-rejected',
+        reason: `人拒绝了对路径 "${decision.path}" 的写入。`,
+      };
+    }
+
+    // 'once' —— 与之前完全一致。
+    return { verdict, basis: verdict.basis, reason: verdict.reason };
+  }
 
   async start(spec: {
     sliceId: string;
@@ -351,7 +455,15 @@ export class AcpAdapter implements ExecutorAdapter {
     //
     // agent 要动工具就来问；我们按写集预约答。
     // **判定不在这里** —— 归一化与判决都在 `src/hook/acp.ts`。
-    app.onRequest('session/request_permission', (ctx) => {
+    //
+    // 「以后都允许」也在这里处理（ADR-133 补充），但**判定**同样在 hook 层
+    // （`src/hook/acp-always.ts`），这里只做「问人」与「记账」。
+    //
+    // **关键**：对 agent **永远回 `allow_once`** —— 绝不回 `allow_always`。
+    // 因为 agent 收到 `allow_always` 会写进自己的 `.cursor/permissions.json`，
+    // 之后同类操作**不再问 zelto** → 逐写判定被绕过、且跨切片存活。
+    // 「以后都允许」的记忆记在 **zelto 这边**（`always-grants.ts`）。
+    app.onRequest('session/request_permission', async (ctx) => {
       const params = ctx.params;
       const toolCall: AcpToolCall = {
         kind: params.toolCall.kind ?? undefined,
@@ -372,8 +484,22 @@ export class AcpAdapter implements ExecutorAdapter {
         kind: o.kind,
       }));
 
-      const verdict = judgeAcpPermission(toolCall, state.ctx);
-      const outcome = renderAcpPermission(verdict, options);
+      let verdict = judgeAcpPermission(toolCall, state.ctx);
+      let basis = verdict.basis;
+      let reason = verdict.reason;
+
+      // ── 「以后都允许」的授权流程 ──────────────────────────────────
+      //
+      // 只在「本次判定要放行」时才问 —— 都要拒了还问「以后都允许吗」
+      // 是荒谬的。
+      if (verdict.decision === 'allow') {
+        const outcome = await this.handleAlwaysGrant(toolCall, state, options, verdict);
+        verdict = outcome.verdict;
+        basis = outcome.basis;
+        reason = outcome.reason;
+      }
+
+      const rendered = renderAcpPermission(verdict, options);
 
       // C4：每次判定都留证据。`harness` 记真实来源（`acp:<command>`），
       // 不硬编码成某一家（ADR-083 §6 的「写假账」同形状）。
@@ -384,8 +510,8 @@ export class AcpAdapter implements ExecutorAdapter {
         {
           decision: verdict.decision,
           ruleId: verdict.ruleId,
-          basis: verdict.basis,
-          reason: verdict.reason,
+          basis,
+          reason,
           path: verdict.path,
           targets: verdict.targets,
           tool: toolCall.name ?? toolCall.kind ?? 'unknown',
@@ -396,7 +522,7 @@ export class AcpAdapter implements ExecutorAdapter {
         state.runId,
       );
 
-      return { outcome: outcome.outcome };
+      return { outcome: rendered.outcome };
     });
 
     // ── session/update：输出文本 + 进展信号 ───────────────────────

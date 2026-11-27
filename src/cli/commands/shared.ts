@@ -1158,6 +1158,10 @@ export function createExecutorAdapter(
       // ADR-090：凭证/网关透传 —— 与其它适配器同口径。
       env: mergeAgentEnv(cfg.agent.env),
       projectRoot: process.cwd(),
+      // ADR-133 补充：「以后都允许」的白名单。
+      //
+      // **缺省空 = 关闭** —— 不配就永远不放开（默认行为不变）。
+      alwaysAllowPaths: cfg.agent.acp?.alwaysAllowPaths ?? [],
     });
   }
 

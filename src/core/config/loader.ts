@@ -140,6 +140,33 @@ export interface ZeltoConfig {
        * 由用户的 agent CLI 决定，zelto 只管按 ACP 协议跟它说话。
        */
       command?: string;
+      /**
+       * 「以后都允许」的白名单（ADR-133 补充）。
+       *
+       * **缺省为空 = 关闭** —— 默认行为与之前完全一致（永不放开）。
+       * 用户要放开就明确列出那些路径 / 目录 / glob。
+       *
+       * 例：
+       *
+       * ```yaml
+       * agent:
+       *   acp:
+       *     alwaysAllowPaths:
+       *       - src/generated/**
+       *       - docs/
+       * ```
+       *
+       * **两条硬约束**（`src/hook/acp-always.ts` 判定）：
+       *
+       *   1. 路径必须在**当前切片的写集内** —— 白名单**不能**放宽写集；
+       *   2. 路径必须在**本白名单内** —— 白名单**不能**放宽保护域。
+       *
+       * 两条都满足时，zelto 才会问人「以后都允许吗」。
+       * 问的结果记在 **zelto 侧**（`.zelto/locks/always-<sliceId>.json`），
+       * **不会**回 `allow_always` 给 agent —— 那会让 agent 自己持久化、
+       * 之后不再问 zelto，逐写判定就被绕过了。
+       */
+      alwaysAllowPaths?: string[];
     };
   };
   /**
@@ -450,6 +477,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let inAgentAcpSection = false;
   let agentAcpIndent = 0;
   let agentAcpCommand: string | undefined;
+  // ADR-133 补充：「以后都允许」的白名单（缺省空 = 关闭）
+  let agentAcpAlwaysAllowPaths: string[] = [];
+  let inAgentAcpAlwaysAllowSection = false;
+  let agentAcpAlwaysAllowIndent = 0;
   let currentCommand: GateCommandConfig | null = null;
   /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
   let currentCommandIndent = 0;
@@ -882,6 +913,52 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
             agentAcpCommand = stripSurroundingQuotes(raw);
           }
           continue;
+        } else if (trimmed.startsWith('alwaysAllowPaths:')) {
+          // ADR-133 补充：「以后都允许」的白名单。
+          //
+          // 两种写法都认：
+          //
+          //   alwaysAllowPaths:            ← 块列表，下面每行 `- xxx`
+          //     - src/generated/**
+          //     - docs/
+          //
+          //   alwaysAllowPaths: [a, b]     ← 行内数组
+          //
+          // **缺省是空 = 关闭** —— 不配就永远不放开。
+          const inline = trimmed.slice('alwaysAllowPaths:'.length).trim();
+          if (inline.startsWith('[') && inline.endsWith(']')) {
+            const inner = inline.slice(1, -1);
+            for (const part of inner.split(',')) {
+              const value = stripSurroundingQuotes(part.trim());
+              if (value) agentAcpAlwaysAllowPaths.push(value);
+            }
+            continue;
+          }
+          if (inline) {
+            // 行内单值：`alwaysAllowPaths: src/**`
+            const value = stripSurroundingQuotes(inline);
+            if (value) agentAcpAlwaysAllowPaths.push(value);
+            continue;
+          }
+          // 空值 → 块列表
+          inAgentAcpAlwaysAllowSection = true;
+          agentAcpAlwaysAllowIndent = indent;
+          continue;
+        }
+      }
+
+      if (inAgentAcpAlwaysAllowSection) {
+        // 缩进回到 `alwaysAllowPaths:` 那一层或更浅 → 段结束。
+        if (indent <= agentAcpAlwaysAllowIndent) {
+          inAgentAcpAlwaysAllowSection = false;
+        } else {
+          // 列表项 `- xxx`
+          const withoutDash = trimmed.startsWith('- ') ? trimmed.slice(2).trim() : trimmed;
+          if (withoutDash && !withoutDash.endsWith(':')) {
+            const value = stripSurroundingQuotes(withoutDash);
+            if (value) agentAcpAlwaysAllowPaths.push(value);
+          }
+          continue;
         }
       }
 
@@ -1310,7 +1387,16 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
                 },
               }
             : {}),
-          ...(agentAcpCommand ? { acp: { command: agentAcpCommand } } : {}),
+          ...(agentAcpCommand || agentAcpAlwaysAllowPaths.length > 0
+            ? {
+                acp: {
+                  ...(agentAcpCommand ? { command: agentAcpCommand } : {}),
+                  ...(agentAcpAlwaysAllowPaths.length > 0
+                    ? { alwaysAllowPaths: agentAcpAlwaysAllowPaths }
+                    : {}),
+                },
+              }
+            : {}),
         },
         ...(web ? { web } : {}),
         ...(worktree ? { worktree } : {}),
