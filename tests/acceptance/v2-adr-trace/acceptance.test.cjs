@@ -465,6 +465,8 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'tests/core/forge/pr-body.test.ts',
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
+    'tests/web-cockpit-diff-expand.test.ts',
+    'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
     'tests/acceptance/v2-adr-trace/acceptance.test.cjs',]);

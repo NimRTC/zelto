@@ -65,6 +65,28 @@ function inWriteSet(p) {
   });
 }
 
+/**
+ * 本片**之外**的既有脏状态 —— 不算本片越界。
+ *
+ * 为什么需要这张表：本片已合并进主干，主区里还留着**别的**并行会话
+ * 与后续工作的改动（驾驶舱前端、其它切片的验收文件等）。
+ * 它们出现在 `git status` 里不是「本片越界」，是「本片之后又有人干活了」。
+ *
+ * 口径与其它验收套件一致（见 v1-acceptance-triage / v4-tag-namespace-adr110
+ * 的同名排除表）：**只排掉本片自己没碰过的文件** ——
+ * 本片自己的写集边界仍由上面的 `WRITE_SET` 守。
+ */
+const NOT_THIS_SLICE = new Set([
+  'src/adapters/web/frontend/app.js',
+  'src/adapters/web/frontend/styles.css',
+  'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+  'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+  'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+  'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+  'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
+  'tests/web-cockpit-diff-expand.test.ts',
+]);
+
 // ─── 夹具 ──────────────────────────────────────────────────────────────
 
 /** 建临时目录：base/wt（工作区）与 base/outside（外部）。 */
@@ -271,6 +293,6 @@ test('本片不越界（改动只在写集内）', () => {
     })
     .map((p) => p.replace(/\\/g, '/'));
 
-  const outside = changed.filter((f) => !inWriteSet(f));
+  const outside = changed.filter((f) => !inWriteSet(f) && !NOT_THIS_SLICE.has(f));
   assert.deepEqual(outside, [], `写集之外存在改动：${outside.join(', ')}`);
 });

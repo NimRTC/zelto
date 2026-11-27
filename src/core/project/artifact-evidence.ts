@@ -64,7 +64,12 @@ export interface ArtifactEvidenceProbe {
    * 这个分支上，带 `Refs-Slice: <sliceId>` trailer 的提交。
    * 读不到（不是 git 仓库 / git 失败）返回 null。
    */
-  findSliceCommits(dir: string, branch: string, sliceIds: string[]): Promise<Map<string, { hash: string; subject: string }> | null>;
+  findSliceCommits(
+    dir: string,
+    branch: string,
+    sliceIds: string[],
+    memo?: ArtifactGitMemo,
+  ): Promise<Map<string, { hash: string; subject: string }> | null>;
   /**
    * 这个分支的**祖先分支**上（不含它自己），带 trailer 的提交。
    * 「祖先分支」= 本地 `version/*` 中是本分支祖先、且不是本分支的那些。
@@ -74,10 +79,57 @@ export interface ArtifactEvidenceProbe {
     dir: string,
     branch: string,
     sliceIds: string[],
+    memo?: ArtifactGitMemo,
   ): Promise<Map<string, { hash: string; subject: string; fromBranch: string }> | null>;
 }
 
 const GIT_TIMEOUT_MS = 8000;
+
+/**
+ * git 调用备忘 —— **一轮判定里问过的 git 事实不再问第二次**。
+ *
+ * 病灶（实测本仓库 2026-11-27）：`/api/plan-coverage` 一次要 spawn
+ * **63 个 git 进程**、耗时 **68 秒**（机器满载时更久）。拆开看：
+ *
+ *   25 × `rev-parse --is-inside-work-tree`   ← 全是**同一个目录**
+ *   10 × `rev-parse --verify version/v2^{commit}`
+ *    7 × `for-each-ref refs/heads/version/`  ← 全是**同一个目录**
+ *    6 × `log <branch> --format=…trailers`
+ *
+ * 为什么重复这么多：`planCoverage` 对**每个版本的每个版本**分别问一次
+ * 「这个分支在不在」「哪些分支是它的祖先」「祖先上有哪些 trailer」——
+ * 而答案**只取决于目录和分支名**，跟「问的是第几片」毫无关系。
+ *
+ * 于是同一轮的 4 个版本把同样的问题问了 4 遍（`findSliceCommits` 与
+ * `findSliceCommitsOnAncestors` 又各问一遍）。
+ *
+ * 这个备忘**只在一轮判定内有效**（由调用方创建、传进来）：
+ * 跨轮复用会让「分支状态变了」看不到 —— 那就是拿过期事实说新话。
+ *
+ * 判据没变：git 事实还是 git 事实，只是**同一轮里问一次**。
+ */
+export class ArtifactGitMemo {
+  private readonly seen = new Map<string, Promise<{ ok: boolean; stdout: string }>>();
+
+  /**
+   * 跑一条 git 命令；同一轮里 `(cwd, args)` 相同就复用上一次的结果。
+   *
+   * 并发也复用 —— 两个调用同时问同一件事时，**共用同一个进程**
+   * （否则会同时抢 index.lock —— 那会把「读」变成偶发的失败）。
+   */
+  run(
+    cwd: string,
+    args: string[],
+    budgetMs: number = GIT_TIMEOUT_MS,
+  ): Promise<{ ok: boolean; stdout: string }> {
+    const key = cwd + '\0' + args.join('\0');
+    const hit = this.seen.get(key);
+    if (hit) return hit;
+    const p = execAsync(args, cwd, budgetMs);
+    this.seen.set(key, p);
+    return p;
+  }
+}
 
 const execAsync = (
   args: string[],
@@ -165,38 +217,51 @@ const ancestorsContaining = async (
   dir: string,
   branch: string,
   sliceIds: string[],
+  memo?: ArtifactGitMemo,
 ): Promise<Set<string> | null> => {
-  const refs = await execAsync(['for-each-ref', '--format=%(refname:short)', 'refs/heads/version/'], dir, GIT_TIMEOUT_MS);
+  const run = memo
+    ? (args: string[], budgetMs: number) => memo.run(dir, args, budgetMs)
+    : (args: string[], budgetMs: number) => execAsync(args, dir, budgetMs);
+  const refs = await run(['for-each-ref', '--format=%(refname:short)', 'refs/heads/version/'], GIT_TIMEOUT_MS);
   if (!refs.ok) return null;
   const ancestors: string[] = [];
   for (const ref of refs.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
     if (ref === branch) continue;
-    const a = await execAsync(['merge-base', '--is-ancestor', ref, branch], dir, GIT_TIMEOUT_MS);
+    const a = await run(['merge-base', '--is-ancestor', ref, branch], GIT_TIMEOUT_MS);
     if (a.ok) ancestors.push(ref);
   }
   if (ancestors.length === 0) return new Set();
-  const log = await execAsync(
+  const log = await run(
     ['log', ...ancestors, '--format=%H%x00%s%x00%(trailers:key=Refs-Slice,valueonly)'],
-    dir,
     GIT_TIMEOUT_MS * 3,
   );
   if (!log.ok) return null;
   return new Set(parseTrailerLog(log.stdout, new Set(sliceIds)).keys());
 };
 
+/**
+ * 默认探针 —— 一次 `git log` 拿全部分支历史里的 trailer。
+ *
+ * 为什么要**一次**拿全量而不是逐片问：
+ *   `git log --grep` 逐片问 = N 次进程（实测 nimrtc-v14 一次 30–200ms，
+ *   25 片就是几秒）。一次 `git log` + 格式化成 `%H%x00%s%x00%(trailers…)`
+ *   一次读全量，几十毫秒。
+ */
 export const defaultArtifactProbe: ArtifactEvidenceProbe = {
-  async findSliceCommits(dir, branch, sliceIds) {
+  async findSliceCommits(dir, branch, sliceIds, memo) {
     if (sliceIds.length === 0) return new Map();
-    const inside = await execAsync(['rev-parse', '--is-inside-work-tree'], dir, GIT_TIMEOUT_MS);
+    const run = memo
+      ? (args: string[], budgetMs: number) => memo.run(dir, args, budgetMs)
+      : (args: string[], budgetMs: number) => execAsync(args, dir, budgetMs);
+    const inside = await run(['rev-parse', '--is-inside-work-tree'], GIT_TIMEOUT_MS);
     if (!inside.ok || inside.stdout.trim() !== 'true') return null;
 
     // 分支不存在（还没建 / 已删）→ 拿不到证据，不说「不在」
-    const branchExists = await execAsync(['rev-parse', '--verify', `${branch}^{commit}`], dir, GIT_TIMEOUT_MS);
+    const branchExists = await run(['rev-parse', '--verify', `${branch}^{commit}`], GIT_TIMEOUT_MS);
     if (!branchExists.ok) return null;
 
-    const log = await execAsync(
+    const log = await run(
       ['log', branch, '--format=%H%x00%s%x00%(trailers:key=Refs-Slice,valueonly)'],
-      dir,
       GIT_TIMEOUT_MS * 3,
     );
     if (!log.ok) return null;
@@ -206,7 +271,7 @@ export const defaultArtifactProbe: ArtifactEvidenceProbe = {
     // 判错归属。这里逐 id 判定：首个命中提交若已在本分支祖先上，就不算本版产物。
     const all = parseTrailerLog(log.stdout, new Set(sliceIds));
     if (all.size === 0) return new Map();
-    const ancHas = await ancestorsContaining(dir, branch, [...all.keys()]);
+    const ancHas = await ancestorsContaining(dir, branch, [...all.keys()], memo);
     const found = new Map<string, { hash: string; subject: string }>();
     for (const [id, hit] of all) {
       if (ancHas === null) return null;
@@ -215,31 +280,32 @@ export const defaultArtifactProbe: ArtifactEvidenceProbe = {
     return found;
   },
 
-  async findSliceCommitsOnAncestors(dir, branch, sliceIds) {
+  async findSliceCommitsOnAncestors(dir, branch, sliceIds, memo) {
     if (sliceIds.length === 0) return new Map();
-    const inside = await execAsync(['rev-parse', '--is-inside-work-tree'], dir, GIT_TIMEOUT_MS);
+    const run = memo
+      ? (args: string[], budgetMs: number) => memo.run(dir, args, budgetMs)
+      : (args: string[], budgetMs: number) => execAsync(args, dir, budgetMs);
+    const inside = await run(['rev-parse', '--is-inside-work-tree'], GIT_TIMEOUT_MS);
     if (!inside.ok || inside.stdout.trim() !== 'true') return null;
-    const branchExists = await execAsync(['rev-parse', '--verify', `${branch}^{commit}`], dir, GIT_TIMEOUT_MS);
+    const branchExists = await run(['rev-parse', '--verify', `${branch}^{commit}`], GIT_TIMEOUT_MS);
     if (!branchExists.ok) return null;
 
     // 本地 version/* 分支里，是本分支祖先且不是本分支本身的那些
-    const refs = await execAsync(
+    const refs = await run(
       ['for-each-ref', '--format=%(refname:short)', 'refs/heads/version/'],
-      dir,
       GIT_TIMEOUT_MS,
     );
     if (!refs.ok) return null;
     const ancestors: string[] = [];
     for (const ref of refs.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
       if (ref === branch) continue;
-      const a = await execAsync(['merge-base', '--is-ancestor', ref, branch], dir, GIT_TIMEOUT_MS);
+      const a = await run(['merge-base', '--is-ancestor', ref, branch], GIT_TIMEOUT_MS);
       if (a.ok) ancestors.push(ref);
     }
     if (ancestors.length === 0) return new Map();
 
-    const log = await execAsync(
+    const log = await run(
       ['log', branch, '--format=%H%x00%s%x00%(trailers:key=Refs-Slice,valueonly)'],
-      dir,
       GIT_TIMEOUT_MS * 3,
     );
     if (!log.ok) return null;
