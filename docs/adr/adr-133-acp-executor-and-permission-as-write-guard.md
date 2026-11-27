@@ -611,6 +611,41 @@ ADR 写于「还没跑过真实 ACP agent」的状态。落地时拿真实 `curs
 （整个 title 就是反引号包裹的命令），套用动词闸门会把命令整个丢掉 →
 拒绝一切 Shell 操作。另需处理 agent 对命令里反引号的转义。
 
+### 修正一之二：只读命令不能被拦（`acp:no-write-target`）
+
+修完路径提取后又暴露一个**更严重**的问题。
+
+实测（同一个探针）：
+
+```
+ls -la       -> deny (acp:unknown-tool)   ← 不该拒
+cat src/a.ts -> deny (acp:unknown-tool)   ← 不该拒
+git status   -> deny (acp:unknown-tool)   ← 不该拒
+npm test     -> deny (acp:unknown-tool)   ← 不该拒
+rm -rf out   -> deny (slice:s1#writes)    ← 该拒
+```
+
+**根因**：`execute` 类别静态分析出「无写目标」时，与「**判不出**写目标」
+被混为一谈 —— 两者都走进「空目标 → 拒绝」那一档。
+
+**后果**：agent **连查个目录都做不了**。这不是 fail closed，是**不可用**。
+
+**fail closed 的正确含义是「*判不出来*才拒绝」，不是「*判出来是只读*也拒绝」。**
+
+**修复**：把「空」拆成**三档**：
+
+| 情形 | 判定 | basis |
+|---|---|---|
+| 只读工具（`kind` ∈ read/search/fetch/think/switch_mode） | 放行 | `acp:read-only` |
+| **命令类（`execute`）但静态分析没发现写目标** | **放行** | `acp:no-write-target` |
+| 未知类别（`other` 或规范外的值），判不出写目标 | **拒绝** | `acp:unknown-tool` |
+
+第二档的**界线**：必须是「**有命令**且分析后没发现写目标」。
+连命令都读不出来（title 形态不对、`rawInput` 没有 command）→ 落到第三档拒绝。
+
+**这条修正对 C9 的影响**：写集预约**仍然照常生效** ——
+`rm -rf out` 照样被 `slice:s1#writes` 拦下。只是不再误伤只读命令。
+
 ### 修正二：鉴权是**独立于版本协商的第二道关卡**
 
 ADR 只写了版本协商 fail closed。实测发现还有一道：

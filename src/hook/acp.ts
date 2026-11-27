@@ -503,10 +503,21 @@ export function renderAcpPermission(
  * 于是写目标为空 → 判定内核会放行。
  *
  * **那正是「不认识 ≠ 放行」的漏洞**（ADR-083 §2 的同一条原则）。
- * 所以这里显式区分两种「空」：
+ * 所以这里显式区分**三种**「空」：
  *
  * - **只读工具**（`kind` ∈ read/search/fetch/think/switch_mode）→ 空目标 → 放行
+ * - **命令类（`execute`）但静态分析没发现写目标** → 空目标 → **放行**
+ *   （`ls` / `cat` / `git status` 这类只读命令不该被拦）
  * - **未知类别**（`other` 或规范外的值）→ 空目标 → **拒绝**
+ *
+ * ── 「命令类」这一档为什么必须单独分出来 ──────────────────────────────
+ *
+ * 实测（2026-11-27）：cursor-agent 把 Shell 操作的命令放在 `title` 里
+ * （`` `ls -la` ``），`rawInput` 整个字段都没有。
+ *
+ * 若把「execute 但无写目标」也归进「拒绝」，那么 **agent 连查个目录都做不了**
+ * —— 那不是 fail closed，是**不可用**。
+ * fail closed 的正确含义是「**判不出来**才拒绝」，不是「**判出来是只读**也拒绝」。
  *
  * @param toolCall — ACP 的 `toolCall`
  * @param ctx — 判定上下文（写集预约、保护域、策略、worktree 根）
@@ -525,6 +536,29 @@ export function judgeAcpPermission(
         decision: 'allow',
         reason: '只读工具，没有写入目标。',
         basis: 'acp:read-only',
+        ruleId: null,
+        path: null,
+        targets: [],
+      };
+    }
+
+    // ── 命令类：静态分析没发现写目标 → 放行 ──────────────────────
+    //
+    // `execute` 的载荷里**有命令**（能读到命令 = 我们知道这次调用是什么），
+    // 而静态分析没在命令里发现写目标 —— 这是**判出来了没有写**，
+    // 不是「判不出来」。
+    //
+    // `ls` / `cat` / `git status` / `npm test` 都属于这一档。
+    // 把它们拦掉等于「agent 连查资料都做不了」—— 那不是 fail closed，
+    // 是**不可用**（fail closed = 判不出来才拒绝）。
+    //
+    // 注意与下一档的界线：这里是**有命令**才放行。
+    // 连命令都读不到（title 形态不对、rawInput 没有 command）→ 落到下一档拒绝。
+    if (payload.tool_name === 'Bash' && payload.tool_input?.command) {
+      return {
+        decision: 'allow',
+        reason: `命令 "${payload.tool_input.command}" 静态分析未发现写入目标。`,
+        basis: 'acp:no-write-target',
         ruleId: null,
         path: null,
         targets: [],

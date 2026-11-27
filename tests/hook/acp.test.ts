@@ -407,6 +407,59 @@ describe('ACP 判定 —— 归一化只做翻译，判定内核一字不改', (
   });
 });
 
+describe('ACP 判定 —— 只读命令不该被拦（实测发现：不然 agent 连查资料都做不了）', () => {
+  //
+  // 实测（2026-11-27）：cursor-agent 的 Shell 操作把命令放在 title 里
+  // （`ls -la` 形态），rawInput 整个字段都没有。
+  //
+  // 修之前：`execute` 类别静态分析出「无写目标」时，与「判不出写目标」
+  // 被混为一谈 → `ls` / `cat` / `git status` 全被拒 → **不可用**。
+  //
+  // fail closed 的正确含义是「**判不出来**才拒绝」，
+  // 不是「**判出来是只读**也拒绝」。
+
+  it('只读命令 → 放行', () => {
+    for (const cmd of ['ls -la', 'cat src/a.ts', 'git status', 'npm test']) {
+      const v = judgeAcpPermission({ kind: 'execute', rawInput: {}, title: '`' + cmd + '`' }, CTX);
+      assert.equal(v.decision, 'allow', `只读命令不该被拦：${cmd}`);
+      assert.equal(v.basis, 'acp:no-write-target');
+    }
+  });
+
+  it('有写目标的命令 → 照常按写集判', () => {
+    const v = judgeAcpPermission(
+      { kind: 'execute', rawInput: {}, title: '`rm -rf out`' },
+      CTX,
+    );
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'slice:s1#writes');
+  });
+
+  it('写集内的写目标 → 放行', () => {
+    const v = judgeAcpPermission(
+      { kind: 'execute', rawInput: {}, title: '`touch src/new.txt`' },
+      CTX,
+    );
+    assert.equal(v.decision, 'allow');
+  });
+
+  it('连命令都读不到 → 仍然拒绝（fail closed）', () => {
+    // 有 execute 类别但**命令读不出来** —— 这是「判不出来」，不是「只读」。
+    const v = judgeAcpPermission({ kind: 'execute', rawInput: {} }, CTX);
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'acp:unknown-tool');
+  });
+
+  it('title 不是整串反引号 → 命令读不出来 → 拒绝', () => {
+    const v = judgeAcpPermission(
+      { kind: 'execute', rawInput: {}, title: 'run `rm -rf out` now' },
+      CTX,
+    );
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'acp:unknown-tool');
+  });
+});
+
 describe('ACP 输出渲染 —— 永不发 allow_always（ADR-133 决策四硬规则 1）', () => {
   it('放行时选 allow_once', () => {
     const out = renderAcpPermission(ALLOW, OPTIONS);
