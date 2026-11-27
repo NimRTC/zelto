@@ -230,6 +230,68 @@ IPC 模型之间存在结构性错配。
 
 闸门开放后，第 2 步应出现 discovery JSON，第 4 步应列出 thread。
 
+## 2026-11-27 复核：闸门仍然关闭，且「ACP 能不能用 IDE 的额度」有明确答案
+
+ADR-133 落地后（ACP 执行器），自然会问：
+「ACP 能不能直接控制这台机器的 IDE 里那个 Cursor？」——实测结论如下。
+
+### 1. 闸门仍然关闭（ADR-091 的结论今天不变）
+
+| 检查 | 结果 |
+|---|---|
+| `~/.cursor/desktop-bridge/` | **不存在** |
+| `cursor desktop ls` | 静默返回空（退出码 0，零行输出） |
+| `cli.js` 里 `desktop` 子命令 | **存在**（`Ts={type:"subcommand",description:"Interact with chat threads in a running Cursor desktop app."}`） |
+| `cli.js` 里 `desktop_bridge` 闸门名 | 0 命中（闸门在 IDE 侧的 `main.js` 里，不在 CLI 侧） |
+
+**IDE 在跑（41 个 `Cursor` 进程），但 bridge 目录不存在** ——
+说明是闸门关着，不是 IDE 没开。
+
+### 2. IDE 里**没有** ACP 实现
+
+| 搜索项 | `workbench.desktop.main.js` 命中数 |
+|---|---|
+| `agentclientprotocol` | **0** |
+| `request_permission` | **0** |
+| `session/new` | **0** |
+| `protocolVersion` | 10 —— 但全是 **MCP** 的（`typeof e.params.protocolVersion=="string"`） |
+
+ACP v1 规范里 `protocolVersion` 是**数字**；IDE 里是**字符串**（MCP 日期格式）。
+`agent_acp` 那个字符串只是 `structured-log.ts` 的**日志分类标签**，
+不是协议实现 —— 看到它就以为「IDE 支持 ACP」是误判。
+
+**结论：ACP 是「zelto 当 client、agent CLI 当 agent」的通路，
+方向是 zelto → 外部 agent CLI，不是 zelto → IDE。**
+
+### 3. 关键问题：`cursor-agent acp` 与 IDE 共用登录态/额度吗？
+
+**不共用（至少不是自动共用）。** 实测证据：
+
+| 位置 | 内容 |
+|---|---|
+| IDE 的登录态 | `%APPDATA%\Cursor\User\globalStorage\state.vscdb`（71 GB），**含 `cursorAuth` key** → IDE 已登录 |
+| `cursor-agent` 读的凭证 | `%APPDATA%\<Name>\auth.json`（bundle 里的 `getAuthFilePath`，Windows 分支 = `APPDATA` + TitleCase(name) + `auth.json`） |
+| 实测 | `%APPDATA%\Cursor\auth.json` **不存在** → CLI **未登录** |
+
+`cursor-agent status` → `Not logged in`；
+`cursor-agent models` → `Authentication required. Run 'agent login', pass --api-key/--auth-token, or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.`
+
+**所以「ACP 用 IDE 的额度」这个诉求不成立** —— 不是 zelto 的问题，
+是 Cursor 自己的 CLI 与 IDE **两套登录态**。
+
+要打通只有两条路：
+
+1. **`cursor-agent login`** —— 走一次浏览器授权，写出 `%APPDATA%\Cursor\auth.json`。
+   登录后 ACP 路线立即可用（**zelto 不代劳**：那是人自己的账号授权）。
+2. **`CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` 环境变量**（ADR-090 的凭证外部化口径）。
+
+### 4. 顺带修正 ADR-091 的一处表述
+
+ADR-091 说 `cursor desktop` 走「用 IDE 自己的登录态与额度」——
+这句对 **bridge 通路**成立（它连的就是 IDE 进程），
+但**容易被误读成「Cursor 的一切都共用 IDE 登录态」**。
+事实是：bridge 通路共用，`cursor-agent` CLI **不共用**。
+
 ## 参考
 
 - `C:\Program Files\cursor\resources\app\out\cli.js`

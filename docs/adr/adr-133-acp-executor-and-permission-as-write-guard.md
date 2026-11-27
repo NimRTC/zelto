@@ -404,6 +404,34 @@ bundle 里 ACP 的实现是完整的（`8096.index.js` 有 `session/request_perm
 
 原因是登录要用户自己做浏览器授权（zelto 不代劳）。
 
+**但登录方式本身是清楚的**（实测 `cursor-agent models` 的错误原文）：
+
+```
+Authentication required. Run 'agent login', pass --api-key/--auth-token,
+or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.
+```
+
+三条路：`agent login`（浏览器授权）/ `--api-key` / `--auth-token` /
+`CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` 环境变量（ADR-090 的凭证外部化口径）。
+
+### ⚠️ 与 IDE 的登录态**不共用**（2026-11-27 实测，重要）
+
+「ACP 能不能用我 IDE 里那个 Cursor 的额度？」——**不能**，实测：
+
+| | 位置 | 实测 |
+|---|---|---|
+| IDE | `%APPDATA%\Cursor\User\globalStorage\state.vscdb`（71 GB），含 `cursorAuth` key | **已登录** |
+| `cursor-agent` CLI | `%APPDATA%\<Name>\auth.json`（bundle 里的 `getAuthFilePath`） | **不存在 → 未登录** |
+
+**Cursor 的 CLI 与 IDE 是两套登录态。** 这不是 zelto 的问题，是 Cursor 自己的设计。
+
+另外 IDE 里**没有 ACP 实现**（`workbench.desktop.main.js` 里
+`agentclientprotocol` / `request_permission` / `session/new` 命中数均为 0）——
+`agent_acp` 只是 structured-log 的**分类标签**，不是协议实现。
+
+ACP 的方向是 **zelto → 外部 agent CLI**，不是 zelto → IDE。
+IDE 那条路（`cursor desktop`）见 **ADR-091**，闸门至今未开放，且过不了 C9。
+
 **当前已验证 vs 未验证的边界**：
 
 | 环节 | 验证方式 |
@@ -419,6 +447,10 @@ bundle 里 ACP 的实现是完整的（`8096.index.js` 有 `session/request_perm
 尤其是真实 agent 的 `toolCall.kind` 取值是否落在
 `src/hook/acp.ts` 的归一化映射表里（ACP 规范的 `kind` 是封闭集合，
 但各家 agent 可能塞进 `other`）。
+
+> **注意与 ADR-091 的区别**：`cursor desktop`（驱动 IDE 内的 agent）与
+> `cursor-agent acp`（驱动独立 CLI 进程）是**两条不同的路**。
+> 前者闸门未开放且过不了 C9；后者今天已可用，只差一次登录。
 
 ## 已拍板（2026-11-27）
 
