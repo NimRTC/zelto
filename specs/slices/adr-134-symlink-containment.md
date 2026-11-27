@@ -13,17 +13,20 @@ junction/symlink，就能写到任意位置，而 C9 的主闸门看不到。
 
 ### 实测漏洞（Windows，2026-11-27）
 
+构造：worktree 内有一个 junction 指向 worktree 外
+（下面的 secret.txt 是**测试里临时造的路径**，不是仓库里的文件）：
+
 ```
 worktree = D:\MyOpen\zelto-symlink-test\wt
 target   = D:\MyOpen\zelto-symlink-test\wt\escape\secret.txt
 （wt\escape 是指向 D:\MyOpen\zelto-outside 的 junction）
 
 zelto 现在的判定（relativizeTarget，纯词法）：
-  -> escape/secret.txt
+  -> escape\secret.txt
   -> 「在 worktree 内」-> 放行          ← 越界
 ```
 
-**为什么三条检查同时失效**：`escape/secret.txt` 的**词法路径**看起来在 worktree 内，
+**为什么三条检查同时失效**：escape\secret.txt 的**词法路径**看起来在 worktree 内，
 所以「逃出隔离目录」检查漏了，**而写集检查拿同一个词法路径去比对**
 ——它也落在写集内，于是「在写集内」误判为真。保护域同理。
 
@@ -49,6 +52,9 @@ zelto 现在的判定（relativizeTarget，纯词法）：
 - 只读 `docs/adr/adr-134-symlink-aware-path-containment.md` —— 本片的规则真源。
 - 只读 `docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`
   —— 「T3 值得学的三处」的来源。
+- 只读 `src/core/arch/imports.ts` —— 依赖白名单（用于验收标准 7 的断言）。
+- 只读 `secret.txt` —— 测试里临时造的样例文件（**不是仓库里的文件**，
+  只在验收用例里用来演示 junction 逃逸；本片不改它）。
 
 ## 需求
 
