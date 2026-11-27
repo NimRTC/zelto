@@ -30,6 +30,35 @@ export interface ArtifactEvidence {
   note: string | null;
 }
 
+/** 一个文件的改动类型。 */
+export type DiffFileStatus =
+  | 'added'
+  | 'modified'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'untracked'
+  | 'unknown';
+
+/**
+ * 一个文件的改动事实（ADR-072 §5.2 的「签字要看得见文件」）。
+ *
+ * **为什么签字复查需要文件级事实**：只有三个数字（文件数/增删行）时，
+ * 人要判断「这个改动该不该签」时最缺的是**哪些文件**。
+ * 数字回答「改了多少」，文件清单回答「改了什么」——
+ * 后者才是签字时真正在看的东西。
+ */
+export interface DiffFileEntry {
+  /** 仓库相对路径 */
+  path: string;
+  /** 改动类型 */
+  status: DiffFileStatus;
+  /** 新增行数；二进制文件为 null */
+  added: number | null;
+  /** 删除行数；二进制文件为 null */
+  deleted: number | null;
+}
+
 /** 写集审计结论（ADR-014） */
 export interface WriteSetAuditFacts {
   /** 越界写入清单；空数组 = 一切改动都在写集内 */
@@ -104,14 +133,26 @@ export interface SignReviewFacts {
      */
     scope: GateScopeFacts;
   };
-  /** diff 统计（文件数/增删行） */
+  /**
+   * diff 统计（文件数/增删行）+ 文件级明细。
+   *
+   * **基准由 core/sign-review/diff.ts 一处解析** —— 签字复查与
+   * `zelto diff` 用同一个基准、同一个文件清单（D-11 教训：
+   * 两处各判一套必然漂移）。
+   */
   diff: {
+    /** diff 的基准 ref；null = 按 HEAD 算（降级，见 baseNote） */
+    baseRef: string | null;
+    /** 基准是怎么定出来的（人话） */
+    baseNote: string;
     /** 变更文件数 */
     filesChanged: number;
     /** 新增行数 */
     addedLines: number;
     /** 删除行数 */
     deletedLines: number;
+    /** 逐个文件的事实（已按「该看的先看」排序） */
+    files: DiffFileEntry[];
   };
   /** 成本聚合（ADR-035） */
   cost: {

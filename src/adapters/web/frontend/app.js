@@ -56,6 +56,19 @@ function rootName(scope, label) {
 let inDetail = false;
 let pollTimer = null;
 
+// ── 改动段的展示限额 ────────────────────────────────────────────────────
+//
+// 一次改动动到几百个文件是常事。全渲染出来会把总览页撑爆 ——
+// 而驾驶舱是**总览**，人在这儿要回答的是「这个改动该不该签」，
+// 不是逐行读 diff。
+//
+// 与 CLI `zelto sign --review` 同一套限额思路（ADR-070 §5.3）：
+// 给前 N 个 + 一行「还有 M 个」。
+const DIFF_FILE_BUDGET = 20;
+
+// 当前详情页看的切片 id —— 「看全部」那行提示要指名道姓。
+let currentSliceId = null;
+
 // ── HTTP ───────────────────────────────────────────────────────────────
 
 /**
@@ -146,6 +159,30 @@ function el(tag, className, text) {
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
+}
+
+/**
+ * 把一段文本复制到剪贴板。
+ *
+ * 为什么用 `navigator.clipboard` 而不是自己写 `document.execCommand('copy')`：
+ * 前者是标准 API（且剪贴板写权限要**用户手势**才给 —— 点击正好是手势）。
+ * 后者在现代浏览器里被废弃，且要临时造一个 textarea 来兜底。
+ *
+ * 拿不到剪贴板权限时**不静默失败**：给个提示，
+ * 否则人点了没反应，以为自己看漏了。
+ */
+function copyText(text) {
+  const value = String(text == null ? '' : text);
+  if (!value) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(value).then(function () {
+      flashHint('已复制：' + value);
+    }).catch(function () {
+      flashHint('复制失败 —— 请手动选中命令文本复制');
+    });
+    return;
+  }
+  flashHint('复制失败 —— 请手动选中命令文本复制');
 }
 
 /**
@@ -517,6 +554,198 @@ function artifactCountCell(own, anc, gap) {
 }
 
 /**
+ * 「眼下该做什么」—— 总览页的第一块。
+ *
+ * **判定不在前端**：服务端给的是 `core/pending/` 排好序的清单
+ * （与 CLI 的 `zelto next` / `zelto suggest` / `zelto dashboard` 同一份）。
+ * 这里只渲染 —— 前端不重排、不自己判断「什么更急」。
+ *
+ * 为什么这么设计：
+ *
+ *   1. **一处结论**：以前驾驶舱首屏只有状态（在跑几片、待签几片），
+ *      没有动作 —— 人看到「3 片待签」还得自己回想该敲哪条命令。
+ *   2. **异常优先**：zelto 的北极星是无人值守完成率 —— 人来得越少越好，
+ *      来了只看需要人管的事。清单按「越该人管越靠前」排，
+ *      「正在顺利跑」排在最后（core/pending/types.ts 的优先级表）。
+ *   3. **不编**：拿不到清单就整块不显示，不自己编一份出来。
+ *
+ * @param pending `/api/pending-actions` 的返回；null = 拿不到
+ */
+function renderNextActions(target, pending) {
+  if (!pending || !Array.isArray(pending.items)) return;
+
+  const items = pending.items;
+  const block = el('div', 'next-block' + (pending.top ? ' top' : ''));
+
+  if (items.length === 0) {
+    // 「没事要做」是**好消息**，值得明说 —— 别让人对着空页面猜。
+    block.appendChild(el('div', 'next-top', '眼下没有需要人管的事'));
+    block.appendChild(el('p', 'next-why', 'agent 自己跑着；跑完会出现在这一页。'));
+    target.appendChild(block);
+    return;
+  }
+
+  // ── 大号提示：就这一件 ──
+  const top = pending.top;
+  if (top) {
+    const line = el('div', 'next-top');
+    line.appendChild(el('span', 'next-kind ' + top.kind, pendingKindLabel(top.kind)));
+    line.appendChild(el('span', 'what', top.prepare || top.title));
+    if (top.id) line.appendChild(el('span', 'who', top.id));
+    block.appendChild(line);
+
+    // 命令做成可点的 —— 人看完就该能开工，而不是抄一行命令。
+    if (top.action) {
+      const cmd = el('code', 'next-cmd', top.action);
+      cmd.title = '点一下复制这条命令';
+      cmd.addEventListener('click', function () { copyText(cmd.textContent); });
+      block.appendChild(cmd);
+    }
+    if (top.reason) block.appendChild(el('p', 'next-why', top.reason));
+  }
+
+  // ── 其余待办 ──
+  const rest = items.slice(1);
+  if (rest.length > 0) {
+    const list = el('div', 'next-list');
+    for (const it of rest) {
+      const row = el('div', 'next-item');
+      row.appendChild(el('span', 'next-kind ' + it.kind, pendingKindLabel(it.kind)));
+      row.appendChild(el('span', 'id', it.id || it.title));
+      row.appendChild(el('span', 'prep', it.prepare || ''));
+      if (it.action) {
+        const cmd = el('code', 'next-cmd', it.action);
+        cmd.title = '点一下复制这条命令';
+        cmd.addEventListener('click', function () { copyText(cmd.textContent); });
+        row.appendChild(cmd);
+      }
+      list.appendChild(row);
+    }
+    block.appendChild(list);
+  }
+
+  target.appendChild(block);
+
+  // ── 其它根的待办（ADR-112）──
+  //
+  // 仓库根之外的版本目录各有各的待办 —— 不列出来，人不知道「那边也有活」。
+  // 折叠成一行计数，点开才看 —— 别让它抢首屏的注意力。
+  if (Array.isArray(pending.byRoot)) {
+    const others = pending.byRoot.filter(function (r) {
+      return r.scope !== 'root' && r.items && r.items.length > 0;
+    });
+    for (const r of others) {
+      const details = el('details');
+      details.appendChild(el('summary', 'muted small',
+        '版本目录 ' + (r.label || '?') + '：还有 ' + r.items.length + ' 件待办'));
+      const list = el('div', 'next-list');
+      for (const it of r.items) {
+        const row = el('div', 'next-item');
+        row.appendChild(el('span', 'next-kind ' + it.kind, pendingKindLabel(it.kind)));
+        row.appendChild(el('span', 'id', it.id || it.title));
+        row.appendChild(el('span', 'prep', it.prepare || ''));
+        list.appendChild(row);
+      }
+      details.appendChild(list);
+      target.appendChild(details);
+    }
+  }
+}
+
+/** 待办类别的中文标签 —— 与 CLI 的 `PENDING_KIND_LABEL` 同一份事实。 */
+function pendingKindLabel(kind) {
+  const map = {
+    stalled: '停机',
+    draft: '草稿',
+    rerun: '退回',
+    sign: '待签',
+    requestSign: '待发签',
+    merge: '待合',
+    version: '版本',
+    autoResolved: '自愈过',
+    sliceState: '未开始',
+    longRunning: '长跑'
+  };
+  return map[kind] || kind;
+}
+
+/**
+ * 改动段 —— 文件级清单（与 CLI `zelto sign --review` 同一份事实）。
+ *
+ * **为什么给文件而不只给数字**：
+ * 「改了 3 个文件 +120 -10」回答不了「这个改动该不该签」；
+ * 「哪些文件被改了」才回答得了（ADR-072 §5.2）。
+ *
+ * **为什么不给全文 diff**：
+ * 驾驶舱是**总览**，不是代码评审器 —— 全文 diff 会把这一页撑爆，
+ * 反而让人看不见其它该看的。人要看全文去终端 `zelto diff <id>`。
+ *
+ * @param diff `facts.diff`；null = 拿不到（整节不显示，不编）
+ */
+function renderDiffSection(target, diff) {
+  if (!diff || typeof diff.filesChanged !== 'number') return;
+
+  target.appendChild(el('h2', null,
+    '改了什么（' + diff.filesChanged + ' 文件 · +' + diff.addedLines + ' -' + diff.deletedLines + '）'));
+
+  if (diff.baseNote) {
+    target.appendChild(el('p', 'muted small', '基准：' + diff.baseNote));
+  }
+
+  const files = diff.files || [];
+  if (files.length === 0) {
+    target.appendChild(el('p', 'muted',
+      diff.filesChanged === 0
+        ? '没有查到文件级改动。'
+        : '查到 ' + diff.filesChanged + ' 个文件，但没有文件级明细。'));
+    return;
+  }
+
+  // ── 只渲染前 N 个文件 ──────────────────────────────────────────────
+  //
+  // 一次改动动到几百个文件是常事（重构、批量搬迁）。全渲染出来
+  // 这一页就撑爆了 —— 而驾驶舱是**总览**，人在这儿要回答的是
+  // 「这个改动该不该签」，不是逐行读 diff。
+  //
+  // 与 CLI `zelto sign --review` 同一套限额思路（ADR-070 §5.3）：
+  // **给前 N 个 + 一行「还有 M 个」**，并说清楚去哪儿看全部。
+  const budget = DIFF_FILE_BUDGET;
+  const shown = files.slice(0, budget);
+
+  const list = el('div', 'diff-list');
+  for (const f of shown) {
+    const row = el('div', 'diff-file');
+    row.appendChild(el('span', 'diff-status ' + f.status, diffStatusLabel(f.status)));
+    row.appendChild(el('code', 'diff-path', f.path));
+    const delta = el('span', 'diff-delta');
+    if (f.added) delta.appendChild(el('span', 'add', '+' + f.added));
+    if (f.deleted) delta.appendChild(el('span', 'del', '-' + f.deleted));
+    row.appendChild(delta);
+    list.appendChild(row);
+  }
+  target.appendChild(list);
+
+  if (files.length > budget) {
+    target.appendChild(el('p', 'muted small',
+      '… 还有 ' + (files.length - budget) + ' 个文件。看全部：终端跑 zelto diff ' + (currentSliceId || '<id>')));
+  }
+}
+
+/** 改动类型 → 中文标签。 */
+function diffStatusLabel(status) {
+  const map = {
+    added: '新增',
+    modified: '修改',
+    deleted: '删除',
+    renamed: '改名',
+    copied: '复制',
+    untracked: '未跟踪',
+    unknown: '未知'
+  };
+  return map[status] || status;
+}
+
+/**
  * 执行目录脉络（多工作区进展）—— 总览页的一节。
  *
  * 为什么要有它：ADR-112 只让人看见「仓库根 + 版本集成目录」这两种根；
@@ -614,7 +843,24 @@ async function viewOverview(target) {  const s = await apiGet('/api/summary');
   } catch (err) {
     coverage = null;
   }
+  // 「眼下该做什么」—— 与 CLI 的 `zelto next` / `suggest` / `dashboard`
+  // 同一份判定（core/pending/）。拿不到就不显示（不编一份清单出来）。
+  let pending = null;
+  try {
+    pending = await apiGet('/api/pending-actions');
+  } catch (err) {
+    pending = null;
+  }
   clear(target);
+
+  // ── 眼下该做什么（首屏第一块）─────────────────────────────────
+  //
+  // 为什么放最上面：驾驶舱首屏要回答的是「**现在该干什么**」，
+  // 不是「工程长什么样」。状态（计数、成本）在那之后。
+  //
+  // 排序是服务端给的（core/pending/rank.ts）—— 与终端里 `zelto next`
+  // 看到的完全一致。这里只渲染，不重排（重排 = 两处结论可能不同）。
+  renderNextActions(target, pending);
 
   const cards = el('div', 'cards');
   const card = function (n, l) {
@@ -1333,6 +1579,7 @@ async function viewEvents(target) {
 async function showSliceDetail(id, forSign, loc) {
   clear(main);
   inDetail = true;
+  currentSliceId = id;
   // ADR-112：记住这个详情页看的是哪个根 —— 轮询、签字、门禁都落回同一个根
   currentLocation = loc && loc.scope ? { scope: loc.scope, label: loc.label || null } : { scope: 'root', label: null };
   const back = el('button', 'back', '← 返回');
@@ -1454,20 +1701,9 @@ async function showSliceDetail(id, forSign, loc) {
     // 版本目录里的提问暂不在驾驶舱归集（见 ADR-112 边界）。
     const pending = await apiGet('/api/questions?status=pending&slice=' + encodeURIComponent(id));
     if (pending && pending.length > 0) {
-      main.appendChild(el('h2', null, 'agent 在问你'));
+      main.appendChild(el('h2', null, 'agent 在问你（' + pending.length + '）'));
       for (const q of pending) {
-        const box = el('div', 'notice');
-        box.appendChild(el('div', null, q.question || q.text || q.prompt || '(问题内容为空)'));
-        const row = el('div', 'answer-row');
-        const input = el('input', 'answer-input');
-        input.type = 'text';
-        input.placeholder = '你的回答…';
-        const send = el('button', 'btn', '提交答案');
-        send.addEventListener('click', function () { doAnswer(id, input, send); });
-        row.appendChild(input);
-        row.appendChild(send);
-        box.appendChild(row);
-        main.appendChild(box);
+        main.appendChild(renderQuestionBox(id, q));
       }
     }
   } catch (err) {
@@ -1486,6 +1722,17 @@ async function showSliceDetail(id, forSign, loc) {
     row.appendChild(el('span', 'adr', c.adrRef));
     main.appendChild(row);
   }
+
+  // ── 改了什么（文件级清单）──────────────────────────────────────────
+  //
+  // 与 CLI `zelto sign --review` 的「改动」段**同一份事实**
+  // （core/sign-review/diff.ts）—— 同一个结论，两处呈现。
+  //
+  // 为什么必须给**文件**而不只是三个数字：
+  // 人签字时要回答的是「这个改动该不该签」，
+  // 而「改了 3 个文件 +120 -10」回答不了这个问题 ——
+  // 「哪些文件」才回答得了（ADR-072 §5.2）。
+  renderDiffSection(main, d.facts && d.facts.diff);
 
   // ── 签字 ────────────────────────────────────────────────────────────
   if (forSign) {
@@ -1509,6 +1756,24 @@ async function showSliceDetail(id, forSign, loc) {
     const rejBtn = el('button', 'btn bad', '拒签');
     rejBtn.addEventListener('click', function () { doReject(id, rejBtn); });
     main.appendChild(rejBtn);
+
+    // ADR-094 §5.1：**退回重跑 / 退回上游** —— 「不批准」还有两档，
+    // 只给「拒签」一个出口的话，人发现「方向不对但代码没错」时
+    // 只能选拒签（把整片作废）或切回终端（驾驶舱在最该起作用时失效）。
+    //
+    // 两档的区别在**回哪个状态**：
+    //   - 退回重跑 → frozen（规格不动，重跑即可）
+    //   - 退回上游 → draft（规格要改，得重新走门禁① + 冻结）
+    //
+    // **意见是强制的**（服务端也强制）：不给意见就让人重跑
+    // = 人自己也不清楚要改什么，重跑必然白跑。
+    const revBtn = el('button', 'btn warn', '退回重跑…');
+    revBtn.addEventListener('click', function () { doSendBack(id, revBtn, 'revise', '退回重跑'); });
+    main.appendChild(revBtn);
+
+    const retBtn = el('button', 'btn warn', '退回上游…');
+    retBtn.addEventListener('click', function () { doSendBack(id, retBtn, 'return', '退回上游'); });
+    main.appendChild(retBtn);
   }
 
   // ── 追溯链 ──────────────────────────────────────────────────────────
@@ -1658,6 +1923,75 @@ async function doReject(sliceId, btn) {
 }
 
 /**
+ * **退回重跑 / 退回上游**（ADR-094 §5.1）—— 签字卡片上的两个按钮。
+ *
+ * 为什么驾驶舱要能「退回」而不只是「签 / 拒」：
+ * 「不批准」有三档，各回不同的状态：
+ *
+ *   | 动作 | 切片回到 | 意思 |
+ *   |---|---|---|
+ *   | 退回重跑 | `frozen` | 方向对，代码有问题 → 带着意见重跑 |
+ *   | 退回上游 | `draft` | 方向不对 → 规格要改，改完重新冻结 |
+ *   | 拒签 | `abandoned` | 整片作废 |
+ *
+ * 只给「签 / 拒」两个按钮时，人遇到「方向不对但代码没错」只能选拒签
+ * —— 把一片不该作废的片作废掉 —— 或者切回终端。
+ * 驾驶舱在最该起作用的时候失效。
+ *
+ * **意见是强制的**：不给意见就让人重跑 = 人自己也不清楚要改什么，
+ * 重跑必然白跑（agent 拿到的信息与上一轮完全等价）。
+ * 前端也拦一道（空意见不发请求），但**服务端同样强制** ——
+ * 前端拦是省一次往返，不是判据。
+ *
+ * @param mode 'revise' = 退回重跑；'return' = 退回上游
+ */
+async function doSendBack(sliceId, btn, mode, label) {
+  const reqs = await apiGet('/api/sign-requests?status=pending' + locQuery(currentLocation));
+  let req = reqs.find(function (r) { return r.sliceId === sliceId; });
+  if (!req) {
+    // 已批准也能退（ADR-094 D11）—— 「签了字又发现方向不对」才是最该退的。
+    const approved = await apiGet('/api/sign-requests?status=approved' + locQuery(currentLocation));
+    req = approved.find(function (r) { return r.sliceId === sliceId; });
+  }
+  if (!req) {
+    showBanner('notice bad', '找不到这条切片的可退签字请求（待签或已批准都没有）。');
+    return;
+  }
+
+  const promptText = mode === 'revise'
+    ? '要改什么？（规格不动，带着这条意见重跑）'
+    : '方向哪里不对？（片会回到 draft，规格可以改了）';
+  const comment = window.prompt(promptText);
+  if (comment === null) return; // 人取消了 —— 不当成空意见
+  if (!comment.trim()) {
+    showBanner('notice bad', label + '必须带意见 —— 没有意见，重跑必然白跑。');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = label + '中…';
+
+  const res = await apiPost(
+    '/api/sign-requests/' + encodeURIComponent(req.id) + '/' + mode,
+    Object.assign({ comment: comment.trim() }, locBody(currentLocation))
+  );
+  if (res.ok && res.body && res.body.ok) {
+    await render(currentView);
+    showBanner('notice ok', '↩️ 已' + label + '。');
+    // 「批准被连带作废」这件事**必须明说** —— 不能悄悄做。
+    if (res.body.revokedApproval) {
+      showBanner('notice bad', '⚠️ 此前的批准已被作废 —— 否则它仍可被合并。');
+    }
+    if (res.body.nextStep) showBanner('notice', res.body.nextStep);
+    return;
+  }
+  const msg = (res.body && (res.body.error || res.body.reason)) || ('HTTP ' + res.status);
+  showBanner('notice bad', label + '失败：' + msg);
+  btn.disabled = false;
+  btn.textContent = label + '…';
+}
+
+/**
  * **回答 agent 的提问** —— 切片详情页里的一个输入框。
  *
  * 只**记录**答案，不续跑（ADR-084 §1.1）：
@@ -1687,6 +2021,80 @@ async function doAnswer(sliceId, input, btn) {
   showBanner('notice bad', '提交答案失败：' + msg);
   btn.disabled = false;
   btn.textContent = '提交答案';
+}
+
+/**
+ * 提问卡片 —— 带类型徽标、候选选项、恢复状态。
+ *
+ * 为什么要把 `type` / `options` 显示出来：
+ *
+ *  - **type**（`spec_gap` / `choice` / `blocker`）决定这件事**急不急** ——
+ *    `blocker` 意味着 agent 已经卡住等这句话，
+ *    而 `spec_gap` 可能只是一条记录。人分不出这个区别，
+ *    就会把所有提问当成同一优先级 —— 那样「该先答哪个」又变成了人猜。
+ *  - **options** 是 agent 给的**候选答案** ——
+ *    只给一个空输入框，等于要人凭空想起有哪些可能。
+ *    点一下就答，是最省步数的路径。
+ *
+ * 选候选项**不自动提交** —— 先填进输入框，让人确认/改写再发。
+ * 直接一点就提交 = 人还没看清就把答案交出去了。
+ */
+function renderQuestionBox(sliceId, q) {
+  const box = el('div', 'notice question-box');
+
+  // ── 头部：类型 + 状态 ──
+  const head = el('div', 'q-head');
+  head.appendChild(el('span', 'q-type ' + (q.type || 'unknown'), questionTypeLabel(q.type)));
+  if (q.severity) {
+    head.appendChild(el('span', 'q-sev ' + q.severity, q.severity === 'blocking' ? '阻塞中' : '不阻塞'));
+  }
+  head.appendChild(el('span', 'muted small', '问于 ' + (q.askedAt ? new Date(q.askedAt).toLocaleString() : '—')));
+  // 恢复状态 —— 答完之后能不能接着聊，靠的是会话 id 在不在。
+  head.appendChild(el('span', 'muted small',
+    q.agentSessionId ? '可恢复会话' : '无会话可恢复（只能记录答案）'));
+  box.appendChild(head);
+
+  box.appendChild(el('div', 'q-text', q.question || q.text || q.prompt || '(问题内容为空)'));
+
+  // ── 候选答案 ──
+  const options = Array.isArray(q.options) ? q.options : [];
+  if (options.length > 0) {
+    const opts = el('div', 'q-options');
+    for (const opt of options) {
+      const chip = el('button', 'q-option', opt);
+      chip.type = 'button';
+      chip.title = '点一下填进输入框（确认后再提交）';
+      chip.addEventListener('click', function () {
+        const input = box.querySelector('.answer-input');
+        if (input) { input.value = opt; input.focus(); }
+      });
+      opts.appendChild(chip);
+    }
+    box.appendChild(opts);
+  }
+
+  // ── 回答 ──
+  const row = el('div', 'answer-row');
+  const input = el('input', 'answer-input');
+  input.type = 'text';
+  input.placeholder = '你的回答…';
+  const send = el('button', 'btn', '提交答案');
+  send.addEventListener('click', function () { doAnswer(sliceId, input, send); });
+  row.appendChild(input);
+  row.appendChild(send);
+  box.appendChild(row);
+
+  return box;
+}
+
+/** 提问类型 → 中文标签。 */
+function questionTypeLabel(type) {
+  const map = {
+    spec_gap: '规格缺口',
+    choice: '选择题',
+    blocker: '阻塞'
+  };
+  return map[type] || type || '提问';
 }
 
 // ── ADR-086：油门（冻结 / 门禁 / 开跑 / 续跑）───────────────────────────
@@ -2088,10 +2496,42 @@ function noteDisconnected(err) {
 function noteConnected() {
   failStreak = 0;
   if (conn.dataset.msg === '') return;
+  // 「已复制」那条提示不是连接状态 —— 断线重连后别把它抹掉。
+  if (conn.dataset.msg.startsWith('已复制')) return;
   conn.dataset.msg = '';
   conn.textContent = '';
   conn.className = 'banner';
   conn.style.display = 'none';
+}
+
+/**
+ * 闪一下提示（「已复制：…」）—— 3 秒后自动淡掉。
+ *
+ * 为什么不用 `window.alert`：它会打断人正在做的事，而且一次动作弹一次框很烦。
+ *
+ * 为什么不用 `conn` 那条横幅：那是**连接状态**（独占语义，反复更新）。
+ * 但这里有个矛盾 —— `conn` 是现成的横幅容器，另造一个又要动 HTML。
+ *
+ * 折中：**只在连接正常时**借 `conn` 闪一下（连接正常时它本来就是空的），
+ * 连接已经断了就不动它（那时它正在说更要紧的话）。
+ */
+let hintTimer = null;
+function flashHint(msg) {
+  if (!conn) return;
+  // 连接已经断了 —— 那条横幅正在说更要紧的事，别覆盖它。
+  if (failStreak > 0) return;
+  clearTimeout(hintTimer);
+  conn.dataset.msg = msg;
+  conn.textContent = msg;
+  conn.className = 'banner';
+  conn.style.display = '';
+  hintTimer = setTimeout(function () {
+    // 只清掉自己写的那条 —— 别把期间发生的连接提示抹掉。
+    if (conn.dataset.msg !== msg) return;
+    conn.dataset.msg = '';
+    conn.textContent = '';
+    conn.style.display = 'none';
+  }, 3000);
 }
 
 async function refreshSummary() {

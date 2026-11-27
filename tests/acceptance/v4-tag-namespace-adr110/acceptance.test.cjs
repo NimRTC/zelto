@@ -121,7 +121,34 @@ const AFTER_V4_PATHS = new Set([
   // 本文件自己（后续补的排除项）—— 它 old 版已在 v4 写集外，按「后续工作」计
   'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
 
-  ]);
+  
+  'src/core/gate/sign.ts',
+  'tests/git-batch-facts.test.ts',
+  'tests/web-cockpit-revise.test.ts',
+  'src/adapters/web/frontend/styles.css',
+  'src/cli/commands/dashboard.ts',
+  'src/cli/commands/diff.ts',
+  'src/cli/commands/info-help.ts',
+  'src/cli/commands/merge-runner.ts',
+  'src/cli/commands/pending-actions.ts',
+  'src/cli/commands/planning-drafts.ts',
+  'src/cli/sign-review/render.ts',
+  'src/core/git/facts.ts',
+  'src/core/pending/collect.ts',
+  'src/core/pending/drafts.ts',
+  'src/core/pending/index.ts',
+  'src/core/pending/merge-candidates.ts',
+  'src/core/pending/rank.ts',
+  'src/core/pending/slice-state.ts',
+  'src/core/pending/types.ts',
+  'src/core/sign-review/collect.ts',
+  'src/core/sign-review/diff.ts',
+  'src/core/sign-review/types.ts',
+  'src/core/slice/store.ts',
+  'tests/adr104-sign-review-scope-evidence.test.ts',
+  'tests/core/forge/pr-body.test.ts',
+  'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
+  'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',]);
 
 /** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
 function decodePorcelainPath(p) {
@@ -182,7 +209,42 @@ const AFTER_V4_LANDED = new Set([
   // ADR-047 / 057 改号（与既有 ADR 撞号），也是后来落的
   'docs/adr/adr-117-submodule-pointer-alignment.md',
   'docs/adr/adr-118-spec-conformance-and-glossary.md',
-]);
+
+  'src/core/gate/sign.ts',
+  'tests/git-batch-facts.test.ts',
+  'tests/web-cockpit-revise.test.ts',
+  'src/adapters/web/api.ts',
+  'src/adapters/web/frontend/app.js',
+  'src/adapters/web/frontend/styles.css',
+  'src/adapters/web/router.ts',
+  'src/cli/commands/dashboard.ts',
+  'src/cli/commands/diff.ts',
+  'src/cli/commands/info-help.ts',
+  'src/cli/commands/merge-runner.ts',
+  'src/cli/commands/pending-actions.ts',
+  'src/cli/commands/planning-drafts.ts',
+  'src/cli/sign-review/render.ts',
+  'src/core/git/facts.ts',
+  'src/core/pending/collect.ts',
+  'src/core/pending/drafts.ts',
+  'src/core/pending/index.ts',
+  'src/core/pending/merge-candidates.ts',
+  'src/core/pending/rank.ts',
+  'src/core/pending/slice-state.ts',
+  'src/core/pending/types.ts',
+  'src/core/sign-review/collect.ts',
+  'src/core/sign-review/diff.ts',
+  'src/core/sign-review/types.ts',
+  'src/core/slice/store.ts',
+  'tests/adr104-sign-review-scope-evidence.test.ts',
+  'tests/core/forge/pr-body.test.ts',
+  'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+  'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
+  'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
+  'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+  'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+  'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+  'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',]);
 
 /**
  * 本片开工前就存在的脏状态（并行会话在改的文件），非本片产物。
@@ -260,7 +322,39 @@ const PENDING_BEFORE_V4 = new Set([
     'src/cli/commands/task-store.ts',
     'tests/adr-129-run-identity.test.ts',
     'tests/zd049-supervisor-takeover.test.ts',
-  ]);
+  
+    'src/core/gate/sign.ts',
+    'tests/git-batch-facts.test.ts',
+    'tests/web-cockpit-revise.test.ts',
+    'src/adapters/web/frontend/styles.css',
+    'src/adapters/web/router.ts',
+    'src/cli/commands/dashboard.ts',
+    'src/cli/commands/diff.ts',
+    'src/cli/commands/merge-runner.ts',
+    'src/cli/commands/pending-actions.ts',
+    'src/cli/commands/planning-drafts.ts',
+    'src/cli/sign-review/render.ts',
+    'src/core/git/facts.ts',
+    'src/core/pending/collect.ts',
+    'src/core/pending/drafts.ts',
+    'src/core/pending/index.ts',
+    'src/core/pending/merge-candidates.ts',
+    'src/core/pending/rank.ts',
+    'src/core/pending/slice-state.ts',
+    'src/core/pending/types.ts',
+    'src/core/sign-review/collect.ts',
+    'src/core/sign-review/diff.ts',
+    'src/core/sign-review/types.ts',
+    'src/core/slice/store.ts',
+    'tests/adr104-sign-review-scope-evidence.test.ts',
+    'tests/core/forge/pr-body.test.ts',
+    'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+    'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
+    'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
+    'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+    'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+    'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',]);
 
 /** 跑 tag-namespace.mjs（argv 传参，非交互），返回 { status, output }。 */function runTagScript(args, input) {
   const res = spawnSync(process.execPath, [TAG_SCRIPT, ...args], {

@@ -12,6 +12,7 @@
 //   GET  /api/events
 //   GET  /api/sign-requests
 //   GET  /api/summary
+//   GET  /api/pending-actions（「眼下该做什么」—— 与 CLI 同一份判定）
 //   GET  /api/project      （工程名 / 根目录 —— 驾驶舱标题用）
 //   GET  /api/metrics      （全项目度量）
 //   GET  /api/stalls       （停机列表）
@@ -146,6 +147,21 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
           }
         : null,
     });
+    return;
+  }
+
+  // ── GET /api/pending-actions ─────────────────────────────────────────
+  // 「眼下该做什么」—— 与 CLI 的 `zelto next` / `suggest` / `dashboard`
+  // **同一份判定与排序**（`core/pending/`）。
+  //
+  // 为什么单开一个端点而不是塞进 `/api/summary`：
+  // 驾驶舱首屏的价值是「一眼看出该干什么」，而 `/api/summary` 给的是
+  // **状态**（在跑几片、待签几片、成本多少）—— 看到「3 片待签」，
+  // 人还得自己回想该敲哪条命令。
+  //
+  // 现在首屏第一块就是这份清单，且它与终端里看到的排序**完全一致**。
+  if (method === 'GET' && path === '/api/pending-actions') {
+    sendJson(res, 200, await api.pendingActions());
     return;
   }
 
@@ -301,6 +317,75 @@ async function dispatch(ctx: WebContext, res: ServerResponse): Promise<void> {
       return;
     }
     sendJson(res, 200, { ok: true, request: result.request });
+    return;
+  }
+
+  // ── POST /api/sign-requests/:id/revise ──────────────────────────────
+  // ADR-094 §5.1：退回重跑 —— 与 CLI 侧 `zelto sign <id> --revise` 同一套实现。
+  //
+  // 人审出毛病但**方向是对的** —— 让片回 frozen 带着意见重跑。
+  //
+  // **意见是强制的**（服务端也强制，不只靠前端）：不给意见就让人重跑
+  // = 人自己也不清楚要改什么，重跑必然白跑。
+  const reviseMatch = path.match(/^\/api\/sign-requests\/([^/]+)\/revise$/);
+  if (reviseMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const signId = validId(reviseMatch[1]);
+    if (!signId) {
+      sendJson(res, 400, { error: '签字请求 id 非法' });
+      return;
+    }
+    const body = ctx.body as { comment?: unknown; scope?: unknown; label?: unknown } | undefined;
+    const comment = typeof body?.comment === 'string' ? body.comment : null;
+    const result = await api.reviseSign(signId, comment, parseLocation(body?.scope, body?.label));
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      request: result.request,
+      revokedApproval: result.revokedApproval,
+      nextStep: result.nextStep,
+    });
+    return;
+  }
+
+  // ── POST /api/sign-requests/:id/return ─────────────────────────────
+  // ADR-094 §5.1：退回上游 —— 与 CLI 侧 `zelto spec revise <id>` 同一套实现。
+  //
+  // 人审出**方向**不对 —— 规格要改。片回 draft，重新走门禁① + 冻结。
+  //
+  // 与「退回重跑」的区别在**回哪个状态**：
+  //   - revise → frozen（规格不动，重跑即可）
+  //   - return → draft（规格要改，得重新冻结；跳过门禁①是不行的）
+  const returnMatch = path.match(/^\/api\/sign-requests\/([^/]+)\/return$/);
+  if (returnMatch) {
+    if (method !== 'POST') {
+      sendJson(res, 405, { error: 'Method not allowed' });
+      return;
+    }
+    const signId = validId(returnMatch[1]);
+    if (!signId) {
+      sendJson(res, 400, { error: '签字请求 id 非法' });
+      return;
+    }
+    const body = ctx.body as { comment?: unknown; scope?: unknown; label?: unknown } | undefined;
+    const comment = typeof body?.comment === 'string' ? body.comment : null;
+    const result = await api.returnSign(signId, comment, parseLocation(body?.scope, body?.label));
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.reason, reason: result.reason });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      request: result.request,
+      revokedApproval: result.revokedApproval,
+      nextStep: result.nextStep,
+    });
     return;
   }
 

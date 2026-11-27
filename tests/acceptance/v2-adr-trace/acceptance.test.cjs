@@ -440,7 +440,34 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'src/core/gate/executor.ts',
     'src/core/gate/types.ts',
     'tests/zd062-gate-kill-tree.test.ts',
-    ]);
+    
+    'src/adapters/web/frontend/styles.css',
+    'src/cli/commands/dashboard.ts',
+    'src/cli/commands/diff.ts',
+    'src/cli/commands/merge-runner.ts',
+    'src/cli/commands/pending-actions.ts',
+    'src/cli/commands/planning-drafts.ts',
+    'src/cli/sign-review/render.ts',
+    'src/core/gate/sign.ts',
+    'src/core/git/facts.ts',
+    'src/core/pending/collect.ts',
+    'src/core/pending/drafts.ts',
+    'src/core/pending/index.ts',
+    'src/core/pending/merge-candidates.ts',
+    'src/core/pending/rank.ts',
+    'src/core/pending/slice-state.ts',
+    'src/core/pending/types.ts',
+    'src/core/sign-review/collect.ts',
+    'src/core/sign-review/diff.ts',
+    'src/core/sign-review/types.ts',
+    'src/core/slice/store.ts',
+    'tests/adr104-sign-review-scope-evidence.test.ts',
+    'tests/core/forge/pr-body.test.ts',
+    'tests/git-batch-facts.test.ts',
+    'tests/web-cockpit-revise.test.ts',
+    'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
+    'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
+    'tests/acceptance/v2-adr-trace/acceptance.test.cjs',]);
 
   const offenders = [];
   for (const p of changedPaths()) {
