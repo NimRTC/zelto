@@ -28,6 +28,8 @@ import {
   DELIVERY_ORDER,
   type CompletedSummary,
 } from './completed-slices.js';
+import { collectRankedPending } from './pending-actions.js';
+import type { PendingItem } from '../../core/pending/index.js';
 
 // ─── Area Mapping ────────────────────────────────────────────────────────────
 
@@ -240,74 +242,32 @@ interface ActionItem {
   priority: number;
   command: string;
   reason: string;
+  /** 这一步在做什么（人话）—— 统一判定给的 */
+  prepare?: string;
+  /** 待办类别（统一判定给的） */
+  kind?: string;
 }
 
-function computeActions(
-  slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
-): ActionItem[] {
-  const actions: ActionItem[] = [];
-
-  // Stalled slices → resume
-  for (const s of slices) {
-    if (s.stallClass) {
-      const stallAge = s.updatedAt ? Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000) : 0;
-      const ageStr = stallAge > 0 ? ` (${fmtAge(stallAge)})` : '';
-      actions.push({ priority: 1, command: `zelto resume ${s.id}`, reason: `⚠️ Stalled: ${s.stallClass}${ageStr}` });
-    }
-  }
-
-  // Plans with completed slices that could be delivered
-  for (const plan of plans) {
-    for (const v of plan.versions) {
-      const total = v.slices.length;
-      const done = v.slices.filter((s) => s.state === 'completed').length;
-      if (total > 0 && done === total) {
-        actions.push({ priority: 2, command: `zelto version deliver ${v.name}`, reason: `📦 Version ${v.name} all ${total} slices completed` });
-      }
-      // Plans with some progress but stalled
-      const stalled = v.slices.filter((s) => s.stallClass).length;
-      if (stalled > 0 && done < total) {
-        actions.push({ priority: 2, command: `zelto version status ${v.name}`, reason: `📋 Version ${v.name}: ${done}/${total} done, ${stalled} stalled` });
-      }
-    }
-  }
-
-  // 待签字队列 —— 真源是 `.zelto/locks/sign-*.json`（与 zelto inbox / next / merge 同源）。
-  //
-  // 这里原来读的是 `.zelto/inbox`：那个目录根本不存在（签字请求落在 locks 下），
-  // 于是「有待签字」这条提示永远不会出现 —— 一道永远敞开的门。
-  const pendingSigns = readPendingSigns();
-  if (pendingSigns.length > 0) {
-    const oldest = pendingSigns[0];
-    const ageMin = oldest.requestedAt
-      ? Math.floor((Date.now() - new Date(oldest.requestedAt).getTime()) / 60000)
-      : 0;
-    const ageStr = ageMin > 0 ? ` (最久一条等 ${fmtAge(ageMin)})` : '';
-    actions.push({
-      priority: 3,
-      command: 'zelto inbox',
-      reason: `📝 ${pendingSigns.length} pending approval(s)${ageStr}`,
-    });
-  }
-
-  // Auto-resolved stalls that haven't been resumed
-  const autoResolved = slices.filter((s) => s.autoResolved > 0 && !s.stallClass);
-  if (autoResolved.length > 0) {
-    actions.push({ priority: 3, command: `zelto stall --auto-resolved`, reason: `🔄 ${autoResolved.length} slice(s) with auto-retry history` });
-  }
-
-  // Running slices (check for long-running)
-  const running = slices.filter((s) => s.state === 'running');
-  for (const s of running) {
-    if (s.updatedAt) {
-      const elapsed = Math.floor((Date.now() - new Date(s.updatedAt).getTime()) / 60000);
-      if (elapsed > 10) {
-        actions.push({ priority: 4, command: `zelto stall ${s.id}`, reason: `⏱️ ${s.id} running ${elapsed}m — check status` });
-      }
-    }
-  }
-
-  return actions.sort((a, b) => a.priority - b.priority);
+/**
+ * 把统一判定（`core/pending/`）的结果摊成看板的一行行。
+ *
+ * **这里不再自己算「该做什么」** —— 判定与排序都在 `core/pending/`：
+ * 那里是唯一口径，`zelto next` / `zelto suggest` / Web 驾驶舱都调它。
+ *
+ * 以前这里有一份自己的 `computeActions()`：三套判定各写各的，
+ * 同一件事（比如「哪片等着签字」）三处结论可能不同（D-11 的老形状）。
+ * 现在看板只做**渲染**，不做判定 —— 换个视角，同一件事只有一个答案。
+ *
+ * @param items 统一判定排好的待办
+ */
+function computeActions(items: PendingItem[]): ActionItem[] {
+  return items.map((it) => ({
+    priority: it.priority,
+    command: it.action,
+    reason: it.reason ?? '',
+    prepare: it.prepare,
+    kind: it.kind,
+  }));
 }
 
 // ─── TTY Render ─────────────────────────────────────────────────────────────
@@ -315,7 +275,7 @@ function computeActions(
 function renderTty(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
-  delivery: CompletedSummary,
+  delivery: CompletedSummary, pending: PendingItem[],
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
@@ -410,11 +370,11 @@ function renderTty(
   }
 
   // Actions
-  const actions = computeActions(slices, plans, releases);
+  const actions = computeActions(pending);
   if (actions.length > 0) {
     lines.push(`  ${h('📋 Next Actions')}`);
     for (const a of actions) {
-      const pfx = a.priority === 1 ? colors.red('⚠') : a.priority === 2 ? colors.blue('▶') : colors.dim('·');
+      const pfx = a.priority <= 10 ? colors.red('⚠') : a.priority <= 50 ? colors.blue('▶') : colors.dim('·');
       lines.push(`    ${pfx} ${colors.bold(a.command)}  ${colors.dim(`# ${a.reason}`)}`);
     }
     lines.push('');
@@ -486,7 +446,7 @@ function renderTty(
 function renderJson(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], costMap: Map<string, SliceCost>, budgetLimit: number,
-  delivery: CompletedSummary,
+  delivery: CompletedSummary, pending: PendingItem[],
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const running = slices.filter((s) => s.state === 'running');
@@ -601,7 +561,7 @@ function renderJson(
         completedSlices: v.slices.filter((s) => s.state === 'completed').length,
       })),
     })),
-    actions: computeActions(slices, plans, releases),
+    actions: computeActions(pending),
   };
 
   return JSON.stringify(data, null, 2);
@@ -657,7 +617,7 @@ function statusLabel(st: string): string {
 function renderHtml(
   slices: SliceData[], plans: PlanSummary[], releases: ReleaseDef[],
   events: EventInfo[], watchMode: boolean, costMap: Map<string, SliceCost>,
-  budgetLimit: number, delivery: CompletedSummary,
+  budgetLimit: number, delivery: CompletedSummary, pending: PendingItem[],
 ): string {
   const stalled = slices.filter((s) => s.stallClass);
   const stateCnt: Record<string, number> = {};
@@ -669,7 +629,7 @@ function renderHtml(
 
   // Cost calculations —— 与 TTY / JSON 共用同一份口径（dashboard-cost.ts）
   const totals = sumCosts(costMap, slices.length);
-  const actions = computeActions(slices, plans, releases);
+  const actions = computeActions(pending);
 
   // ── Summary ──────────────────────────────────────────────────────────────────
   const summary = `
@@ -1152,13 +1112,15 @@ register('dashboard', async (args) => {
     const costMap = collectCosts();
     const budgetLimit = await readBudgetLimit();
     const delivery = await collectCompletedSummary();
-    return { slices, plans, releases, events, costMap, budgetLimit, delivery };
+    // 「该你做什么」—— 统一判定（core/pending/），看板不再自己算一遍。
+    const pending = await collectRankedPending();
+    return { slices, plans, releases, events, costMap, budgetLimit, delivery, pending };
   };
 
   // ── TTY mode ────────────────────────────────────────────────────────────
   if (ttyMode) {
-    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
-    process.stdout.write(renderTty(slices, plans, releases, events, costMap, budgetLimit, delivery));
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery, pending } = await gather();
+    process.stdout.write(renderTty(slices, plans, releases, events, costMap, budgetLimit, delivery, pending));
 
     if (watchMode) {
       console.log(colors.dim('  👀 Watching... (Ctrl+C to stop)'));
@@ -1167,7 +1129,7 @@ register('dashboard', async (args) => {
           const d = await gather();
           process.stdout.write('\x1b[2J\x1b[H'); // clear screen
           process.stdout.write(
-            renderTty(d.slices, d.plans, d.releases, d.events, d.costMap, d.budgetLimit, d.delivery),
+            renderTty(d.slices, d.plans, d.releases, d.events, d.costMap, d.budgetLimit, d.delivery, d.pending),
           );
         } catch { /* ignore */ }
       };
@@ -1184,15 +1146,15 @@ register('dashboard', async (args) => {
 
   // ── JSON mode ───────────────────────────────────────────────────────────
   if (jsonMode) {
-    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
-    console.log(renderJson(slices, plans, releases, events, costMap, budgetLimit, delivery));
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery, pending } = await gather();
+    console.log(renderJson(slices, plans, releases, events, costMap, budgetLimit, delivery, pending));
     return 0;
   }
 
   // ── HTML mode (default) ─────────────────────────────────────────────────
   const generate = async () => {
-    const { slices, plans, releases, events, costMap, budgetLimit, delivery } = await gather();
-    return renderHtml(slices, plans, releases, events, watchMode, costMap, budgetLimit, delivery);
+    const { slices, plans, releases, events, costMap, budgetLimit, delivery, pending } = await gather();
+    return renderHtml(slices, plans, releases, events, watchMode, costMap, budgetLimit, delivery, pending);
   };
 
   writeFileSync(outputPath, await generate(), 'utf-8');

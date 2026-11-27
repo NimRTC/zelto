@@ -156,6 +156,10 @@ tr.clickable:hover td { background: #161b22; }
    批准是绿色（推进），拒签与拉闸是红色（收回控制权）。 */
 .btn.bad { background: #8b2c2c; border-color: #da3633; }
 .btn.bad:hover:not(:disabled) { background: #da3633; }
+/* ADR-094 §5.1：退回重跑 / 退回上游 —— 「不批准，但没到作废」。
+   橙色 = 介于「推进（绿）」与「收回（红）」之间 —— 片子还会回来。 */
+.btn.warn { background: #7a5410; border-color: #d29922; }
+.btn.warn:hover:not(:disabled) { background: #9e6a03; }
 /* 顶栏的拉闸按钮 —— 跟导航按钮同排，但要一眼看出是「刹车」 */
 nav button.danger { color: var(--bad); border-color: var(--bad); margin-left: auto; }
 nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
@@ -175,6 +179,54 @@ nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
   font: inherit;
 }
 .answer-input:focus { outline: none; border-color: var(--accent); }
+
+/* ── 提问卡片（ADR-084）──────────────────────────────────────────────
+ *
+ * 为什么把「类型」和「候选答案」显示出来：
+ *   - type 决定这件事急不急（blocker = agent 已经卡住等这句话）；
+ *   - options 是 agent 给的候选答案 —— 只给空输入框等于要人凭空想。
+ */
+.question-box { margin: 10px 0; }
+.q-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.q-type {
+  font-size: 10px;
+  border-radius: 8px;
+  padding: 1px 7px;
+  font-weight: 600;
+  color: #fff;
+  background: #6e7681;
+}
+.q-type.blocker { background: #f85149; }
+.q-type.choice { background: #d29922; }
+.q-type.spec_gap { background: #58a6ff; }
+.q-sev {
+  font-size: 10px;
+  border-radius: 8px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.q-sev.blocking { color: var(--bad); border-color: var(--bad); }
+.q-text { margin-bottom: 4px; }
+.q-options { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.q-option {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--fg);
+  padding: 3px 12px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+.q-option:hover { border-color: var(--accent); }
 .notice {
   border-left: 3px solid var(--warn);
   background: #1c2128;
@@ -213,6 +265,124 @@ pre {
   margin: 1px 3px 1px 0;
   font-size: 11px;
 }
+
+/* ── 「眼下该做什么」（统一待办清单）───────────────────────────────
+ *
+ * 驾驶舱首屏的第一块 —— 与 CLI 的 `zelto next` 同一份判定。
+ *
+ * 设计取向：**异常优先，正在顺利跑的收起来**。
+ * zelto 的北极星是无人值守完成率 —— 人来得越少越好，
+ * 来了只看需要人管的事。所以清单按「越该人管越靠前」排，
+ * 而「正在顺利跑」排在最后（core/pending/types.ts 的优先级表）。
+ */
+.next-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+.next-block.top { border-color: var(--accent); }
+/* 大号提示 —— 「就这一件」，点它就能开工 */
+.next-top {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.next-top .what { font-size: 15px; font-weight: 600; }
+.next-top .who { color: var(--muted); font-size: 12px; }
+.next-cmd {
+  font-family: var(--mono, monospace);
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--fg);
+}
+.next-cmd:hover { border-color: var(--accent); }
+.next-why { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+/* 其余待办 —— 折叠成一行一条，别喧宾夺主 */
+.next-list { margin-top: 10px; }
+.next-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.next-item:first-child { border-top: none; }
+.next-kind {
+  font-size: 10px;
+  border-radius: 8px;
+  padding: 1px 7px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+}
+/* 类别配色 —— 越靠前（越该人管）越暖 */
+.next-kind.stalled { background: #f85149; }
+.next-kind.draft { background: #a371f7; }
+.next-kind.rerun { background: #db6d28; }
+.next-kind.sign { background: #d29922; }
+.next-kind.requestSign { background: #9e6a03; }
+.next-kind.merge { background: #3fb950; }
+.next-kind.version { background: #58a6ff; }
+.next-kind.autoResolved { background: #6e7681; }
+.next-kind.sliceState { background: #484f58; }
+.next-kind.longRunning { background: #484f58; }
+.next-item .id { font-weight: 600; }
+.next-item .prep { color: var(--muted); font-size: 12px; }
+
+/* ── 改动清单（签字复查的文件级事实）────────────────────────────────
+ *
+ * 为什么给「文件」而不只给三个数字：人签字时要回答的是
+ * 「这个改动该不该签」——「改了 3 个文件 +120 -10」回答不了，
+ * 「哪些文件被改了」才回答得了（ADR-072 §5.2）。
+ *
+ * 与 CLI `zelto sign --review` 同一份事实（core/sign-review/diff.ts）。
+ */
+.diff-list {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.diff-file {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.diff-file:first-child { border-top: none; }
+.diff-status {
+  font-size: 10px;
+  border-radius: 8px;
+  padding: 1px 7px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #fff;
+  background: #6e7681;
+}
+.diff-status.deleted { background: #f85149; }
+.diff-status.added { background: #3fb950; }
+.diff-status.untracked { background: #2ea043; }
+.diff-status.modified { background: #d29922; }
+.diff-status.renamed,
+.diff-status.copied { background: #58a6ff; }
+.diff-path {
+  font-size: 12px;
+  word-break: break-all;
+  flex: 1 1 200px;
+}
+.diff-delta { font-size: 11px; white-space: nowrap; }
+.diff-delta .add { color: #3fb950; }
+.diff-delta .del { color: #f85149; }
 
 /* ── 窄屏适配（ADR-109 决策四）────────────────────────────────────────
  *

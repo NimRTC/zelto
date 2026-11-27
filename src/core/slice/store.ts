@@ -263,6 +263,11 @@ export class SliceStore {
     return resolveWithin(this.baseDir, `${id}.json`);
   }
 
+  /** 切片文件所在目录 —— 需要自己拼路径的调用方用这个。 */
+  get slicesDir(): string {
+    return this.baseDir;
+  }
+
   async read(id: string): Promise<SliceData> {
     const content = await readFile(this.path(id), 'utf-8');
     // Windows 编辑器可能带 BOM —— 去掉再解析（仓库惯例：读时容错、写时不动）

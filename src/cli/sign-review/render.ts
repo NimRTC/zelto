@@ -19,6 +19,25 @@ export interface SignReviewViewport {
 const DEFAULT_VIEWPORT: Required<SignReviewViewport> = { width: 80, height: 24 };
 
 /**
+ * 单屏预算 —— 除文件清单外的固定行数。
+ *
+ * 头 1 + 分隔 1 + 追溯链 4 + 验收 2 + 改动标题 1 + 脚注 1 + 分隔 1
+ * + 成本 1 + 停机 1 + 分隔 1 + 四项确认 5 + 分隔 1 + 签字≠合并 1 = 21
+ *
+ * **这个数字是数出来的，不是估的** —— 改动段的文件清单要挤进剩下的行里，
+ * 挤不下就少列几个（宁可少列也不超屏，ADR-070 §5.3）。
+ */
+const FIXED_LINE_COUNT = 21;
+
+/**
+ * 文件清单最多列几个文件（实际上限；实际取视口余量的较小者）。
+ *
+ * 留一行给「… 还有 N 个文件」—— 有漏报的文件时**必须说出来**，
+ * 不能让人以为清单就是全部。
+ */
+const DIFF_FILE_BUDGET = 3;
+
+/**
  * 渲染一片切片的签字复查。
  *
  * @param checks   `evaluateSignChecks` 的四项确认项
@@ -32,6 +51,7 @@ export function renderSignReview(
   viewport: SignReviewViewport = {},
 ): string {
   const width = viewport.width ?? DEFAULT_VIEWPORT.width;
+  const height = viewport.height ?? DEFAULT_VIEWPORT.height;
 
   const lines: string[] = [];
 
@@ -44,21 +64,24 @@ export function renderSignReview(
   lines.push(traceLine('req', '需求', facts.trace.requirements, width));
   lines.push(traceLine('ctr', '契约', facts.trace.contracts, width));
   lines.push(traceLine('tst', '测试', facts.trace.tests, width));
-  lines.push(divider(width));
 
   // ② 验收（门禁②）
   lines.push(sectionTitle('验收（门禁②）'));
   lines.push(`  ${formatAcceptance(facts)}`);
-  lines.push(divider(width));
 
-  // ③ 改动
-  lines.push(sectionTitle(`改动（${facts.diff.filesChanged} 文件 · +${facts.diff.addedLines} -${facts.diff.deletedLines}）`));
-  lines.push(`  完整 diff：zelto diff ${facts.sliceId}`);
+  // ③ 改动 —— **文件级清单**（ADR-072 §5.2 的「签字要看得见改了什么」）
+  //
+  // 以前这一段只有三个数字（文件数 / 增删行），
+  // 人要判断「这个改动该不该签」时最缺的是**哪些文件**。
+  // 现在把 core 收集的文件清单直接列出来 —— 与 `zelto diff` 同一份。
+  lines.push(sectionTitle(formatDiffHeading(facts.diff)));
+  const fileLines = renderDiffFiles(facts.diff.files, width, diffFileBudget(height));
+  for (const l of fileLines) lines.push(l);
+  lines.push(`  ${colors.dim(formatDiffFooter(facts.diff, facts.sliceId))}`);
   lines.push(divider(width));
 
   // ④ 成本
   lines.push(sectionTitle(`成本 $${formatUsd(facts.cost.totalUsd)}`));
-  lines.push(divider(width));
 
   // ⑤ 停机
   lines.push(sectionTitle(formatStall(facts)));
@@ -78,6 +101,106 @@ export function renderSignReview(
 }
 
 // ─── 小工具 ──────────────────────────────────────────────────────────────────
+
+/**
+ * 改动段标题 —— 文件数 + 增删行。
+ *
+ * **保留「改动」两个字** —— 签字复查的段标题是稳定的锚点
+ * （验收测试按段标题断言），不能因为加了文件清单就改掉。
+ */
+function formatDiffHeading(diff: SignReviewFacts['diff']): string {
+  const files = diff.files ?? [];
+  const count = diff.filesChanged ?? files.length;
+  return `改动（${count} 文件 · +${diff.addedLines ?? 0} -${diff.deletedLines ?? 0}）`;
+}
+
+/**
+ * 文件清单最多占几行 —— 由视口高度算出来。
+ *
+ * 固定结构占 `FIXED_LINE_COUNT` 行，剩下的是文件清单的预算，
+ * 再留一行给「… 还有 N 个文件」的漏报提示。
+ *
+ * 高度不够时（预算 ≤ 0）→ 一个文件都不列，但**漏报提示仍然要给** ——
+ * 让人知道「这里本来有文件但屏幕放不下」，比让人以为「没改动」强。
+ */
+function diffFileBudget(height: number): number {
+  const free = height - FIXED_LINE_COUNT - 1;
+  return Math.max(0, Math.min(DIFF_FILE_BUDGET, free));
+}
+
+/**
+ * 改动段的文件清单 —— 单屏预算内列前几个。
+ *
+ * **为什么要有预算**：ADR-070 §5.3 要求「单屏铺开、不分页」，
+ * 80x24 是验收标准。文件可能有几十个 —— 全部列出来就超屏了。
+ * 宁可只列前几个 + 一行「还有 N 个」，也不要超屏。
+ *
+ * 选哪几个：`core/sign-review/diff.ts` 已经按「该看的先看」排过序
+ * （删除 → 未跟踪 → 新增 → 改名 → 修改），所以取前 N 个就是最该看的 N 个。
+ *
+ * @returns 渲染出来的行（**已含**「还有 N 个」那一行）
+ */
+function renderDiffFiles(
+  files: SignReviewFacts['diff']['files'] | undefined,
+  width: number,
+  budget: number,
+): string[] {
+  const list = files ?? [];
+  if (list.length === 0) return [];
+
+  const shown = list.slice(0, budget);
+  const lines = shown.map(
+    (f) => `  ${diffStatusMarker(f.status)} ${truncate(f.path, width - 14)}${diffLineDelta(f)}`,
+  );
+
+  if (list.length > shown.length) {
+    lines.push(colors.dim(`  … 还有 ${list.length - shown.length} 个文件`));
+  }
+  return lines;
+}
+
+/**
+ * 改动段的脚注 —— 基准 + 完整 diff 的入口。
+ *
+ * **基准必须说出来**：人签字时要能回答「相对什么算的改动」。
+ * 以前这一段完全没提基准（只按 HEAD 算），现在写清楚。
+ */
+function formatDiffFooter(diff: SignReviewFacts['diff'], sliceId: string): string {
+  const parts: string[] = [];
+  if (diff.baseNote) parts.push(diff.baseNote);
+  parts.push(`完整 diff：zelto diff ${sliceId}`);
+  return parts.join(' · ');
+}
+
+/** 改动类型 → 记号 + 颜色。 */
+function diffStatusMarker(status: string): string {
+  switch (status) {
+    case 'added':
+      return colors.green('+');
+    case 'modified':
+      return colors.yellow('✎');
+    case 'deleted':
+      return colors.red('−');
+    case 'renamed':
+    case 'copied':
+      return colors.cyan('»');
+    case 'untracked':
+      return colors.green('*');
+    default:
+      return colors.dim('?');
+  }
+}
+
+/** 行数增量 —— 没有行数（二进制/未跟踪）就不显示。 */
+function diffLineDelta(file: { added: number | null; deleted: number | null }): string {
+  const added = file.added ?? 0;
+  const deleted = file.deleted ?? 0;
+  if (added === 0 && deleted === 0) return '';
+  const parts: string[] = [];
+  if (added > 0) parts.push(colors.green(`+${added}`));
+  if (deleted > 0) parts.push(colors.red(`-${deleted}`));
+  return ` ${colors.dim('(')}${parts.join(' ')}${colors.dim(')')}`;
+}
 
 /**
  * 佐证文案的呈现 —— 正常截断（ADR-104 决策三）。

@@ -3,12 +3,23 @@
  *
  * Shows a summary of changes made by a slice: which files were modified,
  * added, or deleted, and a git diff since the slice was frozen.
+ *
+ * **基准与文件清单来自 `core/sign-review/diff.ts`** —— 与 `zelto sign --review`
+ * 同一份实现。这不是"顺手统一"，而是必须的：
+ * 签字时看到的「改了 3 个文件」与这里列出的 7 个对不上，
+ * 签字前确认就成了走形式（D-11 教训：两处各判一套必然漂移）。
  */
 
 import { register } from '../commands/shared.js';
 import { store, existingWorktreePath } from '../commands/shared.js';
 import { colors } from '../color.js';
 import { execSync } from 'node:child_process';
+import {
+  collectDiffFacts,
+  resolveDiffBase,
+  type DiffFile,
+  type DiffFileStatus,
+} from '../../core/sign-review/diff.js';
 
 register('diff', async (args) => {
   const [id] = args;
@@ -28,128 +39,81 @@ register('diff', async (args) => {
     const worktreePath = existingWorktreePath(id);
     const cwd = worktreePath ?? process.cwd();
 
-    // Determine diff base: use baseCommit, or try git log to find the frozen state
-    let baseRef: string | null = slice.baseCommit;
-    if (!baseRef) {
-      // Try to find the commit when this slice was created/frozen via event stream
-      try {
-        const log = execSync(
-          `git log --all --oneline --diff-filter=A -- specs/slices/${id}.md`,
-          { encoding: 'utf-8', timeout: 5000, cwd },
-        ).trim();
-        if (log) {
-          baseRef = log.split('\n')[0].split(' ')[0];
-        }
-      } catch {
-        // Fall back to HEAD~1 or similar
-      }
-    }
+    // 基准解析只在 core/sign-review/diff.ts 一处 —— 签字复查与这里说同一份事实。
+    const { baseRef, baseNote } = resolveDiffBase(id, slice.baseCommit ?? null, cwd);
 
-    // Default fallback
-    // In a worktree the agent's changes are usually uncommitted, so diff against the
-    // base commit directly (covers both committed and working-tree changes).
-    const diffTarget = worktreePath
-      ? (baseRef ?? 'HEAD')
-      : (baseRef ? `${baseRef}..HEAD` : '--cached');
+    // 文件级事实（状态 + 增删行 + 未跟踪文件）
+    const diffFacts = collectDiffFacts({
+      sliceId: id,
+      baseCommit: slice.baseCommit ?? null,
+      worktreePath,
+      repoRoot: cwd,
+    });
 
-    // Get file change stats
-    let statOutput = '';
-    let nameOutput = '';
+    // 全文 diff —— 只在 `zelto diff` 这里给（签字复查放不下全文）
     let diffOutput = '';
-
     try {
-      statOutput = execSync(
-        `git diff ${diffTarget} --stat`,
+      diffOutput = execSync(
+        `git diff ${baseRef ?? 'HEAD'}`,
         { encoding: 'utf-8', timeout: 10000, cwd },
       ).trim();
     } catch { /* no changes */ }
-
-    try {
-      nameOutput = execSync(
-        `git diff ${diffTarget} --name-status`,
-        { encoding: 'utf-8', timeout: 10000, cwd },
-      ).trim();
-    } catch { /* no changes */ }
-
-    // Uncommitted changes inside the worktree are not part of `base..HEAD`
-    let uncommittedOutput = '';
-    if (worktreePath) {
-      try {
-        uncommittedOutput = execSync(
-          'git diff HEAD --stat',
-          { encoding: 'utf-8', timeout: 10000, cwd },
-        ).trim();
-      } catch { /* no changes */ }
-    }
 
     if (isStat && !isJson) {
       console.log(`Changes for slice "${id}":`);
       console.log('');
-      if (statOutput) {
-        console.log(statOutput);
+      if (diffFacts.files.length > 0) {
+        console.log(formatStatBlock(diffFacts.files));
       } else {
         console.log('  No changes detected.');
       }
       return 0;
     }
 
-    try {
-      diffOutput = execSync(
-        `git diff ${diffTarget}`,
-        { encoding: 'utf-8', timeout: 10000, cwd },
-      ).trim();
-    } catch { /* no changes */ }
-
     if (isJson) {
-      const files: Array<{ status: string; path: string }> = [];
-      if (nameOutput) {
-        for (const line of nameOutput.split('\n')) {
-          const parts = line.trim().split(/\s+/);
-          if (parts.length >= 2) {
-            files.push({ status: parts[0], path: parts.slice(1).join(' ') });
-          }
-        }
-      }
-      console.log(JSON.stringify({
-        sliceId: id,
-        baseRef,
-        worktree: worktreePath,
-        files,
-        diff: diffOutput || null,
-        uncommitted: uncommittedOutput || null,
-      }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            sliceId: id,
+            baseRef,
+            baseNote,
+            worktree: worktreePath,
+            filesChanged: diffFacts.filesChanged,
+            addedLines: diffFacts.addedLines,
+            deletedLines: diffFacts.deletedLines,
+            files: diffFacts.files.map((f) => ({
+              path: f.path,
+              status: f.status,
+              added: f.added,
+              deleted: f.deleted,
+            })),
+            diff: diffOutput || null,
+          },
+          null,
+          2,
+        ),
+      );
       return 0;
     }
 
     // Default: human-readable output
     console.log(`${colors.bold(`Changes for slice "${id}":`)}`);
-    console.log(`  ${colors.dim(`Base: ${baseRef ?? '(working tree vs cached)'}`)}`);
+    console.log(`  ${colors.dim(`Base: ${baseNote}`)}`);
     if (worktreePath) {
       console.log(`  ${colors.dim(`Worktree: ${worktreePath}`)}`);
     }
     console.log('');
 
-    if (!nameOutput && !diffOutput && !uncommittedOutput) {
+    if (diffFacts.files.length === 0 && !diffOutput) {
       console.log('  No changes detected.');
       return 0;
     }
 
-    // Show file list
-    if (nameOutput) {
+    // Show file list —— 与签字复查看到的是同一份清单
+    if (diffFacts.files.length > 0) {
       console.log(`${colors.bold('Files:')}`);
-      for (const line of nameOutput.split('\n')) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length >= 2) {
-          const status = parts[0];
-          const path = parts.slice(1).join(' ');
-          const statusColor: Record<string, (s: string) => string> = {
-            M: colors.yellow,
-            A: colors.green,
-            D: colors.red,
-          };
-          const colorFn = statusColor[status] ?? colors.dim;
-          console.log(`  ${colorFn(status === 'M' ? '✎' : status === 'A' ? '+' : '−')} ${path}`);
-        }
+      for (const file of diffFacts.files) {
+        console.log(`  ${statusMarker(file.status)} ${file.path}${formatLineDelta(file)}`);
       }
       console.log('');
     }
@@ -187,3 +151,50 @@ register('diff', async (args) => {
   }
   return 0;
 });
+
+// ─── 呈现小工具 ──────────────────────────────────────────────────────────────
+
+/** 状态 → 记号 + 颜色。 */
+function statusMarker(status: DiffFileStatus): string {
+  switch (status) {
+    case 'added':
+      return colors.green('+');
+    case 'modified':
+      return colors.yellow('✎');
+    case 'deleted':
+      return colors.red('−');
+    case 'renamed':
+      return colors.cyan('»');
+    case 'copied':
+      return colors.cyan('»');
+    case 'untracked':
+      return colors.green('*');
+    default:
+      return colors.dim('?');
+  }
+}
+
+/** 行数增量 —— 二进制/未跟踪文件没有行数，就不显示。 */
+function formatLineDelta(file: DiffFile): string {
+  if (file.added === null && file.deleted === null) return '';
+  const parts: string[] = [];
+  if (file.added) parts.push(colors.green(`+${file.added}`));
+  if (file.deleted) parts.push(colors.red(`-${file.deleted}`));
+  return parts.length > 0 ? `  ${colors.dim('(')} ${parts.join(' ')} ${colors.dim(')')}` : '';
+}
+
+/** `--stat` 模式的聚合块（对齐 git 的 stat 观感）。 */
+function formatStatBlock(files: DiffFile[]): string {
+  const lines: string[] = [];
+  for (const f of files) {
+    const counts =
+      f.added === null && f.deleted === null ? '-' : `${f.added ?? 0} ${f.deleted ?? 0}`;
+    lines.push(` ${f.path} | ${counts}`);
+  }
+  lines.push(
+    ` ${files.length} file${files.length === 1 ? '' : 's'} changed, ` +
+      `${files.reduce((a, f) => a + (f.added ?? 0), 0)} insertions(+), ` +
+      `${files.reduce((a, f) => a + (f.deleted ?? 0), 0)} deletions(-)`,
+  );
+  return lines.join('\n');
+}

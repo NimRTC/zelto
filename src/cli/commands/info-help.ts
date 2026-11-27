@@ -24,7 +24,8 @@ import { MetricsCollector } from '../../core/metrics/collector.js';
 import { register } from './shared.js';
 import { store, events, ZELTO_DIR, SLICES_DIR, EVENTS_DIR, loadPolicyConfig, loadConfig } from './shared.js';
 import { collectPlanningDrafts, draftConfirmCommand, draftShowCommand } from './planning-drafts.js';
-import { collectPendingActions, type PendingAction } from './pending-actions.js';
+import { collectGroupedPending, collectRankedPending, type PendingItem } from './pending-actions.js';
+import { PENDING_SECTION_TITLE } from '../../core/pending/index.js';
 import {
   collectCompletedSummary,
   deliveryLabel,
@@ -38,139 +39,48 @@ import { writeOutput } from '../output.js';
 
 // ─── next ────────────────────────────────────────────────────────────────────
 
+/**
+ * `zelto next` —— 眼下最该做的一件事。
+ *
+ * **判据来自 `core/pending/` 的统一判定**（与 `zelto dashboard`、
+ * Web 驾驶舱的「眼下该做什么」**同一份**）——
+ * 以前这里另写一套，于是三处结论可能不同（D-11 的老形状）。
+ *
+ * 优先级（详见 `core/pending/types.ts`）：
+ *   停机 → 规划草稿 → 待重跑 → 待签字 → 待发起签字 → 待合并
+ *   → 版本级 → 还没开始的活 → 长跑
+ */
 register('next', async () => {
   const list = await store.list();
 
-  // 规划草稿只读收集：上游没确认，下游跑了也白跑，所以排在切片状态之前。
-  // 停机仍最高——那是执行中被交回控制权，眼下唯一该做的事。
-  const drafts = await collectPlanningDrafts(ZELTO_DIR);
+  // 统一待办 —— 收集在 CLI 层、判定与排序在 core/pending。
+  const pending = await collectRankedPending();
 
-  // 停机切片优先：人被交还控制权的那一刻，最该看见的就是「哪些切片等着他处理」。
-  // 停机切片的状态通常还是 frozen（回退后的状态），按状态优先级排会被
-  // draft/clarifying 挤到后面去 —— 而它们才是眼下唯一该做的事。
-  const stalled: Array<{ id: string; title: string; class: string }> = [];
-  for (const id of list) {
-    try {
-      const s = await store.read(id);
-      if (s.stall.class !== null) {
-        stalled.push({ id, title: s.title, class: s.stall.class });
-      }
-    } catch {
-      // Skip unreadable slices
+  if (pending.length === 0) {
+    if (list.length === 0) {
+      console.log('No slices found. Create one to get started.');
+      return 0;
     }
-  }
-
-  if (stalled.length > 0) {
-    const first = stalled[0];
-    console.log(`Next: ${first.id} (stalled: ${first.class})`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: zelto stall ${first.id}`);
-    console.log(`  Then:  zelto resume ${first.id} && zelto run ${first.id}`);
-    if (stalled.length > 1) {
-      console.log(`  (还有 ${stalled.length - 1} 个停机切片：${stalled.slice(1).map((s) => s.id).join('、')})`);
-    }
+    console.log('All slices are up to date.');
     return 0;
   }
 
-  if (drafts.length > 0) {
-    const first = drafts[0];
-    console.log(`Next: ${first.kind} ${first.id} (draft)`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: ${draftShowCommand(first)}`);
-    console.log(`  Then:  ${draftConfirmCommand(first)}`);
-    if (drafts.length > 1) {
-      console.log(`  (还有 ${drafts.length - 1} 个待确认草稿：${drafts.slice(1).map((d) => `${d.kind} ${d.id}`).join('、')})`);
-    }
-    return 0;
+  const first = pending[0];
+  console.log(`Next: ${first.id} (${first.kind})`);
+  console.log(`  ${first.title}`);
+  console.log(`  ${first.prepare}`);
+  console.log(`  Action: ${first.action}`);
+  if (first.reason) {
+    console.log(`  Why: ${first.reason}`);
   }
 
-  // 待签字 / 待合并排在状态排序之前。
-  // 判据用签字请求的状态而不是切片状态 —— `completed` 同时表示「门禁过了」
-  // 与「已签字」（ADR-018），只看状态会把早已签过的切片也报成待签字。
-  const pendingActions = await collectPendingActions();
-
-  // 待重跑**排最前**（ADR-094 §5.1）。
-  //
-  // 为什么压在签字前面：
-  //   - 待签字的是**已经做完**的片 —— 只差人点一下；
-  //   - 待重跑的是**人刚说过「要改」**的片 —— 还没做完，带着意见。
-  //
-  // 人刚把控制权要回去改东西 —— 那就是眼下最该做的事。
-  // 而签字队列里的片已经躺了不知道多久，多等一天少一天，
-  // 退回的这片每多放一天就多错一天。
-  if (pendingActions.rerun.length > 0) {
-    const first = pendingActions.rerun[0];
-    console.log(`Next: ${first.sliceId} (sent back for rework)`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: ${first.action}`);
-    if (pendingActions.rerun.length > 1) {
-      console.log(`  (还有 ${pendingActions.rerun.length - 1} 个待重跑：${pendingActions.rerun.slice(1).map((a) => a.sliceId).join('、')})`);
-    }
-    return 0;
+  // 同类里还排着别的 —— 让人知道不是只有这一件。
+  const sameKind = pending.filter((p) => p.kind === first.kind);
+  if (sameKind.length > 1) {
+    const rest = sameKind.slice(1).map((p) => p.id);
+    console.log(`  (还有 ${rest.length} 个同类待办：${rest.join('、')})`);
   }
 
-  if (pendingActions.sign.length > 0) {
-    const first = pendingActions.sign[0];
-    console.log(`Next: ${first.sliceId} (awaiting signature)`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: ${first.action}`);
-    if (pendingActions.sign.length > 1) {
-      console.log(`  (还有 ${pendingActions.sign.length - 1} 个待签字：${pendingActions.sign.slice(1).map((a) => a.sliceId).join('、')})`);
-    }
-    return 0;
-  }
-
-  if (pendingActions.merge.length > 0) {
-    const first = pendingActions.merge[0];
-    console.log(`Next: ${first.sliceId} (signed, awaiting merge)`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: ${first.action}`);
-    if (pendingActions.merge.length > 1) {
-      console.log(`  (还有 ${pendingActions.merge.length - 1} 个待合并：${pendingActions.merge.slice(1).map((a) => a.sliceId).join('、')})`);
-    }
-    return 0;
-  }
-
-  if (pendingActions.requestSign.length > 0) {
-    const first = pendingActions.requestSign[0];
-    console.log(`Next: ${first.sliceId} (gate passed, needs signature request)`);
-    console.log(`  ${first.title}`);
-    console.log(`  Action: ${first.action}`);
-    if (pendingActions.requestSign.length > 1) {
-      console.log(`  (还有 ${pendingActions.requestSign.length - 1} 个待发起签字：${pendingActions.requestSign.slice(1).map((a) => a.sliceId).join('、')})`);
-    }
-    return 0;
-  }
-
-  if (list.length === 0) {
-    console.log('No slices found. Create one to get started.');
-    return 0;
-  }
-
-  const priority: Array<string> = ['draft', 'clarifying', 'frozen', 'running'];
-  for (const state of priority) {
-    for (const id of list) {
-      try {
-        const s = await store.read(id);
-        if (s.state === state) {
-          const actions: Record<string, string> = {
-            draft: 'zelto check <id> && zelto freeze <id>',
-            clarifying: 'Complete clarification',
-            frozen: 'zelto run <id> --dry-run',
-            running: 'Wait for execution (blocking other slices?)',
-          };
-          console.log(`Next: ${id} (${s.state})`);
-          console.log(`  ${s.title}`);
-          console.log(`  Action: ${actions[s.state]?.replaceAll('<id>', id) ?? 'Review'}`);
-          return 0;
-        }
-      } catch {
-        // Skip unreadable slices
-      }
-    }
-  }
-
-  console.log('All slices are up to date.');
   return 0;
 });
 
@@ -190,19 +100,8 @@ register('suggest', async () => {
     return 0;
   }
 
-  // 规划草稿先行：上游没确认，下游切片跑了也白跑。
-  // 只读展示，不改状态，确认入口是 show → confirm（G-5 同一入口）。
-  if (drafts.length > 0) {
-    console.log(formatSection('Planning Drafts'));
-    for (const d of drafts) {
-      console.log(`  ${colors.bold(`${d.kind} ${d.id}`)}`);
-      console.log(`    ${colors.dim(d.title)}`);
-      console.log(`    ${colors.cyan(draftShowCommand(d))}   → 看完再 ${colors.cyan(draftConfirmCommand(d))}`);
-    }
-  }
-
   // Check overall project state
-  let suggested = drafts.length > 0;
+  let suggested = false;
   if (list.length > 0) {
     const stateCounts: Record<string, number> = {};
     for (const id of list) {
@@ -238,87 +137,32 @@ register('suggest', async () => {
         console.log(`    ${colors.dim(deliveryLabel(status))}  ${colors.bold(String(count))}`);
       }
     }
+  }
 
-    // Check each slice and suggest next action
-    console.log(formatSection('Suggested Actions'));
+  // 统一待办 —— 与 `zelto next`、`zelto dashboard`、Web 驾驶舱**同一份**判定与排序。
+  //
+  // 以前这里另写一套（rerun/sign/merge/requestSign 四段 + 一套按状态的兜底），
+  // 段名与顺序都跟 `next` 各自维护 —— 三处结论可能不同（D-11 的老形状）。
+  // 现在分组与顺序都来自 `core/pending/rank.ts`。
+  console.log(formatSection('Suggested Actions'));
 
-    // 待签字 / 待合并 / 待发起签字 —— 判据取自签字请求的状态，与 inbox、merge 同源。
-    // 切片状态 `completed` 同时表示「门禁过了」与「已签字」（ADR-018），
-    // 只按状态列会把早已签过的切片也报成待签字，所以 completed 不进状态分组。
-    const pendingActions = await collectPendingActions();
-    const printActions = (items: PendingAction[]) => {
-      for (const a of items) {
-        console.log(`  ${colors.bold(a.sliceId)}`);
-        console.log(`    ${colors.dim(a.title)}`);
-        console.log(`    ${colors.cyan(a.prepare)}`);
-        console.log(`    ${colors.gray(a.action)}`);
-        suggested = true;
+  const { groups } = await collectGroupedPending();
+  const printActions = (items: PendingItem[]) => {
+    for (const a of items) {
+      console.log(`  ${colors.bold(a.id)}`);
+      console.log(`    ${colors.dim(a.title)}`);
+      console.log(`    ${colors.cyan(a.prepare)}`);
+      console.log(`    ${colors.gray(a.action)}`);
+      if (a.then) {
+        console.log(`    ${colors.gray(`Then: ${a.then}`)}`);
       }
-    };
+      suggested = true;
+    }
+  };
 
-    if (pendingActions.rerun.length > 0) {
-      console.log(formatSection('Sent Back For Rework'));
-      printActions(pendingActions.rerun);
-    }
-    if (pendingActions.sign.length > 0) {
-      console.log(formatSection('Awaiting Signature'));
-      printActions(pendingActions.sign);
-    }
-    if (pendingActions.merge.length > 0) {
-      console.log(formatSection('Awaiting Merge'));
-      printActions(pendingActions.merge);
-    }
-    if (pendingActions.requestSign.length > 0) {
-      console.log(formatSection('Needs Signature Request'));
-      printActions(pendingActions.requestSign);
-    }
-
-    const priority: Array<{ state: string; action: string; prepare: string }> = [
-      { state: 'draft', action: 'zelto check <id> && zelto freeze <id>', prepare: 'Check and freeze spec' },
-      { state: 'clarifying', action: 'zelto clarify <id>', prepare: 'Answer clarification questions' },
-      { state: 'frozen', action: 'zelto run <id> [--dry-run]', prepare: 'Execute slice' },
-      { state: 'running', action: 'zelto events <id>', prepare: 'Monitor execution' },
-    ];
-
-    // 已经在「Sent Back For Rework」里列过的切片不再按状态重复列 ——
-    // 那一条的提示更准（带着「人说了什么」的上下文），
-    // 泛泛的「Execute slice」反而把那条信息盖掉了。
-    const alreadyShown = new Set(pendingActions.rerun.map((a) => a.sliceId));
-
-    for (const p of priority) {
-      for (const id of list) {
-        if (alreadyShown.has(id)) continue;
-        try {
-          const s = await store.read(id);
-          if (s.state === p.state) {
-            console.log(`  ${colors.bold(id)}`);
-            console.log(`    ${colors.dim(s.title)}`);
-            console.log(`    ${colors.cyan(p.prepare)}`);
-            console.log(`    ${colors.gray(p.action.replaceAll('<id>', id))}`);
-            suggested = true;
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    if (!suggested) {
-      // Check stalled slices
-      const stalled: string[] = [];
-      for (const id of list) {
-        try {
-          const s = await store.read(id);
-          if (isSliceStalled(s)) stalled.push(id);
-        } catch { /* skip */ }
-      }
-      if (stalled.length > 0) {
-        console.log(`  ${colors.yellow(`${stalled.length} stalled slice(s):`)}`);
-        for (const id of stalled) {
-          console.log(`    ${colors.cyan(`zelto stall ${id}`)} — inspect and resolve`);
-          console.log(`    ${colors.cyan(`zelto resume ${id}`)} — resume after resolution`);
-        }
-        suggested = true;
-      }
-    }
+  for (const g of groups) {
+    console.log(formatSection(PENDING_SECTION_TITLE[g.kind]));
+    printActions(g.items);
   }
 
   if (!suggested) {

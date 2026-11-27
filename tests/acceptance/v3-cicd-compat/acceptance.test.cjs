@@ -162,7 +162,36 @@ const AFTER_V4_PATHS = new Set([
     'src/cli/commands/task-store.ts',
     'tests/adr-129-run-identity.test.ts',
     'tests/zd049-supervisor-takeover.test.ts',
-  ]);
+  
+    'src/core/gate/sign.ts',
+    'tests/git-batch-facts.test.ts',
+    'tests/web-cockpit-revise.test.ts',
+    'src/adapters/web/frontend/styles.css',
+    'src/cli/commands/dashboard.ts',
+    'src/cli/commands/diff.ts',
+    'src/cli/commands/merge-runner.ts',
+    'src/cli/commands/pending-actions.ts',
+    'src/cli/commands/planning-drafts.ts',
+    'src/cli/sign-review/render.ts',
+    'src/core/git/facts.ts',
+    'src/core/pending/collect.ts',
+    'src/core/pending/drafts.ts',
+    'src/core/pending/index.ts',
+    'src/core/pending/merge-candidates.ts',
+    'src/core/pending/rank.ts',
+    'src/core/pending/slice-state.ts',
+    'src/core/pending/types.ts',
+    'src/core/sign-review/collect.ts',
+    'src/core/sign-review/diff.ts',
+    'src/core/sign-review/types.ts',
+    'src/core/slice/store.ts',
+    'tests/adr104-sign-review-scope-evidence.test.ts',
+    'tests/core/forge/pr-body.test.ts',
+    'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
+    'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
+    'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
+    'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
+    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',]);
 
 /** 后来被删掉的文件（删动作本身也是「后来落的」）。 */
 const DELETED_AFTER_V4 = new Set([

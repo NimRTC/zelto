@@ -246,6 +246,15 @@ export class SignManager {
     id: string,
     decidedBy: string = 'human',
     comment: string | null = null,
+    /**
+     * 在哪儿做的（'cli' / 'web'）—— 与 actor 是两个维度（ADR-084 §4）。
+     *
+     * 为什么要记这个：追溯链上「谁做的」说「人」，
+     * 但「人在哪儿做的」是另一条信息 ——
+     * 驾驶舱上批的和终端里批的，走的是不同的入口，
+     * 出问题时这条信息能指到正确的排查路径。
+     */
+    via: string = 'cli',
   ): Promise<SignRequest> {
     const req = await this.get(id);
     if (req.status !== 'pending' && req.status !== 'approved') {
@@ -300,6 +309,7 @@ export class SignManager {
       signId: id,
       sliceId: req.sliceId,
       comment,
+      via,
     });
 
     // 状态转移：completed → frozen
@@ -339,6 +349,8 @@ export class SignManager {
     id: string,
     decidedBy: string = 'human',
     comment: string | null = null,
+    /** 在哪儿做的（'cli' / 'web'）—— 与 actor 是两个维度（ADR-084 §4）。 */
+    via: string = 'cli',
   ): Promise<SignRequest> {
     const req = await this.get(id);
     if (req.status !== 'pending' && req.status !== 'approved') {
@@ -375,6 +387,7 @@ export class SignManager {
       signId: id,
       sliceId: req.sliceId,
       comment,
+      via,
     });
 
     // 状态转移：completed → draft

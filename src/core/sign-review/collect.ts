@@ -18,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { parseTestRunnerStats } from '../gate/acceptance.js';
 import type { EventEnvelope } from '../events/stream.js';
 import type { SliceData } from '../slice/store.js';
+import { collectDiffFacts as collectCoreDiffFacts } from './diff.js';
 import type { ArtifactEvidence, GateScopeFacts, ScopeSource, SignReviewFacts } from './types.js';
 
 /**
@@ -61,7 +62,7 @@ export async function collectSignReviewFacts(
   const violationEvents = allEvents.filter((e) => e.type === 'policy.violation');
 
   const gate = collectGateFacts(gateResultEvents);
-  const diff = collectDiffFacts(sliceId, source);
+  const diff = collectDiffFacts(sliceId, source, slice.baseCommit ?? null);
   const artifact = collectArtifactFacts(slice.writes, source.repoRoot);
 
   return {
@@ -339,44 +340,32 @@ function isTimestampAfter(a: string, b: string): boolean {
 // ─── diff ────────────────────────────────────────────────────────────────────
 
 /**
- * 跑 `git diff HEAD --numstat` 取改动统计。
+ * 收集 diff 事实 —— **委托给 core/sign-review/diff.ts**。
  *
- * 有切片 worktree 时在 worktree 里跑（agent 的未提交改动在那里）；
- * 否则在仓库根跑。git 失败（非 git 仓库 / 无提交）→ 按 0 处理，不抛错
- * （与产物证据的 `unknown` 同哲学：读不到就说读不到）。
+ * 基准解析与文件清单只在**一处**实现（D-11 教训）：
+ * 签字复查与 `zelto diff` 说出的必须是同一份事实，
+ * 否则「签字时看到的数字」与「点进去看到的清单」对不上，
+ * 签字前确认就成了走形式。
  */
-function collectDiffFacts(sliceId: string, source: SignReviewSource): SignReviewFacts['diff'] {
-  const worktreePath = source.worktreePath(sliceId);
-  const cwd = worktreePath ?? source.repoRoot;
-
-  let filesChanged = 0;
-  let addedLines = 0;
-  let deletedLines = 0;
-
-  try {
-    const out = execFileSync('git', ['diff', 'HEAD', '--numstat'], {
-      cwd,
-      encoding: 'utf-8',
-      timeout: 15_000,
-      maxBuffer: 16 * 1024 * 1024,
-      // git 在非仓库目录会把整页 usage 打到 stderr —— 那不该漏到用户终端。
-      // stdout 仍走管道（要拿返回值），stderr 丢弃（读不到就说读不到，不刷屏）。
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    for (const line of out.split('\n')) {
-      const cols = line.trim().split('\t');
-      if (cols.length < 3) continue;
-      const add = cols[0] === '-' ? 0 : Number.parseInt(cols[0], 10) || 0;
-      const del = cols[1] === '-' ? 0 : Number.parseInt(cols[1], 10) || 0;
-      filesChanged += 1;
-      addedLines += add;
-      deletedLines += del;
-    }
-  } catch {
-    // 非 git 仓库 / 没有 HEAD —— 查不到就按 0
-  }
-
-  return { filesChanged, addedLines, deletedLines };
+function collectDiffFacts(
+  sliceId: string,
+  source: SignReviewSource,
+  baseCommit: string | null,
+): SignReviewFacts['diff'] {
+  const facts = collectCoreDiffFacts({
+    sliceId,
+    baseCommit,
+    worktreePath: source.worktreePath(sliceId),
+    repoRoot: source.repoRoot,
+  });
+  return {
+    baseRef: facts.baseRef,
+    baseNote: facts.baseNote,
+    filesChanged: facts.filesChanged,
+    addedLines: facts.addedLines,
+    deletedLines: facts.deletedLines,
+    files: facts.files,
+  };
 }
 
 // ─── artifact ────────────────────────────────────────────────────────────────
