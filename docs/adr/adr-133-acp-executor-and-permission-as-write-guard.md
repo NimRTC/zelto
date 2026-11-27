@@ -286,7 +286,158 @@ adapter 只负责「问人」与「记账」（有 I/O，不进 hook 层）。
 ACP 规范的 `session/update` 种类是封闭集合；**不认识的 `sessionUpdate` 值一律忽略并记警告**，
 不因新版本多一种通知就让会话崩掉。
 
-## 被否决的方案
+## T3 值得学的三处（2026-11-27 实测源码后补记）
+
+上午讨论 T3 时记了「zelto 与 T3 的三处**刻意分歧**」（那些是**不学**什么）。
+这里是反过来 —— **值得学**的，实测过源码（`packages/provider-acp/src/server/clientPolicy.ts`）
+并在 Windows 上跑过对比。
+
+### 一、符号链接感知的路径 containment —— **这是真的越界漏洞**
+
+ADR 上文那条「决定：借鉴 T3 的 `clientPolicy.ts`」当时**只写了字、没落代码** ——
+`src/hook/` 里搜不到任何 `realpath` / `symlink` 处理。
+
+**实测出来的差距**（Windows，junction 实测）：
+
+```
+worktree = D:\MyOpen\zelto-symlink-test\wt
+target   = ...\wt\escape\secret.txt
+（wt\escape 是指向 worktree 外的 junction）
+
+zelto 现在的判定：
+  relativizeTarget -> escape/secret.txt
+  判定 -> 在 worktree 内，放行          ← 越界！
+
+T3 的做法（realpath 感知）：
+  canonical -> D:\MyOpen\zelto-outside\secret.txt
+  判定 -> 已逃出 worktree，拒绝          ← 正确
+```
+
+**为什么 zelto 会漏**：`relativizeTarget()`（`src/hook/pretool.ts:114`）做的是
+**纯词法**归一化 —— `resolve()` + `relative()`。词法归一化**看不见符号链接**：
+`wt/escape/secret.txt` 词法上确实在 `wt/` 里面，但它的**真实落点**在 `wt/` 外面。
+
+**后果**：agent 只要在 worktree 里建一个指向外部的 junction/symlink，
+就能把文件写到写集之外 —— 而写集检查是在**词法路径**上做的，
+所以「写集内」也会被误判为真。**C9 的主闸门在这个形状下是可绕过的。**
+
+**T3 的修法**（值得学的核心）：`acpCanonicalPathForContainment()` ——
+用 `realpathSync.native()` 解析**已存在的祖先**，再把不存在的后缀接回去：
+
+```ts
+function acpCanonicalPathForContainment(path: string): string | undefined {
+  let candidate = path;
+  const missingSuffix: Array<string> = [];
+  for (;;) {
+    try {
+      return resolve(realpathSync.native(candidate), ...missingSuffix);
+    } catch (cause) {
+      if (cause.code !== 'ENOENT') return undefined;   // 非「不存在」→ 失败即拒绝
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) return undefined;
+    missingSuffix.unshift(basename(candidate));
+    candidate = parent;
+  }
+}
+```
+
+两个要点：
+1. **先 realpath 再判包含** —— 词法 `..` 归一化会掩盖符号链接逃逸；
+2. **失败即拒绝**（fail closed）—— realpath 抛非 ENOENT 错误就返回 `undefined`，
+   调用方一律当「不可信」处理。
+
+**要注意**：这条**不只**影响 ACP 路线 —— `relativizeTarget()` 是 hook 路线
+（Claude Code / Cursor / Codex）**共用**的路径判定。所以修的时候要一起修，
+否则 ACP 补上了、hook 路线还漏着。
+
+### 二、「unknown 传播」：读不全的改动集**不许**被当作「读全了」
+
+zelto 现在的 `pickPathFromContent()`（`src/hook/acp.ts:272`）是
+**「找到第一个就返回」**：
+
+```ts
+for (const block of content) {
+  const direct = pickPath(block as Record<string, unknown>);
+  if (direct) return direct;      // ← 只取第一个命中的
+}
+```
+
+**问题**：`content` 是一个**块数组**。一个改动集可能有多个 diff 块、
+且 `diff.changes[]` 里每个 change 还带自己的路径（`move` 有 `oldPath` + `path`）。
+zelto 只取**第一个**，**其余的写目标就看不见了** —— 判据是**不完整**的，
+而 C9 要求的恰恰是「判不出就拒绝」。
+
+**T3 的修法**：`acpChangedPathsOfToolCall()` 把结果建模成
+**三态**而不是「数组或空」：
+
+```ts
+export type AcpChangedPaths = ReadonlyArray<string> | "unknown";
+```
+
+- 收齐**所有**来源：`locations` / `content[].diff.path` / `content[].diff.changes[].path` /
+  `content[].diff.changes[].oldPath` / `rawInput` 的路径键；
+- **任何一块读不明白 → 整体变 `"unknown"`**（不是「跳过那块」）；
+- 超过 `MAX_ACP_CHANGED_PATHS = 256` 个路径 → 也是 `"unknown"`；
+- `mergeAcpChangedPaths()`：任一边是 `"unknown"` → 合并结果是 `"unknown"`。
+
+**关键那句注释**：
+
+> An unknown change is never approved by a folder check.
+
+—— 「读不全的改动集**永远不许**被目录检查放行」。这正是 C9 的 fail closed，
+但 zelto 现在表达不了这个状态（只有 `string[]`，没有「读不全」）。
+
+**还有一个细节值得学**：T3 明确区分了 `copy` 与其它操作 ——
+
+```ts
+case "copy":
+  // A copy only reads its source.
+  requirePath(change.path);
+  break;
+```
+
+`copy` 的源路径是**只读**的，不算写目标。而 `move` 要**两个**路径都算
+（`oldPath` + `path`）。zelto 现在的实现没区分这两者。
+
+### 三、`acpCheckablePath`：哪些路径字符串**根本不该**被当成路径
+
+T3 对「什么算一个可检查的路径」有明确判据（`acpCheckablePath()`）：
+
+```ts
+if (typeof value !== "string" || value.trim().length === 0 || value.includes("\0")) return undefined;
+if (isAbsolute(value)) return value;
+if (value.startsWith("~") || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value)) return undefined;
+if (sep === "/" && value.includes("\\")) return undefined;
+```
+
+拒绝的四类：
+- **空串 / 非字符串 / 含 NUL 字节** —— 不是文件名；
+- **`~` 开头** —— `~` 的展开规则各 agent 不同，zelto 猜不出来；
+- **带 URL scheme**（`file://`、`http://`）—— 不是本地路径；
+- **POSIX 上带反斜杠** —— `a\b` 与 `a/b` 含义不同。
+
+**为什么值得学**：zelto 现在的路径提取是「字段名候选列表 + 取第一个非空」。
+它**不检查值的形状**。一个 `file:///etc/passwd` 或 `~/../../etc/passwd`
+会被当成普通路径塞进判定流程 —— 判定结果取决于后续的词法归一化，
+而不是「这个值根本不是合法路径」的判断。
+
+### 修法的边界（不能照抄 T3）
+
+T3 是**通用 coding agent**，它的策略维度是「runtimeMode / sandboxPolicy /
+approvalPolicy」；zelto 的维度是**写集预约 + 保护域**（C9）。
+所以：
+
+- **判定的骨架不换** —— 还是 zelto 的 `judgeWriteTargets()`（写集 / 保护域 / 逃逸）；
+- **只借它的「路径可信度」那一层** —— realpath canonicalize、
+  「读不全 → unknown → 拒绝」、可检查路径的形状判据；
+- **不合并为共享模块** —— 路径判定留在各自的 hook 层，`core/` 保持 C2 纯洁
+  （这条在上面的「已决」里已经写死了）；
+- **要一起修 hook 路线** —— `relativizeTarget()` 是三条 hook 路线共用的。
+
+**这三条都需要写 ADR 落地**（改了路径判定的语义 = 动了 C9 的主闸门）。
+本节只记录「差距是什么、参照物是什么、修法的边界在哪」。
+
 
 1. **把 ACP 塞进 `hook-install.ts`（继续装 hook）**：
    ACP agent 并不读某家 CLI 的 hooks 配置；继续装等于「看起来装了、实际不生效」。
@@ -643,6 +794,8 @@ IDE 那条路（`cursor desktop`）见 **ADR-091**，闸门至今未开放，且
 - **是否借鉴 T3 的 `clientPolicy.ts`**：其路径 canonicalize（符号链接感知、fail closed）与 zelto 现有逻辑相似。
   **决定：借鉴**。在 `src/hook/acp.ts` 的路径判定中参考其思路（符号链接识别、失败即拒绝），
   但不合并为共享模块——路径判定仍留在各自的 hook 层，`core/` 保持 C2 纯洁。
+  **（2026-11-27 补记：这条「决定：借鉴」当时只写了字、没落代码。
+  下面「T3 值得学的三处」记录了实测出来的差距与修法。）**
 - **ACP session 的 checkpoint 能力（若有）** 是否接入 zelto：
   **不在本 ADR 范围内**。当前 zelto 没有 checkpoint，只在切片层做回滚。后续如需接入，另开 ADR。
 
