@@ -108,6 +108,27 @@
   something false is worse than having no traceability chain at all**.
 
 ### Fixed
+- **提问标记少写三个尖括号，整轮白跑（ADR-137 / ZD-065）**。
+  `parseQuestion()` 只认 `<<<ZELTO_QUESTION` 这**一个精确串**，
+  agent 写成 `ZELTO_QUESTION` 就**完全收不到**。
+  病灶（nimrtc-v14 `v1-transport-manager-pacing`，2026-11-27）：
+  agent 停下来问了人（问题完全正确 —— 新文件要注册 CMake 源列表，
+  但 `src/engine/CMakeLists.txt` 不在写集里），标记却少写三个尖括号 →
+  问题**从未登记** → 「agent 停下问人」被当成「agent 成功完成」→
+  门禁在一个**零改动**的 worktree 上跑 → 报
+  `Error: .../build is not a directory`。
+  **那条报错指错了方向** —— 人看到会去查构建配置，
+  而真正该做的（回答那个问题）已经静默消失。
+  代价：整轮白跑（$2.78）+ 一条误导性的错误信息。
+  修法：**外壳宽松，内容严格** —— 标记的**识别**认得 0..3 个前导 `<`、
+  空白、代码块围栏与尾冒号；**字段的解析**一个字都不松
+  （`type` 仍须是三种之一、`question` 仍须非空）。
+  缺收尾标记 `>>>` 时取引用块到输出末尾，而不是整条丢掉。
+  宁可**多认**一个不是问题的标记（后面被字段校验挡掉），
+  也不要**漏认**一个真的是问题的标记 ——
+  后者让 agent 的提问静默消失。
+  七个外壳变体 + 三个内容严格性用例已进
+  `tests/core/question/protocol.test.ts`。
 - **`audit verify` now distinguishes three states, not two**
   (ADR-105, ADR-100 §3). `verifyChain` returned a single boolean `ok`, so
   "the chain is intact and I checked every line" and "there is no chain

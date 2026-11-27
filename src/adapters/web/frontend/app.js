@@ -56,6 +56,29 @@ function rootName(scope, label) {
 let inDetail = false;
 let pollTimer = null;
 
+// ── 轮询在飞标记 ────────────────────────────────────────────────────────
+//
+// 病灶（实测本仓库 2026-11-27，机器满载时更明显）：
+// 轮询是 `setInterval(…, 5000)`，而**每一轮要等 3 个请求**
+// （`/api/summary` + `/api/plan-coverage` + `/api/pending-actions`），
+// 慢的一轮能跑十几秒。于是**新的一轮在旧的还没结束时又发起了** ——
+// 请求越堆越多，服务端越堵，人看到的页面越旧。
+//
+// 实测：一次首屏加载期间 `/api/summary` 被发了 **4 次**，
+// 30 秒稳态里 `/api/summary` 发了 **8 次**（5 秒一轮 = 6 次，
+// 多出来的就是重叠的那些）。
+//
+// 这不是「刷新勤一点」，是**自我拥塞**：每一轮都比上一轮更堵，
+// 于是永远追不上。慢的那个不是 git，是**自己叠自己**。
+//
+// 修法：上一轮没跑完就不发起新一轮（**跳过**，不是排队 ——
+// 排队会让延迟越积越长）。
+//
+// 为什么不用「等上一轮结束再计时 5 秒」：那会让空闲时也慢半拍。
+// 「跳过」在空闲时行为完全不变（上一轮早就结束了），
+// 只在堵的时候止住雪崩。
+let pollInFlight = false;
+
 // ── 改动段的展示限额 ────────────────────────────────────────────────────
 //
 // 一次改动动到几百个文件是常事。全渲染出来会把总览页撑爆 ——
@@ -708,26 +731,77 @@ function renderDiffSection(target, diff) {
   // 「这个改动该不该签」，不是逐行读 diff。
   //
   // 与 CLI `zelto sign --review` 同一套限额思路（ADR-070 §5.3）：
-  // **给前 N 个 + 一行「还有 M 个」**，并说清楚去哪儿看全部。
+  // **给前 N 个 + 一行「还有 M 个」**。
+  //
+  // 但**不能只有上限没有出口**：真要看全部（比如要逐个核对某个
+  // 大重构动了哪些文件）时，人不该被迫切回终端 ——
+  // 驾驶舱是给人看东西的地方，不是给人「只许看一半」的地方。
+  //
+  // 所以给一个「展开全部」按钮：点了就地渲染剩余的，
+  // 再点收起回到封顶视图。
+  //
+  // 注意「展开」是**纯前端**行为 —— 文件清单已经在 payload 里了
+  // （`facts.diff.files`），不需要再请求一次服务端
+  // （服务端那份已经是全部，只是渲染时截了）。
   const budget = DIFF_FILE_BUDGET;
-  const shown = files.slice(0, budget);
 
   const list = el('div', 'diff-list');
-  for (const f of shown) {
-    const row = el('div', 'diff-file');
-    row.appendChild(el('span', 'diff-status ' + f.status, diffStatusLabel(f.status)));
-    row.appendChild(el('code', 'diff-path', f.path));
-    const delta = el('span', 'diff-delta');
-    if (f.added) delta.appendChild(el('span', 'add', '+' + f.added));
-    if (f.deleted) delta.appendChild(el('span', 'del', '-' + f.deleted));
-    row.appendChild(delta);
-    list.appendChild(row);
-  }
   target.appendChild(list);
 
+  /** 渲染一批文件行（追加到 list）。 */
+  const renderRows = function (items) {
+    for (const f of items) {
+      const row = el('div', 'diff-file');
+      row.appendChild(el('span', 'diff-status ' + f.status, diffStatusLabel(f.status)));
+      row.appendChild(el('code', 'diff-path', f.path));
+      const delta = el('span', 'diff-delta');
+      if (f.added) delta.appendChild(el('span', 'add', '+' + f.added));
+      if (f.deleted) delta.appendChild(el('span', 'del', '-' + f.deleted));
+      row.appendChild(delta);
+      list.appendChild(row);
+    }
+  };
+
+  let expanded = false;
+  renderRows(files.slice(0, budget));
+
   if (files.length > budget) {
-    target.appendChild(el('p', 'muted small',
-      '… 还有 ' + (files.length - budget) + ' 个文件。看全部：终端跑 zelto diff ' + (currentSliceId || '<id>')));
+    // 文本与按钮**分成两个节点**。
+    //
+    // 为什么不能写成「一个 <p>，点的时候 note.textContent = '...'」：
+    // 在真 DOM 里赋 `textContent` 会**替换掉所有子节点** ——
+    // 按钮自己也被抹掉了，于是点第一次能展开、再点就没得可点了。
+    // （这是那种「浏览器里一用就露馅、但代码读起来完全合理」的坑。）
+    //
+    // 所以：文本在 span 里改，按钮独立存在。
+    const note = el('p', 'muted small');
+    const noteText = el('span');
+    const toggle = el('button', 'btn link', '展开全部');
+    const countText = '还有 ' + (files.length - budget) + ' 个文件。';
+
+    toggle.addEventListener('click', function () {
+      if (expanded) {
+        // 收起 —— 把超出封顶的行删掉，回到首屏友好的样子。
+        const rows = list.querySelectorAll('.diff-file');
+        for (let i = budget; i < rows.length; i++) rows[i].remove();
+        expanded = false;
+        toggle.textContent = '展开全部';
+        noteText.textContent = countText + ' 想看全部：';
+      } else {
+        renderRows(files.slice(budget));
+        expanded = true;
+        toggle.textContent = '收起';
+        noteText.textContent = '已展开全部 ' + files.length + ' 个文件。';
+      }
+    });
+
+    noteText.textContent = countText + ' 想看全部：';
+    note.appendChild(noteText);
+    note.appendChild(toggle);
+    note.appendChild(
+      document.createTextNode(' 或终端跑 zelto diff ' + (currentSliceId || '<id>')),
+    );
+    target.appendChild(note);
   }
 }
 
@@ -835,22 +909,27 @@ function renderWorktreeMap(target, map) {
   ));
 }
 
-async function viewOverview(target) {  const s = await apiGet('/api/summary');
-  // ADR-114：计划对照表 —— 拿不到就整节不显示（不编一份计划出来）
-  let coverage = null;
-  try {
-    coverage = await apiGet('/api/plan-coverage');
-  } catch (err) {
-    coverage = null;
-  }
-  // 「眼下该做什么」—— 与 CLI 的 `zelto next` / `suggest` / `dashboard`
-  // 同一份判定（core/pending/）。拿不到就不显示（不编一份清单出来）。
-  let pending = null;
-  try {
-    pending = await apiGet('/api/pending-actions');
-  } catch (err) {
-    pending = null;
-  }
+async function viewOverview(target) {
+  // 三个请求**并发**发出去，不是串行等。
+  //
+  // 病灶（实测本仓库 2026-11-27）：原来是
+  //   `await summary` → `await plan-coverage` → `await pending-actions`
+  // 三段**首尾相接**。而三段各自都要重新读一遍 149 片的事件流、
+  // 问一遍 git —— 于是首屏总耗时是**三段之和**。
+  //
+  // 实测那一轮：summary 3.2s + plan-coverage 42s + pending-actions 7s
+  // = **52 秒白屏**。
+  //
+  // 改成并发后总耗时 = **最慢的那一个**，其余与之重叠。
+  // 判据没变、返回的内容也没变 —— 只是不再一个接一个地等。
+  //
+  // 注意：`plan-coverage` 与 `pending-actions` 各自 catch ——
+  // 拿不到就整节不显示（不编一份计划出来），不影响其它两块。
+  const [s, coverage, pending] = await Promise.all([
+    getSummary(false),
+    apiGet('/api/plan-coverage').catch(function () { return null; }),
+    apiGet('/api/pending-actions').catch(function () { return null; }),
+  ]);
   clear(target);
 
   // ── 眼下该做什么（首屏第一块）─────────────────────────────────
@@ -2534,12 +2613,63 @@ function flashHint(msg) {
   }, 3000);
 }
 
+// ── 概况的共享取数 ──────────────────────────────────────────────────────
+//
+// 病灶（实测 2026-11-27）：一轮轮询里 `/api/summary` 被取了**两次** ——
+//
+//   ① `viewOverview()` 取一次（要 `s` 里的计数来渲染卡片）
+//   ② `refreshSummary()` 又取一次（要同一份 `s` 里的计数来渲染顶栏那行字）
+//
+// 两边要的**是同一个响应**。而这个响应不便宜 ——
+// 服务端要为 149 片读事件流 + 问 git。
+//
+// 修法：把取数收敛成**一次**，两个渲染点共用。
+//
+// 怎么做才不引入「读到过期数据」：
+//   - **在飞共享**：同一时刻只发一个请求，后来者等它（`summaryInflight`）
+//   - **极短 TTL**：取到后 1 秒内复用（`summaryCachedAt`）
+//
+// 为什么 TTL 只给 1 秒：`viewOverview` 与 `refreshSummary` 是**同一轮**
+// 里前后脚调的，间隔远小于 1 秒 —— 复用窗口只需要覆盖「同一轮」。
+// 1 秒之后一定重新取，所以「看到的是最新数据」这件事不受影响。
+//
+// 为什么不用更长的 TTL：那会把「页面在更新」变成假的 ——
+// 顶栏的时间戳在跳，数字却是几十秒前的。
+const SUMMARY_TTL_MS = 1000;
+let summaryCached = null;
+let summaryCachedAt = 0;
+let summaryInflight = null;
+
+/**
+ * 取 `/api/summary` —— 同一时刻只发一个请求。
+ *
+ * @param {boolean} fresh 强制重新取（绕过缓存）。
+ *   默认 false：短 TTL 内复用上一份。
+ */
+async function getSummary(fresh) {
+  const now = Date.now();
+  if (!fresh && summaryCached && now - summaryCachedAt < SUMMARY_TTL_MS) {
+    return summaryCached;
+  }
+  if (summaryInflight) return summaryInflight;
+  summaryInflight = apiGet('/api/summary')
+    .then(function (s) {
+      summaryCached = s;
+      summaryCachedAt = Date.now();
+      return s;
+    })
+    .finally(function () {
+      summaryInflight = null;
+    });
+  return summaryInflight;
+}
+
 async function refreshSummary() {
   // 工程名只在还没拿到时才重试 —— 第一次可能赶上服务/文件没就绪，
   // 一次性失败不该让标题永远停在「…」（函数内部由 projectLoaded 防重）
   if (!projectLoaded) void loadProjectInfo();
   try {
-    const s = await apiGet('/api/summary');
+    const s = await getSummary(false);
     // 在跑 / 可疑 / 已死分开说（D-30）：只报 active 的话，
     // 一片进程早就没了的 running 片会从总览行里彻底消失，人以为一切正常。
     const live = s.live || {};
@@ -2692,5 +2822,10 @@ pollTimer = setInterval(function () {
   if (failStreak < OFFLINE_AFTER) markRefresh(false);
   // 停在切片详情页时不轮询 —— 免得把人正在看的内容刷掉
   if (inDetail) return;
-  refreshSilently(currentView);
+  // 上一轮还没跑完就**不发起新一轮** —— 见下方 pollInFlight 的注释。
+  if (pollInFlight) return;
+  pollInFlight = true;
+  refreshSilently(currentView).finally(function () {
+    pollInFlight = false;
+  });
 }, 5000);

@@ -166,6 +166,8 @@ const AFTER_V4_PATHS = new Set([
     'src/core/gate/sign.ts',
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
+    'tests/web-cockpit-diff-expand.test.ts',
+    'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'src/adapters/web/frontend/styles.css',
     'src/cli/commands/dashboard.ts',
     'src/cli/commands/diff.ts',

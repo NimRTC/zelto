@@ -160,6 +160,21 @@ tr.clickable:hover td { background: #161b22; }
    橙色 = 介于「推进（绿）」与「收回（红）」之间 —— 片子还会回来。 */
 .btn.warn { background: #7a5410; border-color: #d29922; }
 .btn.warn:hover:not(:disabled) { background: #9e6a03; }
+/* 「展开全部 / 收起」—— 不是动作按钮，是**行内开关**。
+   它不该看起来像「点一下就改变了什么状态」，
+   而该像一句话里嵌了个可点的词 —— 因为它改变的只是**显示**，不是事实。 */
+.btn.link {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0 2px;
+  font: inherit;
+  text-decoration: underline;
+  vertical-align: baseline;
+}
+.btn.link:hover:not(:disabled) { background: transparent; color: var(--fg); }
+.btn.link:disabled { opacity: 0.5; cursor: default; }
 /* 顶栏的拉闸按钮 —— 跟导航按钮同排，但要一眼看出是「刹车」 */
 nav button.danger { color: var(--bad); border-color: var(--bad); margin-left: auto; }
 nav button.danger:hover { background: #3d1d1d; color: var(--fg); }

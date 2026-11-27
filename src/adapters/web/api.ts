@@ -50,7 +50,7 @@ import {
 import { buildBranchIndex } from '../../core/git/facts.js';
 // ADR-126：产物证据（`Refs-Slice:` trailer 在版本分支上）——
 // 补上 ADR-114 那列恒为 0 的「状态文件是否进分支」给不出的信息。
-import { defaultArtifactProbe } from '../../core/project/artifact-evidence.js';
+import { defaultArtifactProbe, ArtifactGitMemo } from '../../core/project/artifact-evidence.js';
 import type { Version, VersionPlan } from '../../core/version/types.js';
 import { HaltStore } from '../../core/halt/index.js';
 import { QuestionStore, type QuestionRecord } from '../../core/question/index.js';
@@ -1214,6 +1214,28 @@ export class WebApi {
     const slices = await this.listSlices();
     const byId = new Map(slices.map((s) => [s.id, s]));
 
+    // ── 本轮的 git 调用备忘 ────────────────────────────────────────
+    //
+    // 病灶（实测本仓库 2026-11-27）：这个接口一次 spawn **63 个 git 进程**、
+    // 耗时 **68 秒**（机器满载时更久）。拆开看：
+    //
+    //   25 × `rev-parse --is-inside-work-tree`   ← 全是**同一个目录**
+    //   10 × `rev-parse --verify version/v2^{commit}`
+    //    7 × `for-each-ref refs/heads/version/`  ← 全是**同一个目录**
+    //    6 × `log <branch> --format=…trailers`
+    //
+    // 重复的原因：产物证据对**每个版本的每个版本**分别问一遍
+    // 「这个分支在不在」「哪些分支是它的祖先」「祖先上有哪些 trailer」——
+    // 而答案**只取决于目录和分支名**，跟「问的是第几片」毫无关系。
+    // 同一轮的 4 个版本把同样的问题问了 4 遍，
+    // 而 `findSliceCommits` 与 `findSliceCommitsOnAncestors` 又各问一遍。
+    //
+    // 备忘**只在一轮判定内有效**（这里 new 出来的就是这个意思）：
+    // 跨轮复用会让「分支状态变了」看不到 —— 那就是拿过期事实说新话。
+    //
+    // 判据没变：git 事实还是 git 事实，只是**同一轮里问一次**。
+    const memo = new ArtifactGitMemo();
+
     // ── 版本计划：仓库根是真源，版本目录里的只是同步副本（ADR-110 / ADR-112）──
     //
     // 同一个 plan id 在多处出现时**只报一份**，仓库根那份优先。
@@ -1281,12 +1303,17 @@ export class WebApi {
       for (const v of plan.versions) {
         const branch = branchOfVersion(v);
         const ids = v.slices.map((s) => s.id);
-        const own = await defaultArtifactProbe.findSliceCommits(this.repoRoot, branch, ids);
+        const own = await defaultArtifactProbe.findSliceCommits(this.repoRoot, branch, ids, memo);
         let anc: Map<string, { hash: string; subject: string }> | null = new Map();
         if (own !== null) {
           const missing = ids.filter((id) => !own.has(id));
           if (missing.length > 0) {
-            anc = await defaultArtifactProbe.findSliceCommitsOnAncestors(this.repoRoot, branch, missing);
+            anc = await defaultArtifactProbe.findSliceCommitsOnAncestors(
+              this.repoRoot,
+              branch,
+              missing,
+              memo,
+            );
           }
         } else {
           anc = null;
@@ -2234,11 +2261,36 @@ async function toSummary(
   const runs = slice.runs ?? [];
   const lastRun = runs.length > 0 ? runs[runs.length - 1] : null;
 
-  // 基线还是开发 —— 判定在 core（C3）。事件流只在真需要时才读
-  // （`classifySliceKindAsync` 自己管这个）。
+  // ── 事件流**只读一次** ────────────────────────────────────────────
+  //
+  // 病灶（实测本仓库 2026-11-27）：`/api/summary` 一次读 149 片的
+  // 事件流，却调了 **248** 次 `events.read` —— 每片读两遍：
+  //
+  //   ① `classifySliceKindAsync` 判「基线还是开发」要事件流
+  //   ② `budget.getSpentDetail` 算成本也要事件流
+  //
+  // 两边要的**是同一份文件**。而事件流不是小文件 ——
+  // 本仓库最大的三个各 400+ KB（922 行），全部读一遍再解析一遍
+  // 就是白扔一半的 IO 与 JSON.parse。
+  //
+  // 修法：**读一次，传给两边**。
+  //
+  // 为什么这样不违反 C3（判定确定性）：读的还是同一份文件、
+  // 判的还是同一个函数里的同一批事件 —— 只是不再**重复读同一份**。
+  // 两次读之间文件若被改过，反而会出现「基线判定用的是旧内容、
+  // 成本判定用的是新内容」的不一致；读一次反而更自洽。
+  //
+  // 代价：判「基线还是开发」现在会**无条件**读事件流。
+  // 之前那 99 次重复读里，有 50 次来自 `classifySliceKindAsync`
+  // 自己的短路（`baseline` 字段有值就不用读事件）。
+  // 净账：248 次 → 149 次（省 40%），而且省下的正好是**最大**的那几份
+  // （有事件流的片子才可能有成本事件）。
+  const events = await loadEvents();
+
+  // 基线还是开发 —— 判定在 core（C3）。
   const kind = await classifySliceKindAsync(
     { id: slice.id, state: slice.state, baseline: slice.baseline },
-    loadEvents,
+    async () => events,
   );
 
   const requirements = toStringList(slice.trace?.requirements);
@@ -2292,7 +2344,7 @@ async function toSummary(
   } catch { /* 没有计数文件就是 0 */ }
 
   const { spent: spentUsd, measured: costMeasured, measurement: costMeasurement } =
-    await budget.getSpentDetail(slice.id);
+    await budget.getSpentDetail(slice.id, events);
   return {
     id: slice.id,
     title: slice.title,

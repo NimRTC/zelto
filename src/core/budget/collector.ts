@@ -80,8 +80,22 @@ export class BudgetCollector {
    *   （核查过了，agent 没报出用量，拿不到金额）
    * - `measured` —— 测到了（金额可能正好是 0）
    */
-  async getSpentDetail(sliceId: string): Promise<{ spent: number; measured: boolean; measurement: CostMeasurement }> {
-    const evts = await this.events.read(sliceId);
+  async getSpentDetail(
+    sliceId: string,
+    /**
+     * 已经读好的事件流 —— 有它就不再读文件。
+     *
+     * 为什么加这个参数：驾驶舱的 `/api/summary` 一次要给 149 片
+     * 算成本，而「判基线还是开发」也要同一份事件流 ——
+     * 两边各读一遍就是 248 次读（实测 2026-11-27），
+     * 其中最大的几份事件流各 400+ KB，白扔一半 IO。
+     *
+     * 判据没变：算的还是同一批事件的同一批字段，
+     * 只是不再**重复读同一份文件**。
+     */
+    preloaded?: EventEnvelope[],
+  ): Promise<{ spent: number; measured: boolean; measurement: CostMeasurement }> {
+    const evts = preloaded ?? (await this.events.read(sliceId));
     let total = 0;
     let measured = false;
     // 「核查过但拿不到金额」—— 与「压根没核查」分开。

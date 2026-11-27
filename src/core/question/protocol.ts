@@ -49,17 +49,43 @@ export function isQuestionType(value: string): value is QuestionType {
  * Only the **last** marker block in the output is considered — the protocol
  * requires the marker to terminate the reply. Returns null when there is no
  * marker or the marker is malformed.
+ *
+ * ── 容错（ZD-065）──────────────────────────────────────────────────────
+ *
+ * 原实现只认 `<<<ZELTO_QUESTION` 一个精确串。agent 少写三个尖括号
+ * （`ZELTO_QUESTION`）就**完全收不到**：
+ *
+ *   病灶（nimrtc-v14 v1-transport-manager-pacing，2026-11-27）：
+ *     agent 停下来问了人（问题本身完全正确：新文件要注册 CMake 源列表），
+ *     但标记写成 `ZELTO_QUESTION` → 解析返回 null → 问题从未登记 →
+ *     「agent 停下问人」被当成「agent 成功完成」→ 门禁在一个**零改动**
+ *     的 worktree 上跑 → 报「build is not a directory」——
+ *     报错指向构建目录，实际根因是**一行代码都没写**。
+ *
+ *   代价：整轮白跑（$2.78）+ 一条指错方向的错误信息。
+ *
+ * 修法（ADR-137）：**标记的识别要宽松，字段的解析要严格**。
+ *   - 识别：`ZELTO_QUESTION` 前后可有 0..3 个 `<`、空白、代码块围栏（```），
+ *           以及 `ZELTO_QUESTION:` 这类带尾冒号的写法；
+ *   - 解析：字段仍必须齐全且合法（`type` ∈ 三种、`question` 非空）——
+ *           宽松的是**外壳**，严格的是**内容**。
+ *
+ * 判据：宁可**多认**一个本来不是问题的标记（后面会被字段校验挡掉），
+ * 也不要**漏认**一个真的是问题的标记 —— 后者让 agent 的提问静默消失，
+ * 而提问静默消失的代价是「agent 停下了但工具以为它干完了」。
  */
 export function parseQuestion(output: string): ParsedQuestion | null {
   if (!output) return null;
 
-  const start = output.lastIndexOf(MARKER_START);
-  if (start === -1) return null;
+  const found = findMarker(output);
+  if (!found) return null;
 
-  const end = output.indexOf(MARKER_END, start + MARKER_START.length);
-  if (end === -1) return null;
+  const { bodyStart } = found;
+  const end = output.indexOf(MARKER_END, bodyStart);
+  // 收尾标记 `>>>` 缺失时，**取到输出末尾** —— 标记本来就该终止回复，
+  // 所以「后面没有别的东西」就是最合理的兜底边界。
+  const body = end === -1 ? output.slice(bodyStart) : output.slice(bodyStart, end);
 
-  const body = output.slice(start + MARKER_START.length, end);
   const fields = parseFields(body);
 
   const rawType = fields.get('type')?.trim() ?? '';
@@ -74,6 +100,37 @@ export function parseQuestion(output: string): ParsedQuestion | null {
     .filter(Boolean);
 
   return { type: rawType, question, options };
+}
+
+/**
+ * 找出标记起始处（宽松匹配）。
+ *
+ * 认这些形态（`MARKER_TOKEN` 是 `ZELTO_QUESTION`）：
+ *
+ *   `<<<ZELTO_QUESTION`   ← 规范形态
+ *   `<<ZELTO_QUESTION`
+ *   `ZELTO_QUESTION`      ← 少了尖括号（ZD-055 实测踩到）
+ *   `<<< ZELTO_QUESTION`  ← 尖括号后带空格
+ *   `ZELTO_QUESTION:`     ← 尾冒号
+ *   ```` ```ZELTO_QUESTION ````  ← 代码块围栏包裹
+ *
+ * 返回**最后一个**匹配 —— 协议要求标记终止回复，所以看最后一个
+ * （与原实现同口径）。
+ *
+ * @returns 标记之后（正文的起点）与匹配起点；没找到返回 null
+ */
+function findMarker(output: string): { start: number; bodyStart: number } | null {
+  // 允许 0..3 个前导 `<` + 零或多个空白 —— 上限 3 是刻意的：
+  // 再多的尖括号几乎肯定是别的标记。
+  const prefix = /(?<![A-Za-z0-9_])(<{0,3}[ \t]*ZELTO_QUESTION\b[ \t]*:?)/g;
+
+  let last: { start: number; bodyStart: number } | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = prefix.exec(output)) !== null) {
+    last = { start: m.index, bodyStart: m.index + m[0].length };
+    if (m[0].length === 0) prefix.lastIndex += 1;
+  }
+  return last;
 }
 
 /**
