@@ -4,6 +4,8 @@
 
 import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   type PreToolContext,
@@ -281,5 +283,52 @@ describe('judgeWriteTargets', () => {
     const verdict = judgeWriteTargets([join(WORKTREE, 'src/core/a.ts')], ctx({ rules: null }));
     assert.equal(verdict.decision, 'allow');
     assert.equal(verdict.basis, 'reservation:only');
+  });
+});
+
+describe('judgeWriteTargets —— 符号链接感知（ADR-134 回归）', () => {
+  it('worktree 内 junction 指向外部 → 拒绝，词法在写集内也拦（protected:0a）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'zelto-pretool-link-'));
+    try {
+      const wt = join(base, 'wt');
+      const outside = join(base, 'outside');
+      mkdirSync(wt);
+      mkdirSync(outside);
+      writeFileSync(join(outside, 'secret.txt'), 's', 'utf-8');
+      symlinkSync(outside, join(wt, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+
+      const verdict = judgeWriteTargets([join(wt, 'escape', 'secret.txt')], {
+        projectRoot: base,
+        worktreeRoot: wt,
+        sliceId: 'slice-a',
+        writes: ['**'],
+        rules: null,
+        policyVersion: 'sha256:test',
+      });
+      assert.equal(verdict.decision, 'deny');
+      assert.equal(verdict.ruleId, 'protected:0a');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('普通相对路径 → 放行（canonical 与词法一致时的行为不变）', () => {
+    const base = mkdtempSync(join(tmpdir(), 'zelto-pretool-link-'));
+    try {
+      const wt = join(base, 'wt');
+      mkdirSync(wt);
+      mkdirSync(join(wt, 'src'));
+      const verdict = judgeWriteTargets(['src/a.ts'], {
+        projectRoot: base,
+        worktreeRoot: wt,
+        sliceId: 'slice-a',
+        writes: ['src/**'],
+        rules: null,
+        policyVersion: 'sha256:test',
+      });
+      assert.equal(verdict.decision, 'allow');
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

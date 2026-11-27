@@ -96,6 +96,7 @@ export interface PreToolPayload {
 
 import { isProtectedPath, matchPath, toPosix } from './protected.js';
 import { isZeltoManagedSpecPath } from './managed-spec.js';
+import { canonicalContainment, createAncestorRealpathCache } from './paths.js';
 import {
   normalizePayload,
   renderDecision,
@@ -428,7 +429,7 @@ export function evaluateRules(
  * 判定一次工具调用是否可以写。
  *
  * 判定顺序（约束优先）：
- * 1. 路径逃逸（写到 worktree 之外）
+ * 1. 路径逃逸（写到 worktree 之外；符号链接感知，ADR-134）
  * 2. 保护域（策略规则改不动）
  * 3. 写集预约（切片只能写自己 writes 内的路径）
  * 4. policy.yaml 规则
@@ -449,11 +450,28 @@ export function judgeWriteTargets(
   if (targets.length === 0) return empty;
 
   const relativeTargets: string[] = [];
+  // 单次判定批次内共享的祖先 realpath 缓存（ADR-134 决策四）。
+  const canonicalCache = createAncestorRealpathCache();
 
   for (const target of targets) {
-    // 1. 路径逃逸
-    const rel = relativizeTarget(target, ctx.worktreeRoot);
-    if (rel === null) {
+    // 1. 路径逃逸（符号链接感知，ADR-134）
+    //
+    // 用 canonical 相对路径判定：词法路径可被 junction/symlink 绕过
+    // （worktree 内一个指向外部的链接，词法上仍「在 worktree 内」）。
+    // realpath 解析失败（ELOOP / 悬空链接 / 权限）与真越界都拒绝，
+    // 但 reason 要能区分（ADR-134 决策三）。
+    const containment = canonicalContainment(target, ctx.worktreeRoot, canonicalCache);
+    if (containment.kind !== 'inside') {
+      if (containment.kind === 'unresolvable') {
+        return {
+          decision: 'deny',
+          reason: `写入目标 "${target}" 无法解析真实路径（可能是符号链接或权限问题），默认拒绝。`,
+          basis: 'AGENTS.md#禁区',
+          ruleId: 'protected:0a',
+          path: null,
+          targets: [...relativeTargets, target],
+        };
+      }
       return {
         decision: 'deny',
         reason: `写入目标 "${target}" 在隔离目录之外，越界。`,
@@ -463,6 +481,7 @@ export function judgeWriteTargets(
         targets: [...relativeTargets, target],
       };
     }
+    const rel = containment.rel;
     relativeTargets.push(rel);
 
     // 2. 保护域
