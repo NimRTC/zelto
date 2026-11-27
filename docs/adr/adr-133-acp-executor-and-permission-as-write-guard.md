@@ -37,6 +37,64 @@ T3 Code（`pingdotgg/t3code`，MIT）已经用它统一驱动 Claude Code、Code
 而且是**由 agent 主动问、由 zelto 回答**，比「装个 hook 等它触发」更硬：
 不回答 = 拒绝，不依赖任何一家 harness 的 `failClosed` 配置。
 
+### T3 怎么用 Cursor 的 ACP（2026-11-27 核对源码）
+
+T3 有**两条** Cursor 路线，**ACP 那条是 `cursor-agent acp`**：
+
+```
+T3 thread
+  → CursorAdapter
+    → shared AcpSessionRuntime
+      → cursor-agent [flags] acp     ← ACP 路线
+        ↔ ACP JSON-RPC over stdio
+```
+
+T3 的 spawn 参数（源码实录）：
+
+```ts
+[
+  ...(apiEndpoint ? ["-e", apiEndpoint] : []),
+  ...(runtimeMode === "auto" ? ["--auto-review"] : []),
+  ...(runtimeMode === "full-access" ? ["--force"] : []),
+  "acp",
+]
+```
+
+**与 zelto 的选型完全一致**（`DEFAULT_ACP_COMMAND = 'cursor-agent acp'`）。
+
+对照三条路：
+
+| | T3 | zelto | 备注 |
+|---|---|---|---|
+| `cursor-agent acp` | ✅ **主力** | ✅ **采用** | 同一条路 |
+| `cursor-agent` **SDK** worker | ✅ 另一条独立的路 | ❌ | 见下 |
+| `cursor desktop`（IDE 线程） | ❌ **源码里 0 命中** | ❌ | 见 ADR-091 |
+
+**T3 的 SDK 路线上周炸了**（`CursorAgentSdkProcessRunner`）：
+Linux 上 `ProcessLauncher` 成实际父进程，而 `ProviderProcesses.register` 硬要求
+`provider.ppid === process.pid` → 75/77 次 turn 失败
+（[t3code#41929](https://github.com/pingdotgg/t3code/issues/41929)、
+[#43530](https://github.com/pingdotgg/t3code/issues/43530)）。
+
+社区给出的绕法**恰好是换到 ACP**：
+
+> run Cursor through ACP instead of the SDK worker. The ACP path never calls
+> `ProviderProcesses.register`, so the ppid check doesn't apply.
+
+**独立佐证了 ACP 是更稳的路**（进程模型更简单，不依赖 ppid 校验）。
+
+### zelto 与 T3 的三处刻意分歧
+
+| 项 | T3 | zelto | 为什么 |
+|---|---|---|---|
+| `authenticate` | 直接调 `authenticate { methodId: "cursor_login" }` | **不代劳**，识别并给人话 | 登录是**人自己的账号授权**（浏览器流程，弹窗在子进程里 zelto 点不了）。ADR-133 的取舍 |
+| permission 答复 | 会自动选 `allow_always` | **永不发 `allow_always`** | 写集预约是**逐写**判定的；`allow_always` 会永久绕开它（ADR-133 决策四硬规则 1） |
+| fs / terminal 回调 | 全关（`false`） | 全关（`clientCapabilities: {}`） | **一致**。执行交给 agent 自己的工具，不给 ACP server 第二个 client 侧 shell/文件系统面 |
+
+第三条对 C9 有意义：既然 fs 回调关着，**agent 的文件写入由 agent 自己执行**，
+但**每次写之前**都要过 `session/request_permission` —— 那正是 zelto 拦的地方。
+（实测见下文「路径在 `title` 里」—— 拦得住的前提是**判得出写目标**。）
+
 ## 决策
 
 ### 决策一：ACP 是 `ExecutorAdapter` 的第三种实现，端口不变
@@ -413,6 +471,46 @@ or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.
 
 三条路：`agent login`（浏览器授权）/ `--api-key` / `--auth-token` /
 `CURSOR_API_KEY` / `CURSOR_AUTH_TOKEN` 环境变量（ADR-090 的凭证外部化口径）。
+
+### ⚠️ 关键发现：cursor-agent 把写入路径放在 `toolCall.title` 里（2026-11-27）
+
+**读 cursor-agent 的 bundle 才看清的**（`5072.index.js` 的 `requestApproval` /
+`formatOperation`）：
+
+```js
+case Write: { const o = e.details.path;
+  return { title: e.details.isNewFile ? `Write ${o}` : `Edit \`${o}\``,
+           kind: "edit", ... } }
+```
+
+也就是说 —— **写入路径在 `title` 里**（形如 ``Edit `src/foo.ts` ``），
+`rawInput` 与 `locations` **都是空的**。
+
+**原实现的缺口**：路径提取只认 `rawInput`（候选字段名）与 `locations`。
+撞上 cursor-agent → 两个都取不到 → 判定层**拒绝**。
+
+拒绝是安全的（fail closed），但**功能不可用** —— zelto 在真实 cursor-agent 上
+会把**每一次写都拒掉**，等于不可用。
+
+**落地补充**（`src/hook/acp.ts` 的 `pickPathFromTitle()`）：
+
+路径提取变成**三档兜底**（先可靠后模糊）：
+
+1. `rawInput` 的候选字段名（结构化，最可靠）
+2. `locations`（规范定义）
+3. `title`（最模糊，**认死形态**）
+
+`title` 解析的**三条纪律**：
+
+- **只对写类 kind 解析** —— 只读工具的 title 是自然语言描述，
+  解析它只会引入误判（只读豁免按类别判，不看路径）；
+- **必须先命中白名单动词**（`edit` / `write` / `delete` / `remove` /
+  `move` / `rename`）—— 否则「Update the configuration file `config.yaml`」
+  这种标题里的反引号内容会被当成路径。
+  **反引号不是路径的充分证据**，只是「取值范围」的界定；
+- **解析不出就返回 undefined** —— 交回兜底链，最后由判定层拒绝。**绝不猜**。
+
+title 提取出的路径**照样受写集判定约束** —— 不是开后门（有单测钉住）。
 
 ### ⚠️ 与 IDE 的登录态**不共用**（2026-11-27 实测，重要）
 

@@ -57,11 +57,16 @@ export type AcpToolKind =
 /**
  * ACP `request_permission` 里的一次工具调用。
  *
- * 只取本模块需要的字段；其余字段（title / content / status …）
+ * 只取本模块需要的字段；其余字段（content / status …）
  * 属于**展示元数据**，不参与判定。
  *
  * 规范明说：「`name` 与 `kind` 是展示元数据，不授予任何权限」——
  * 所以判定**不能**依赖 `name`，只能依赖 `kind` + `rawInput` 里的实际内容。
+ *
+ * **但 `title` 是个例外**（落地补充，2026-11-27）：实测 `cursor-agent`
+ * 把**写入路径放在 `title` 里**（形如 ``Edit `src/foo.ts` ``），
+ * `rawInput` 与 `locations` 都是空的。所以 `title` 参与**路径提取**
+ * —— 不是参与「判定」，只是「找路径」这条兜底链上的一环。
  */
 export interface AcpToolCall {
   /** ACP 的工具类别 */
@@ -72,6 +77,21 @@ export interface AcpToolCall {
   rawInput?: unknown;
   /** 工具涉及的位置（规范里的 `locations`） */
   locations?: Array<{ path?: string; line?: number | null }>;
+  /**
+   * 展示用的一句话标题。
+   *
+   * **实测有些 agent 把写入路径放在这里**（cursor-agent 的
+   * `` Edit `path` `` / `Write path`）。所以它参与路径提取。
+   */
+  title?: string | null;
+  /**
+   * 工具调用的内容块（规范里的 `content`）。
+   *
+   * **实测 cursor-agent 的写入信息在这**：`content: [{ type: "diff",
+   * path: "<路径>", oldText, newText }]` —— 这是**结构化**的路径，
+   * 比 `title` 可靠得多。
+   */
+  content?: unknown;
 }
 
 /**
@@ -173,10 +193,146 @@ function pickCommand(input: Record<string, unknown>): string | undefined {
 }
 
 /**
+ * 从 ACP 的 `toolCall.title` 里解析出写入路径。
+ *
+ * ── 为什么需要 ──────────────────────────────────────────────────────
+ *
+ * 实测（2026-11-27，`cursor-agent 2026.09.18-9a7762b` 的
+ * `5072.index.js` 里 `requestApproval` / `formatOperation`）：
+ *
+ *   case Write: { const o = e.details.path;
+ *     return { title: e.details.isNewFile ? `Write ${o}` : `Edit \`${o}\``,
+ *              kind: "edit", ... } }
+ *
+ * 也就是说 —— **cursor-agent 把写入路径放在 `title` 里**，
+ * `rawInput` 与 `locations` 都是空的。zelto 只认那两个的话，
+ * 撞上 cursor-agent 时会把**每一次写都拒掉**（安全，但功能不可用）。
+ *
+ * ── 边界 ────────────────────────────────────────────────────────────
+ *
+ * `title` 是**给人看的一句话**，不是结构化字段。解析它必须：
+ *
+ *   1. **只对写类 kind 解析** —— 只读工具的 title 是自然语言描述，
+ *      解析它只会引入误判（只读豁免按类别判，不看路径）；
+ *   2. **必须先命中白名单动词** —— 否则「Update the configuration file
+ *      `config.yaml`」这种标题里的反引号内容会被当成路径。
+ *      反引号**不是**路径的充分证据，只是「取值范围」的界定；
+ *   3. **解析不出就返回 undefined** —— 交回原来的兜底链，
+ *      最后由判定层拒绝。**绝不猜**。
+ *
+ * 这一层**不做判定**，只做「找路径」（与 `pickPath` 同一职责）。
+ */
+function pickPathFromTitle(
+  title: string | undefined | null,
+  kind: string | undefined,
+): string | undefined {
+  // 只有写类 kind 才解析 —— 只读 title 是描述，解析它没意义。
+  if (kind !== 'edit' && kind !== 'delete' && kind !== 'move') return undefined;
+  if (typeof title !== 'string') return undefined;
+  const trimmed = title.trim();
+  if (!trimmed) return undefined;
+
+  // ── 先过动词闸门 ────────────────────────────────────────────────
+  //
+  // 动词是**唯一**的「这标题说的是一次文件操作」的证据。
+  // 没有它就返回 undefined —— 后面的反引号取值只是「从哪取」，
+  // 不是「该不该取」。
+  const verb = /^(edit|write|delete|remove|move|rename)\b\s*(.*)$/i.exec(trimmed);
+  const rest = verb?.[2]?.trim();
+  if (!verb || !rest) return undefined;
+  //
+  // cursor-agent 的 `Edit \`path\`` / `Write path` 都落在这。
+  const backtick = /`([^`]+)`/.exec(rest);
+  if (backtick?.[1]) {
+    const p = backtick[1].trim();
+    if (p) return p;
+  }
+
+  // 形态二：动词后直接跟路径（无反引号）—— `Write src/new-file.ts`。
+  const p = rest.trim();
+  if (p) return p;
+
+  return undefined;
+}
+
+/**
+ * 从 ACP 的 `toolCall.content` 里挑出路径。
+ *
+ * **实测 cursor-agent 把写入路径放在这儿**（`5072.index.js` 的
+ * `formatOperation`）：
+ *
+ *   case Write: return { title: ..., kind: "edit",
+ *     content: [{ type: "diff", path: o, oldText, newText }] }
+ *
+ * 这是**结构化**字段 —— 比 `title` 可靠得多，所以它是第一档兜底。
+ *
+ * `content` 的形状在 ACP 规范里是封闭的内容块数组，但块内的 `path`
+ * 属于各家 agent 的扩展（规范不约束）。所以按候选字段名找。
+ */
+function pickPathFromContent(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || Array.isArray(block)) continue;
+    const direct = pickPath(block as Record<string, unknown>);
+    if (direct) return direct;
+  }
+  return undefined;
+}
+
+/**
+ * 从 ACP 的 `toolCall.title` 里解析出**命令**。
+ *
+ * ── 为什么单独一个函数 ──────────────────────────────────────────────
+ *
+ * cursor-agent 的 Shell 操作（实测，`formatOperation` 的 `case Shell`）：
+ *
+ *   return { title: `\`${e.details.command.replaceAll("`","\\`")}\``,
+ *            kind: "execute", ... }
+ *
+ * 注意两点：
+ *
+ *   1. **没有动词** —— title 就是**整个反引号包裹的命令**；
+ *   2. 命令里的反引号被转义成 `` \` ``。
+ *
+ * 所以命令的解析**不能**套用路径那套「动词闸门」——
+ * 那会把命令整个丢掉，导致判不出写目标 → 拒绝一切 Shell 操作。
+ *
+ * 形态：整个 title 就是一个反引号包裹的字符串 → 解出来就是命令。
+ */
+function pickCommandFromTitle(
+  title: string | undefined | null,
+  kind: string | undefined,
+): string | undefined {
+  if (kind !== 'execute') return undefined;
+  if (typeof title !== 'string') return undefined;
+  const trimmed = title.trim();
+  if (!trimmed) return undefined;
+
+  // 形态：`` `cmd` `` —— 整个 title 是一个反引号包裹的字符串。
+  //
+  // 必须**整串**都是反引号包裹的（否则「`cmd` 后面还有话」会误取）。
+  const whole = /^`([\s\S]+)`$/.exec(trimmed);
+  if (whole?.[1]) {
+    // 反解义：agent 转义了命令里的反引号。
+    const cmd = whole[1].replace(/\\`/g, '`').trim();
+    if (cmd) return cmd;
+  }
+
+  return undefined;
+}
+
+/**
  * 把 ACP 的一次工具调用归一化成统一载荷。
  *
  * **兜底原则与 `harness.ts` 一致**：工具类别不认识时**不是**「不判定」，
  * 而是「去找路径字段」；找不到就交由判定层拒绝。
+ *
+ * 路径的查找顺序（先可靠后模糊）：
+ *
+ *   1. `rawInput` 的候选字段名（结构化，最可靠）
+ *   2. `content` 里的 `diff.path`（**实测 cursor-agent 在这儿**）
+ *   3. `locations`（规范定义的字段）
+ *   4. `title`（**实测 cursor-agent 也在这儿**，最模糊，认死形态）
  *
  * @param toolCall — ACP 的 `toolCall`（`RequestPermissionRequest.toolCall`）
  */
@@ -202,6 +358,16 @@ export function normalizeAcpToolCall(toolCall: AcpToolCall | undefined): Normali
     if (path) toolInput.file_path = path;
   }
 
+  // `content` 里的 `diff.path` —— 实测 cursor-agent 把写入路径放在这儿
+  // （`content: [{ type: "diff", path, oldText, newText }]`），
+  // 而它的 `rawInput` **整个字段都没有**。
+  //
+  // 结构化，排在 `locations` 前面。
+  if (!toolInput.file_path) {
+    const fromContent = pickPathFromContent(toolCall?.content);
+    if (fromContent) toolInput.file_path = fromContent;
+  }
+
   // ACP 的 `locations` 是**规范定义的**位置列表 —— 它比 `rawInput` 里的
   // 字段名更可靠（规范保证有 `path`）。作为兜底补进路径。
   if (!toolInput.file_path && Array.isArray(toolCall?.locations)) {
@@ -211,6 +377,24 @@ export function normalizeAcpToolCall(toolCall: AcpToolCall | undefined): Normali
         break;
       }
     }
+  }
+
+  // `title` 是**最后一档**兜底 —— 实测 cursor-agent 也把写入路径放在这儿
+  // （`` Edit `src/foo.ts` ``）。
+  //
+  // 放最后：结构化字段优先，title 最模糊。
+  if (!toolInput.file_path) {
+    const fromTitle = pickPathFromTitle(toolCall?.title, kind);
+    if (fromTitle) toolInput.file_path = fromTitle;
+  }
+
+  // 命令的兜底 —— 实测 cursor-agent 的 Shell 操作把命令放在 title 里
+  // （`` `rm -rf out` ``，**没有动词**），`rawInput` 整个字段都没有。
+  //
+  // 判不出命令 → 判不出写目标 → 拒绝一切 Shell 操作（不可用）。
+  if (!toolInput.command && tool === 'Bash') {
+    const cmd = pickCommandFromTitle(toolCall?.title, kind);
+    if (cmd) toolInput.command = cmd;
   }
 
   const out: NormalizedPayload = {

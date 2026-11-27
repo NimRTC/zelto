@@ -358,6 +358,13 @@ export class AcpAdapter implements ExecutorAdapter {
         name: params.toolCall.name ?? undefined,
         rawInput: params.toolCall.rawInput,
         locations: params.toolCall.locations ?? undefined,
+        // 实测（2026-11-27）：cursor-agent 把**写入路径放在 title 里**
+        // （形如 `` Edit `src/foo.ts` ``），`rawInput` 整个字段都没有。
+        // 不带过来 → zelto 判不出写目标 → 把每一次写都拒掉。
+        title: params.toolCall.title ?? undefined,
+        // 同上 —— `content: [{ type: "diff", path, oldText, newText }]`
+        // 里也有结构化的路径，比 title 可靠。
+        content: params.toolCall.content ?? undefined,
       };
       const options: AcpPermissionOption[] = params.options.map((o) => ({
         optionId: o.optionId,

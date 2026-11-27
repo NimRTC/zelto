@@ -132,6 +132,211 @@ describe('ACP 归一化 —— 路径与命令的提取', () => {
   });
 });
 
+describe('ACP 归一化 —— title 兜底（实测 cursor-agent 把路径放这儿）', () => {
+  //
+  // 实测来源（2026-11-27，cursor-agent 2026.09.18-9a7762b 的
+  // `5072.index.js` 里 `requestApproval` / `formatOperation`）：
+  //
+  //   case Write: { const o = e.details.path;
+  //     return { title: e.details.isNewFile ? `Write ${o}` : `Edit \`${o}\``,
+  //              kind: "edit", ... } }
+  //
+  // 即：**路径在 title 里，rawInput 与 locations 都是空的**。
+  // 不解析 title → zelto 判不出写目标 → 把每一次写都拒掉（安全但不可用）。
+
+  it('cursor-agent 的 Edit 形态（反引号）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      title: 'Edit `src/foo.ts`',
+    });
+    assert.equal(p.tool_input.file_path, 'src/foo.ts');
+  });
+
+  it('cursor-agent 的 Write 形态（无反引号）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      title: 'Write src/new-file.ts',
+    });
+    assert.equal(p.tool_input.file_path, 'src/new-file.ts');
+  });
+
+  it('delete / move 也认', () => {
+    assert.equal(
+      normalizeAcpToolCall({ kind: 'delete', rawInput: {}, title: 'Delete `src/old.ts`' })
+        .tool_input.file_path,
+      'src/old.ts',
+    );
+    assert.equal(
+      normalizeAcpToolCall({ kind: 'move', rawInput: {}, title: 'Move `a.ts`' })
+        .tool_input.file_path,
+      'a.ts',
+    );
+  });
+
+  it('结构化字段优先于 title（rawInput 的 path 赢）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: { path: '/x/from-rawinput.ts' },
+      title: 'Edit `src/from-title.ts`',
+    });
+    assert.equal(p.tool_input.file_path, '/x/from-rawinput.ts');
+  });
+
+  it('locations 优先于 title', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      locations: [{ path: '/x/from-locations.ts' }],
+      title: 'Edit `src/from-title.ts`',
+    });
+    assert.equal(p.tool_input.file_path, '/x/from-locations.ts');
+  });
+
+  it('只读 kind 不解析 title（title 是描述，解析只会引入误判）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'read',
+      rawInput: {},
+      title: 'Read the docs about `foo.ts`',
+    });
+    assert.equal(p.tool_input.file_path, undefined);
+    assert.equal(p.read_only, true);
+  });
+
+  it('白名单外的动词不解析（不猜）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      title: 'Update the configuration file `config.yaml`',
+    });
+    assert.equal(p.tool_input.file_path, undefined);
+  });
+
+  it('title 缺失或空 → undefined（不炸）', () => {
+    assert.equal(normalizeAcpToolCall({ kind: 'edit', rawInput: {} }).tool_input.file_path, undefined);
+    assert.equal(
+      normalizeAcpToolCall({ kind: 'edit', rawInput: {}, title: '   ' }).tool_input.file_path,
+      undefined,
+    );
+  });
+
+  it('title 里的路径照样受写集判定约束（不是开后门）', () => {
+    const v = judgeAcpPermission(
+      { kind: 'edit', rawInput: {}, title: 'Edit `other/x.txt`' },
+      CTX,
+    );
+    assert.equal(v.decision, 'deny', 'title 提取的路径同样要过写集');
+    assert.equal(v.path, 'other/x.txt');
+  });
+
+  it('title 里的路径在写集内 → 放行', () => {
+    const v = judgeAcpPermission(
+      { kind: 'edit', rawInput: {}, title: 'Edit `src/a.ts`' },
+      CTX,
+    );
+    assert.equal(v.decision, 'allow');
+  });
+});
+
+describe('ACP 归一化 —— content 兜底（实测 cursor-agent 的 diff.path）', () => {
+  //
+  // 实测来源（2026-11-27，cursor-agent 2026.09.18-9a7762b 的
+  // `5072.index.js` 里 `formatOperation`）：
+  //
+  //   case Write: return { title: ..., kind: "edit",
+  //     content: [{ type: "diff", path: o, oldText, newText }] }
+  //
+  // 即：**结构化的路径在 content 里**，比 title 可靠。
+
+  it('diff.path 被认出', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      content: [{ type: 'diff', path: 'src/foo.ts', oldText: 'a', newText: 'b' }],
+    });
+    assert.equal(p.tool_input.file_path, 'src/foo.ts');
+  });
+
+  it('content 优先于 title（结构化 > 展示文本）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      content: [{ type: 'diff', path: 'src/from-content.ts' }],
+      title: 'Edit `src/from-title.ts`',
+    });
+    assert.equal(p.tool_input.file_path, 'src/from-content.ts');
+  });
+
+  it('content 不是数组 / 不是对象 → 不炸', () => {
+    assert.equal(
+      normalizeAcpToolCall({ kind: 'edit', rawInput: {}, content: 'oops' }).tool_input.file_path,
+      undefined,
+    );
+    assert.equal(
+      normalizeAcpToolCall({ kind: 'edit', rawInput: {}, content: [1, 2] }).tool_input.file_path,
+      undefined,
+    );
+  });
+});
+
+describe('ACP 归一化 —— Shell 命令在 title 里（实测 cursor-agent）', () => {
+  //
+  // 实测来源（同上，`formatOperation` 的 `case Shell`）：
+  //
+  //   return { title: `\`${e.details.command.replaceAll("`","\\`")}\``,
+  //            kind: "execute", ... }
+  //
+  // 注意：**没有动词**，整个 title 就是反引号包裹的命令。
+  // 所以命令的解析不能套用路径那套「动词闸门」。
+
+  it('反引号包裹的命令被认出', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'execute',
+      rawInput: {},
+      title: '`rm -rf out`',
+    });
+    assert.equal(p.tool_name, 'Bash');
+    assert.equal(p.tool_input.command, 'rm -rf out');
+  });
+
+  it('命令里的反引号被反解义', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'execute',
+      rawInput: {},
+      title: '`echo \\`hi\\``',
+    });
+    assert.equal(p.tool_input.command, 'echo `hi`');
+  });
+
+  it('命令里的写目标照样能被静态分析判出', () => {
+    const v = judgeAcpPermission(
+      { kind: 'execute', rawInput: {}, title: '`rm -rf out`' },
+      CTX,
+    );
+    // 写集是 src/**，out/ 在外面 → 拒绝。
+    assert.equal(v.decision, 'deny');
+  });
+
+  it('title 不是整串反引号包裹 → 不取（不猜）', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'execute',
+      rawInput: {},
+      title: 'run `rm -rf out` now',
+    });
+    assert.equal(p.tool_input.command, undefined);
+  });
+
+  it('非 execute kind 不从 title 取命令', () => {
+    const p = normalizeAcpToolCall({
+      kind: 'edit',
+      rawInput: {},
+      title: '`src/foo.ts`',
+    });
+    assert.equal(p.tool_input.command, undefined);
+  });
+});
+
 describe('ACP 判定 —— 归一化只做翻译，判定内核一字不改', () => {
   it('写集内的写入 → 放行', () => {
     const v = judgeAcpPermission(
