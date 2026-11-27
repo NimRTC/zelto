@@ -1,5 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
+import type { GateCommand } from './types.js';
 
 // 门禁失败的**精准证据提取** —— 从测试输出里抽「哪个用例挂了、断言说了什么」
 // See docs/实战缺陷记录-nimrtc-v14.md（ZD-027）
@@ -1086,11 +1087,11 @@ export function narrowCommandsToFailedTests(
  * 返回 `{ commands, narrowed }`；返回 null 表示一条都没收窄 —— 调用方据此退回全量。
  */
 export function narrowCommandsToFailedTestsByFile(
-  commands: Array<{ name: string; run: string }>,
+  commands: GateCommand[],
   failedByName: Map<string, string[]>,
   manifestFiles: Map<string, string>,
 ): {
-  commands: Array<{ name: string; run: string }>;
+  commands: GateCommand[];
   narrowed: Map<string, string[]>;
 } | null {
   if (failedByName.size === 0) return null;
@@ -1106,7 +1107,10 @@ export function narrowCommandsToFailedTestsByFile(
     if (rewritten && rewritten !== c.run) {
       anyNarrowed = true;
       narrowed.set(c.name, names);
-      return { name: c.name, run: rewritten };
+      // 展开原命令 —— 收窄只改 `run`，**其余字段原样带走**。
+      // 写成 `{ name, run }` 会把命令级 `timeoutSec` 丢掉：
+      // 收窄后的命令会退回全局超时，而超时正是它最需要的那个值。
+      return { ...c, run: rewritten };
     }
     return c;
   });

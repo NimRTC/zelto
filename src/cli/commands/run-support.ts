@@ -41,7 +41,12 @@ export function resolveGateCommands(sliceType: string): GateCommandSummary[] {
   const config = loadConfig();
   const profile = config.gate.profiles?.[sliceType];
   const commands = profile && profile.length > 0 ? profile : config.gate.commands;
-  return commands.map((c) => ({ name: c.name, run: c.run }));
+  // 命令原样传下去 —— 裁剪字段就是丢配置（命令级 timeoutSec 会丢）。
+  return commands.map((c) => ({
+    name: c.name,
+    run: c.run,
+    ...(c.timeoutSec !== undefined ? { timeoutSec: c.timeoutSec } : {}),
+  }));
 }
 
 /**
@@ -50,10 +55,15 @@ export function resolveGateCommands(sliceType: string): GateCommandSummary[] {
  * 本片**专属**的门禁命令优先（ADR-051）—— `slice.spec.gateCommands` 是
  * 人写的「这片怎么算验过了」，比项目级命令更具体。
  */
-export function gateCommandsForSlice(slice: { writes: string[]; spec?: { gateCommands?: Array<{ name: string; run: string }> } }): GateCommandSummary[] {
+export function gateCommandsForSlice(slice: { writes: string[]; spec?: { gateCommands?: Array<{ name: string; run: string; timeoutSec?: number }> } }): GateCommandSummary[] {
   const specific = slice.spec?.gateCommands;
   if (specific && specific.length > 0) {
-    return specific.map((c) => ({ name: c.name, run: c.run }));
+    // 原样传下去 —— 裁剪字段就是丢配置（命令级 timeoutSec 会丢）。
+    return specific.map((c) => ({
+      name: c.name,
+      run: c.run,
+      ...(c.timeoutSec !== undefined ? { timeoutSec: c.timeoutSec } : {}),
+    }));
   }
   return resolveGateCommands(detectSliceType(slice.writes));
 }
@@ -383,7 +393,11 @@ export async function checkBudget(id: string): Promise<boolean> {
 export async function autoGateAfterRun(id: string): Promise<void> {
   const config = loadConfig();
   const gateConfig: GateConfig = {
-    commands: config.gate.commands.map((c) => ({ name: c.name, run: c.run })),
+    commands: config.gate.commands.map((c) => ({
+      name: c.name,
+      run: c.run,
+      ...(c.timeoutSec !== undefined ? { timeoutSec: c.timeoutSec } : {}),
+    })),
     profiles: config.gate.profiles,
     ...(config.gate.acceptance ? { acceptance: config.gate.acceptance } : {}),
     // 门禁作用域（ADR-097）—— 自动门禁与手动门禁**同一套**规则，

@@ -23,7 +23,7 @@ import { GateExecutor } from '../gate/executor.js';
 import { SignManager } from '../gate/sign.js';
 import { rm } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
-import type { GateConfig } from '../gate/types.js';
+import type { GateCommand, GateConfig } from '../gate/types.js';
 import {
   narrowCommandsToFailedTestsByFile,
   resolveCtestManifestPlacement,
@@ -69,10 +69,20 @@ export interface GateOptions {
 
 /** 门禁配置 —— 由调用方提供（CLI 与 Web 各自的 config 读法不同）。 */
 export interface GateConfigSource {
-  /** 项目级门禁命令 */
-  commands: Array<{ name: string; run: string }>;
+  /**
+   * 项目级门禁命令。
+   *
+   * 类型是 `GateCommand` 而不是 `{ name; run }` —— **命令级 timeoutSec
+   * 必须能活到这里**。写成窄类型时，解析器读出来的 `timeoutSec` 会在
+   * 这个边界上被**静默丢掉**（结构类型裁剪），executor 拿到的命令永远
+   * 没有自己的超时，只能退回全局 `timeoutSec`。
+   *
+   * 实测（2026-11-27）：全量测试要 ~650 秒，全局 timeoutSec 是 120
+   * → 门禁必红，且没有任何提示说「你的命令级超时被丢了」。
+   */
+  commands: GateCommand[];
   /** 按切片类型分的命令档 */
-  profiles?: Record<string, Array<{ name: string; run: string }>>;
+  profiles?: Record<string, GateCommand[]>;
   /** 超时（秒） */
   timeoutSec: number;
   /** 重试上限 */
@@ -221,7 +231,7 @@ export async function runGate(
       return ok('干跑：未执行任何命令', {
         sliceId,
         dryRun: true,
-        commands: commands.map((c) => ({ name: c.name, run: c.run })),
+        commands: commands.map((c) => ({ name: c.name, run: c.run, ...(c.timeoutSec !== undefined ? { timeoutSec: c.timeoutSec } : {}) })),
         timeoutSec: gateConfig.timeoutSec,
         retry: gateConfig.retry.max,
         // 作用域事实（ADR-097）—— 干跑也要说清「这轮会不会收窄」。
@@ -431,7 +441,7 @@ function joinZeltoDir(repoRoot: string): string {
 function selectProfileCommands(
   config: GateConfigSource,
   sliceType: string,
-): Array<{ name: string; run: string }> {
+): GateCommand[] {
   const profile = config.profiles?.[sliceType];
   return profile && profile.length > 0 ? profile : config.commands;
 }
@@ -461,10 +471,10 @@ function selectProfileCommands(
 async function narrowToFailedTests(
   events: LifecycleContext['events'],
   sliceId: string,
-  commands: Array<{ name: string; run: string }>,
+  commands: GateCommand[],
   gateRoot: string,
 ): Promise<{
-  commands: Array<{ name: string; run: string }>;
+  commands: GateCommand[];
   narrowed: Map<string, string[]>;
   manifestFiles: string[];
 } | null> {

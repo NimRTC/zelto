@@ -236,6 +236,29 @@ describe('ADR-096 · narrowCommandsToFailedTestsByFile', () => {
     );
     assert.equal(r, null);
   });
+
+  // ── 回归：收窄不许丢命令级 timeoutSec（2026-11-27 实测）───────────────
+  //
+  // 病灶：收窄时用 `{ name, run }` 重新造了一个对象，把 timeoutSec 丢了。
+  // 后果：被收窄的命令退回全局超时 —— 而**超时正是它最需要的那个值**
+  // （全量测试要 ~650 秒，全局 120 秒 → 门禁必红）。
+  it('收窄后命令级 timeoutSec 不丢', () => {
+    const commands = [
+      { name: 'build', run: 'cmake --build build', timeoutSec: 600 },
+      { name: 'test', run: 'cmd /c "ctest --test-dir build"', timeoutSec: 1200 },
+    ];
+    const failedByName = new Map([['test', ['A.B']]]);
+    const manifestFiles = new Map([['test', 'm-test.txt']]);
+
+    const r = narrowCommandsToFailedTestsByFile(commands, failedByName, manifestFiles);
+    assert.ok(r);
+    assert.equal(r.commands[0].timeoutSec, 600, '未被收窄的命令也要保留 timeoutSec');
+    assert.equal(
+      r.commands[1].timeoutSec,
+      1200,
+      '被收窄的命令必须保留自己的 timeoutSec —— 丢了就退回全局超时',
+    );
+  });
 });
 
 describe('ADR-096 · 清单文件实写实读（端到端）', () => {
