@@ -180,6 +180,20 @@ ACP 规范的 `session/update` 种类是封闭集合；**不认识的 `sessionUp
 | `tests/adapters/acp/`（**新增**） | 协议层单测、permission 映射、**「绝不回 allow_always」断言** |
 | `tests/hook/acp.test.ts`（**新增**） | 归一化/渲染纯函数单测 |
 
+**实际落地时新增的文件**（ADR 原稿未列，是落地必需的）：
+
+| 文件 | 作用 |
+|---|---|
+| `tests/acp-adapter.test.ts` | 协议层 / 事件映射 / 用量口径 / **依赖作用域断言** |
+| `tests/acp-e2e.test.ts` | **真子进程**跑通 permission 判定（mock ACP agent） |
+| `tests/acp-write-guard.test.ts` | **permission 路线不装任何 hook**（验收 2） |
+| `tests/acp-command-resolution.test.ts` | 命令解析与 `--adapter` 取值校验 |
+| `tests/fixtures/mock-acp-agent.mjs` | mock ACP agent（端到端测试用，非生产代码） |
+
+**原计划的 `tests/adapters/acp/dependency-scope.test.ts` 落到了
+`tests/acp-adapter.test.ts`**（同一份文件里已经有依赖作用域那条断言）——
+测试文件的位置按 zelto 现有惯例放在 `tests/` 根下，与其它适配器测试一致。
+
 **不涉及**：`core/policy/`、`core/gate/`、`core/sched/` 的判定逻辑（C3 不受影响）、
 `.zelto/config.yaml` 的 JSON Schema（没有 schema，手写解析，同 ADR-090）。
 
@@ -264,6 +278,59 @@ SDK 只出现在 `src/adapters/acp/`，它把 ACP 的 `toolCall` 翻译成 `src/
 10. `@agentclientprotocol/sdk` 只被 `src/adapters/acp/**` import；
     其它位置出现 → `tests/adapters/acp/dependency-scope.test.ts` 判非零；
 11. `zod` 已加入 `package.json` 的 `dependencies`（SDK 的必需 peer）。
+
+## 落地时发现并修掉的三处「跑起来的不是你说的那个」（2026-11-27）
+
+ADR 写的接口与实现之间有三处缝。它们的共同形状是：**界面看不出问题，
+跑起来才发现连的不是那个 agent** —— 这类 bug 最难查，所以逐条钉住。
+
+### 1. `resolveAgentCommand` 不认 ACP —— 命令解析落回 Claude
+
+`resolveAgentCommand` 只认 `cursor-agent`，其它一律落回 `cfg.agent.command`
+（默认 `npx claude-code`）。于是 `zelto run --adapter acp` 会**三处不一致**：
+
+- 界面显示 `Agent: npx claude-code`（错的）；
+- 预检去查 `where npx`（查的不是真要跑的东西）；
+- 而适配器实际起的是 `agent.acp.command`。
+
+**修法**：`resolveAgentCommand` 认 `acp` → 走 `resolveAcpCommand`。
+显式覆盖（`--agent`）优先级不变 —— 忽略它会让用户传的参数静默失效。
+
+### 2. ACP 分支忽略显式传入的 `--agent`
+
+`createExecutorAdapter` 的 ACP 分支直接用 `resolveAcpCommand(cfg)`，
+把调用方传进来的 `agentCommand` 参数**丢掉了**。
+**修法**：与其它适配器统一为「显式覆盖 > adapter 默认值 > 配置」。
+
+### 3. `--adapter` 的取值没有校验 —— 打错字静默落回 Claude
+
+`--adapter acpp`（打错字）会落回默认分支，跑起 Claude，**不报任何错**。
+界面正常、流程正常，只是跑的不是你要的 agent。
+
+**修法**：新增 `validateAdapterName()` + `ADAPTER_NAMES` 白名单，
+认不出的值**当场报错**并列出可选值。
+
+**共同教训**：`adapter` 决定「跑的是谁」这件事，在本 ADR 之前**散落在三处**
+（命令解析、预检、适配器工厂），三处各写一份 → 迟早漂移。
+现在由 `resolveAgentCommand` / `resolveAcpCommand` / `writeGuardForAdapter`
+三个函数**各自单一来源**，其余地方只调不写。
+
+### 附带修正的两处 ADR 表述
+
+- **验收标准 8**：`getUsage` 的准确口径是「**agent 报了才有，没报就是 null**」——
+  ACP v1 的 `usage_update.cost` 字段其实存在（ADR 原文写「没有标准用量字段」不准确）。
+  币种非 USD 时**不折算**（折算需要汇率，是「不确定」的来源）。
+- **验收标准 2 的边界**：ACP 路线不装 hook，但**预约照取不误** ——
+  permission 回调读的就是那份预约。「谁来问」不同，不等于「有没有判据」。
+
+### 一处 ACP 路线独有的 fail closed 闸门（ADR 未写，落地时补）
+
+ACP 的 `kind` 是规范定义的**封闭集合**。落到 `other` 或规范外的值，
+意味着这次调用**可能**在写东西，而我们看不出它写什么 ——
+这类请求**直接拒绝**，不走 hook 路线的「空目标 = 放行」。
+
+hook 路线下「不认识的工具名」会走「找路径字段」的兜底，找到就判、找不到就放行；
+而 ACP 那边「找不到路径」+「不是只读」= **判不出写目标 = 拒绝**。
 
 ## 已拍板（2026-11-27）
 

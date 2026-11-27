@@ -88,7 +88,7 @@ import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { RuntimeBudgetGuard } from '../../core/budget/index.js';
 import { budgetInterceptionMessage } from '../../core/budget/runtime-guard.js';
-import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, writeGuardForAdapter, resolveAgentCommand, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict, buildSpecIntegrity } from './shared.js';
+import { store, events, ZELTO_DIR, loadPolicyConfig, hashSpecFile, loadConfig, createLlmFromConfig, createExecutorAdapter, harnessForAdapter, writeGuardForAdapter, resolveAgentCommand, resolveAcpCommand, validateAdapterName, worktreeManager, ensureWorktree, removeWorktree, optionValue, optionValueStrict, buildSpecIntegrity } from './shared.js';
 import { executeSlicesByPhase, printParallelSummary, zeltoOwnedPaths } from './parallel-executor.js';
 import { buildExecutionPlan, printExecutionPlan } from './execution-plan.js';
 import { generateClarifyQuestions } from '../../llm/generators/clarify.js';
@@ -1375,7 +1375,7 @@ register('run', async (args) => {
   // `--help` 只读说明，不能进执行 —— 不拦住的话 `--help` 会被当成切片 id 去跑
   if (args.includes('--help') || args.includes('-h')) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
-    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent');
+    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent | acp');
     console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
     console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
     console.error('       zelto run <slice-id> --detach [--json]');
@@ -1389,7 +1389,7 @@ register('run', async (args) => {
   const [id] = args;
   if (!id) {
     console.error('Usage: zelto run <slice-id> [--agent <name>] [--adapter <type>] [--dry-run]');
-    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent');
+    console.error('       --adapter: claude-agent (默认) | claude-agent-sdk | cursor-agent | acp');
     console.error('       zelto run --parallel <id1> [id2 ...] [--agent <name>]');
     console.error('       zelto run --hotfix <slice-id> [--agent <name>]');
     return 1;
@@ -1719,7 +1719,22 @@ register('run', async (args) => {
 
     const cfg = loadConfig();
     const adapterType = optionValueStrict(args, '--adapter');
-    const agentCmd = cfg.agent.command;
+    // 打错字的 adapter 名**当场报错** —— 静默落回 claude-agent 会让人
+    // 以为在跑另一个 agent，而界面上完全看不出来（ADR-133 落地时发现）。
+    const adapterError = validateAdapterName(adapterType);
+    if (adapterError) {
+      console.error(`  ❌ ${adapterError}`);
+      return 1;
+    }
+    // ADR-133：ACP 走**独立**的命令来源（`agent.acp.command`）。
+    //
+    // 拿 `cfg.agent.command`（默认 `npx claude-code`）当「配置里的那条命令」
+    // 去对比，ACP 场景下会得出「你用的是命令行传的 --agent」这种误导性提示 ——
+    // 而实际上用户什么都没传。
+    const agentCmd =
+      (adapterType ?? cfg.agent.adapter) === 'acp'
+        ? resolveAcpCommand(cfg)
+        : cfg.agent.command;
 
     // D-2：`--agent` 没给值时回退到配置里的默认 agent，
     // 而不是把 undefined 当成「用户指定的值」传下去。
@@ -2219,6 +2234,13 @@ async function runParallel(args: string[]): Promise<number> {
   const agentName = optionValueStrict(args, '--agent');
   const adapterType = optionValueStrict(args, '--adapter');
 
+  // 打错字的 adapter 名**当场报错**（见 run 单片路径的同一处说明）。
+  const adapterError = validateAdapterName(adapterType);
+  if (adapterError) {
+    console.error(`❌ ${adapterError}`);
+    return 1;
+  }
+
   // 排阶段（G-1 + G-2）：依赖分层 + 写集冲突降级
   const plan = await buildExecutionPlan(ids, args);
 
@@ -2477,6 +2499,12 @@ register('start', async (args) => {
 
     const cfg = loadConfig();
     const adapterType = optionValueStrict(args, '--adapter');
+    // 打错字的 adapter 名**当场报错**（见 run 单片路径的同一处说明）。
+    const adapterError = validateAdapterName(adapterType);
+    if (adapterError) {
+      console.error(`  ❌ ${adapterError}`);
+      return 1;
+    }
     // D-2：同上 —— `--agent` 没给值时回退到默认 agent。
     // **adapter 决定默认命令**（Cursor → `cursor-agent`）。
     const agentName = optionValue(
@@ -2491,7 +2519,12 @@ register('start', async (args) => {
     try {
       const { checkAgentAvailable } = await import('../../adapters/agent-command.js');
       // D-27：同上 —— 带上配置里的命令，错误信息要指向能用的那条。
-      const agentError = await checkAgentAvailable(agentName, cfg.agent.command);
+      // ADR-133：ACP 的配置命令来自 `agent.acp.command`，不是 `agent.command`。
+      const configuredCommand =
+        (adapterType ?? cfg.agent.adapter) === 'acp'
+          ? resolveAcpCommand(cfg)
+          : cfg.agent.command;
+      const agentError = await checkAgentAvailable(agentName, configuredCommand);
       if (agentError) {
         console.error(`  ❌ ${agentError}`);
         return 1;

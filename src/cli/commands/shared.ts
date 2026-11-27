@@ -767,6 +767,40 @@ export function createLlmFromConfig(
 export type AdapterType = 'claude-agent' | 'claude-agent-sdk' | 'cursor-agent' | 'acp';
 
 /**
+ * 所有合法的 adapter 名。
+ *
+ * **用来校验 `--adapter` 的取值** —— 打错字（`acpp` / `cursor` / `codex`）
+ * 不能静默落回 `claude-agent`：那意味着「我以为在跑 ACP，其实在跑 Claude」。
+ *
+ * 界面看不出问题、跑起来才发现连的不是那个 agent —— 这是最难查的一类 bug。
+ * 所以**认不出的值一律报错**，让人当场改对。
+ *
+ * `codex` 也认：它一直在 `harnessForAdapter` 里被特殊处理
+ * （装 `.codex/hooks.json`），虽然还没有对应的 `ExecutorAdapter`。
+ */
+export const ADAPTER_NAMES: readonly AdapterType[] = [
+  'claude-agent',
+  'claude-agent-sdk',
+  'cursor-agent',
+  'acp',
+];
+
+/**
+ * 校验 `--adapter` 的取值。
+ *
+ * @returns null 表示合法；否则返回一句人话，说明怎么改。
+ */
+export function validateAdapterName(name: string | undefined): string | null {
+  if (name === undefined) return null;
+  if ((ADAPTER_NAMES as readonly string[]).includes(name)) return null;
+  return (
+    `未知的 adapter "${name}"。` +
+    `可选值：${ADAPTER_NAMES.join(' | ')}。` +
+    `（认不出的值一律报错 —— 静默落回 claude-agent 会让你以为在跑另一个 agent。）`
+  );
+}
+
+/**
  * 某个 adapter 对应的 **hook harness**。
  *
  * adapter 决定「谁在跑 agent」，harness 决定「agent 的钩子协议长什么样」。
@@ -829,10 +863,15 @@ export function writeGuardForAdapter(adapterType: string | undefined): WriteGuar
 export function resolveAgentCommand(
   adapterType: string | undefined,
   override: string | undefined,
-  cfg: { agent: { command: string } },
+  cfg: { agent: { command: string; acp?: { command?: string } } },
 ): string {
   if (override && override.trim()) return override.trim();
   if (adapterType === 'cursor-agent') return DEFAULT_CURSOR_COMMAND;
+  // ADR-133：ACP 走**独立**的命令来源（`agent.acp.command`）。
+  //
+  // 不复用 `agent.command` —— 那个默认是 `npx claude-code`，
+  // 复用会让「adapter 是 acp、跑起来却是 Claude」。
+  if (adapterType === 'acp') return resolveAcpCommand(cfg);
   return cfg.agent.command;
 }
 
@@ -845,7 +884,9 @@ export function resolveAgentCommand(
  *
  * 优先级：`agent.acp.command` > 默认值。
  */
-export function resolveAcpCommand(cfg: { agent: { acp?: { command?: string } } }): string {
+export function resolveAcpCommand(cfg: {
+  agent: { acp?: { command?: string } };
+}): string {
   const configured = cfg.agent.acp?.command;
   if (configured && configured.trim()) return configured.trim();
   return DEFAULT_ACP_COMMAND;
@@ -1105,9 +1146,13 @@ export function createExecutorAdapter(
     // 命令走**独立的** `agent.acp.command`（不复用 `agent.command`）：
     // Cursor 适配器那套 flag 拼装与 `where` 查询对 `cursor-agent acp`
     // 这种带子命令的形式不适用。
+    //
+    // 优先级与其它适配器**一致**：显式覆盖（`--agent`）> adapter 默认值
+    // > 配置里的命令。忽略显式覆盖会让用户传的 `--agent` 静默失效 ——
+    // 那是最难查的一类「参数不起作用」。
     return new AcpAdapter({
       cwd: workDir,
-      agentCommand: resolveAcpCommand(cfg),
+      agentCommand: resolveAgentCommand(type, agentCommand, cfg),
       timeoutMs,
       maxRetries: cfg.agent.maxRetries ?? 2,
       // ADR-090：凭证/网关透传 —— 与其它适配器同口径。
