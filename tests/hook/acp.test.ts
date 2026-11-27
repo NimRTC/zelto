@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  extractAcpChangedPaths,
   judgeAcpPermission,
   normalizeAcpToolCall,
   renderAcpPermission,
@@ -548,5 +549,117 @@ describe('ACP 选项挑选', () => {
       { optionId: 'r', kind: 'reject_always' },
     ];
     assert.equal(selectRejectOption(onlyAlways), 'r');
+  });
+});
+
+describe('ACP 三态路径提取（ADR-135 —— 读不全的改动集必须表达为 unknown）', () => {
+  it('多块 content → 收齐所有路径（不是第一个）', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      rawInput: {},
+      content: [
+        { type: 'diff', path: 'src/a.ts' },
+        { type: 'diff', path: 'src/d.ts' },
+      ],
+    });
+    assert.deepEqual(paths, ['src/a.ts', 'src/d.ts']);
+  });
+
+  it('第一块在写集内、第二块在写集外 → 拒绝（核心用例）', () => {
+    // 修之前：第一块在写集内 → 只看到第一块 → 放行 → 实际写了写集外的文件。
+    const v = judgeAcpPermission(
+      {
+        kind: 'edit',
+        rawInput: {},
+        content: [
+          { type: 'diff', path: 'src/a.ts' },
+          { type: 'diff', path: 'other/x.txt' },
+        ],
+      },
+      CTX,
+    );
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'slice:s1#writes');
+  });
+
+  it('content 里有非 diff 块 → unknown → 拒绝', () => {
+    const paths = extractAcpChangedPaths({ kind: 'edit', content: [{ type: 'unknown_block' }] });
+    assert.equal(paths, 'unknown');
+
+    const v = judgeAcpPermission({ kind: 'edit', content: [{ type: 'unknown_block' }] }, CTX);
+    assert.equal(v.decision, 'deny');
+  });
+
+  it('diff.changes 存在但不是数组 → unknown', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [{ type: 'diff', path: 'src/a.ts', changes: 'not-an-array' }],
+    });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('不认识的 change.operation → unknown', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [{ type: 'diff', changes: [{ operation: 'frobnicate' }] }],
+    });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('move → 源与目标都算写目标；源在写集外 → 拒绝', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [{ type: 'diff', changes: [{ operation: 'move', oldPath: 'other/source.ts', path: 'src/b.ts' }] }],
+    });
+    assert.deepEqual(paths, ['other/source.ts', 'src/b.ts']);
+
+    const v = judgeAcpPermission(
+      {
+        kind: 'edit',
+        rawInput: {},
+        content: [{ type: 'diff', changes: [{ operation: 'move', oldPath: 'other/source.ts', path: 'src/b.ts' }] }],
+      },
+      CTX,
+    );
+    assert.equal(v.decision, 'deny', 'move 的源在写集外 → 拒绝');
+  });
+
+  it('copy → 只有目标算写目标；源在写集外但目标在写集内 → 放行', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [{ type: 'diff', changes: [{ operation: 'copy', oldPath: 'other/source.ts', path: 'src/b.ts' }] }],
+    });
+    assert.deepEqual(paths, ['src/b.ts']);
+
+    const v = judgeAcpPermission(
+      {
+        kind: 'edit',
+        rawInput: {},
+        content: [{ type: 'diff', changes: [{ operation: 'copy', oldPath: 'other/source.ts', path: 'src/b.ts' }] }],
+      },
+      CTX,
+    );
+    assert.equal(v.decision, 'allow', 'copy 的源只读 → 目标在写集内 → 放行');
+  });
+
+  it('路径数 > 256 → unknown', () => {
+    const content = Array.from({ length: 257 }, (_, i) => ({ type: 'diff', path: `src/file${i}.ts` }));
+    assert.equal(extractAcpChangedPaths({ kind: 'edit', content }), 'unknown');
+  });
+
+  it('确实没有写目标（只读）→ [] 不是 unknown，且放行（只读豁免）', () => {
+    assert.deepEqual(extractAcpChangedPaths({ kind: 'read', rawInput: { path: 'src/a.ts' } }), []);
+
+    const v = judgeAcpPermission({ kind: 'read', rawInput: { path: 'src/a.ts' } }, CTX);
+    assert.equal(v.decision, 'allow');
+    assert.equal(v.basis, 'acp:read-only');
+  });
+
+  it('unknown 时的判决可审计：basis 是 acp:incomplete-targets、reason 含「读不完整」', () => {
+    const v = judgeAcpPermission({ kind: 'edit', content: [{ type: 'unknown_block' }] }, CTX);
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'acp:incomplete-targets');
+    assert.equal(v.ruleId, 'acp:incomplete-targets');
+    assert.match(v.reason, /读不完整/);
   });
 });

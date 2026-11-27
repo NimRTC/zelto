@@ -433,11 +433,28 @@ export function evaluateRules(
  * 2. 保护域（策略规则改不动）
  * 3. 写集预约（切片只能写自己 writes 内的路径）
  * 4. policy.yaml 规则
+ *
+ * 入参是三态（ADR-135）：`string[]` 是「完整读到的写目标，就这些」；
+ * `'unknown'` 是「读不全 —— 可能还有别的写目标」，直接拒绝（fail closed），
+ * 不得把它当成「这次没写东西」。
  */
 export function judgeWriteTargets(
-  targets: string[],
+  targets: string[] | 'unknown',
   ctx: PreToolContext,
 ): PreToolVerdict {
+  if (targets === 'unknown') {
+    // 「读不全」≠「没有写目标」。审计不能把一次越界尝试读成「没写东西」
+    // （ADR-135 决策五），所以 basis/reason 都指明是「读不完整」。
+    return {
+      decision: 'deny',
+      reason: '改动集读不完整，无法确认写入范围，默认拒绝。',
+      basis: 'acp:incomplete-targets',
+      ruleId: 'acp:incomplete-targets',
+      path: null,
+      targets: [],
+    };
+  }
+
   const empty: PreToolVerdict = {
     decision: 'allow',
     reason: '没有可判定的写入目标',
