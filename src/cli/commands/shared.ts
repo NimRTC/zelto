@@ -10,6 +10,7 @@ import { EventEmittingLlmAdapter, type PricingTable } from '../../adapters/llm/e
 import { ClaudeAgentAdapter } from '../../adapters/claude-agent/index.js';
 import { ClaudeAgentSdkAdapter } from '../../adapters/claude-agent-sdk/index.js';
 import { CursorAgentAdapter, DEFAULT_CURSOR_COMMAND } from '../../adapters/cursor-agent/index.js';
+import { AcpAdapter, DEFAULT_ACP_COMMAND } from '../../adapters/acp/index.js';
 import { EventStream } from '../../core/events/stream.js';
 import type { PolicyConfig, PolicyRule } from '../../core/policy/types.js';
 import { parsePolicyYaml, stripSurroundingQuotes } from '../../core/policy/yaml.js';
@@ -763,7 +764,7 @@ export function createLlmFromConfig(
 
 // ─── Executor Adapter Factory ──────────────────────────────────────────────
 
-export type AdapterType = 'claude-agent' | 'claude-agent-sdk' | 'cursor-agent';
+export type AdapterType = 'claude-agent' | 'claude-agent-sdk' | 'cursor-agent' | 'acp';
 
 /**
  * 某个 adapter 对应的 **hook harness**。
@@ -833,6 +834,21 @@ export function resolveAgentCommand(
   if (override && override.trim()) return override.trim();
   if (adapterType === 'cursor-agent') return DEFAULT_CURSOR_COMMAND;
   return cfg.agent.command;
+}
+
+/**
+ * ACP agent 的命令（ADR-133）。
+ *
+ * **独立于 `agent.command`** —— Cursor 适配器对命令做 flag 拼装与
+ * `where` 查询，那套逻辑对 `cursor-agent acp` 这种带子命令的形式不适用。
+ * 复用会让两个适配器互相污染（Cursor 的 flag 拼到 ACP 上 → 起不来）。
+ *
+ * 优先级：`agent.acp.command` > 默认值。
+ */
+export function resolveAcpCommand(cfg: { agent: { acp?: { command?: string } } }): string {
+  const configured = cfg.agent.acp?.command;
+  if (configured && configured.trim()) return configured.trim();
+  return DEFAULT_ACP_COMMAND;
 }
 
 /**
@@ -1076,6 +1092,27 @@ export function createExecutorAdapter(
         ? { maxBudgetUsd: cfg.budgetLimitUsd }
         : {}),
       ...(pricePerKToken ? { pricePerKToken } : {}),
+    });
+  }
+
+  if (type === 'acp') {
+    // ADR-133：ACP 路线 —— agent 是子进程，stdio 上跑 JSON-RPC。
+    //
+    // **C9 的主判定点是 `session/request_permission` 回调**，不是 hook ——
+    // 所以这个适配器**不装任何钩子**（见 `runtime-guard.ts` 的
+    // `writeGuard: 'permission'` 分支）。
+    //
+    // 命令走**独立的** `agent.acp.command`（不复用 `agent.command`）：
+    // Cursor 适配器那套 flag 拼装与 `where` 查询对 `cursor-agent acp`
+    // 这种带子命令的形式不适用。
+    return new AcpAdapter({
+      cwd: workDir,
+      agentCommand: resolveAcpCommand(cfg),
+      timeoutMs,
+      maxRetries: cfg.agent.maxRetries ?? 2,
+      // ADR-090：凭证/网关透传 —— 与其它适配器同口径。
+      env: mergeAgentEnv(cfg.agent.env),
+      projectRoot: process.cwd(),
     });
   }
 

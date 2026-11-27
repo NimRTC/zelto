@@ -64,6 +64,16 @@ export interface PersistentSessionData {
    * 追溯链在续跑那一段不断。
    */
   runId?: string | null;
+  /**
+   * 累计花费（美元）。
+   *
+   * **可选**：不是所有 agent 都报用量。ACP 的 `usage_update.cost` 是可选字段，
+   * 没报就是 `undefined` —— 语义是「没测到」，不是「零」。
+   *
+   * 所以读它的地方必须区分 `undefined`（没测到）与 `0`（确实没花钱）：
+   * 谎报 0 会让预算闸门变成一道**假闸门**（ADR-035 口径）。
+   */
+  costUsd?: number;
 }
 
 /** 会话文件路径（相对项目根）。 */

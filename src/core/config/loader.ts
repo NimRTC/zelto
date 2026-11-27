@@ -125,6 +125,22 @@ export interface ZeltoConfig {
        */
       apiKeyEnv?: string;
     };
+    /**
+     * ACP 专属可选参数（ADR-133）。只在 `adapter: acp` 时有意义。
+     *
+     * **独立字段，不复用 `agent.command`** —— Cursor 适配器对命令做
+     * flag 拼装与 `where` 查询，那套逻辑对 ACP（`cursor-agent acp`
+     * 这种带子命令的形式）不适用。混用会让两个适配器互相污染。
+     */
+    acp?: {
+      /**
+       * 启动 ACP agent 的命令。
+       *
+       * 形如 `cursor-agent acp` / `codex acp` —— 具体跑哪家的 agent
+       * 由用户的 agent CLI 决定，zelto 只管按 ACP 协议跟它说话。
+       */
+      command?: string;
+    };
   };
   /**
    * Web 驾驶舱的配置（ADR-086 §7）。
@@ -430,6 +446,10 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
   let agentCursorIndent = 0;
   let agentCursorEndpoint: string | undefined;
   let agentCursorApiKeyEnv: string | undefined;
+  // agent.acp 段（ADR-133）
+  let inAgentAcpSection = false;
+  let agentAcpIndent = 0;
+  let agentAcpCommand: string | undefined;
   let currentCommand: GateCommandConfig | null = null;
   /** 缩进层级：用来区分「命令自身的 timeoutSec」与「gate 全局 timeoutSec」 */
   let currentCommandIndent = 0;
@@ -796,6 +816,17 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
         inAgentCursorSection = true;
         agentCursorIndent = indent;
         inAgentEnvSection = false;
+        inAgentAcpSection = false;
+        continue;
+      }
+      if (trimmed === 'acp:') {
+        // ADR-133：agent.acp 段。位置与 env:/cursor: 同级 ——
+        // 必须在 command:/adapter:/timeout: 之前判，否则 acp 下面的键
+        // 会被当成 agent 顶层键。
+        inAgentAcpSection = true;
+        agentAcpIndent = indent;
+        inAgentEnvSection = false;
+        inAgentCursorSection = false;
         continue;
       }
 
@@ -829,6 +860,28 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
               stripSurroundingQuotes(trimmed.slice(10).trim()) || undefined;
             continue;
           }
+        }
+      }
+
+      if (inAgentAcpSection) {
+        if (indent <= agentAcpIndent) {
+          inAgentAcpSection = false;
+        } else if (trimmed.startsWith('command:')) {
+          // ADR-133：agent.acp.command —— 启动 ACP agent 的命令。
+          //
+          // 支持块标量（`|`，ADR-028 的块标量解析）—— 长命令用块写更可读。
+          const raw = trimmed.slice(8).trim();
+          const header = parseBlockScalarHeader(raw);
+          if (header) {
+            const block = readBlockScalar(lines, i, indent, header);
+            if (block) {
+              agentAcpCommand = block.value;
+              i = block.nextIndex - 1;
+            }
+          } else {
+            agentAcpCommand = stripSurroundingQuotes(raw);
+          }
+          continue;
         }
       }
 
@@ -881,6 +934,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
       // 认不出的 agent 子键：结束嵌套节，交回其它段处理。
       inAgentEnvSection = false;
       inAgentCursorSection = false;
+      inAgentAcpSection = false;
     }
 
     if (inWebSection && trimmed.startsWith('maxConcurrentRuns:')) {
@@ -1256,6 +1310,7 @@ export function parseConfigYaml(content: string): ZeltoConfig | null {
                 },
               }
             : {}),
+          ...(agentAcpCommand ? { acp: { command: agentAcpCommand } } : {}),
         },
         ...(web ? { web } : {}),
         ...(worktree ? { worktree } : {}),
