@@ -48,6 +48,7 @@ src/adapters/acp/
   index.ts        AcpAdapter implements ExecutorAdapter
   protocol.ts     JSON-RPC 信封、ACP method 名、版本协商
   events.ts       session/update → zelto 事件（进度信号 / 输出文本）
+  auth.ts         initialize 的 authMethods → 鉴权失败的修法（落地补充）
   permission.ts   session/request_permission → C9 判定 → allow_once / reject_once
 ```
 
@@ -60,6 +61,15 @@ agent:
     command: "cursor-agent acp"     # 或 "codex acp" —— 由用户的 agent CLI 决定
     # 凭证：与 ADR-090 同口径，走 agent.env / 用户已有登录态，zelto 不接管
 ```
+
+> **「ACP 要不要单独安装」的答案：不用装 —— 但子命令可能被藏起来。**
+>
+> 实测（2026-11-27，`cursor-agent 2026.09.18-9a7762b`）：`cursor-agent acp`
+> **存在且可用**，但注册时带 `hidden: true`，所以 `cursor-agent --help`
+> 列出的 20 个子命令里**看不到它**。
+>
+> 只查 `--help` 会得出「不支持 ACP」的错误结论 —— 这也是为什么本 ADR
+> 的实测章节要求**直接跑一次握手**，而不只看帮助文本。
 
 `start / resume / continueSession / stop / waitForExit / markProgress / getUsage` 的语义逐一对应：
 
@@ -335,6 +345,80 @@ ACP 的 `kind` 是规范定义的**封闭集合**。落到 `other` 或规范外�
 
 hook 路线下「不认识的工具名」会走「找路径字段」的兜底，找到就判、找不到就放行；
 而 ACP 那边「找不到路径」+「不是只读」= **判不出写目标 = 拒绝**。
+
+### 真实 agent 实测（2026-11-27，`cursor-agent acp`）
+
+ADR 写的是「任何 ACP agent」。落地后拿**真实**的 `cursor-agent acp`（2026.09.18-9a7762b）
+实测，发现两件 ADR 没写的事：
+
+#### 1. `cursor-agent acp` 存在，但**在 `--help` 里看不见**
+
+它的子命令注册是 `_e.command("acp", { hidden: true })` ——
+所以 `cursor-agent --help` 列出 20 个子命令，里面**没有** `acp`。
+
+**这就是「ACP 要不要单独安装」这个问题的答案：不用装，但要知道它被藏起来了。**
+只查 `cursor-agent --help` 会得出「不支持 ACP」的错误结论。
+
+bundle 里 ACP 的实现是完整的（`8096.index.js` 有 `session/request_permission`、
+`session/new`、`authenticate` 等全套方法）。
+
+#### 2. 协议版本对得上，但**鉴权是独立的关卡**
+
+实测 `initialize` 回包：
+
+```json
+{"protocolVersion":1,
+ "agentCapabilities":{"loadSession":true, ...},
+ "authMethods":[{"id":"cursor_login","name":"Cursor Login",
+                 "description":"Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in."}]}
+```
+
+**`protocolVersion: 1`** —— 与 zelto 的 `PROTOCOL_VERSION = 1` 完全一致，
+版本闸门（ADR-133 已决的 fail closed）在真实 agent 上**不会误伤**。
+
+但紧接着是第二道关卡：**没登录时 `session/new` 直接返回**
+`Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'.`
+
+**ADR 没写这一道**，原实现直接把这句话透传成
+「ACP 会话失败：Authentication required」—— 说的是事实，但人不知道该做什么。
+
+**落地补充**（`src/adapters/acp/auth.ts`）：
+
+- `initialize` 回包里的 `authMethods` 记下来；
+- 失败时识别「需要登录」，给出**可执行的修法**（登录方式 + agent 自己的说明）；
+- 认不出是鉴权问题 → **照原样报错，不猜**。
+
+**zelto 不替用户登录**，这是有意的：
+
+- 登录是浏览器授权流程（`agent login`），弹窗在 agent 子进程里 ——
+  zelto 看不见、也点不了；
+- 就算能点，也是**替人做凭证授权**（ADR-090 凭证外部化的精神）。
+
+这与 C9 的 fail closed 不冲突：鉴权失败时**根本进不了判定环节**，
+没有「静默放行」的可能。
+
+### 登录之后的那一段，尚未在真实 agent 上验证（2026-11-27）
+
+实测到「需要登录」为止 —— 本机 `cursor-agent status` 显示 `Not logged in`，
+再往下（真实 `session/prompt` + 真实 `session/request_permission` 往返）**没有实测过**。
+
+原因是登录要用户自己做浏览器授权（zelto 不代劳）。
+
+**当前已验证 vs 未验证的边界**：
+
+| 环节 | 验证方式 |
+|---|---|
+| `initialize` 握手 + protocolVersion=1 | ✅ 真实 `cursor-agent acp` 实测 |
+| `authMethods` 抽取与错误信息 | ✅ 真实 agent + 单测 |
+| 版本不匹配 → fail closed | ✅ 单测（mock agent 报错版本） |
+| permission 回调 → 允许/拒绝 | ✅ 端到端（mock ACP agent，真子进程） |
+| **真实 agent 的 prompt 往返** | ❌ **未验证**（需先登录） |
+| **真实 agent 的 permission 往返** | ❌ **未验证**（需先登录） |
+
+**这不是「已完成」**。登录一次之后应当补测最后两行 ——
+尤其是真实 agent 的 `toolCall.kind` 取值是否落在
+`src/hook/acp.ts` 的归一化映射表里（ACP 规范的 `kind` 是封闭集合，
+但各家 agent 可能塞进 `other`）。
 
 ## 已拍板（2026-11-27）
 

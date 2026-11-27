@@ -60,6 +60,7 @@ import {
 import { killProcessTreeGracefully } from '../process-tree.js';
 import { loadSession, saveSession, type PersistentSessionData } from '../session-store.js';
 import { PROTOCOL_VERSION, createAcpStream, isSupportedProtocolVersion, protocolVersionError } from './protocol.js';
+import { detectAuthRequired, extractAuthMethods, type AcpAuthMethod } from './auth.js';
 import { extractAcpCost, extractAcpText, isProgressUpdate } from './events.js';
 
 /** ACP 适配器选项。 */
@@ -416,6 +417,9 @@ export class AcpAdapter implements ExecutorAdapter {
     const stream = createAcpStream(child.stdin, child.stdout);
     const connection = app.connect(stream);
 
+    // 声明在 try 之外 —— catch 里要用它把「要登录」翻译成人话。
+    let authMethods: AcpAuthMethod[] = [];
+
     try {
       const init = await connection.agent.request('initialize', {
         protocolVersion: PROTOCOL_VERSION,
@@ -434,6 +438,15 @@ export class AcpAdapter implements ExecutorAdapter {
         return;
       }
 
+      // ── 鉴权方式（ADR-133 落地补充）───────────────────────────
+      //
+      // 记下来，不是为了自动登录 —— 是为了**建会话失败时**能给出人话。
+      //
+      // 实测（2026-11-27，`cursor-agent acp`）：agent 的 `initialize`
+      // 回包里带 `authMethods`，没登录时 `session/new` 会返回
+      // 「Authentication required」。不记它，错误就只剩半句。
+      authMethods = extractAuthMethods(init);
+
       const session = await connection.agent.buildSession(this.cwd).start();
       state.acpSessionId = session.sessionId;
       sessionData.agentSessionId = session.sessionId;
@@ -446,7 +459,11 @@ export class AcpAdapter implements ExecutorAdapter {
       await session.prompt(instructions);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.failSession(sessionId, `ACP 会话失败：${message}`);
+      // 鉴权失败**换成人话**（有登录方式就给出来）。
+      //
+      // 认不出是鉴权问题 → 照原样报错（不猜）。
+      const authHint = detectAuthRequired(message, authMethods);
+      this.failSession(sessionId, authHint ?? `ACP 会话失败：${message}`);
     } finally {
       connection.close();
       // 关掉子进程的 stdin —— agent 靠 stdin 结束知道自己该退出了。
