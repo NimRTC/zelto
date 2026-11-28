@@ -63,6 +63,8 @@ if (typeof v === 'string' && v) return v;    // ← 只看「是不是非空字�
   只在验收用例里用来演示正常相对路径；本片不改它）。
 - 只读 `AGENTS.md` —— 项目约定（**不是仓库里待改的文件**；
   本片引用它是为了说明「规格里没写的行为要停下来问」这条纪律）。
+- 只读 `tests/hook/pretool.test.ts` —— 既有 hook 判定单测
+  （**本片不改它**；引用它是为了说明「空目标是放行」这条既有行为）。
 
 ## 需求
 
@@ -135,7 +137,7 @@ if (typeof v === 'string' && v) return v;    // ← 只看「是不是非空字�
 
 **这句话是错的**（实测 2026-11-27）：`judgeWriteTargets([])` 返回
 `{ decision: 'allow', basis: 'hook:no-target' }` —— **空目标是放行**，
-不是拒绝（既有测试 `tests/hook/pretool.test.ts`
+不是拒绝（既有测试 只读 `tests/hook/pretool.test.ts`
 「allows when there are no targets to judge」断言了这个行为）。
 
 所以「在提取层把形状非法的值过滤掉」会**制造一个新的绕过**：
