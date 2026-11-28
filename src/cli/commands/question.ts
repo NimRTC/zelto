@@ -48,6 +48,11 @@ function questionStore(): QuestionStore {
  *
  * 事件列表由调用方**一次性读入**（纯计算，C3）：调用发生在写 `run.resumed`
  * 之前，所以不存在「读到本次续跑自己刚写的事件」的循环。
+ *
+ * **注意 `run.resumed` 现在写在续跑之后**（ADR-140 决策五 —— 它要带
+ * `sessionMode`，而通道要等握手完成才知道）。这不影响这里的判定：
+ * `resumeRunIdForAnswer` 找的是 `run.started` + `stall.classified`，
+ * `run.resumed` **不参与**判定 —— 少一条/晚一条都不影响结果。
  */
 export function resumeRunIdForAnswer(sliceId: string, stream: ReadonlyArray<unknown>): string | null {
   const task = loadRunningTask(sliceId);
@@ -112,6 +117,25 @@ function loadRunningTask(sliceId: string): { runId?: string } | null {
 }
 
 // ─── 提问检测与挂起（供 run 流程复用） ──────────────────────────────────────
+
+/**
+ * 读这一轮续跑**实际用哪条**通道（ADR-140）。
+ *
+ * 读不到 → null（适配器不实现 `getSessionMode`，或这一轮不是续跑）。
+ * **null 不等于 `'new'`** —— 「不知道」与「确实是新会话」是两件事，
+ * 不能混（混了会把「没实现这个能力」说成「上下文丢了」）。
+ */
+function readSessionMode(
+  adapter: ExecutorAdapter,
+  sessionId: string,
+): 'resume' | 'load' | 'new' | null {
+  if (typeof adapter.getSessionMode !== 'function') return null;
+  try {
+    return adapter.getSessionMode(sessionId);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * 检测 agent 输出末尾的问题标记，并把问题登记进队列。
@@ -299,11 +323,6 @@ register('answer', async (args) => {
     answer: answerText,
     answeredBy: 'human',
   });
-  await events.append(sliceId, 'run.resumed', 'zelto', {
-    sliceId,
-    resolution: 'question_answered',
-    questionId,
-  });
 
   console.log(`Answered ${questionId} — resuming slice "${sliceId}"...`);
 
@@ -356,6 +375,41 @@ register('answer', async (args) => {
     // 起跑失败 → 守卫必须释放（预约悬空 → 下片撞写集冲突）。
     await guard.release();
     return 1;
+  }
+
+  // ── 续跑语义（ADR-140 决策二 / 决策五）───────────────────────────
+  //
+  // 「这次是真续还是新会话」——**上下文在不在**，语义完全不同。
+  //
+  // - 真续（`session/resume` / `session/load`）—— agent 记得刚才讨论过什么；
+  // - 退回（`session/new`）—— **上下文丢了**，agent 得从零摸索。
+  //
+  // **必须说清楚**（决策二）：静默退回 = 人以为 agent 记得，
+  // 实际它什么都不记得 —— 人会基于错误的假设做判断。
+  //
+  // **必须进事件**（决策五）：C4 说事件是追溯的唯一证据载体 ——
+  // 「这次续跑是不是真续」正是审计要问的问题。
+  //
+  // **为什么在续跑之后才写这条事件**：通道要等握手完成才知道
+  // （`session/resume` 成功与否也是握手的一部分）。
+  // 提前写就只能是「渠道待定」，等于没写。
+  //
+  // **只写一条**（不补第二条）：补写会让「这片被续跑了几次」翻倍 ——
+  // 而 `rework_rate` 之类「事件条数 ÷ 门禁次数」的指标会被这个翻倍直接带偏
+  // （见 `core/sched/engine.ts` 里 `run.resumed` 的说明）。
+  const sessionMode = readSessionMode(adapter, newSessionId);
+  await events.append(sliceId, 'run.resumed', 'zelto', {
+    sliceId,
+    resolution: 'question_answered',
+    questionId,
+    ...(sessionMode ? { sessionMode } : {}),
+  });
+
+  if (sessionMode === 'new') {
+    console.error(
+      '⚠️  agent 不支持 session/resume / session/load —— 这次续跑是**新会话**。',
+    );
+    console.error('    agent 之前的上下文已丢失，它需要重新摸索。');
   }
 
   const exitCode = await adapter.waitForExit(newSessionId);

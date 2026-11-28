@@ -60,8 +60,22 @@ import {
 } from '../../hook/pretool.js';
 import { killProcessTreeGracefully } from '../process-tree.js';
 import { loadSession, saveSession, type PersistentSessionData } from '../session-store.js';
-import { PROTOCOL_VERSION, createAcpStream, isSupportedProtocolVersion, protocolVersionError } from './protocol.js';
+import {
+  PROTOCOL_VERSION,
+  createAcpStream,
+  isSupportedProtocolVersion,
+  parseAcpSessionContinuation,
+  protocolVersionError,
+  type AcpSessionContinuation,
+} from './protocol.js';
 import { detectAuthRequired, extractAuthMethods, type AcpAuthMethod } from './auth.js';
+import {
+  buildFallbackContinueInstructions,
+  buildFallbackResumeInstructions,
+  decideSessionMode,
+  describeSessionMode,
+  type AcpSessionMode,
+} from './continuation.js';
 import { extractAcpCost, extractAcpText, isProgressUpdate } from './events.js';
 import { addGrant, hasGrant, loadGrants, type AlwaysGrant } from './always-grants.js';
 import { promptAlwaysAllow } from './always-prompt.js';
@@ -109,6 +123,9 @@ const ADAPTER_META: AdapterMeta = {
     resume: true,
     events: false,
     modelSelection: false,
+    // ADR-140：ACP 的续跑能力上限 —— 真续（session/resume | session/load）。
+    // 实际用哪条取决于那个 agent 在 initialize 回包里声明了什么。
+    sessionContinuation: 'load-resume',
     // ADR-133：C9 的主判定点是 ACP 的 permission 回调，**不是** hook。
     writeGuard: 'permission',
   },
@@ -132,6 +149,27 @@ interface AcpSessionState {
   ctx: PreToolContext;
   /** agent 报出来的累计花费（美元）；没报就是 null */
   costUsd: number | null;
+  /**
+   * 续跑时**实际用哪条**通道（ADR-140 决策五）—— 事件负载里的 `sessionMode`。
+   *
+   * `'resume'` —— 发了 `session/resume`（真续，上下文在）
+   * `'load'`   —— 发了 `session/load`（真续，历史回放）
+   * `'new'`    —— 退回 `session/new`（**上下文丢了**）
+   */
+  sessionMode: AcpSessionMode;
+  /**
+   * 「会话已建立、通道已知」的信号（ADR-140）。
+   *
+   * 续跑方（`resume()` / `continueSession()`）要**等**这个信号才能知道
+   * 走的是哪条通道 —— 因为「真续 vs 新会话」这件事必须在**人看到之前**
+   * 说出来（决策二），也必须进 `run.resumed` 的负载（决策五）。
+   *
+   * **一定会兑现**：`connect()` 的每一条退出路径都 resolve 它
+   * （失败时按 `'new'` 兑现）—— 续跑方不会永远挂着。
+   */
+  sessionModeReady: Promise<AcpSessionMode>;
+  /** 兑现 `sessionModeReady` 的函数（只兑现一次）。 */
+  resolveSessionMode: (mode: AcpSessionMode) => void;
 }
 
 export class AcpAdapter implements ExecutorAdapter {
@@ -299,6 +337,11 @@ export class AcpAdapter implements ExecutorAdapter {
     instructions: string;
     bundlePath: string;
     runId: string | null;
+    /**
+     * 要续的 ACP 会话 id（ADR-140）—— 非 null 时走 `session/resume` /
+     * `session/load`（真续），null 时走 `session/new`。
+     */
+    resumeAcpSessionId?: string | null;
   }): { sessionId: string } {
     const { sessionId, sliceId, instructions, bundlePath } = opts;
     const workDir = this.cwd;
@@ -347,6 +390,11 @@ export class AcpAdapter implements ExecutorAdapter {
       },
     });
 
+    let resolveSessionMode: (mode: AcpSessionMode) => void = () => {};
+    const sessionModeReady = new Promise<AcpSessionMode>((resolve) => {
+      resolveSessionMode = resolve;
+    });
+
     const state: AcpSessionState = {
       child,
       acpSessionId: null,
@@ -359,6 +407,9 @@ export class AcpAdapter implements ExecutorAdapter {
       runId: opts.runId,
       ctx,
       costUsd: null,
+      sessionMode: 'new',
+      sessionModeReady,
+      resolveSessionMode,
     };
     this.sessions.set(sessionId, state);
 
@@ -370,7 +421,7 @@ export class AcpAdapter implements ExecutorAdapter {
       this.touchActivity(sessionId);
     });
 
-    void this.connect(sessionId, state, sessionData, instructions);
+    void this.connect(sessionId, state, sessionData, instructions, opts.resumeAcpSessionId ?? null);
 
     this.resetIdleTimer(sessionId);
 
@@ -429,17 +480,33 @@ export class AcpAdapter implements ExecutorAdapter {
   /**
    * 建立 ACP 连接并跑完这一轮。
    *
-   * 流程：`initialize` → 版本校验 → `session/new` → `session/prompt`。
+   * 流程：`initialize` → 版本校验 → 建会话 → `session/prompt`。
+   *
+   * **建会话**这一步按 agent 声明的能力分三条路（ADR-140）：
+   *
+   * ```
+   * 有 resumeAcpSessionId？
+   *   agent 声明 sessionCapabilities.resume → session/resume（真续，首选）
+   *   agent 声明 agentCapabilities.loadSession → session/load（真续，次选）
+   *   都不支持 → session/new（退回）+ 明确告知人「上下文丢了」
+   * 没有 resumeAcpSessionId（首轮）→ session/new
+   * ```
+   *
+   * **为什么 `session/resume` 优先于 `session/load`**：`session/load` 会把
+   * 整个对话历史回放给 client，而 zelto 的提问检测是纯字符串解析 ——
+   * 回放出来的旧问题标记会被再解析一次 → 无限挂起。
    */
   private async connect(
     sessionId: string,
     state: AcpSessionState,
     sessionData: PersistentSessionData,
     instructions: string,
+    resumeAcpSessionId: string | null,
   ): Promise<void> {
     const child = state.child;
     if (!child.stdin || !child.stdout) {
       this.failSession(sessionId, 'ACP agent 子进程没有可用的 stdio');
+      state.resolveSessionMode(state.sessionMode);
       return;
     }
 
@@ -448,6 +515,7 @@ export class AcpAdapter implements ExecutorAdapter {
       app = client({ name: 'zelto' });
     } catch (err) {
       this.failSession(sessionId, `创建 ACP client 失败：${err instanceof Error ? err.message : String(err)}`);
+      state.resolveSessionMode(state.sessionMode);
       return;
     }
 
@@ -568,6 +636,7 @@ export class AcpAdapter implements ExecutorAdapter {
       if (!isSupportedProtocolVersion(init?.protocolVersion)) {
         const message = protocolVersionError(init?.protocolVersion);
         this.failSession(sessionId, message);
+        state.resolveSessionMode(state.sessionMode);
         return;
       }
 
@@ -580,16 +649,76 @@ export class AcpAdapter implements ExecutorAdapter {
       // 「Authentication required」。不记它，错误就只剩半句。
       authMethods = extractAuthMethods(init);
 
-      const session = await connection.agent.buildSession(this.cwd).start();
-      state.acpSessionId = session.sessionId;
-      sessionData.agentSessionId = session.sessionId;
+      // ── 建会话（ADR-140）─────────────────────────────────────────
+      //
+      // 三条路，按 agent 声明的能力选（`resume` 优先于 `load`）：
+      //
+      //   session/resume —— 真续，**不回放历史**（省 token，且不会让
+      //                     提问检测把历史里的旧标记再解析一次）
+      //   session/load   —— 真续，但**回放整个历史**（次选）
+      //   session/new    —— 退回路径：**上下文丢了**，明确告知人
+      //
+      // 规范硬约束（`SessionStatus`）：换了一条连接之后，
+      // **MUST still call `session/load` or `session/resume`** before
+      // sending `session/prompt` —— 不发那两个就发 prompt = 违反规范。
+      const capability = parseAcpSessionContinuation(init);
+      const mode = decideSessionMode(capability, resumeAcpSessionId);
+      state.sessionMode = mode;
+
+      if (mode === 'resume') {
+        await connection.agent.request('session/resume', {
+          sessionId: resumeAcpSessionId as string,
+          cwd: this.cwd,
+          // `mcpServers` 是**可选**的 —— 不传 = 「沿用会话原有的」。
+          // zelto 从不给 agent 配 MCP server（ADR-133 决策四），不传更一致。
+        });
+        state.acpSessionId = resumeAcpSessionId;
+        sessionData.agentSessionId = resumeAcpSessionId;
+      } else if (mode === 'load') {
+        await connection.agent.request('session/load', {
+          sessionId: resumeAcpSessionId as string,
+          cwd: this.cwd,
+          // `mcpServers` 是**必填**字段 —— 不传 = 违反 schema = agent 可能拒绝。
+          // zelto 不配 MCP server，所以传空数组。
+          mcpServers: [],
+        });
+        state.acpSessionId = resumeAcpSessionId;
+        sessionData.agentSessionId = resumeAcpSessionId;
+      } else {
+        // 退回路径：开新会话。
+        //
+        // **明确告知人**（ADR-140 决策二）—— 静默退回 = 人以为 agent
+        // 记得刚才讨论过什么，实际它什么都不记得。
+        if (resumeAcpSessionId) {
+          const notice = describeSessionMode('new');
+          state.output.push(`[zelto: ${notice}]`);
+          sessionData.output.push(`[zelto: ${notice}]`);
+          if (this.onOutput) this.onOutput(sessionId, `\n[zelto: ${notice}]\n`);
+        }
+        const session = await connection.agent.buildSession(this.cwd).start();
+        state.acpSessionId = session.sessionId;
+        sessionData.agentSessionId = session.sessionId;
+      }
+
+      // 通道已知 —— 兑现信号（续跑方在等它，ADR-140）。
+      state.resolveSessionMode(mode);
+
       try {
         saveSession(sessionData);
       } catch {
         /* 写盘失败不阻断运行 */
       }
 
-      await session.prompt(instructions);
+      // `session/prompt` 直接走原始 JSON-RPC（不走 SDK 的 `ActiveSession`）——
+      // 因为真续路径下**没有** `session/new` 的回包，
+      // SDK 的 `ActiveSession` 是围着 `session/new` 回包建的。
+      //
+      // 提示词的形状与 SDK 的 `ActiveSession.prompt()` 一致：
+      // 字符串 → 一个 text content block。
+      await connection.agent.request('session/prompt', {
+        sessionId: state.acpSessionId as string,
+        prompt: [{ type: 'text', text: instructions }],
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // 鉴权失败**换成人话**（有登录方式就给出来）。
@@ -598,6 +727,9 @@ export class AcpAdapter implements ExecutorAdapter {
       const authHint = detectAuthRequired(message, authMethods);
       this.failSession(sessionId, authHint ?? `ACP 会话失败：${message}`);
     } finally {
+      // 建会话失败时也要兑现信号 —— 否则续跑方会永远挂着。
+      // （失败时按当前的 `sessionMode` 兑现：要么 `'new'`，要么真续的模式。）
+      state.resolveSessionMode(state.sessionMode);
       connection.close();
       // 关掉子进程的 stdin —— agent 靠 stdin 结束知道自己该退出了。
       //
@@ -727,6 +859,11 @@ export class AcpAdapter implements ExecutorAdapter {
    * 拿不到就**不能**续（不同于 Claude Code 可以预先指定 `--session-id`）。
    * 这里宁可抛错，也不静默开一个新会话：
    * 静默开新会话 = 上下文清零 = agent 已经做掉的事全作废（ADR-013 §3.4）。
+   *
+   * **ADR-140**：拿到那个 id 之后**真的用它** ——
+   * 起新连接后发 `session/resume`（首选）或 `session/load`（次选），
+   * 而不是发 `session/new` 把上下文清零。
+   * agent 都不支持时才退回 `session/new`，并**明确告知人**。
    */
   async resume(
     sessionId: string,
@@ -745,22 +882,27 @@ export class AcpAdapter implements ExecutorAdapter {
     }
 
     const newSessionId = `acp-${data.sliceId}-${Date.now()}-resume`;
-    const instructions = [
-      'You previously asked a question and the human answered it.',
-      '',
-      'The answer is:',
-      patch,
-      '',
-      'Continue the work in this same session. If anything is still unclear, ask again using the question marker.',
-    ].join('\n');
+    const instructions = buildFallbackResumeInstructions(patch);
 
-    return this.spawn({
+    const spawned = this.spawn({
       sessionId: newSessionId,
       sliceId: data.sliceId,
       instructions,
       bundlePath: data.prompt,
       runId: opts?.runId ?? data.runId ?? null,
+      // ADR-140：把上一轮的 ACP 会话 id 带下去 —— `connect()` 会按 agent
+      // 声明的能力发 `session/resume` / `session/load`（真续）。
+      resumeAcpSessionId: acpSessionId,
     });
+
+    // ADR-140 决策二：**等通道确定**再返回 —— 调用方要在**人看到之前**
+    // 知道「这次是真续还是新会话」（新会话要明确告知「上下文丢了」）。
+    //
+    // 这个等待是**有界的**：信号在握手完成、建好会话时就兑现
+    // （`session/prompt` **之前**）—— 不等整轮跑完。
+    await this.sessions.get(newSessionId)?.sessionModeReady;
+
+    return spawned;
   }
 
   /** 续同一个会话，但提示词是任意的（超时重试：「接着上次做」）。 */
@@ -780,13 +922,20 @@ export class AcpAdapter implements ExecutorAdapter {
     }
 
     const newSessionId = `acp-${data.sliceId}-${Date.now()}-continue`;
-    return this.spawn({
+    const spawned = this.spawn({
       sessionId: newSessionId,
       sliceId: data.sliceId,
-      instructions,
+      instructions: buildFallbackContinueInstructions(instructions),
       bundlePath: data.prompt,
       runId: opts?.runId ?? data.runId ?? null,
+      // ADR-140：真续同一个 ACP 会话（见上）。
+      resumeAcpSessionId: acpSessionId,
     });
+
+    // 与 `resume()` 同一理由：等通道确定（有界 —— 握手完成就兑现）。
+    await this.sessions.get(newSessionId)?.sessionModeReady;
+
+    return spawned;
   }
 
   // ─── 输出 ────────────────────────────────────────────────────────────────
@@ -804,6 +953,21 @@ export class AcpAdapter implements ExecutorAdapter {
     if (state?.acpSessionId) return state.acpSessionId;
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     return data?.agentSessionId ?? null;
+  }
+
+  /**
+   * 这一轮续跑**实际用哪条**通道（ADR-140 决策五）。
+   *
+   * - `'resume'` —— 发了 `session/resume`（真续，上下文在）
+   * - `'load'`   —— 发了 `session/load`（真续，历史回放）
+   * - `'new'`    —— 退回 `session/new`（**上下文丢了**）
+   *
+   * **为什么调用方需要知道**：续跑的**语义**不同（上下文在不在），
+   * 人看到「agent 又问了同一个问题」时的判断完全不同。
+   * 而且这件事必须在追溯链上看得见（C4）—— 它进 `run.resumed` 的负载。
+   */
+  getSessionMode(sessionId: string): AcpSessionMode | null {
+    return this.sessions.get(sessionId)?.sessionMode ?? null;
   }
 
   /**

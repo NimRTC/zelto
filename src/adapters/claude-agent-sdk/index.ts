@@ -97,6 +97,8 @@ const ADAPTER_META: AdapterMeta = {
     resume: true,
     events: true,
     modelSelection: true,
+    // ADR-140：Agent SDK 的续跑是真续（同一 sessionId）。
+    sessionContinuation: 'load-resume',
     // ADR-133：C9 主判定点在 agent 侧的 PreToolUse 钩子。
     writeGuard: 'hook',
   },

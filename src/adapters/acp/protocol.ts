@@ -42,6 +42,61 @@ export function protocolVersionError(version: unknown): string {
 }
 
 /**
+ * agent 的会话续跑能力（ADR-140）。
+ *
+ * - `'resume'` —— 支持 `session/resume`（不回放历史，首选）
+ * - `'load'`   —— 只支持 `session/load`（回放历史，次选）
+ * - `'new'`    —— 都不支持，续跑只能开新会话（上下文会丢）
+ *
+ * 取值顺序就是**优先顺序**：`resume` 优于 `load`。
+ */
+export type AcpSessionContinuation = 'resume' | 'load' | 'new';
+
+/** `initialize` 回包里与会话续跑相关的部分。 */
+export interface AcpInitCapabilities {
+  agentCapabilities?: { loadSession?: unknown } | null;
+  sessionCapabilities?: { resume?: unknown } | null;
+}
+
+/**
+ * 从 `initialize` 回包判定会话续跑能力（ADR-140 决策三）。
+ *
+ * **读不到就当作没有**（fail closed）：
+ * - `sessionCapabilities.resume` 必须是对象（`{}` 也算）；
+ * - `agentCapabilities.loadSession` 必须是 `true`。
+ *
+ * 协议自己已经给了 fail closed 的默认值（`loadSession: default(false)`、
+ * `sessionCapabilities.resume` 是 `nullish`）—— 这里只是照着实现。
+ *
+ * **`resume` 优先于 `load`**（ADR-140 决策六）：
+ * `session/load` 会把整个历史回放给 client，而 zelto 的提问检测是纯字符串解析 ——
+ * 回放出来的旧问题标记会被**再解析一次**，导致无限挂起。
+ * 所以只要 agent 支持 `session/resume`，就**不**用 `session/load`。
+ */
+export function parseAcpSessionCapabilities(
+  init: AcpInitCapabilities | null | undefined,
+): AcpSessionContinuation {
+  const resume = init?.sessionCapabilities?.resume;
+  if (resume !== null && typeof resume === 'object') return 'resume';
+
+  if (init?.agentCapabilities?.loadSession === true) return 'load';
+
+  return 'new';
+}
+
+/**
+ * `parseAcpSessionCapabilities` 的别名（ADR-140 规格里的命名）。
+ *
+ * **为什么两个名字**：规格写的是 `parseAcpSessionCapabilities`，
+ * 而实现里 `AcpSessionContinuation`（续跑**通道**）这个概念更准确 ——
+ * 能力位（capability）与通道（mode）是两件事：
+ * 能力位是 agent 声明的**事实**，通道是 zelto **选出来**的动作。
+ *
+ * 保留别名是为了规格与实现对得上（能 grep 到规格里的名字）。
+ */
+export const parseAcpSessionContinuation = parseAcpSessionCapabilities;
+
+/**
  * 把子进程的 stdin/stdout 接成 ACP 的流。
  *
  * ACP v1 的传输是 **NDJSON**（每行一个 JSON-RPC 消息），不是 Content-Length 分帧。

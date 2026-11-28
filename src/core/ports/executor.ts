@@ -14,6 +14,26 @@ export interface AdapterMeta {
     events: boolean;
     modelSelection: boolean;
     /**
+     * 续跑时**真续会话**的能力（ADR-140）。
+     *
+     * - `'load-resume'` —— 续跑能续同一个 agent 会话（上下文在）
+     * - `'new-session'`  —— 续跑只能开新会话（上下文会丢）
+     *
+     * **声明的是能力上限，不是运行时结论**：
+     * ACP adapter 声明 `'load-resume'`，但实际用 `session/resume`、
+     * `session/load` 还是退回 `session/new`，取决于**那个 agent**
+     * 在 `initialize` 回包里声明了什么能力。
+     *
+     * 为什么声明上限而不是运行时结论：`AdapterMeta` 是**静态**的，
+     * 而调用方（`question.ts`）需要在 `adapter.resume()` **之前**
+     * 就知道这件事 —— 因为它要在**人看到之前**给出提示。
+     * 运行时才知道 = 提示来不及。
+     *
+     * 为什么不是反过来（声明 `'new-session'`）：那样即使实际 agent
+     * 支持 load/resume，zelto 也永远不会去试 —— 能力被静态声明卡死。
+     */
+    sessionContinuation: 'load-resume' | 'new-session';
+    /**
      * C9 的**主判定点**（ADR-133）。
      *
      * 「写集预约在哪里被强制」是**这个 adapter 怎么实现 C9** 的事实，
@@ -197,6 +217,41 @@ export interface ExecutorAdapter {
    * 与 `getUsage` 同一个原则：没数据不等于没花钱。
    */
   getLiveUsage?(sessionId: string): AdapterUsage | null;
+
+  /**
+   * 当前处于哪个**启动阶段**（ADR-143）；不在启动阶段 → null。
+   *
+   * 存在的理由：agent 的**启动阶段**（加载 MCP server、鉴权、读上下文文件）
+   * **不是工具调用** —— 所以它不发 `tool_call`，也就不会喂 `markProgress`。
+   * 于是「空转超时」（没有进展就这么久就杀）会把一个**正常启动但比较慢**的
+   * agent 当成「卡住了」杀掉 —— 而它被杀的时候**一行代码都还没写**。
+   *
+   * 启动阶段**豁免**空转超时（不是延长它 —— 那要引入魔法数字）。
+   * 豁免的依据是「阶段是否结束」这个**协议事实**，
+   * 而阶段**只从真实信号来**（被等待的协议请求），**绝不用计时器**。
+   *
+   * **可选方法**：hook 路线的三个 adapter 没有这个概念 ——
+   * 为它们编一个 `null` 就是「假装有这个能力」。
+   * 不实现 = 没有这个能力（调用方要判存在性）。
+   *
+   * 返回的字符串是**给人看的**阶段名（如 `'initialize'` / `'session'`）。
+   */
+  getStartupPhase?(sessionId: string): string | null;
+
+  /**
+   * 这一轮续跑**实际用哪条**通道（ADR-140）；不适用时 → null。
+   *
+   * - `'resume'` —— 真续（`session/resume`），上下文在
+   * - `'load'`   —— 真续（`session/load`），上下文在（历史回放）
+   * - `'new'`    —— 退回 `session/new`，**上下文丢了**
+   *
+   * **为什么调用方需要知道**：续跑的**语义**不同（上下文在不在），
+   * 人看到「agent 又问了同一个问题」时的判断完全不同。
+   * 而且这件事必须进事件流（C4）—— 它进 `run.resumed` 的负载。
+   *
+   * **可选方法**：只有 ACP 路线有「协议层的会话通道」这个概念。
+   */
+  getSessionMode?(sessionId: string): 'resume' | 'load' | 'new' | null;
 
   /**
    * Stop/kill an agent session.
