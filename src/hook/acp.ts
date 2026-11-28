@@ -29,6 +29,7 @@
 // 2. **找不到路径/命令就拒绝** —— 不认识 ≠ 放行（ADR-083 §2 同原则）。
 
 import type { NormalizedPayload } from './harness.js';
+import { isCheckablePath } from './paths.js';
 import {
   extractBashWriteTargets,
   judgeWriteTargets,
@@ -192,6 +193,59 @@ function pickPath(input: Record<string, unknown>): string | undefined {
 }
 
 /**
+ * 从 ACP 的 `rawInput` 里挑出路径字段，**并区分三种情况**（ADR-136）。
+ *
+ * 这是 `pickPath()` 的形状判据版：
+ *
+ * - `found` —— 字段存在、形状合法 → 值就是写目标；
+ * - `absent` —— 字段根本不存在（候选字段名一个都没命中）→
+ *   这才是「这个来源不提供写目标」；
+ * - `malformed` —— 字段**存在**但形状非法（NUL 字节 / `~` 开头 /
+ *   URL scheme / 纯空白 …）→ 这是一个**形状非法的写目标**。
+ *
+ * **为什么必须区分 absent 与 malformed**（ADR-136 决策三）：
+ * 静默忽略形状非法的值 = 把「可能有写目标」当成「没有写目标」→
+ * agent 故意传 `file:///etc/passwd` 就能骗过判定。
+ * 这正是 ADR-083 §2「不认识 ≠ 放行」。
+ */
+type PathPick =
+  | { kind: 'found'; value: string }
+  | { kind: 'absent' }
+  | { kind: 'malformed'; raw: string };
+
+function pickPathChecked(input: Record<string, unknown>): PathPick {
+  for (const key of [
+    'path',
+    'file_path',
+    'filePath',
+    'target_file',
+    'absolute_path',
+    'relative_workspace_path',
+    'filename',
+  ]) {
+    const v = input[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== 'string') {
+      // 字段存在但不是字符串 —— 读不明白
+      return { kind: 'malformed', raw: String(v) };
+    }
+    if (!isCheckablePath(v)) {
+      return { kind: 'malformed', raw: v };
+    }
+    if (v) return { kind: 'found', value: v };
+  }
+  // 有些 agent 把路径放在嵌套对象里（`{ file: { path } }` / `{ edit: { path } }`）
+  for (const nested of ['file', 'edit', 'target', 'location']) {
+    const v = input[nested];
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const inner = pickPathChecked(v as Record<string, unknown>);
+      if (inner.kind !== 'absent') return inner;
+    }
+  }
+  return { kind: 'absent' };
+}
+
+/**
  * 从 ACP 的 `rawInput` 里挑出命令字段。
  *
  * 与 `harness.ts` 的 `pickCommand()` 同一口径：`command` / `cmd` / `script`，
@@ -334,12 +388,26 @@ export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpCh
     raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
 
   const paths: string[] = [];
-  const push = (p: unknown): void => {
-    if (typeof p === 'string' && p) paths.push(p);
+  /**
+   * 收一个写目标。
+   *
+   * 形状非法 → **整体 unknown**（ADR-136 决策三），不是静默跳过：
+   * 跳过 = 把「可能有写目标」当成「没有写目标」。
+   *
+   * `undefined` 表示「这个来源不提供写目标」（字段不存在），
+   * 与「形状非法」是两回事 —— 前者不改变结论，后者必须拒绝。
+   */
+  const push = (p: unknown): boolean => {
+    if (p === undefined || p === null) return true;
+    if (!isCheckablePath(p)) return false;
+    if (typeof p === 'string') paths.push(p);
+    return true;
   };
 
   // 1. rawInput 的路径字段（结构化，最可靠）
-  push(pickPath(input));
+  const rawPick = pickPathChecked(input);
+  if (rawPick.kind === 'malformed') return 'unknown';
+  if (rawPick.kind === 'found') paths.push(rawPick.value);
 
   // 2. locations（规范定义的字段）
   const locations = toolCall?.locations;
@@ -347,6 +415,7 @@ export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpCh
     if (!Array.isArray(locations)) return 'unknown';
     for (const loc of locations) {
       if (loc && typeof loc === 'object' && typeof loc.path === 'string' && loc.path) {
+        if (!isCheckablePath(loc.path)) return 'unknown';
         paths.push(loc.path);
       }
     }
@@ -361,7 +430,9 @@ export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpCh
       const b = block as Record<string, unknown>;
       if (b.type === 'diff') {
         // 块级路径
-        push(pickPath(b));
+        const blockPick = pickPathChecked(b);
+        if (blockPick.kind === 'malformed') return 'unknown';
+        if (blockPick.kind === 'found') paths.push(blockPick.value);
         // 块内嵌套的 changes[] —— 每个 change 带自己的路径
         const changes = b.changes;
         if (changes !== undefined && changes !== null) {
@@ -372,15 +443,15 @@ export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpCh
             switch (c.operation) {
               case 'move':
                 // 源被移走 = 源也被改了 → 源与目标都算写目标
-                push(c.oldPath);
-                push(c.path);
+                if (!push(c.oldPath)) return 'unknown';
+                if (!push(c.path)) return 'unknown';
                 break;
               case 'add':
               case 'delete':
               case 'modify':
               case 'copy':
                 // copy 的源只被读 → 只有目标算写目标
-                push(c.path);
+                if (!push(c.path)) return 'unknown';
                 break;
               default:
                 // 不认识的 operation：可能写字段没显示的地方 → 整体 unknown
@@ -410,7 +481,10 @@ export function extractAcpChangedPaths(toolCall: AcpToolCall | undefined): AcpCh
   //    把**唯一**路径放 title 里、rawInput 与 locations 都空。它不参与
   //    「收齐」—— 否则自然语言标题会把别处的文件名也收进来造成误拒。
   if (paths.length === 0) {
-    push(pickPathFromTitle(toolCall?.title, kind));
+    // title 里的路径也要过形状判据 —— 反引号里的内容**不保证**是路径。
+    const fromTitle = pickPathFromTitle(toolCall?.title, kind);
+    if (fromTitle !== undefined && !isCheckablePath(fromTitle)) return 'unknown';
+    if (fromTitle !== undefined) paths.push(fromTitle);
   }
 
   // 6. 数量上限（防 DoS 兜底）

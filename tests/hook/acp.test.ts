@@ -663,3 +663,61 @@ describe('ACP 三态路径提取（ADR-135 —— 读不全的改动集必须表
     assert.match(v.reason, /读不完整/);
   });
 });
+
+describe('ACP 路径形状判据（ADR-136 —— 形状非法的值必须上报为 unknown）', () => {
+  it('rawInput 的 path 是 URL scheme → unknown，不是 []', () => {
+    const paths = extractAcpChangedPaths({ kind: 'edit', rawInput: { path: 'file:///etc/passwd' } });
+    assert.equal(paths, 'unknown', '形状非法的值不能被静默忽略成「没有写目标」');
+  });
+
+  it('rawInput 的 path 以 ~ 开头 → unknown', () => {
+    const paths = extractAcpChangedPaths({ kind: 'edit', rawInput: { path: '~/../../etc/passwd' } });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('rawInput 的 path 含 NUL 字节 → unknown', () => {
+    const paths = extractAcpChangedPaths({ kind: 'edit', rawInput: { path: 'a\u0000b' } });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('content 的 diff.path 形状非法 → unknown', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [{ type: 'diff', path: 'file:///etc/passwd' }],
+    });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('locations[].path 形状非法 → unknown', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      locations: [{ path: 'file:///etc/passwd' }],
+    });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('changes[].oldPath 形状非法 → unknown', () => {
+    const paths = extractAcpChangedPaths({
+      kind: 'edit',
+      content: [
+        {
+          type: 'diff',
+          path: 'src/a.ts',
+          changes: [{ operation: 'move', oldPath: 'file:///etc/passwd', path: 'src/a.ts' }],
+        },
+      ],
+    });
+    assert.equal(paths, 'unknown');
+  });
+
+  it('形状非法 → 走完整判定是拒绝，不是放行', () => {
+    const v = judgeAcpPermission({ kind: 'edit', rawInput: { path: 'file:///etc/passwd' } }, CTX);
+    assert.equal(v.decision, 'deny');
+    assert.equal(v.basis, 'acp:incomplete-targets');
+  });
+
+  it('正常路径不受影响（行为不变）', () => {
+    const paths = extractAcpChangedPaths({ kind: 'edit', rawInput: { path: 'src/a.ts' } });
+    assert.deepEqual(paths, ['src/a.ts']);
+  });
+});

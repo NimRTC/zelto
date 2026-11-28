@@ -96,7 +96,7 @@ export interface PreToolPayload {
 
 import { isProtectedPath, matchPath, toPosix } from './protected.js';
 import { isZeltoManagedSpecPath } from './managed-spec.js';
-import { canonicalContainment, createAncestorRealpathCache } from './paths.js';
+import { canonicalContainment, createAncestorRealpathCache, isCheckablePath } from './paths.js';
 import {
   normalizePayload,
   renderDecision,
@@ -465,6 +465,32 @@ export function judgeWriteTargets(
   };
 
   if (targets.length === 0) return empty;
+
+  // ── 形状闸门（ADR-136）─────────────────────────────────────────────
+  //
+  // 「这个值是不是一条路径」必须在归一化**之前**回答 ——
+  // 归一化只会把 `file:///etc/passwd` 变成 `<worktree>/file:/etc/passwd`
+  // （落在 worktree 内、可能落在写集内 → 放行），而 agent 真正要写的是
+  // `/etc/passwd`。
+  //
+  // **为什么闸门在这里（判定内核），不在各路线的提取层**：
+  // 提取层过滤掉畸形值 = 提取结果为空 = `judgeWriteTargets([])` = **放行**
+  // （空目标是 allow，不是 deny —— 见 ADR-136 决策四之一）。
+  // 静默过滤 = 把「可能有写目标」当成「没有写目标」。
+  //
+  // 判定内核是所有路线唯一共用的收口点（ACP 的 judgeAcpPermission()
+  // 与 hook 的 runPreTool() 都调它）—— 所以一处就够。
+  for (const target of targets) {
+    if (isCheckablePath(target)) continue;
+    return {
+      decision: 'deny',
+      reason: `写入目标 "${target}" 不是合法路径，无法确认它指向哪个文件，默认拒绝。`,
+      basis: 'hook:malformed-path',
+      ruleId: 'hook:malformed-path',
+      path: null,
+      targets: [...targets],
+    };
+  }
 
   const relativeTargets: string[] = [];
   // 单次判定批次内共享的祖先 realpath 缓存（ADR-134 决策四）。
