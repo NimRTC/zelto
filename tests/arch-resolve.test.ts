@@ -46,6 +46,8 @@ function scan(moduleFiles: Record<string, string[]>): ScanResult {
       vendorFiles: 0,
       // ADR-066：测试文件数
       testFiles: 0,
+      // ADR-138：工具脚本数
+      toolingFiles: 0,
     },
     // ADR-065：vendor 边界
     vendorDirs: [],

@@ -259,7 +259,12 @@ function renderReport(
     // ADR-066：分母**也排除**测试文件 ——
     // 测试文件不产生依赖边（测试引用被测对象是测试的本职），
     // 算进「没验过」会让覆盖率失真。
-    const checkedTotal = coverage.totalFiles - coverage.vendorFiles - coverage.testFiles;
+    //
+    // ADR-138：分母**也排除**工具脚本 ——
+    // 工具脚本不产生依赖边（脚本读被操作对象是脚本的本职），
+    // 而且它们不是架构的一部分，算进分母同样会失真。
+    const checkedTotal =
+      coverage.totalFiles - coverage.vendorFiles - coverage.testFiles - coverage.toolingFiles;
     out.push(
       `    ${colors.yellow('⚠')} 本次只验证了 ${coverage.verifiedFiles}/${checkedTotal} 个文件的依赖关系。`,
     );
@@ -279,6 +284,18 @@ function renderReport(
     out.push(`  ${colors.bold('测试代码')}`);
     out.push(
       `    ${colors.dim('·')} ${colors.dim(`${coverage.testFiles} 个测试文件不参与架构检查 —— 测试引用被测对象是测试的本职，不构成架构耦合。`)}`,
+    );
+  }
+  // ─── 工具脚本（ADR-138）────────────────────────────────────────────────
+  //
+  // 工具脚本**不参与**依赖验证，也不参与模块归属判定 ——
+  // 它们不是架构的一部分，只是开发期用来操作这个项目的脚本。
+  // 但要**说清楚**，否则「已验证 47 个 C++ 文件」会给人错觉。
+  if (coverage.toolingFiles > 0) {
+    out.push('');
+    out.push(`  ${colors.bold('开发工具脚本')}`);
+    out.push(
+      `    ${colors.dim('·')} ${colors.dim(`${coverage.toolingFiles} 个工具脚本不参与架构检查 —— 脚本读取被操作对象是脚本的本职，不是架构耦合。`)}`,
     );
   }
   // ─── vendor 目录（ADR-065）────────────────────────────────────────────

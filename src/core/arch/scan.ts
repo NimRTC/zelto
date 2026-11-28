@@ -32,6 +32,7 @@ import {
   type PatternSpecificity,
 } from './normalize.js';
 import { isTestFile } from './test-files.js';
+import { isToolingFile } from './tooling-files.js';
 import type {
   LangCategory,
   LangCoverage,
@@ -959,6 +960,21 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
     // 只是不成为依赖边的来源。
     if (isTestFile(path)) continue;
 
+    // ADR-138：**工具脚本也不产生依赖边** ——
+    // 一个检查脚本读项目的模块，是这个脚本的**本职**（与测试同理）。
+    //
+    // 真实场景：`tools/check_engine_layering.py` 要读 `src/engine/src/**`
+    // 才能检查分层；`scripts/api_freeze_scan.js` 要扫 `src/**` 的 API。
+    // 这类引用**不是架构耦合** —— 它不构成「模块 A 依赖模块 B」。
+    //
+    // 与测试文件同一判据：引用被操作对象是脚本的本职。
+    //
+    // 注意：多数项目里工具目录不被任何模块认领，脚本自身 owner 为 null，
+    // 那时边自然不会产生（`owner` 为空即跳过）。但若设计真的声明了
+    // `tools/**` 模块，脚本就会拿到 owner 并产生边 —— 那是**假边**，
+    // 会伪造成「未声明依赖」甚至假环。所以这里显式排除。
+    if (isToolingFile(path)) continue;
+
     let source: string;
     try {
       source = readFileSync(join(root, path), 'utf-8');
@@ -1137,8 +1153,23 @@ export function scanArchitecture(root: string, rawModules: ModuleSpec[]): ScanRe
   // 「文件无归属（deny）」而 blocked —— 修这个 trigger 的切片自己过不去。
   //
   // 与依赖边同一判据：测试文件仍计入文件数与覆盖统计，只是不产生偏离。
+  //
+  // ADR-138：工具脚本（`tools/` `scripts/`）同理 —— 它们不是架构的一部分，
+  // 没有「依赖谁」「被谁依赖」，只是开发期操作这个项目的脚本。
+  //
+  // 真实证据（nimrtc-v14 靶子项目，2026-11-28）：`tools/` 76 个 +
+  // `scripts/` 15 个文件无归属。任何改工具脚本的切片都被这条偏离拦住
+  // （自锁）—— 而成因是**扫描器的归属模型覆盖不到工具目录**，
+  // 不是那片切片真的违反了架构。
+  //
+  // 注意这里的不对称：文档与构建脚本因为「扫描器读不懂」（detectLang 返回 null）
+  // 从来不进 `scanned`，所以从不被拦；工具脚本恰好是 Python / JS，
+  // **扫描器读得懂，于是成了唯一被拦的一类**。那是实现细节的泄漏。
+  //
+  // 三者（测试 / 工具脚本 / vendor）判据一致：**不是这个项目的架构的东西，
+  // 就不是这个项目的架构偏离** —— 但都仍然计入文件数与覆盖统计。
   const unmapped = scanned
-    .filter((f) => f.module === null && !f.isTest)
+    .filter((f) => f.module === null && !f.isTest && !isToolingFile(f.path))
     .map((f) => f.path);
 
   return {
@@ -1193,11 +1224,18 @@ function computeCoverage(
   // ADR-066：**测试文件也单独计数** —— 理由同上：
   // 测试文件不参与依赖验证（它们不产生依赖边），
   // 混进分母会让「覆盖率」失真。
+  //
+  // ADR-138：**工具脚本同样单独计数** —— 理由同上：
+  // 工具脚本不参与依赖验证（ADR-138：脚本读被操作对象是脚本的本职），
+  // 而且它们不是架构的一部分 —— 混进分母会让「覆盖率」失真。
   const vendorSet = new Set(vendorFiles);
   const testSet = new Set(scanned.filter((f) => f.isTest).map((f) => f.path));
+  // ADR-138：工具脚本不参与架构判定 —— 单独计数，不混进语言分母。
+  const toolingSet = new Set(scanned.filter((f) => isToolingFile(f.path)).map((f) => f.path));
   for (const path of allFiles) {
     if (vendorSet.has(path)) continue;
     if (testSet.has(path)) continue;
+    if (toolingSet.has(path)) continue;
     const category = classifyLangCategory(path);
     counts[category] = (counts[category] ?? 0) + 1;
   }
@@ -1223,7 +1261,9 @@ function computeCoverage(
     verifiable,
     // ADR-066：`verifiedFiles` 只数**生产代码**里参与 import 图的文件 ——
     // 测试文件不产生依赖边，算进来会虚报「验证了这么多」。
-    verifiedFiles: scanned.filter((f) => !f.isTest).length,
+    //
+    // ADR-138：工具脚本同理 —— 它们不产生依赖边，也不算进「已验证」。
+    verifiedFiles: scanned.filter((f) => !f.isTest && !isToolingFile(f.path)).length,
     unverifiableCodeFiles,
     nonCodeFiles,
     totalFiles: allFiles.length,
@@ -1235,6 +1275,10 @@ function computeCoverage(
     // 它们没参与验证，但它们**不是**「这个工具没判据」，
     // 而是「这些是测试，不构成架构耦合」。
     testFiles: testSet.size,
+    // ADR-138：工具脚本**单独计数** ——
+    // 它们没参与验证，但它们**不是**「这个工具没判据」，
+    // 而是「这些是开发期工具脚本，不是架构的一部分」。
+    toolingFiles: toolingSet.size,
   };
 }
 

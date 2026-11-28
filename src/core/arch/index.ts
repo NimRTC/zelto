@@ -34,6 +34,8 @@ export { buildArchitectureReport, findCycles } from './report.js';
 
 export { isTestFile, partitionTestFiles } from './test-files.js';
 
+export { isToolingFile, partitionToolingFiles } from './tooling-files.js';
+
 export {
   buildArchRelaxSnippet,
   filterDesignScopedDeviations,

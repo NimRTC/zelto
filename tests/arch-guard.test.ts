@@ -72,6 +72,8 @@ function emptyCoverage(): LangCoverage {
     vendorFiles: 0,
     // ADR-066：测试文件数
     testFiles: 0,
+    // ADR-138：工具脚本数
+    toolingFiles: 0,
   };
 }
 
