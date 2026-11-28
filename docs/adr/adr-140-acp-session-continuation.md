@@ -1,6 +1,6 @@
 # ADR-140：ACP 续跑必须续同一个会话，不许重开
 
-**状态**：已决（2026-11-28）· 待落地
+**状态**：已决（2026-11-28）· 已落地（提交 `0cd2398`）
 **日期**：2026-11-28
 **相关**：ADR-133（ACP 执行器）、ADR-013（提问回路）、ADR-139（续跑段重装守卫）、ADR-055（超时续跑）、C1/C3/C4/C9
 
@@ -365,3 +365,14 @@ fs/terminal 回调全关），所以传空数组。
   `packages/provider-acp/src/server/adapter.ts`
 - 本仓库：`docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`、
   `src/adapters/acp/index.ts`
+
+---
+
+## 版本追溯
+
+| 字段 | 值 |
+| --- | --- |
+| 所属版本号 | v0.7.1 |
+| 关联 ADR 编号 | ADR-140 |
+| 提交哈希 | 0cd2398f094d64a5fe229bb7a272a3565a2e53c8 |
+| 验证方式 | [tests/adr-140-acp-session-continuation.test.ts 用例全绿 + npm test 全绿 + npm run lint 通过 + 人工复核] |

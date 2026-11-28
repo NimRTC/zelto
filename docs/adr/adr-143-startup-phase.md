@@ -1,6 +1,6 @@
 # ADR-143：启动阶段要用真实信号报，不能被空转超时误杀
 
-**状态**：已决（2026-11-28）· 已落地
+**状态**：已决（2026-11-28）· 已落地（提交 `342d954`）
 **日期**：2026-11-28
 **相关**：ADR-055（超时续跑）、ADR-083（多 harness 判定内核）、ADR-133（ACP 执行器）、
 C1/C3/C4
@@ -380,3 +380,14 @@ getStartupPhase?(sessionId: string): string | null;
 - T3 Code `docs/internals/01_architecture.md`（「Turn completion and checkpoints」）
 - 本仓库：`docs/adr-055-timeout-kills-tree-and-continues.md`、`docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`、
   `src/adapters/acp/index.ts`、`src/adapters/acp/events.ts`
+
+---
+
+## 版本追溯
+
+| 字段 | 值 |
+| --- | --- |
+| 所属版本号 | v0.7.1 |
+| 关联 ADR 编号 | ADR-143 |
+| 提交哈希 | 342d9546337618bd5237c31b0abd29c4f5c16599 |
+| 验证方式 | [tests/adr-143-startup-phase.test.ts 16 个用例全绿 + npm test 全绿 + npm run lint 通过 + 人工复核] |

@@ -1,6 +1,6 @@
 # ADR-142：配额耗尽是独立停机类，不许自动重试
 
-**状态**：已决（2026-11-28）· 已落地
+**状态**：已决（2026-11-28）· 已落地（提交 `a538011`）
 **日期**：2026-11-28
 **相关**：ADR-035（adapter 成本与预算闸门）、ADR-047（agent 失败解卡）、ADR-052（重试预算）、
 C1/C3/C4
@@ -315,3 +315,14 @@ options?: { maxRetries?: number; agentOutput?: string }
 - 本仓库：`docs/adr-035-adapter-cost-budget-loop.md`、
   `docs/adr-047-agent-failure-unsticks-slice.md`、
   `docs/adr-052-retry-budget-reset.md`、`src/core/stall/`、`src/cli/commands/run-support.ts`
+
+---
+
+## 版本追溯
+
+| 字段 | 值 |
+| --- | --- |
+| 所属版本号 | v0.7.1 |
+| 关联 ADR 编号 | ADR-142 |
+| 提交哈希 | a538011521ddb6f38e908eaf99572daaaa989138 |
+| 验证方式 | [tests/adr-142-usage-limit-stall-class.test.ts 24 个用例全绿 + npm test 全绿 + npm run lint 通过 + 人工复核] |

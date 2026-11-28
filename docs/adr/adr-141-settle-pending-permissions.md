@@ -1,6 +1,6 @@
 # ADR-141：终止路径必须结算挂起的 permission 请求
 
-**状态**：已决（2026-11-28）· 已落地
+**状态**：已决（2026-11-28）· 已落地（提交 `d7a623b`）
 **日期**：2026-11-28
 **相关**：ADR-133（ACP 执行器）、ADR-083（多 harness 判定内核）、C1/C3/C4/C9
 
@@ -317,3 +317,14 @@ key 是 JSON-RPC 请求 id。
 - T3 Code PR #21439（`fix(acp): recover sessions after cancellation fails or stalls`）
 - 本仓库：`docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`、
   `src/adapters/acp/index.ts`
+
+---
+
+## 版本追溯
+
+| 字段 | 值 |
+| --- | --- |
+| 所属版本号 | v0.7.1 |
+| 关联 ADR 编号 | ADR-141 |
+| 提交哈希 | d7a623b6c745b883eb901540f800578558637082 |
+| 验证方式 | [tests/adr-141-settle-permissions.test.ts 18 个用例全绿 + npm test 全绿 + npm run lint 通过 + 人工复核] |

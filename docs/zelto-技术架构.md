@@ -1,4 +1,4 @@
-﻿# zelto 技术架构
+# zelto 技术架构
 
 > 版本: v0.3.0 · 最后更新: 2026-11-04
 > 项目定位见 `docs/zelto-项目目标.md`；功能全貌见 `docs/zelto-场景功能地图.md`
@@ -367,6 +367,18 @@ interface HarnessMetaPort { // 执行器元信息
 }
 ```
 
+**ACP 相关的能力位在 `ExecutorAdapter` 上**（`src/core/ports/executor.ts`）：
+
+| 能力位 | 取值 | ADR |
+|---|---|---|
+| `capabilities.sessionContinuation` | `'load-resume'` \| `'new-session'` | 140 —— 续跑能力的**上限**，不是运行时结论 |
+| `capabilities.writeGuard` | `'hook'` \| `'permission'` | 133 —— C9 主判定点在哪个协议层 |
+| `getStartupPhase?(sessionId)` | `'launch'` \| `'initialize'` \| `'session'` \| `'authenticating'` \| `null` | 143 —— **可选**：只有 ACP 有协议握手可观察 |
+
+`getStartupPhase` 是**纯读取**（读当前状态不改任何行为），
+所以放在端口上没问题；`sessionContinuation` 是**静态声明**，
+调用方要在 `adapter.resume()` **之前**知道，所以也放在端口上。
+
 ### 3.12 Hook — `src/hook/`
 
 **文件**: `index.ts`
@@ -567,6 +579,44 @@ CLI 入口：`zelto arch check [--design <id>] [--root <dir>] [--strict] [--json
 这次变化，自动化会把破坏也一起签掉，那道闸门就白设了。
 回归检出同样留了人的出口：`--accept-regression` 显式放行并留事件
 （与 ADR-015 的 hotfix `--yes` 同一思路）。
+
+### 3.22 ACP 执行器的四条协议纪律（ADR-140 / 141 / 142 / 143）
+
+这四条都落在 **ACP 执行器**（`src/adapters/acp/`）这一层，共同点是：
+**zelto 与 agent 之间的协议边界**，而不是判定内核。它们借自 T3 Code 的实现，
+但每条都按 zelto 的不变量重新推导过。
+
+| ADR | 纪律 | 为什么 | 落点 |
+|---|---|---|---|
+| 140 | 续跑**必须续同一个会话** | 静默退回 `session/new` = 人以为 agent 记得刚才讨论过什么 | `adapters/acp/continuation.ts` + `session/resume` \| `session/load` 优先序 |
+| 141 | 终止路径**必须结算**挂起的 permission 请求 | 「既没允许也没拒绝」的写入在事件流里查不到 | `adapters/acp/permission.ts` 的归属权协议（`resolve(requestId, owner)`） |
+| 142 | `usage_limit` 是**独立停机类**，不可自动解决 | 配额墙不会因为重试而恢复 —— 重试只是白烧 token | `core/stall/usage-limit.ts`（纯函数）+ `core/stall/classifier.ts` |
+| 143 | 启动阶段**只由协议里程碑驱动** | 慢启动与真卡住在信号上完全一样，zelto 区分不了 | `adapters/acp/startup-phase.ts`（封闭集合，绝不用计时器） |
+
+**为什么这四条不违反 C3**：它们都**不是判定**。
+判定内核（写集匹配、保护域、策略规则）仍然只在 `src/hook/` 里，
+这四条改的是**协议层怎么跟 agent 说话**、以及**什么时候把 agent 的沉默
+当成异常**。反过来，ADR-143 的启动阶段豁免**不是**「放宽判定」——
+豁免的是「**空转超时**」这个**运行健康度**信号，判定本身一次没少。
+
+**为什么 ADR-142 落在 `core/` 而 ADR-140/141/143 落在 `adapters/`**：
+配额识别是**纯函数**（读一段输出文本，判「这是不是配额墙」），
+与 adapter 无关，所以进 `core/stall/`（C3：不调模型不触网）。
+另外三条都要**发协议请求**、**管会话生命周期**，必须待在 adapter 里。
+
+**为什么 ADR-141 用「归属权」而不是「谁先取到谁写」**：
+判定方（agent 正在等人授权）与终止方（超时 / 人手停 / 进程退出）
+**可能同时在跑**。用「谁先取到谁写」会出现「两边都判完了，
+事件流里两条 decision」或「两边都判不了，谁都没写」。
+归属权协议让**恰好一方**拿到决定权，并保证**恰好一条** `policy.decision` 落盘。
+
+**为什么启动阶段要「对人可见」**：
+`startupPhase` 落在**两处** —— `zelto run` 的进度行（`getStartupPhase`，
+端口上的**可选**方法）与会话文件（`.zelto/sessions/<id>.json`）。
+前者让人实时看到「它现在卡在握手上还是鉴权上」，
+后者让事后审计能回答「那一轮启动花了多久」。
+端口方法做成**可选**是因为 hook 路线的 adapter 没有协议握手 ——
+强塞一个 `null` 上去等于「留了个运行时才炸的能力」（ADR-141 的同一原则）。
 
 ---
 
@@ -890,6 +940,10 @@ classifyStall(signal): StallClass
 isAutoResolvable(stallClass): boolean
 isSliceStalled(slice): boolean
 detectUsageLimit(output): UsageLimitSignal   // ADR-142：配额识别（纯函数）
+
+// Executor adapter（ACP 相关能力位见 ADR-140 / 133 / 143）
+AdapterMeta.capabilities.sessionContinuation: 'load-resume' | 'new-session'
+ExecutorAdapter.getStartupPhase?(sessionId): string | null
 
 // Halt
 HaltStore.request(scope, requestedBy, reason): HaltRequest
