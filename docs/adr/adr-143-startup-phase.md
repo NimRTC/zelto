@@ -1,6 +1,6 @@
 # ADR-143：启动阶段要用真实信号报，不能被空转超时误杀
 
-**状态**：已决（2026-11-28）· 待落地
+**状态**：已决（2026-11-28）· 已落地
 **日期**：2026-11-28
 **相关**：ADR-055（超时续跑）、ADR-083（多 harness 判定内核）、ADR-133（ACP 执行器）、
 C1/C3/C4
@@ -186,23 +186,47 @@ zelto 的口径：**拿到第一个 `session/update` 通知就算「能干别的
 豁免的代价是：agent 卡在 `initialize` 不回包 → 空转计时器不管它 →
 **永远不杀**。
 
-所以补一道：**每个协议请求自带一个超时**。
-`initialize` / `session/new` / `session/load` / `session/resume` / `session/prompt`
+所以补两道：
+
+**(a) 握手请求自带超时** ——
+`initialize` / `session/new` / `session/load` / `session/resume`
 各自有超时（用现有的 `timeoutMs`），超了就当失败。
 
+**(b) 启动阶段有自己的上界** ——
+`startupTimeoutMs`（默认 15 分钟）：从接到指令到**第一次产出**，
+最多给这么久。超了就是「启动卡住」，单独一条出口
+（`handleStartupTimeout()`），写出的提示与空转超时**不同**。
+
+**为什么 `session/prompt` 不套请求级超时**：ACP 里 `session/prompt` 是
+**整轮**的时长（agent 干完活才回 `stopReason`）—— 套请求级超时会杀掉
+**长轮次**（有进展但做得久）。那与 ADR-055 的空转超时语义冲突。
+
 **为什么这不是重复**：两者管的是**不同的东西**：
-- 请求级超时：管「**这一把请求**有没有回来」；
+- 请求级超时：管「**这一把握手请求**有没有回来」；
+- 启动上界：管「**启动总共多久**」（启动阶段没有进展信号，
+  只能按总时长计）；
 - 空转超时：管「**这一轮工作**有没有在推进」。
 
-`session/prompt` 返回之后，工作才开始 —— 那之后靠 `tool_call` 判定进展。
-`session/prompt` 还没返回时 → 靠请求级超时。
+**所以交接点是「第一条 `session/update`」**：
+- 收到之前 → 启动上界管（阶段还没结束）；
+- 收到之后 → 空转超时管（且此时已有 `tool_call` 可作进展信号）。
 
-**所以两者的交接点是「prompt 返回」**：
-- prompt 返回之前 → 请求级超时管；
-- prompt 返回之后 → 空转超时管（且此时已有 `tool_call` 可作进展信号）。
+**为什么不让两个计时器同时活着**：同一时刻两个都能触发 →
+「谁先写状态」变成竞态（状态可能是 timeout 也可能是 failed），
+判定不确定（C3 要求确定性判定）。
 
-**这条也解释了为什么启动阶段可以豁免** ——
-启动阶段里的每个步骤都有一个「正在被等待的请求」，都被请求级超时管着。
+### 决策五之二：失败优先于退出码
+
+失败是 **zelto 这一侧**判定的（握手超时、鉴权失败、协议版本不符……），
+而**子进程可能自己正常退出**（退出码 0）。
+
+只看退出码 → 「这一轮失败了」会被读成「这一轮成功了」。
+后果是实打实的：CLI 走进「成功」分支，门禁照跑、签字照走 ——
+而实际上 agent **一行代码都没写**。
+
+所以：**退出码 = 退出码 + 失败记录** 一起判。
+`failSession()` 记下原因，`handleExit()` 把对外的退出码从 0 改成 1，
+`waitForExit()` 返回纠正后的值。
 
 ### 决策六：阶段要**对人可见**
 
@@ -259,10 +283,14 @@ getStartupPhase?(sessionId: string): string | null;
 
 1. **启动阶段延长空转超时**（给一个魔法数字）：
    决策四。「给多久」在不同 agent 上没有共同答案。
-2. **启动阶段豁免空转超时，但不补请求级超时**：
+2. **启动阶段豁免空转超时，但不补兜底**：
    决策五的前半。代价是「agent 卡在 initialize」→ **永远不杀**，
    切片卡在 running 直到看门狗（ADR-074）来收。这不是「更安全」，
    这是「换个地方卡住」。
+   > **落地补充**：这条在落地时改成了「豁免 + **两道**兜底」——
+   > 握手请求级超时（挡「协议卡住」）+ 启动上界（挡「启动卡住」）。
+   > 单靠请求级超时不够：握手完了但 agent 一个字都不说，
+   > 那个空档里没有任何请求在等待 —— 请求级超时管不到它。
 3. **用计时器推导阶段**（如「发起后 5 秒还在等 → 阶段是 `initialize`」）：
    T3 明文拒绝（「never a timer」）。而且它把「阶段」变成了「猜的」。
 4. **给 ACP 加更多阶段**（如「加载 MCP server」「读文件」）：
@@ -280,12 +308,12 @@ getStartupPhase?(sessionId: string): string | null;
 
 | 文件 | 改动 |
 |---|---|
-| `src/adapters/acp/index.ts` | 启动阶段状态；阶段推进点；豁免空转超时；请求级超时 |
-| `src/adapters/acp/startup-phase.ts`（**新增**） | 阶段类型 + 阶段与「是否豁免空转」的纯计算（C3） |
+| `src/adapters/acp/index.ts` | 启动阶段状态；阶段推进点；豁免空转超时；握手请求级超时；启动上界；失败优先于退出码 |
+| `src/adapters/acp/startup-phase.ts`（**新增**） | 阶段类型 + 阶段与「是否豁免空转」的纯计算（C3）+ 启动上界的默认值 |
 | `src/core/ports/executor.ts` | `ExecutorAdapter` 加**可选**方法 `getStartupPhase?()` |
 | `src/adapters/session-store.ts` | 会话文件加 `startupPhase` 字段（可选） |
 | `src/cli/commands/core-slice.ts` | 进度输出显示阶段 |
-| `tests/acp-adapter.test.ts` | 阶段的用例 |
+| `tests/adr-143-startup-phase.test.ts`（**新增**） | 17 条用例（纯函数 + 端到端 + 源码检查） |
 
 **不涉及**：判定内核（`src/hook/`）、写集匹配、保护域、
 事件**类型**清单、事件契约 schema、端口的**必填**部分。
@@ -311,9 +339,10 @@ getStartupPhase?(sessionId: string): string | null;
    验证方式：单测断言「在启动阶段 + 无进展」**不会**触发空转超时；
    且「不在启动阶段 + 无进展」**会**触发。
    > **为什么这条不能省**：这是本 ADR 要修的病灶本身。
-5. **协议请求有独立超时** ——
+5. **协议卡住有兜底，不会永不终止** ——
    验证方式：单测让 mock agent **不回** `initialize` 回包，
-   断言在超时后**失败**（而不是永远挂着）。
+   断言在超时后**失败**（而不是永远挂着）；
+   且断言「启动阶段一直不产出 → 启动上界到了就被杀」。
    > **为什么这条不能省**：豁免空转超时的代价就是这一条。
    > 没有它，「agent 卡在 initialize」= 永不终止。
 6. **阶段对人可见** ——
@@ -326,8 +355,14 @@ getStartupPhase?(sessionId: string): string | null;
 8. **会话文件加的是可选字段** ——
    验证方式：单测用一个**没有** `startupPhase` 的老会话文件，
    断言读出来不报错、该字段为 undefined。
-9. **现有 ACP 单测与端到端测试全绿、`npm test` 全绿、`npm run lint` 通过。**
-10. **不越界** —— 改动只在写集内。
+9. **失败优先于退出码** ——
+   验证方式：单测让握手超时（子进程**正常退出**，退出码 0），
+   断言 `waitForExit()` 返回**非 0**、会话状态是 `failed`。
+   > **为什么这条不能省**：只看退出码的话，「这一轮失败了」会被读成
+   > 「这一轮成功了」—— CLI 走成功分支、门禁照跑、签字照走，
+   > 而 agent 一行代码都没写。
+10. **现有 ACP 单测与端到端测试全绿、`npm test` 全绿、`npm run lint` 通过。**
+11. **不越界** —— 改动只在写集内。
 
 ## 一个自查提醒（实施时不要按直觉走）
 
@@ -343,5 +378,5 @@ getStartupPhase?(sessionId: string): string | null;
 
 - T3 Code `docs/internals/03_providers.md`（「Startup phases come from real signals」）
 - T3 Code `docs/internals/01_architecture.md`（「Turn completion and checkpoints」）
-- 本仓库：`docs/adr/adr-055-*`、`docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`、
+- 本仓库：`docs/adr-055-timeout-kills-tree-and-continues.md`、`docs/adr/adr-133-acp-executor-and-permission-as-write-guard.md`、
   `src/adapters/acp/index.ts`、`src/adapters/acp/events.ts`

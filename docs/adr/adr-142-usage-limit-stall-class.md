@@ -312,6 +312,6 @@ options?: { maxRetries?: number; agentOutput?: string }
 ## 参考
 
 - T3 Code `docs/internals/03_providers.md`（「Usage limits」）
-- 本仓库：`docs/adr/adr-035-adapter-cost-budget-loop.md`、
-  `docs/adr/adr-047-agent-failure-unsticks-slice.md`、
-  `docs/adr/adr-052-retry-budget-reset.md`、`src/core/stall/`、`src/cli/commands/run-support.ts`
+- 本仓库：`docs/adr-035-adapter-cost-budget-loop.md`、
+  `docs/adr-047-agent-failure-unsticks-slice.md`、
+  `docs/adr-052-retry-budget-reset.md`、`src/core/stall/`、`src/cli/commands/run-support.ts`

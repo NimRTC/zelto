@@ -77,6 +77,13 @@ import {
   type AcpSessionMode,
 } from './continuation.js';
 import { extractAcpCost, extractAcpText, isProgressUpdate } from './events.js';
+// ADR-143：启动阶段（只从真实信号来，绝不用计时器）
+import {
+  DEFAULT_STARTUP_TIMEOUT_MS,
+  clearPhaseOnFirstOutput,
+  shouldExemptIdleTimeout,
+  type AcpStartupPhase,
+} from './startup-phase.js';
 import {
   PendingPermissionRegistry,
   TERMINATED_BASIS,
@@ -97,6 +104,16 @@ export interface AcpAdapterOptions {
   env?: NodeJS.ProcessEnv;
   /** 空转超时（毫秒）—— 没有进展就这么久就杀掉 */
   timeoutMs?: number;
+  /**
+   * 启动阶段的**上界**（毫秒）—— ADR-143。
+   *
+   * 启动阶段**豁免**空转超时（决策四），代价是「启动卡住」不再被
+   * 空转超时杀。这个上界就是那道兜底。
+   *
+   * **它不决定阶段是什么** —— 阶段只由协议信号推进
+   * （T3 的「never a timer」）；它只是给「启动总共多久」一个上界。
+   */
+  startupTimeoutMs?: number;
   /** 失败重试次数 */
   maxRetries?: number;
   /** 主仓库根 —— policy / 预约 / 事件流都在这里 */
@@ -149,6 +166,8 @@ const ADAPTER_META: AdapterMeta = {
 
 /** 一次 ACP 运行的状态。 */
 interface AcpSessionState {
+  /** 会话 id（zelto 侧的 session key）—— 计时器重算要用 */
+  sessionId: string;
   child: ChildProcess;
   /** ACP 侧会话 id（`session/new` 返回的）—— 续跑靠它 */
   acpSessionId: string | null;
@@ -193,6 +212,47 @@ interface AcpSessionState {
    * 不是进程号的事实。
    */
   pendingPermissions: PendingPermissionRegistry;
+  /**
+   * 启动阶段（ADR-143）—— 只从真实信号来，绝不用计时器。
+   *
+   * `null` = 不在启动阶段（agent 已经能干别的了）。
+   *
+   * **为什么需要它**：ACP agent 的启动阶段**不发 `tool_call`** ——
+   * 初始化模型连接、加载 MCP server、鉴权、读项目上下文，这些都不是
+   * 工具调用，是 agent **进程内部**的事。没有这个字段，
+   * **正常启动但比较慢**的 agent 会被空转超时**误杀**（白跑一轮）。
+   */
+  startupPhase: AcpStartupPhase | null;
+  /**
+   * 是否已经收到过 `session/update` 通知（ADR-143 决策三）。
+   *
+   * 收到第一条 → 阶段清空（「provider 能干别的了」）。
+   */
+  sawFirstUpdate: boolean;
+  /**
+   * 启动阶段的**上界计时器**（ADR-143 决策四的代价）。
+   *
+   * 启动阶段**豁免**空转超时 —— 代价是「agent 卡在启动」不再被
+   * 空转超时杀。这个计时器就是那个**上界**：启动阶段总共不超过这么久。
+   *
+   * 撤掉函数 —— 阶段结束时（收到第一条 `session/update`）调用。
+   */
+  startupDeadlineClear: (() => void) | null;
+  /**
+   * 这一轮**失败**的原因（ADR-143 落地补充）。
+   *
+   * ## 为什么需要它
+   *
+   * 失败是 zelto 这一侧判定的（请求超时、鉴权失败、协议版本不符……），
+   * 而**子进程可能自己正常退出**（退出码 0）。
+   *
+   * 那时若只看退出码 → 「这一轮失败了」会被读成「这一轮成功了」。
+   * 后果是实打实的：CLI 走进「成功」分支，门禁照跑，签字照走 ——
+   * 而实际上 agent 一行代码都没写。
+   *
+   * **所以退出码要由「退出码 + 失败记录」一起判**，不能只看退出码。
+   */
+  failure: string | null;
 }
 
 export class AcpAdapter implements ExecutorAdapter {
@@ -203,6 +263,16 @@ export class AcpAdapter implements ExecutorAdapter {
   private readonly cwd: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly timeoutMs: number;
+  /**
+   * 启动阶段的上界（毫秒）—— ADR-143 决策四的兜底。
+   *
+   * **为什么与 `timeoutMs` 分开**：两者管的是**不同的东西** ——
+   * - `startupTimeoutMs`：「它**根本没起步**」（启动阶段）；
+   * - `timeoutMs`：「它在跑，但**没有进展**」（工作阶段）。
+   *
+   * 混成一个 → 事后审计分不清「agent 干到一半卡住」与「agent 连话都没说上」。
+   */
+  private readonly startupTimeoutMs: number;
   private readonly maxRetries: number;
   private readonly projectRoot: string;
   private readonly sliceId: string | null;
@@ -214,6 +284,14 @@ export class AcpAdapter implements ExecutorAdapter {
   private readonly sessions = new Map<string, AcpSessionState>();
   private readonly sessionData = new Map<string, PersistentSessionData>();
   private readonly timeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * 启动阶段的上界计时器（ADR-143）—— 按会话记。
+   *
+   * **为什么与 `timeouts`（空转超时）分开记**：两者是**不同**的停机，
+   * 触发时写出的状态与提示也不同 —— 混在一张表里就没法分清
+   * 「启动卡住」与「跑着没进展」。
+   */
+  private readonly startupTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly progressIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(options: AcpAdapterOptions = {}) {
@@ -221,6 +299,7 @@ export class AcpAdapter implements ExecutorAdapter {
     this.cwd = options.cwd ?? process.cwd();
     this.env = options.env ?? process.env;
     this.timeoutMs = options.timeoutMs ?? 900_000;
+    this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
     this.maxRetries = options.maxRetries ?? 2;
     this.projectRoot = options.projectRoot ?? process.cwd();
     this.sliceId = options.sliceId ?? null;
@@ -391,6 +470,10 @@ export class AcpAdapter implements ExecutorAdapter {
       cwd: workDir,
       resumedFrom: null,
       runId: opts.runId,
+      // ADR-143：会话一落盘就是「启动中（进程已起）」——
+      // 跨进程看（`zelto status` / 驾驶舱）时立刻知道它在启动，
+      // 而不是只看到一个「running 但不知道在干什么」的会话。
+      startupPhase: 'launch',
     };
     saveSession(sessionData);
     this.sessionData.set(sessionId, sessionData);
@@ -423,6 +506,7 @@ export class AcpAdapter implements ExecutorAdapter {
     });
 
     const state: AcpSessionState = {
+      sessionId,
       child,
       acpSessionId: null,
       startedAt: nowIso,
@@ -438,6 +522,12 @@ export class AcpAdapter implements ExecutorAdapter {
       sessionModeReady,
       resolveSessionMode,
       pendingPermissions: new PendingPermissionRegistry(),
+      // ADR-143：spawn 之后、`initialize` 发出之前 = 'launch'。
+      // 这是**协议事实**（子进程已起、还没握手），不是计时器推出来的。
+      startupPhase: 'launch',
+      sawFirstUpdate: false,
+      startupDeadlineClear: null,
+      failure: null,
     };
     this.sessions.set(sessionId, state);
 
@@ -450,6 +540,10 @@ export class AcpAdapter implements ExecutorAdapter {
     });
 
     void this.connect(sessionId, state, sessionData, instructions, opts.resumeAcpSessionId ?? null);
+
+    // ADR-143：启动阶段的**上界**（决策四的兜底）——
+    // 启动阶段豁免了空转超时，所以「它根本没起步」这条路径由它兜。
+    this.armStartupDeadline(state);
 
     this.resetIdleTimer(sessionId);
 
@@ -524,6 +618,135 @@ export class AcpAdapter implements ExecutorAdapter {
    * 整个对话历史回放给 client，而 zelto 的提问检测是纯字符串解析 ——
    * 回放出来的旧问题标记会被再解析一次 → 无限挂起。
    */
+  /**
+   * 发一个**带超时**的协议请求（ADR-143 决策五）。
+   *
+   * ## 为什么需要它
+   *
+   * 启动阶段豁免了空转超时（决策四）—— 代价是：
+   * 「agent 卡在 `initialize` 不回包 → 空转计时器不管它 → **永远不杀**」。
+   *
+   * ## 只用于**握手请求**（决策五的「请求级超时」）
+   *
+   * `initialize` / `session/new` / `session/load` / `session/resume`
+   * —— 它们的语义是「建立连接」，**必须很快回来**。
+   *
+   * **`session/prompt` 不用它** —— 因为在 ACP 里 `session/prompt` 是
+   * **整轮**的时长（agent 干完活才回 `stopReason`），给它套一个
+   * `timeoutMs` 会把**长轮次**（有进展但做得久）也杀掉 ——
+   * 那与 ADR-055 的空转超时语义冲突。
+   *
+   * `session/prompt` 的兜底是**启动阶段的上界**（见 `startupTimeoutMs`）：
+   * 启动阶段一结束（收到第一条 `session/update`）就换成空转超时接管。
+   *
+   * ## 为什么这不是重复
+   *
+   * 两者管的是**不同的东西**：
+   * - 请求级超时：管「**这一把握手请求**有没有回来」；
+   * - 空转超时：管「**这一轮工作**有没有在推进」。
+   *
+   * @param request 发请求的函数
+   * @param label 请求名（超时信息里要说清是哪一把）
+   */
+  private async requestWithTimeout<T>(
+    request: () => Promise<T>,
+    label: string,
+  ): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        request(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`ACP 请求超时（${label}）：${this.timeoutMs}ms 没有回包`));
+          }, this.timeoutMs);
+          (timer as unknown as { unref?: () => void }).unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * 启动阶段的**上界计时器**（ADR-143 决策四的代价）。
+   *
+   * ## 为什么需要它
+   *
+   * 启动阶段**豁免**空转超时 —— 代价是：
+   * 「握手完了但 agent 一个字都不说」→ 空转计时器不管它 → **永远不杀**。
+   *
+   * 这个计时器就是那个**上界**。它**不决定阶段是什么** —— 阶段只由
+   * 协议信号推进（T3 的「never a timer」）；它只是给「启动阶段总共
+   * 多久」一个上界。
+   *
+   * ## 与空转超时的交接点
+   *
+   * 收到**第一条** `session/update` → 阶段清空 → **撤掉**这个计时器
+   * （`state.startupDeadlineClear`）—— 之后由空转超时接管。
+   *
+   * **为什么不让两个计时器同时活着**：那会出现「同一时刻两个都能触发」
+   * → 「谁先写状态」变成竞态（状态可能是 timeout 也可能是 failed），
+   * 判定不确定（C3 要求确定性判定）。
+   */
+  private armStartupDeadline(state: AcpSessionState): void {
+    const sessionId = state.sessionId;
+    const clear = (): void => {
+      const existing = this.startupTimeouts.get(sessionId);
+      if (existing) {
+        clearTimeout(existing);
+        this.startupTimeouts.delete(sessionId);
+      }
+      state.startupDeadlineClear = null;
+    };
+
+    state.startupDeadlineClear = clear;
+
+    const timer = setTimeout(() => {
+      this.handleStartupTimeout(sessionId);
+    }, this.startupTimeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.startupTimeouts.set(sessionId, timer);
+  }
+
+  /**
+   * 启动阶段超时 —— 启动卡住（不是「跑着没进展」）。
+   *
+   * **为什么单独一个出口**：两种停机是**不同的事** ——
+   * - 空转超时：「它在跑，但**没有进展**」（工作阶段）；
+   * - 启动超时：「它**根本没起步**」（启动阶段）。
+   *
+   * 混成同一个事件 → 事后审计分不清「agent 干到一半卡住」与
+   * 「agent 连话都没说上」。人看到的提示也不同。
+   */
+  private handleStartupTimeout(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    // 已经在工作阶段了 → 不归这条管（空转超时才是那儿的判据）。
+    if (session.startupPhase === null) return;
+
+    session.terminated = 'timeout';
+
+    // ADR-141：先结算挂起的 permission 请求，再杀进程。
+    this.settlePendingPermissions(sessionId, 'timeout');
+
+    const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
+    if (data && data.status === 'running') {
+      data.status = 'timeout';
+      data.output.push(
+        `[zelto: startup timeout — no output within ${this.startupTimeoutMs}ms — killed]`,
+      );
+      saveSession(data);
+    }
+    if (this.onOutput) {
+      this.onOutput(
+        sessionId,
+        `\n[zelto: startup timeout — no output within ${this.startupTimeoutMs}ms — killed]\n`,
+      );
+    }
+    this.killSessionTree(sessionId, session.child.pid);
+  }
+
   private async connect(
     sessionId: string,
     state: AcpSessionState,
@@ -685,6 +908,28 @@ export class AcpAdapter implements ExecutorAdapter {
         sessionData.output.push(text);
         if (this.onOutput) this.onOutput(sessionId, text);
       }
+
+      // ADR-143 决策三：**收到第一条 `session/update` → 启动阶段结束**。
+      //
+      // T3 的规则：「Clear it the moment the provider can be doing something else.」
+      //
+      // 为什么不是「第一个 tool_call」：太晚了。
+      // `session/update` 里先来的是 `agent_message_chunk`（agent 开始说话了）
+      // —— 那已经说明 agent **活着且在动**。
+      //
+      // 为什么不是「prompt 返回」：更晚。agent 可能先说一段话、
+      // 再调工具、最后才结束这一轮。
+      if (!state.sawFirstUpdate) {
+        state.sawFirstUpdate = true;
+        this.setStartupPhase(state, clearPhaseOnFirstOutput(state.startupPhase, true));
+        // ADR-143 决策五：**交接点** —— 阶段结束，「启动上界」就**让位**
+        // 给空转超时（那个按 `tool_call` 记进展，语义更准）。
+        //
+        // 不让位的话两个计时器会**同时**活着 → 同一时刻可能两个都触发
+        // → 「谁先写状态」变成竞态（状态可能是 timeout 也可能是 failed）。
+        state.startupDeadlineClear?.();
+      }
+
       // 进展信号：任何 tool_call / tool_call_update 都算「agent 在动」。
       // 这比 hook 路线直接 —— hook 路线要靠 hook 进程写事件来喂。
       if (isProgressUpdate(update)) {
@@ -705,11 +950,19 @@ export class AcpAdapter implements ExecutorAdapter {
     let authMethods: AcpAuthMethod[] = [];
 
     try {
-      const init = await connection.agent.request('initialize', {
-        protocolVersion: PROTOCOL_VERSION,
-        clientCapabilities: {},
-        clientInfo: { name: 'zelto', version: ADAPTER_META.version },
-      });
+      // ADR-143：发出 `initialize` 之前推进到 'initialize' ——
+      // 这是一个**语义唯一的被等待的请求**（T3 的规则）。
+      this.setStartupPhase(state, 'initialize');
+
+      const init = await this.requestWithTimeout(
+        () =>
+          connection.agent.request('initialize', {
+            protocolVersion: PROTOCOL_VERSION,
+            clientCapabilities: {},
+            clientInfo: { name: 'zelto', version: ADAPTER_META.version },
+          }),
+        'initialize',
+      );
 
       // ── 版本校验（ADR-133 已决：拒绝，不降级）──────────────────
       //
@@ -748,23 +1001,35 @@ export class AcpAdapter implements ExecutorAdapter {
       const mode = decideSessionMode(capability, resumeAcpSessionId);
       state.sessionMode = mode;
 
+      // ADR-143：准备建会话 → 推进到 'session'（`session/new`|`load`|`resume`
+      // 是**语义唯一的被等待的请求**）。
+      this.setStartupPhase(state, 'session');
+
       if (mode === 'resume') {
-        await connection.agent.request('session/resume', {
-          sessionId: resumeAcpSessionId as string,
-          cwd: this.cwd,
-          // `mcpServers` 是**可选**的 —— 不传 = 「沿用会话原有的」。
-          // zelto 从不给 agent 配 MCP server（ADR-133 决策四），不传更一致。
-        });
+        await this.requestWithTimeout(
+          () =>
+            connection.agent.request('session/resume', {
+              sessionId: resumeAcpSessionId as string,
+              cwd: this.cwd,
+              // `mcpServers` 是**可选**的 —— 不传 = 「沿用会话原有的」。
+              // zelto 从不给 agent 配 MCP server（ADR-133 决策四），不传更一致。
+            }),
+          'session/resume',
+        );
         state.acpSessionId = resumeAcpSessionId;
         sessionData.agentSessionId = resumeAcpSessionId;
       } else if (mode === 'load') {
-        await connection.agent.request('session/load', {
-          sessionId: resumeAcpSessionId as string,
-          cwd: this.cwd,
-          // `mcpServers` 是**必填**字段 —— 不传 = 违反 schema = agent 可能拒绝。
-          // zelto 不配 MCP server，所以传空数组。
-          mcpServers: [],
-        });
+        await this.requestWithTimeout(
+          () =>
+            connection.agent.request('session/load', {
+              sessionId: resumeAcpSessionId as string,
+              cwd: this.cwd,
+              // `mcpServers` 是**必填**字段 —— 不传 = 违反 schema = agent 可能拒绝。
+              // zelto 不配 MCP server，所以传空数组。
+              mcpServers: [],
+            }),
+          'session/load',
+        );
         state.acpSessionId = resumeAcpSessionId;
         sessionData.agentSessionId = resumeAcpSessionId;
       } else {
@@ -778,7 +1043,10 @@ export class AcpAdapter implements ExecutorAdapter {
           sessionData.output.push(`[zelto: ${notice}]`);
           if (this.onOutput) this.onOutput(sessionId, `\n[zelto: ${notice}]\n`);
         }
-        const session = await connection.agent.buildSession(this.cwd).start();
+        const session = await this.requestWithTimeout(
+          () => connection.agent.buildSession(this.cwd).start(),
+          'session/new',
+        );
         state.acpSessionId = session.sessionId;
         sessionData.agentSessionId = session.sessionId;
       }
@@ -798,6 +1066,17 @@ export class AcpAdapter implements ExecutorAdapter {
       //
       // 提示词的形状与 SDK 的 `ActiveSession.prompt()` 一致：
       // 字符串 → 一个 text content block。
+      //
+      // ADR-143：阶段**不在这里**清空 —— 清空的时机是「拿到第一个
+      // `session/update` 通知」（决策三）。prompt 返回只说明 agent 收到了
+      // 指令，不代表它已经**开始干活**（它可能还要加载 MCP server、
+      // 读项目上下文 —— 这段时间它一条 tool_call 都不发）。
+      //
+      // **为什么不用请求级超时套住它**：ACP 里 `session/prompt` 是
+      // **整轮**的时长（agent 干完活才回 `stopReason`）——
+      // 套请求级超时会杀掉长轮次（有进展但做得久）。
+      // 启动阶段的兜底是**启动上界**（`armStartupDeadline`），
+      // 工作阶段的兜底是**空转超时**。
       await connection.agent.request('session/prompt', {
         sessionId: state.acpSessionId as string,
         prompt: [{ type: 'text', text: instructions }],
@@ -808,6 +1087,15 @@ export class AcpAdapter implements ExecutorAdapter {
       //
       // 认不出是鉴权问题 → 照原样报错（不猜）。
       const authHint = detectAuthRequired(message, authMethods);
+      // ADR-143：鉴权是**独立于版本协商的第二道关卡**（ADR-133 修正二）——
+      // 识别出来就把阶段标成 'authenticating'，让人知道「卡在登录」，
+      // 而不是「卡在别的地方」。
+      //
+      // **阶段是协议事实** —— 这里不是「猜它在鉴权」，
+      // 是「agent 明确说它要鉴权」。
+      if (authHint) {
+        this.setStartupPhase(state, 'authenticating');
+      }
       this.failSession(sessionId, authHint ?? `ACP 会话失败：${message}`);
     } finally {
       // 建会话失败时也要兑现信号 —— 否则续跑方会永远挂着。
@@ -838,15 +1126,97 @@ export class AcpAdapter implements ExecutorAdapter {
     this.resetIdleTimer(sessionId);
   }
 
+  // ─── 启动阶段（ADR-143）────────────────────────────────────────────────────
+
+  /**
+   * 设置启动阶段（ADR-143 决策二）。
+   *
+   * **阶段只能在这里被推进** —— 而且每个调用点都是「刚发出一个
+   * 语义唯一的协议请求」或「刚拿到它的回包」。
+   *
+   * **绝不用计时器**（T3 明文：「never a timer」）：
+   * 一旦允许计时器，「启动阶段」就退化成「启动后 X 毫秒内都算启动阶段」
+   * —— 那等于给超时加了一个宽限期，而宽限期是**拍脑袋的魔法数字**。
+   *
+   * @param phase 新阶段；null = 阶段结束（provider 能干别的了）
+   */
+  private setStartupPhase(state: AcpSessionState, phase: AcpStartupPhase | null): void {
+    if (state.startupPhase === phase) return;
+    state.startupPhase = phase;
+    // 落盘 —— 阶段要**跨进程**可见（`zelto status` / 驾驶舱 / 事后审计）。
+    //
+    // 写盘失败不阻断运行（状态是「给人看的」，不是判定的依据）。
+    this.persistStartupPhase(state, phase);
+    // 阶段变了 → 空转计时器要重算（豁免状态可能变了）。
+    //
+    // **为什么**：豁免是「当前这刻」的事实 —— 阶段结束后豁免就没了，
+    // 那时若无进展就应当按空转超时杀。计时器不重算的话，
+    // 「启动阶段」期间设的计时器会**带着旧的豁免语义**跑完。
+    this.rearmIdleTimer(state);
+  }
+
+  /** 把阶段写进会话文件（失败不阻断）。 */
+  private persistStartupPhase(state: AcpSessionState, phase: AcpStartupPhase | null): void {
+    try {
+      const data = this.sessionData.get(state.sessionId);
+      if (!data) return;
+      data.startupPhase = phase;
+      saveSession(data);
+    } catch {
+      /* 写盘失败不阻断运行 */
+    }
+  }
+
+  /**
+   * 当前处于哪个启动阶段（ADR-143 决策六）。
+   *
+   * 不在启动阶段 → `null`。
+   */
+  getStartupPhase(sessionId: string): string | null {
+    const state = this.sessions.get(sessionId);
+    if (!state) return null;
+    return state.startupPhase;
+  }
+
   // ─── 超时 ────────────────────────────────────────────────────────────────
 
   private resetIdleTimer(sessionId: string): void {
-    const existing = this.timeouts.get(sessionId);
-    if (existing) clearTimeout(existing);
-    if (!this.sessions.has(sessionId)) {
+    const state = this.sessions.get(sessionId);
+    if (!state) {
+      const existing = this.timeouts.get(sessionId);
+      if (existing) clearTimeout(existing);
       this.timeouts.delete(sessionId);
       return;
     }
+    this.rearmIdleTimer(state);
+  }
+
+  /**
+   * 重算空转计时器（ADR-143 决策四）。
+   *
+   * **空转超时在启动阶段被完全豁免** —— 不是「延长」，是「不计入」。
+   *
+   * 语义：「**不在启动阶段**且**没有进展**这么久 → 杀掉」。
+   *
+   * **为什么豁免不会导致永不超时**：启动阶段**一定会结束** ——
+   * 阶段是由协议请求推进的，而那些请求都有回包，且每个请求自带超时
+   * （决策五）。agent 卡在 `initialize` 不回包 → 那是「协议卡住」，
+   * 由请求级超时兜。
+   *
+   * **为什么在启动阶段里不设计时器**（而不是设一个更长的）：
+   * 设更长的需要一个「启动阶段该给多久」的魔法数字 ——
+   * 那在不同 agent / 网络 / 模型上根本没有共同答案。
+   */
+  private rearmIdleTimer(state: AcpSessionState): void {
+    const sessionId = state.sessionId;
+    const existing = this.timeouts.get(sessionId);
+    if (existing) clearTimeout(existing);
+    this.timeouts.delete(sessionId);
+    if (!this.sessions.has(sessionId)) return;
+
+    // 启动阶段 → **不设**空转计时器（豁免）。
+    if (shouldExemptIdleTimeout(state.startupPhase)) return;
+
     const timer = setTimeout(() => {
       this.handleTimeout(sessionId);
     }, this.timeoutMs);
@@ -912,7 +1282,7 @@ export class AcpAdapter implements ExecutorAdapter {
 
     for (const item of pending) {
       try {
-        // **抢归属权** —— 判定方可能**已经判完了**（正��写事件）。
+        // **抢归属权** —— 判定方可能**已经判完了**（正在写事件）。
         // 抢不到 → 判定方已经写了事件 → 这里**不重复写**。
         //
         // 抢到了 → 这次写入**确实没被处理** → 由我写「因终止未处理」事件。
@@ -997,6 +1367,11 @@ export class AcpAdapter implements ExecutorAdapter {
     if (session) {
       session.output.push(`[zelto: ${reason}]`);
       if (this.onOutput) this.onOutput(sessionId, `[zelto: ${reason}]`);
+      // ADR-143 落地补充：**记下失败原因**。
+      //
+      // 为什么：失败是 zelto 判定的，而子进程可能**自己正常退出**（退出码 0）。
+      // 只看退出码 → 「失败了」被读成「成功了」（CLI 走成功分支、门禁照跑）。
+      session.failure = reason;
     }
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data && data.status === 'running') {
@@ -1019,6 +1394,12 @@ export class AcpAdapter implements ExecutorAdapter {
       clearTimeout(timeout);
       this.timeouts.delete(sessionId);
     }
+    // ADR-143：启动上界也要撤 —— 会话结束了，那个计时器没有意义。
+    const startupTimer = this.startupTimeouts.get(sessionId);
+    if (startupTimer) {
+      clearTimeout(startupTimer);
+      this.startupTimeouts.delete(sessionId);
+    }
     const interval = this.progressIntervals.get(sessionId);
     if (interval) {
       clearInterval(interval);
@@ -1031,6 +1412,11 @@ export class AcpAdapter implements ExecutorAdapter {
       if (data.status === 'timeout') {
         data.status = 'timeout';
       } else if (data.status === 'running') {
+        // ADR-143 落地补充：**zelto 判定的失败优先于退出码**。
+        //
+        // 子进程可能自己正常退出（退出码 0），而这一轮其实是失败的
+        // （握手超时 / 鉴权失败 / 版本不符）—— 那时若按退出码写成
+        // 'completed'，「失败了」就被读成「成功了」。
         data.status = exitCode === 0 ? 'completed' : 'failed';
       }
       const state = this.sessions.get(sessionId);
@@ -1042,6 +1428,19 @@ export class AcpAdapter implements ExecutorAdapter {
     if (state) {
       state.exited = true;
       state.exitCode = exitCode;
+      // ADR-143 落地补充：**这一轮失败了 → 对外的退出码不能是 0**。
+      //
+      // 为什么必须在这里改（而不是在 `failSession` 里）：
+      // `failSession` 发生时进程还活着，退出码**还没定**；
+      // 而 `waitForExit` 的返回值是 CLI 判断「这一轮成功没有」的唯一依据
+      // —— 返回 0 就意味着「成功」，门禁照跑、签字照走，
+      // 而实际上 agent 一行代码都没写。
+      //
+      // 「失败」的退出码取 1 —— 与 `waitForExit` 里 `child.on('error')`
+      // 的口径一致（那也是「起不来」，也是 1）。
+      if (state.failure !== null && exitCode === 0) {
+        state.exitCode = 1;
+      }
     }
   }
 
@@ -1202,7 +1601,13 @@ export class AcpAdapter implements ExecutorAdapter {
     const interval = this.progressIntervals.get(sessionId);
     if (interval) {
       clearInterval(interval);
-      this.progressIntervals.delete(sessionId);
+          // ADR-143：启动上界也要撤 —— 会话结束了，那个计时器没有意义。
+    const startupTimer = this.startupTimeouts.get(sessionId);
+    if (startupTimer) {
+      clearTimeout(startupTimer);
+      this.startupTimeouts.delete(sessionId);
+    }
+this.progressIntervals.delete(sessionId);
     }
 
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
@@ -1230,7 +1635,14 @@ export class AcpAdapter implements ExecutorAdapter {
     if (session.exited) return Promise.resolve(session.exitCode);
 
     return new Promise<number | null>((resolve) => {
-      session.child.on('close', (code) => resolve(code));
+      session.child.on('close', (code) => {
+        // ADR-143 落地补充：zelto 判定的失败优先于退出码。
+        //
+        // `handleExit` 已经把 `state.exitCode` 纠正过了 —— 但 `close` 与
+        // `exit` 的触发顺序不保证谁先，所以这里**再取一次**内存里的值
+        // （`handleExit` 一定会先跑，因为它绑在 `exit` 上）。
+        resolve(session.exitCode ?? code);
+      });
       session.child.on('error', () => resolve(1));
     });
   }

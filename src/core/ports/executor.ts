@@ -165,6 +165,25 @@ export interface ExecutorAdapter {
   markProgress?(sessionId: string): void;
 
   /**
+   * Get the startup phase of a session (ADR-143).
+   *
+   * The phase names the step a *starting* turn is on — `launch`,
+   * `initialize`, `session`, `authenticating`. Null when the session is not
+   * in a startup phase (the agent can already do something else).
+   *
+   * **Why optional**: only the ACP adapter has this concept — the hook-route
+   * adapters have no protocol handshake to observe. Forcing them to
+   * implement it would mean inventing a `null` for a capability they do not
+   * have ("a capability left enabled that fails at runtime is a bug").
+   *
+   * **Why a port method at all** (rather than `instanceof AcpAdapter` in the
+   * CLI): a *read* of the current state changes no behaviour. ADR-141
+   * rejected putting a behaviour difference on the port; this is the other
+   * kind — like `getUsage` / `markProgress` / `getLiveUsage`.
+   */
+  getStartupPhase?(sessionId: string): string | null;
+
+  /**
    * Get the agent's output text for a session.
    *
    * Used to read the agent's final answer — e.g. to parse the question marker

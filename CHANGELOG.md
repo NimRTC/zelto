@@ -3,6 +3,48 @@
 ## [Unreleased]
 
 ### Added
+- **ACP 续跑必须续同一个会话，不许重开**（ADR-140）。
+  续跑原来发的是 `session/new` —— **上下文整个丢了**，而人看到的是
+  「续跑成功」。现在按 agent 在 `initialize` 回包里声明的能力选：
+  `session/resume`（优先，不回放历史）→ `session/load`（次选，回放整个历史）
+  → `session/new`（退回路径，**明确告知人「上下文已丢失」**）。
+  为什么不优先 `session/load`：它把历史回放给 client，
+  而 zelto 的提问检测是纯字符串解析 —— 回放出来的旧问题标记会被再解析一次
+  → 无限挂起。
+- **终止路径必须结算挂起的 permission 请求**（ADR-141）。
+  原来 agent 被超时杀掉 / 人手动 stop / 进程自己退出时，
+  那些**正在等答复**的 `session/request_permission` 就**悬着** ——
+  事件流里既没有 decision 也没有文件变化，事后审计会推断「没发生过」。
+  现在三条终止路径都**先结算再杀**：主动回一个明确的拒绝，
+  并写下 `policy.decision`（`basis: 'acp:terminated'`）。
+  「谁写事件」用**归属权**决定（`resolve(requestId, owner)`），
+  不是「谁先取到谁写」—— 判定方与终止方可能同时在跑，
+  归属权保证**只写一条**事件。
+- **配额耗尽是独立的停机类，不许自动重试**（ADR-142）。
+  `usage_limit`（上游的 429 / quota / rate limit）与 zelto 自己的
+  `budget_exhausted`（本地预算闸门）是**两件事** —— 那是**账号**，
+  那是**钱**。原来配额错误混在普通失败里，zelto 会**自动重试**：
+  重试解决不了配额问题，只是白烧一轮 token 并把重试预算耗光。
+  现在 `usage_limit` **不可自动解决**，直接停下来，并把
+  「什么时候恢复」原样告诉人（能解析出 `resetAt` / `retryAfterSec` 就给，
+  解析不出就明说「不知道」—— **不猜**）。
+- **启动阶段用真实信号报，不再被空转超时误杀**（ADR-143）。
+  ACP agent 的启动阶段**不发 `tool_call`** —— 初始化模型连接、加载 MCP server、
+  鉴权、读项目上下文，这些都不是工具调用，是 agent **进程内部**的事。
+  于是「正常启动但比较慢」的 agent 被 zelto 当成「卡住了」杀掉 ——
+  而且它被杀的时候**一行代码都还没写**，白跑一轮。
+  更糟的是：从 zelto 的视角看，慢启动与真卡住**在信号上完全一样**
+  （都是 0 条 tool_call、静默）—— zelto 区分不了。
+  现在维护一个显式的 `startupPhase`（封闭集合：`launch` / `initialize` /
+  `session` / `authenticating`），**只从协议信号推进，绝不用计时器**
+  （T3 的「never a timer」）；启动阶段**完全豁免**空转超时，
+  阶段**对人可见**（`zelto run` 的进度行 + 会话文件）。
+  豁免的代价由两道兜底补上：握手请求级超时（挡「协议卡住」）
+  + 启动阶段上界（挡「启动卡住」）。
+  顺带修掉一个真 bug：**失败优先于退出码** —— 子进程可能自己正常退出（退出码 0），
+  而这一轮其实失败了（握手超时 / 鉴权失败）。只看退出码的话，
+  「失败了」会被读成「成功了」—— CLI 走成功分支、门禁照跑、签字照走，
+  而 agent 一行代码都没写。
 - **驾驶舱现在能开到 VPN / 内网，手机端也能用了**（ADR-109）。
   需求是「周末在外面想看进度、想重启切片开发」。核实后发现
   **要的能力驾驶舱已经有了**，缺的是「手机连得上」与「窄屏能用」两件事 ——
@@ -49,6 +91,30 @@
   - 新增 `tests/web-dialable-addresses.test.ts`（20 个用例）——
     筛选逻辑抽成纯函数（喂合成输入测，不依赖运行机器的网卡配置）、
     物理/虚拟标记、渲染措辞、端到端横幅。
+  - **移动端交互实测补齐**（ADR-109 落地后的第二轮实测缺口）。
+    用 Chrome DevTools 在 390×844 视口（iPhone 尺寸）实测后发现
+    「窄屏适配」只做了**排版**，没做**可点**与**可键盘用**：
+      - **触摸目标不达标**：`.q-option`（提问候选答案按钮）只有 **57×27px** ——
+        而它恰恰是「手机回答 agent 提问」时**最常点的元素**；
+        `← 返回` 只有 **42×31px**，`.next-cmd` 只有 37px。
+        现在窄屏下全部 ≥44px（iOS HIG 下限）；回答输入框字号提到 16px，
+        免得 iOS Safari 自动放大页面。
+      - **全站没有 `:focus-visible` 规则** —— 键盘用户 Tab 过去
+        **不知道自己站在哪**（按钮样式把浏览器默认焦点环盖掉了）。
+        现在有全局焦点环，用 `outline`（不触发布局抖动，
+        高对比度模式下也不会被系统抹掉）。
+      - **154 个可点击行全部键盘不可达** —— `<tr>` 没有 `tabindex`、
+        没有 `role`，键盘与读屏用户完全进不去列表。
+        现在 `table()` 给可点行挂 `tabindex="0"` + `role="button"`，
+        Enter 与 Space 都能触发（Space 会 `preventDefault`，
+        否则页面一边触发一边滚）。
+      - **窄屏导航占 3 行**（9 个视图按钮 + 拉闸）——
+        把首屏内容挤到屏幕外。现在折叠成「当前视图名 + ☰ 菜单」，
+        点菜单外面或按 Esc 收起；**拉闸按钮留在菜单之外** ——
+        它是「刹车」，真出事时要能一眼看到、一键点到。
+        桌面端排版**一像素不变**。
+  - 新增 `tests/web-mobile-usability.test.ts`（25 个用例）——
+    触摸目标、焦点可见、键盘可达、导航折叠、并发取数五组。
 - **Events are now a hash chain — tampering is verifiable from the outside**
   (ADR-100). The event stream was append-only (C4), but "append-only" only
   meant *zelto* wouldn't rewrite it; an external reader had no way to tell

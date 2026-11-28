@@ -65,6 +65,19 @@ export interface PersistentSessionData {
    */
   runId?: string | null;
   /**
+   * 启动阶段（ADR-143）—— **可选字段**。
+   *
+   * 老会话文件没有这个字段是**正常的** —— 读出来是 `undefined`，
+   * 不报错（加可选字段，不是改必填字段）。
+   *
+   * **为什么要落盘**：阶段是**跨进程**要看的 ——
+   * `zelto status` / 驾驶舱 / 事后审计都要知道「当时它在干什么」。
+   * 内存里的状态进程一死就没了。
+   *
+   * 取值是封闭集合（`AcpStartupPhase`）；`null` = 不在启动阶段。
+   */
+  startupPhase?: string | null;
+  /**
    * 累计花费（美元）。
    *
    * **可选**：不是所有 agent 都报用量。ACP 的 `usage_update.cost` 是可选字段，

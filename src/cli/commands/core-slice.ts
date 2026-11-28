@@ -183,6 +183,68 @@ async function resumeForRetry(
 }
 
 /**
+ * 进度行（ADR-143 决策六：阶段要**对人可见**）。
+ *
+ * 人看到「正在启动（建立会话 / 等待 agent 起步）」比看到
+ * 「Agent running... 2m 30s」有用得多 ——
+ * 后者让人以为它卡住了（实际上它可能在加载 MCP server）。
+ *
+ * **只显示第一个启动阶段** —— 阶段是封闭集合，认不出就不显示
+ * （**不编**）。
+ *
+ * 阶段只读**可选**的端口方法 `getStartupPhase` ——
+ * hook 路线的 adapter 没有这个概念（不实现 = 没有这个能力）。
+ */
+function progressLine(
+  adapter: ExecutorAdapter | null | undefined,
+  sessionId: string | null | undefined,
+  elapsedSec: number,
+): string {
+  const mins = Math.floor(elapsedSec / 60);
+  const secs = elapsedSec % 60;
+  const phase = readStartupPhase(adapter, sessionId);
+  const label = phase ? describeStartupPhaseLabel(phase) : null;
+  if (label) {
+    return `\r  ??  ${label} (${mins}m ${secs}s)`;
+  }
+  return `\r  ??  Agent running... ${mins}m ${secs}s`;
+}
+
+/** 读启动阶段（**永不抛**；没有这个能力 → null）。 */
+function readStartupPhase(
+  adapter: ExecutorAdapter | null | undefined,
+  sessionId: string | null | undefined,
+): string | null {
+  if (!adapter || !sessionId) return null;
+  if (typeof adapter.getStartupPhase !== 'function') return null;
+  try {
+    return adapter.getStartupPhase(sessionId);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 阶段 → 人话。
+ *
+ * **只认封闭集合里的值** —— 认不出就返回 null（**不编**一个像样的说法）。
+ */
+function describeStartupPhaseLabel(phase: string): string | null {
+  switch (phase) {
+    case 'launch':
+      return '启动中（进程已起）';
+    case 'initialize':
+      return '启动中（协议握手）';
+    case 'session':
+      return '启动中（建立会话 / 等待 agent 起步）';
+    case 'authenticating':
+      return '启动中（鉴权）';
+    default:
+      return null;
+  }
+}
+
+/**
  * 取 agent 的输出文本（**永不抛**）—— ADR-142 配额识别用。
  *
  * 为什么要有这个包装：`getOutput()` 会读会话文件 —— 会话文件可能已经
@@ -1955,9 +2017,7 @@ register('run', async (args) => {
     // Start progress display
     progressTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
+      process.stdout.write(progressLine(adapter, sessionId, elapsed));
     }, 1000);
 
     // Retry loop: agent may auto-retry internally (adapter handles transient failures),
@@ -2139,9 +2199,7 @@ register('run', async (args) => {
           // Restart progress display
           progressTimer = setInterval(() => {
             const e = Math.floor((Date.now() - startTime) / 1000);
-            const mins = Math.floor(e / 60);
-            const secs = e % 60;
-            process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
+            process.stdout.write(progressLine(adapter, sessionId, e));
           }, 1000);
 
           continue; // Retry
@@ -2598,9 +2656,7 @@ register('start', async (args) => {
     // 起跑端 / 收尾端各自用**同一个** (runStartedAt, attempt) 重算，值必相同。
     let progressTimer = setInterval(() => {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
+      process.stdout.write(progressLine(adapter, sessionId, elapsed));
     }, 1000);
 
     // Retry loop
@@ -2727,9 +2783,7 @@ register('start', async (args) => {
           }
           progressTimer = setInterval(() => {
             const e = Math.floor((Date.now() - startTime) / 1000);
-            const mins = Math.floor(e / 60);
-            const secs = e % 60;
-            process.stdout.write(`\r  ??  Agent running... ${mins}m ${secs}s`);
+            process.stdout.write(progressLine(adapter, sessionId, e));
           }, 1000);
           continue;
         }
