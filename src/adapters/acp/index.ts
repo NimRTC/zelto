@@ -77,6 +77,12 @@ import {
   type AcpSessionMode,
 } from './continuation.js';
 import { extractAcpCost, extractAcpText, isProgressUpdate } from './events.js';
+import {
+  PendingPermissionRegistry,
+  TERMINATED_BASIS,
+  renderSettlementOutcome,
+  type TerminationReason,
+} from './permission.js';
 import { addGrant, hasGrant, loadGrants, type AlwaysGrant } from './always-grants.js';
 import { promptAlwaysAllow } from './always-prompt.js';
 import { judgeAlwaysGrant } from '../../hook/acp-always.js';
@@ -106,6 +112,16 @@ export interface AcpAdapterOptions {
    * 用户要放开就明确列出那些路径/目录/glob。
    */
   alwaysAllowPaths?: string[];
+  /**
+   * 「以后都允许」的提问方式（ADR-133 补充）—— 缺省用 `promptAlwaysAllow`。
+   *
+   * **为什么要能替换**：这个提问会**阻塞**在 readline 上等人回答。
+   * 而「阻塞中的 permission 回调」正是 ADR-141 要结算的那种状态 ——
+   * 没有这个口子，那条路径就**测不了**（默认实现非 TTY 时立刻返回）。
+   *
+   * 也给未来别的界面（网页驾驶舱）留了接法。
+   */
+  promptAlwaysAllow?: (path: string) => Promise<'once' | 'always' | 'reject'>;
   /** 实时输出回调 */
   onOutput?: (sessionId: string, text: string) => void;
   /** 进展回调 */
@@ -170,6 +186,13 @@ interface AcpSessionState {
   sessionModeReady: Promise<AcpSessionMode>;
   /** 兑现 `sessionModeReady` 的函数（只兑现一次）。 */
   resolveSessionMode: (mode: AcpSessionMode) => void;
+  /**
+   * 挂起的 `session/request_permission` 请求（ADR-141）。
+   *
+   * **为什么按会话记**：终止是**会话**级的事实（这个会话的 agent 死了），
+   * 不是进程号的事实。
+   */
+  pendingPermissions: PendingPermissionRegistry;
 }
 
 export class AcpAdapter implements ExecutorAdapter {
@@ -184,6 +207,7 @@ export class AcpAdapter implements ExecutorAdapter {
   private readonly projectRoot: string;
   private readonly sliceId: string | null;
   private readonly alwaysAllowPaths: string[];
+  private readonly promptAlwaysAllow: (path: string) => Promise<'once' | 'always' | 'reject'>;
   private readonly onOutput?: (sessionId: string, text: string) => void;
   private readonly onProgress?: (sessionId: string, elapsedMs: number, status: string) => void;
 
@@ -201,6 +225,9 @@ export class AcpAdapter implements ExecutorAdapter {
     this.projectRoot = options.projectRoot ?? process.cwd();
     this.sliceId = options.sliceId ?? null;
     this.alwaysAllowPaths = options.alwaysAllowPaths ?? [];
+    this.promptAlwaysAllow =
+      options.promptAlwaysAllow ??
+      ((path: string) => promptAlwaysAllow(path));
     this.onOutput = options.onOutput;
     this.onProgress = options.onProgress;
   }
@@ -265,7 +292,7 @@ export class AcpAdapter implements ExecutorAdapter {
     //
     // 非 TTY → `promptAlwaysAllow` 直接返回 'once'（不放开），
     // 见 `always-prompt.ts` 的文件头。
-    const choice = await promptAlwaysAllow(decision.path);
+    const choice = await this.promptAlwaysAllow(decision.path);
 
     if (choice === 'always') {
       addGrant(this.projectRoot, sliceId, {
@@ -410,6 +437,7 @@ export class AcpAdapter implements ExecutorAdapter {
       sessionMode: 'new',
       sessionModeReady,
       resolveSessionMode,
+      pendingPermissions: new PendingPermissionRegistry(),
     };
     this.sessions.set(sessionId, state);
 
@@ -552,6 +580,21 @@ export class AcpAdapter implements ExecutorAdapter {
         kind: o.kind,
       }));
 
+      // ── 登记挂起（ADR-141）────────────────────────────────────────
+      //
+      // **在判定之前**登记 —— 因为判定里可能要**问人**
+      // （「以后都允许吗」，`handleAlwaysGrant` 会等 readline）。
+      // 那段时间里进程可能被杀 → 这条请求就悬着了。
+      //
+      // 登记在判定之前，才覆盖得到「判定进行中被终止」那条路径。
+      const requestId = String(ctx.requestId);
+      state.pendingPermissions.add({
+        requestId,
+        options,
+        tool: toolCall.name ?? toolCall.kind ?? 'unknown',
+        path: null, // 判定出来之前不猜写目标
+      });
+
       let verdict = judgeAcpPermission(toolCall, state.ctx);
       let basis = verdict.basis;
       let reason = verdict.reason;
@@ -565,6 +608,43 @@ export class AcpAdapter implements ExecutorAdapter {
         verdict = outcome.verdict;
         basis = outcome.basis;
         reason = outcome.reason;
+      }
+
+      // ── 判定进行中被终止（ADR-141 验收 6）────────────────────────
+      //
+      // 上面那段「问人」可能等了很久 —— 期间进程被超时杀掉 / 被人 stop /
+      // agent 自己退了。
+      //
+      // **抢归属权**（见 `permission.ts` 的「谁写事件」）：
+      // - 抢到了 → 终止路径**没有**结算过这条请求 → 由我写事件；
+      // - 抢不到 → 终止路径**已经**结算并写过事件 → 这里不重复写。
+      //
+      // **已终止 → 不写答复**（连接已断，写了也没用），但**仍然写事件** ——
+      // 「这次写入没被处理」这个**事实**必须留痕（C4）。
+      //
+      // 为什么事件照写：事后审计看到「没有 decision、也没有文件变化」
+      // 会推断「没发生过」—— 而它**发生过**（agent 确实要写）。
+      //
+      // **注意顺序**：先 `judgeAcpPermission` 判定，再抢归属权 ——
+      // 判定期间请求**仍留在登记册里**，终止路径才结算得到它。
+      const ownsEvent = state.pendingPermissions.resolve(requestId, 'judge');
+      if (!ownsEvent) {
+        // 终止路径已经结算过这条请求了 —— 事件它写过了，这里不重复写。
+        // 回**它**结算时选的答复（保持一致：结算选了 reject_once，
+        // 这里就不能回 cancelled —— 同一个请求两种答复会让 agent 困惑）。
+        const settled = state.pendingPermissions.getSettled(requestId);
+        return settled ?? { outcome: { outcome: 'cancelled' } };
+      }
+
+      if (state.terminated !== null) {
+        this.appendTerminatedDecision(state, {
+          tool: toolCall.name ?? toolCall.kind ?? 'unknown',
+          path: verdict.path,
+          reason: state.terminated === 'timeout' ? 'timeout' : 'killed',
+        });
+        // 判定完成 → 这条请求不再挂起（归属权留着，重复来的请求不会写第二条）。
+        state.pendingPermissions.take(requestId);
+        return { outcome: { outcome: 'cancelled' } };
       }
 
       const rendered = renderAcpPermission(verdict, options);
@@ -589,6 +669,9 @@ export class AcpAdapter implements ExecutorAdapter {
         },
         state.runId,
       );
+
+      // 判定完成 → 这条请求不再挂起。
+      state.pendingPermissions.take(requestId);
 
       return { outcome: rendered.outcome };
     });
@@ -781,6 +864,13 @@ export class AcpAdapter implements ExecutorAdapter {
     if (!session) return;
     session.terminated = 'timeout';
 
+    // ADR-141：**先结算挂起的 permission 请求**，再杀进程。
+    //
+    // 为什么先结算：杀进程之后连接就断了 —— 那时再「结算」就没有连接可写了。
+    // 结算本身就是**主动回一个明确的拒绝**（让 agent 知道被拒了，可以改道），
+    // 而不是「等连接断了自己猜」。
+    this.settlePendingPermissions(sessionId, 'timeout');
+
     const data = this.sessionData.get(sessionId) ?? loadSession(sessionId);
     if (data && data.status === 'running') {
       data.status = 'timeout';
@@ -791,6 +881,104 @@ export class AcpAdapter implements ExecutorAdapter {
       this.onOutput(sessionId, `\n[zelto: no progress for ${this.timeoutMs}ms — killed]\n`);
     }
     this.killSessionTree(sessionId, session.child.pid);
+  }
+
+  // ─── 终止时的挂起请求结算（ADR-141）─────────────────────────────────────
+
+  /**
+   * 结算这个会话里**所有**挂起的 `session/request_permission` 请求。
+   *
+   * **三条终止路径的共同出口** —— 进程退出 / 空转超时 / 人工停止。
+   * 结算必须是**所有**路径的出口 —— 三条路径各漏一条，
+   * 就会出现「换个终止方式就绕过结算」的形状。
+   *
+   * **绝不抛异常** —— 结算是在「进程要死了」时跑的，
+   * 它抛异常会**掩盖真正的终止原因**。
+   *
+   * **幂等** —— 结算可能被调用多次（超时 → 杀进程 → exit 事件 → 又走一遍退出路径）。
+   * 重复结算会写出**重复的事件**，而 C4 说事件流是 append-only，
+   * 重复事件无法撤销。所以每条挂起请求只结算一次。
+   *
+   * @param reason 终止原因 —— 写进事件负载，让人能回答
+   *   「这次写入为什么没被处理」。
+   */
+  private settlePendingPermissions(sessionId: string, reason: TerminationReason): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // `drain()` 一次取走全部 —— 取走就移走 → 天然幂等。
+    const pending = session.pendingPermissions.drain();
+    if (pending.length === 0) return;
+
+    for (const item of pending) {
+      try {
+        // **抢归属权** —— 判定方可能**已经判完了**（正��写事件）。
+        // 抢不到 → 判定方已经写了事件 → 这里**不重复写**。
+        //
+        // 抢到了 → 这次写入**确实没被处理** → 由我写「因终止未处理」事件。
+        if (!session.pendingPermissions.resolve(item.requestId, 'termination')) {
+          continue;
+        }
+
+        // 回给 agent 的答复 —— **只可能是拒绝**（`renderSettlementOutcome`
+        // 绝不回 `allow_always`，见 `permission.ts` 的说明）。
+        //
+        // 答复**写不出去也没关系** —— 连接可能已经断了（这正是终止路径的常态）。
+        // 真正要紧的是**事件**（下面的 `appendTerminatedDecision`）——
+        // 那才是追溯链需要的证据。
+        const outcome = renderSettlementOutcome(item.options);
+        session.pendingPermissions.markSettled(item.requestId, outcome);
+
+        this.appendTerminatedDecision(session, {
+          tool: item.tool,
+          path: item.path,
+          reason,
+        });
+      } catch {
+        // **绝不抛** —— 结算失败不能掩盖终止原因。
+        // 事件写不出来是可惜，但终止流程必须正常走完。
+      }
+    }
+  }
+
+  /**
+   * 写一条「因终止而未处理」的判定事件（ADR-141）。
+   *
+   * `basis` 是独立值 `acp:terminated` —— 与 `acp:unknown-tool` 形状不同：
+   * - `acp:unknown-tool` —— 我们**看了**这次调用，判不出写目标（agent 的问题）；
+   * - `acp:terminated` —— 我们**根本没判**（进程没了，zelto 的问题）。
+   *
+   * 混成一个 → 事后审计分不清是 agent 的问题还是 zelto 的问题。
+   *
+   * **decision 恒为 `deny`** —— 这次写入**没有被允许**。
+   * 记成 `allow` 是说谎：它没被允许，它只是没被处理。
+   */
+  private appendTerminatedDecision(
+    session: AcpSessionState,
+    info: { tool: string; path: string | null; reason: TerminationReason },
+  ): void {
+    try {
+      const eventSlice = session.ctx.sliceId ?? '_acp';
+      appendDecisionEvent(
+        this.projectRoot,
+        eventSlice,
+        {
+          decision: 'deny',
+          ruleId: 'acp:terminated',
+          basis: TERMINATED_BASIS,
+          reason: `agent terminated before the write was judged (${info.reason})`,
+          path: info.path,
+          targets: info.path ? [info.path] : [],
+          tool: info.tool,
+          policyVersion: session.ctx.policyVersion,
+          harness: `acp:${this.agentCommand}`,
+          sliceId: session.ctx.sliceId,
+        },
+        session.runId,
+      );
+    } catch {
+      // **绝不抛** —— 写事件失败不能掩盖终止原因。
+    }
   }
 
   private killSessionTree(sessionId: string, wrapperPid: number | undefined): void {
@@ -819,6 +1007,13 @@ export class AcpAdapter implements ExecutorAdapter {
   }
 
   private handleExit(sessionId: string, exitCode: number | null): void {
+    // ADR-141：**先结算挂起的 permission 请求**（进程退出也是终止路径）。
+    //
+    // 为什么在清 timer 之前：结算要写的答复需要连接还活着 ——
+    // 连接一断就写不出去了。虽然「答复写不出去」不影响「事件已留痕」，
+    // 但能写出去就写（agent 那边能立刻知道「被拒了」而不是干等）。
+    this.settlePendingPermissions(sessionId, 'exit');
+
     const timeout = this.timeouts.get(sessionId);
     if (timeout) {
       clearTimeout(timeout);
@@ -993,6 +1188,12 @@ export class AcpAdapter implements ExecutorAdapter {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Session "${sessionId}" not found`);
 
+    // ADR-141：人工停止也是终止路径 —— **必须结算**挂起的请求。
+    //
+    // **在杀进程之前**结算 —— 连接还活着，答复能写出去。
+    session.terminated = 'killed';
+    this.settlePendingPermissions(sessionId, 'killed');
+
     const timeout = this.timeouts.get(sessionId);
     if (timeout) {
       clearTimeout(timeout);
@@ -1010,7 +1211,6 @@ export class AcpAdapter implements ExecutorAdapter {
       data.output.push('[zelto: session stopped by user]');
       saveSession(data);
     }
-    session.terminated = 'killed';
 
     session.child.kill('SIGTERM');
     this.killSessionTree(sessionId, session.child.pid);

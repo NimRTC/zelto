@@ -37,7 +37,7 @@ const skipPermission = process.env.MOCK_ACP_SKIP_PERMISSION === '1';
 const capabilityMode = process.env.MOCK_ACP_CAPABILITIES ?? 'new';
 const logFile = process.env.MOCK_ACP_LOG ?? null;
 const hangInitialize = process.env.MOCK_ACP_HANG_INITIALIZE === '1';
-const hangPermission = process.env.MOCK_ACP_HANG_PERMISSION === '1';
+const hangPermission = process.env.MOCK_ACP_HANG_PERMISSION ?? '';
 const slowStartMs = Number.parseInt(process.env.MOCK_ACP_SLOW_START ?? '0', 10);
 
 /** 往 stdout 发一条 JSON-RPC 消息（NDJSON）。 */
@@ -169,35 +169,79 @@ async function handle(msg) {
       });
 
       let outcome = 'skipped';
+      // **不管挂不挂起，都要发这个请求** ——
+      // 「挂起」的含义是「发了请求但**不等到答复**」，不是「不发请求」。
       if (!skipPermission) {
-        try {
-          const res = await request('session/request_permission', {
-            sessionId: 'mock-session-1',
-            toolCall: {
-              toolCallId: 'tc-1',
-              kind: toolKind,
-              name: 'mock_write',
-              status: 'pending',
-              rawInput: { path: toolPath },
-              locations: [{ path: toolPath }],
-            },
-            options: [
-              { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
-              { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
-              { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
-            ],
+        // 构造请求体（两条路径共用）。
+        const permParams = {
+          sessionId: 'mock-session-1',
+          toolCall: {
+            toolCallId: 'tc-1',
+            kind: toolKind,
+            name: 'mock_write',
+            status: 'pending',
+            // 路径**只放在 rawInput 里** —— 跟真的 agent 一样。
+            //
+            // 为什么不能两处都放：`extractAcpChangedPaths()` 会把
+            // `rawInput.path` 与 `locations[].path` **都**收进来 ——
+            // 两处都放 → 两个目标 → 「以后都允许」判定
+            // （只认**单个**目标）永远不 eligible。
+            rawInput: { path: toolPath },
+          },
+          options: [
+            { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+            { optionId: 'allow-always', name: 'Always allow', kind: 'allow_always' },
+            { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+          ],
+        };
+
+        if (hangPermission) {
+          // ADR-141：**不等答复** ——
+          //
+          // **为什么不能 `await`**：`await` 会让 mock **卡到 zelto 回答为止**。
+          // 而 zelto 那边（judge 路径）正**阻塞在「问人」上** ——
+          // 两边互相等待 → 终止路径永远走不到 → 测不到 ADR-141。
+          //
+          // 所以这里**发出去就不管了**（fire-and-forget）：
+          // 模拟「agent 问了，然后就退出了」的真实形状。
+          request('session/request_permission', permParams).catch((err) => {
+            appendFileSync(
+              outputFile,
+              `permission-error: ${err instanceof Error ? err.message : String(err)}\n`,
+              'utf-8',
+            );
           });
+
+          // 两种终止方式（`MOCK_ACP_HANG_PERMISSION`）：
+          // - `exit` —— 等一小会儿（让 zelto 那边**登记**到这条请求）然后退出
+          //   → 走 zelto 的「进程退出」路径；
+          // - `wait` —— **永远不退出** → 逼 zelto 的空闲超时
+          //   → 走 zelto 的「空转超时」路径。
+          //
+          // **为什么要等一小会儿**：请求写出去不等于 zelto 已经收到并登记了。
+          // 立刻退出的话，zelto 可能还没派发这个请求 → 没有「挂起的请求」
+          // 可供结算 → 测不到那条规则。
+          appendFileSync(outputFile, `permission-outcome: pending\n`, 'utf-8');
+          if (hangPermission === 'wait') {
+            // 永远不退出 —— 让 zelto 的空闲超时来收尾。
+            setInterval(() => {}, 1 << 30);
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 800));
+          process.exit(0);
+        }
+
+        try {
+          const res = await request('session/request_permission', permParams);
           outcome = JSON.stringify(res?.outcome ?? null);
         } catch (err) {
           outcome = `error: ${err instanceof Error ? err.message : String(err)}`;
         }
       }
 
-      // ADR-141：发完 permission 请求就退出，**不等答复** ——
-      // 逼 zelto 走终止路径的结算。
       if (hangPermission) {
-        appendFileSync(outputFile, `permission-outcome: pending\n`, 'utf-8');
-        process.exit(0);
+        // 到不了这里 —— 上面已经 return / process.exit 了。
+        // 留着是为了让「不挂起」路径的流程保持完整。
       }
 
       appendFileSync(outputFile, `permission-outcome: ${outcome}\n`, 'utf-8');
