@@ -183,6 +183,24 @@ async function resumeForRetry(
 }
 
 /**
+ * 取 agent 的输出文本（**永不抛**）—— ADR-142 配额识别用。
+ *
+ * 为什么要有这个包装：`getOutput()` 会读会话文件 —— 会话文件可能已经
+ * 坏了、删了、或者适配器实现不同（有的读内存、有的读盘）。
+ * 拿不到输出只意味着「识别不了配额」—— **不该因此崩掉整条失败路径**。
+ *
+ * 拿不到就返回空串 —— `detectUsageLimit('')` 返回「不是配额」。
+ */
+function safeGetOutput(adapter: ExecutorAdapter | null | undefined, sessionId: string | null): string {
+  if (!adapter || !sessionId) return '';
+  try {
+    return adapter.getOutput(sessionId) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
  * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
  * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
@@ -2090,7 +2108,12 @@ register('run', async (args) => {
       // 否则会写两遍事件、迁两次状态。
       let stalled = false;
       if (attempt < maxRetries) {
-        const result = await handleAgentFailure(id, exitCode, { maxRetries });
+        const result = await handleAgentFailure(id, exitCode, {
+          maxRetries,
+          // ADR-142：把 agent 的输出给判定层 —— 配额耗尽只体现在输出里
+          //（退出码说不了这件事）。不传就识别不了 = 配额错误照样被重试。
+          agentOutput: safeGetOutput(adapter, sessionId),
+        });
         if (result.action === 'retry') {
           attempt = result.retryCount ?? attempt + 1;          // Re-create adapter and re-start agent for retry
           adapter = createExecutorAdapter(adapterType, agentName, agentTimeout, workDir);
@@ -2128,7 +2151,11 @@ register('run', async (args) => {
 
       // Not retrying — write stall and stop
       if (!stalled) {
-        await handleAgentFailure(id, exitCode, { maxRetries });
+        await handleAgentFailure(id, exitCode, {
+          maxRetries,
+          // ADR-142：同上 —— 配额耗尽只体现在输出里。
+          agentOutput: safeGetOutput(adapter, sessionId),
+        });
       }
       alreadyStalled = true;
       finalExitCode = exitCode;
@@ -2677,7 +2704,11 @@ register('start', async (args) => {
       // 它已经把切片停机了（退 frozen + 写分类 + 留痕）—— 别调两遍。
       let stalled = false;
       if (attempt < maxRetries) {
-        const result = await handleAgentFailure(id, exitCode, { maxRetries });
+        const result = await handleAgentFailure(id, exitCode, {
+          maxRetries,
+          // ADR-142：把 agent 的输出给判定层 —— 配额耗尽只体现在输出里。
+          agentOutput: safeGetOutput(adapter, sessionId),
+        });
         if (result.action === 'retry') {
           attempt = result.retryCount ?? attempt + 1;
           adapter = createExecutorAdapter(adapterType, agentName, sliceForTimeout.agentTimeout);
@@ -2706,7 +2737,11 @@ register('start', async (args) => {
       }
 
       if (!stalled) {
-        await handleAgentFailure(id, exitCode, { maxRetries });
+        await handleAgentFailure(id, exitCode, {
+          maxRetries,
+          // ADR-142：同上 —— 配额耗尽只体现在输出里。
+          agentOutput: safeGetOutput(adapter, sessionId),
+        });
       }
       finalExitCode = exitCode;
       break;

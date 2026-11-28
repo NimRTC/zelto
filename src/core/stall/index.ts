@@ -9,6 +9,8 @@ export type {
   StallInfo,
   StallResolution,
 } from './types.js';
+export { detectUsageLimit } from './usage-limit.js';
+export type { UsageLimitSignal } from './usage-limit.js';
 export {
   findDeadSlices,
   findOrphanShells,

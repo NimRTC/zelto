@@ -29,6 +29,10 @@ export type {
  *
  * `human_halt` is never auto-resolvable either: 人喊停要的就是「停下来等人」，
  * agent 自己把它重试起来就违背了拉闸的意图（ADR-020 §3.3）。
+ *
+ * `usage_limit` is never auto-resolvable (ADR-142 §决策六): 配额墙**不会**
+ * 因为重试而恢复 —— 重试只是再撞一次同样的墙，还要**重新起一个 agent 会话**
+ * 重新烧 token，并且会把重试预算烧光。
  */
 export function isAutoResolvable(stallClass: StallClass): boolean {
   return stallClass === 'permission_prompt'
@@ -46,6 +50,9 @@ export function classifyStall(signal: {
   if (signal.type === 'permission_ask') return 'permission_prompt';
   if (signal.type === 'max_turns' || signal.type === 'context_limit') return 'context_exhaustion';
   if (signal.type === 'budget_exhausted') return 'budget_exhausted';
+  // ADR-142：**必须在 `cognitive_stuck` 之前** ——
+  // 配额错误不该被「重试次数够了」的兜底规则吃掉。
+  if (signal.type === 'usage_limit') return 'usage_limit';
   if (signal.type === 'plan_approval_request') return 'plan_gate';
   if ((signal.attempts ?? 0) >= 2 || (signal.sameFailureCount ?? 0) >= 3) return 'cognitive_stuck';
   if (signal.type === 'build_failure' || signal.type === 'test_failure') return 'environment_failure';

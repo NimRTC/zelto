@@ -510,9 +510,20 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       // 只有「可自动恢复」的停机类别才值得重试（环境抖动、上下文超限…）。
       // agent 主动报错、预算耗尽这类重试也白搭。
       const { classifyStall, isAutoResolvable } = await import('../../core/stall/classifier.js');
+      const { detectUsageLimit } = await import('../../core/stall/usage-limit.js');
       const { handleAgentFailure } = await import('./run-support.js');
+
+      // ADR-142：配额耗尽**不可自动恢复** —— 配额墙不会因为重试而恢复。
+      // 识别靠 agent 的**输出**（退出码说不了这件事）。
+      const agentOutput = safeGetOutput(adapter, sessionId);
+      const usageLimit = detectUsageLimit(agentOutput);
+
       const stallClass = classifyStall({
-        type: exitCode === null ? 'build_failure' : 'test_failure',
+        type: usageLimit.isUsageLimit
+          ? 'usage_limit'
+          : exitCode === null
+            ? 'build_failure'
+            : 'test_failure',
         message: `Agent exited with code ${exitCode ?? 'signal'}`,
         attempts: 1,
       });
@@ -523,7 +534,11 @@ export async function runSupervisor(args: SupervisorArgs): Promise<number> {
       }
 
       attempt += 1;
-      const failure = await handleAgentFailure(args.sliceId, exitCode, { maxRetries });
+      const failure = await handleAgentFailure(args.sliceId, exitCode, {
+        maxRetries,
+        // ADR-142：把 agent 的输出给判定层。
+        agentOutput,
+      });
       if (failure.action !== 'retry') {
         // `handleAgentFailure` 已经停机了（重试预算耗尽）——
         // 收尾时不要再停一次（ADR-047 §2.1.1）
@@ -790,6 +805,27 @@ async function anyProcessAlive(
     if (await isProcessTreeAlive(pid)) return true;
   }
   return false;
+}
+
+/**
+ * 取 agent 的输出文本（**永不抛**）—— ADR-142 配额识别用。
+ *
+ * 为什么要有这个包装：`getOutput()` 会读会话文件 —— 会话文件可能已经
+ * 坏了、删了、或者适配器实现不同（有的读内存、有的读盘）。
+ * 拿不到输出只意味着「识别不了配额」—— **不该因此崩掉整条失败路径**。
+ *
+ * 拿不到就返回空串 —— `detectUsageLimit('')` 返回「不是配额」。
+ */
+function safeGetOutput(
+  adapter: import('../../core/ports/executor.js').ExecutorAdapter | null | undefined,
+  sessionId: string | null | undefined,
+): string {
+  if (!adapter || !sessionId) return '';
+  try {
+    return adapter.getOutput(sessionId) ?? '';
+  } catch {
+    return '';
+  }
 }
 
 /**

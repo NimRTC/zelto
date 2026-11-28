@@ -13,7 +13,7 @@
 // C3: 纯类型声明，不含运行期逻辑
 // C6: core/ 内，不依赖 adapters/
 
-/** 停机的 9 个分类 */
+/** 停机的 10 个分类 */
 export type StallClass =
   | 'permission_prompt'   // ① 权限确认 — hook returned ask
   | 'environment_failure' // ② 环境失败 — build/test repeatedly fail
@@ -23,7 +23,8 @@ export type StallClass =
   | 'budget_exhausted'    // ⑥ 预算耗尽 — max budget reached
   | 'gate_retry'          // ⑦ 门禁重试 — gate executor retries exhausted
   | 'agent_question'      // ⑧ agent 提问 — 等待人回答（ADR-013）
-  | 'human_halt';         // ⑨ 人工拉闸 — 人喊停，等人处理现场（ADR-020）
+  | 'human_halt'          // ⑨ 人工拉闸 — 人喊停，等人处理现场（ADR-020）
+  | 'usage_limit';        // ⑩ 配额耗尽 — agent 服务端的 usage limit（ADR-142）
 
 /** 停机的处置方式 */
 export type StallResolution = 'auto_resolved' | 'needs_attention' | 'escalated';

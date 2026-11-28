@@ -20,6 +20,8 @@ import {
 // 而 core-slice.ts 又 import 并行执行器，于是变成三条命令文件互相咬。
 import { autoGateAfterRun, settleRunCost, markSliceStalled } from './run-support.js';
 import { classifyStall } from '../../core/stall/classifier.js';
+// ADR-142：配额识别（纯函数，在 core/stall/ 下 —— C3 判定层）
+import { detectUsageLimit } from '../../core/stall/usage-limit.js';
 import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
 // ADR-139：续跑段要重新装运行时守卫（C9 的主防线）。
 // 装法在独立模块里 —— 它要的 `zeltoOwnedPaths` 住在 parallel-executor.ts，
@@ -134,6 +136,23 @@ function readSessionMode(
     return adapter.getSessionMode(sessionId);
   } catch {
     return null;
+  }
+}
+
+/**
+ * 取 agent 的输出文本（**永不抛**）—— ADR-142 配额识别用。
+ *
+ * 为什么要有这个包装：`getOutput()` 会读会话文件 —— 会话文件可能已经
+ * 坏了、删了、或者适配器实现不同（有的读内存、有的读盘）。
+ * 拿不到输出只意味着「识别不了配额」—— **不该因此崩掉整条失败路径**。
+ *
+ * 拿不到就返回空串 —— `detectUsageLimit('')` 返回「不是配额」。
+ */
+function readAgentOutput(adapter: ExecutorAdapter, sessionId: string): string {
+  try {
+    return adapter.getOutput(sessionId) ?? '';
+  } catch {
+    return '';
   }
 }
 
@@ -453,17 +472,44 @@ register('answer', async (args) => {
     const elapsedNote = `exit ${exitCode ?? 'signal'}`;
     console.error(`❌ Agent exited with ${elapsedNote} after the answer.`);
     await events.append(sliceId, 'run.aborted', 'zelto', { sliceId, exitCode, ...(runId ? { runId } : {}) });
+
+    // ADR-142：配额耗尽要**单独**分类 —— 它不可自动恢复
+    //（配额墙不会因为重试而恢复），而且退出码与普通失败**一模一样**。
+    //
+    // 识别靠 agent 的**输出** —— 退出码说不了这件事。
+    const agentOutput = readAgentOutput(adapter, newSessionId);
+    const usageLimit = detectUsageLimit(agentOutput);
+
     // 续跑失败同样要退回 frozen（ADR-047）：切片本来就在 running
     // （提问回路挂起时不迁状态），不退回就永远卡在 running ——
     // 准入只认 frozen / completed，人救不回来。
     await markSliceStalled(sliceId, classifyStall({
-      type: exitCode === null ? 'build_failure' : 'test_failure',
+      type: usageLimit.isUsageLimit
+        ? 'usage_limit'
+        : exitCode === null
+          ? 'build_failure'
+          : 'test_failure',
       message: `Agent exited with code ${exitCode ?? 'signal'} after the answer`,
       attempts: 1,
     }), {
       exitCode,
       reason: `agent failed after answer: ${exitCode ?? 'signal'}`,
+      // ADR-142：配额重置时间（取不到就是 null —— 不编）。
+      resetAt: usageLimit.resetAt,
+      retryAfterSec: usageLimit.retryAfterSec,
     });
+
+    // 配额耗尽要**说清「等，别重跑」**（ADR-142 决策五）。
+    if (usageLimit.isUsageLimit) {
+      console.error('⚠️  Agent 服务端配额已耗尽 —— 重试没用（配额不会因为重试而恢复）。');
+      if (usageLimit.resetAt) {
+        console.error(`    恢复时间: ${usageLimit.resetAt}`);
+      } else if (usageLimit.retryAfterSec !== null) {
+        console.error(`    恢复时间: 约 ${usageLimit.retryAfterSec} 秒后`);
+      } else {
+        console.error('    恢复时间: 未知（agent 没报）—— 查服务商的配额页面');
+      }
+    }
     return 1;
   }
 

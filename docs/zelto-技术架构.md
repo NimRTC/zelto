@@ -254,16 +254,23 @@ type StallClass =
   | 'context_exhaustion'   // max_turns 耗尽
   | 'cognitive_stuck'      // 同种失败 ≥ 3 次
   | 'plan_gate'            // agent 请求计划审批
-  | 'budget_exhausted'     // 预算超限
+  | 'budget_exhausted'     // 预算超限（**zelto 自己的闸门**）
   | 'gate_retry'           // 门禁重试耗尽
   | 'agent_question'       // agent 提问，等人回答（ADR-013）
-  | 'human_halt';          // 人工拉闸，等人处理现场（ADR-020）
+  | 'human_halt'           // 人工拉闸，等人处理现场（ADR-020）
+  | 'usage_limit';         // agent 服务端配额/限流耗尽（ADR-142）
 
 function classifyStall(signal): StallClass
 function isAutoResolvable(stallClass): boolean
   // permission_prompt / environment_failure / context_exhaustion 可自动恢复
   // agent_question / human_halt 永远不可自动恢复 —— 都要人介入
+  // usage_limit 也不可自动恢复（ADR-142）—— 配额墙不会因为重试而恢复
 ```
+
+**配额识别（ADR-142）**：`usage_limit` 靠**输出文本**识别（退出码说不了这件事）——
+`src/core/stall/usage-limit.ts` 的 `detectUsageLimit(output)` 是纯函数（C3），
+返回 `{ isUsageLimit, resetAt, retryAfterSec, matched }`。
+取不到重置时间就**如实留空**，不编。
 
 ### 3.6 Scheduler — `src/core/sched/`
 
@@ -882,6 +889,7 @@ SignManager.revoke(id, decidedBy, comment): SignRequest   // 撤销已通过的�
 classifyStall(signal): StallClass
 isAutoResolvable(stallClass): boolean
 isSliceStalled(slice): boolean
+detectUsageLimit(output): UsageLimitSignal   // ADR-142：配额识别（纯函数）
 
 // Halt
 HaltStore.request(scope, requestedBy, reason): HaltRequest

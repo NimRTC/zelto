@@ -58,6 +58,24 @@ import {
 /** 单个切片在并行批次里的结局 */
 export type SliceOutcomeStatus = 'completed' | 'failed' | 'stalled' | 'asked' | 'halted';
 
+/**
+ * 取 agent 的输出文本（**永不抛**）—— ADR-142 配额识别用。
+ *
+ * 为什么要有这个包装：`getOutput()` 会读会话文件 —— 会话文件可能已经
+ * 坏了、删了、或者适配器实现不同（有的读内存、有的读盘）。
+ * 拿不到输出只意味着「识别不了配额」—— **不该因此崩掉整条失败路径**。
+ *
+ * 拿不到就返回空串 —— `detectUsageLimit('')` 返回「不是配额」。
+ */
+function safeGetOutput(adapter: ExecutorAdapter | null | undefined, sessionId: string | null): string {
+  if (!adapter || !sessionId) return '';
+  try {
+    return adapter.getOutput(sessionId) ?? '';
+  } catch {
+    return '';
+  }
+}
+
 export interface SliceOutcome {
   id: string;
   status: SliceOutcomeStatus;
@@ -822,7 +840,12 @@ export async function executeSlicesParallel(
         let stalled = false;
         if (attempt < maxRetries) {
           await events.append(st.id, 'run.aborted', 'zelto', { sliceId: st.id, exitCode: exitCode.exitCode });
-          const result = await handleAgentFailure(st.id, exitCode.exitCode, { maxRetries });
+          const result = await handleAgentFailure(st.id, exitCode.exitCode, {
+            maxRetries,
+            // ADR-142：把 agent 的输出给判定层 —— 配额耗尽只体现在输出里
+            //（退出码说不了这件事）。不传就识别不了 = 配额错误照样被重试。
+            agentOutput: safeGetOutput(adapters[i], st.sessionId),
+          });
           if (result.action === 'retry') {
             const timeout = slices[i]?.agentTimeout;
             adapters[i] = createExecutorAdapter(

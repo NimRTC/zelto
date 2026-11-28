@@ -20,6 +20,8 @@ import type { GateCommandSummary, GateScopeSummary } from '../../core/sched/type
 import { resolveScope } from '../../core/gate/scope.js';
 import { pathMatches } from '../../core/pathspec/index.js';
 import { classifyStall, isAutoResolvable, type StallClass } from '../../core/stall/classifier.js';
+// ADR-142：配额识别（纯函数，在 core/stall/ 下 —— C3 判定层）
+import { detectUsageLimit } from '../../core/stall/usage-limit.js';
 import { parseScopePaths } from '../../core/spec/scope.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 import { store, events, ZELTO_DIR, loadConfig, worktreeManager } from './shared.js';
@@ -522,7 +524,19 @@ export async function autoGateAfterRun(id: string): Promise<void> {
 export async function markSliceStalled(
   id: string,
   stallClass: StallClass,
-  options?: { exitCode?: number | null; reason?: string; actor?: string },
+  options?: {
+    exitCode?: number | null;
+    reason?: string;
+    actor?: string;
+    /**
+     * ADR-142：配额重置时间（`resetAt` / `retryAfterSec`）。
+     *
+     * **只在 `usage_limit` 时有意义** —— 别的分类没有「等多久」这回事。
+     * 取不到就传 null —— **如实留空，不编**。
+     */
+    resetAt?: string | null;
+    retryAfterSec?: number | null;
+  },
 ): Promise<{ reverted: boolean; from: string | null; to: string | null }> {
   const actor = options?.actor ?? 'zelto';
   const exitCode = options?.exitCode ?? null;
@@ -540,6 +554,14 @@ export async function markSliceStalled(
     await events.append(id, 'stall.classified', actor, {
       sliceId: id, class: stallClass, exitCode, runAborted: true,
       stateFrom: rollback.from, stateTo: rollback.to,
+      // ADR-142：配额重置时间（只有 usage_limit 才有）。
+      // 取不到 → null（**不编**）。
+      ...(stallClass === 'usage_limit'
+        ? {
+            resetAt: options?.resetAt ?? null,
+            retryAfterSec: options?.retryAfterSec ?? null,
+          }
+        : {}),
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -554,15 +576,39 @@ export async function markSliceStalled(
  * environment_failure, context_exhaustion), automatically retry up to maxRetries.
  * For non-auto-resolvable stalls, write stall info and return 'stall'.
  *
+ * ## `agentOutput` —— 配额识别（ADR-142）
+ *
+ * `options.agentOutput` 是**可选**的 agent 输出文本（stdout + stderr）。
+ * 传了就用它识别「服务端配额耗尽」；不传 = 拿不到输出 = 识别不了 =
+ * 退回改动前的行为。
+ *
+ * **为什么必须靠输出而不是退出码**：agent 撞配额时退出码就是普通的非 0 ——
+ * 退出码**说不了**这件事。
+ *
+ * **为什么识别了就直接停机**：配额墙**不会**因为重试而恢复 ——
+ * 重试只是再撞一次同样的墙，还要重新起一个 agent 会话重新烧 token，
+ * 并把重试预算烧光（真需要重试的机会也没了）。
+ *
  * @returns 'retry' if auto-retry is happening, 'stall' if the slice should stall
  */
 export async function handleAgentFailure(
   id: string,
   exitCode: number | null,
-  options?: { maxRetries?: number },
+  options?: { maxRetries?: number; agentOutput?: string },
 ): Promise<{ action: 'retry' | 'stall'; retryCount?: number }> {
+  // ADR-142：先看是不是服务端配额耗尽。
+  //
+  // **为什么放在 classifyStall 之前**：识别结果决定的是 **type**，
+  // 而 `classifyStall` 只接 type 字符串（core 的判定层不读输出 ——
+  // 那会让 core 依赖「输出存在哪」的形状）。
+  const usageLimit = detectUsageLimit(options?.agentOutput);
+
   const stallClass = classifyStall({
-    type: exitCode === null ? 'build_failure' : 'test_failure',
+    type: usageLimit.isUsageLimit
+      ? 'usage_limit'
+      : exitCode === null
+        ? 'build_failure'
+        : 'test_failure',
     message: `Agent exited with code ${exitCode ?? 'signal'}`,
     attempts: 1,
   });
@@ -606,6 +652,9 @@ export async function handleAgentFailure(
   const rollback = await markSliceStalled(id, stallClass, {
     exitCode,
     reason: `agent failed: ${exitCode ?? 'signal'}`,
+    // ADR-142：配额重置时间进事件（取不到就是 null —— 不编）。
+    resetAt: usageLimit.resetAt,
+    retryAfterSec: usageLimit.retryAfterSec,
   });
 
   // Prominent stall notification
@@ -626,6 +675,26 @@ export async function handleAgentFailure(
         `下次失败会直接停机`,
     );
     console.log(`     恢复自动重试: zelto resume ${id} --reset-retry\n`);
+  }
+
+  // ADR-142：配额耗尽**必须说清「等，别重跑」** ——
+  //
+  // 配额耗尽的退出码与普通失败**一模一样**，
+  // 人看到「agent failed」的第一反应必然是「重跑」→ 再撞一次墙 → 再烧一遍。
+  //
+  // 而且它**没有**走上面的「重试预算用尽」那条提示 ——
+  // 配额不可自动恢复，压根不进重试分支。必须**单独**说。
+  if (usageLimit.isUsageLimit) {
+    console.log(`  ⚠️ Agent 服务端配额已耗尽（识别特征: ${usageLimit.matched}）`);
+    console.log(`     重试没用 —— 配额不会因为重试而恢复（zelto 也不自动重试它）。`);
+    if (usageLimit.resetAt) {
+      console.log(`     恢复时间: ${usageLimit.resetAt}`);
+    } else if (usageLimit.retryAfterSec !== null) {
+      console.log(`     恢复时间: 约 ${usageLimit.retryAfterSec} 秒后`);
+    } else {
+      console.log(`     恢复时间: 未知（agent 没报）—— 查服务商的配额页面`);
+    }
+    console.log(`     人要做的: 等配额恢复，或换个账号 / 模型。\n`);
   }
 
   return { action: 'stall' };
