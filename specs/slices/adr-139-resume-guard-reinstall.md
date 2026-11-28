@@ -19,7 +19,7 @@
 00:33:18  stall.classified       ← agent 提问，切片挂起
 00:33:18  reservation.released  ← ★ 守卫释放、钩子撤掉
 00:33:30  run.resumed            ← ★ 续跑 —— 守卫没重新装
-00:34:05  run.finished           ← agent 在这段里写了 docs/probe.md
+00:34:05  run.finished           ← agent 在这段里写了探针文档
 ```
 
 **续跑段一条 `policy.decision` 都没有。**
@@ -91,13 +91,14 @@
 ## 验收标准
 
 1. **续跑段必须有写集预约** ——
-   验证方式：单测断言续跑前 `.zelto/locks/<sliceId>.json` 生效（`releasedAt` 为空）。
+   验证方式：单测断言续跑前预约文件（`.zelto/locks/` 下按切片 id 命名的那个）
+   生效（`releasedAt` 为空）。
    > **为什么这条不能省**：预约是 C9 的**判据来源** ——
    > hook 读的就是它。没有预约，hook 只能「无从判定」。
 
 2. **续跑段必须有 PreToolUse 钩子** ——
-   验证方式：单测断言续跑期间 `<worktree>/.claude/settings.local.json` 里
-   有 zelto 装的那条 `PreToolUse`。
+   验证方式：单测断言续跑期间 worktree 里有 zelto 装的那条 `PreToolUse`。
+   只读 `.claude/settings.local.json` —— 该文件由守卫**代装**，agent 不改它。
    > **为什么这条不能省**：钩子才是「主防线」本身。预约只是判据来源，
    > 没人问就没人判。
 
@@ -190,7 +191,8 @@ try {
 
 **「`zelto run` 已经装过守卫了，续跑不用再装」** —— 这是错的。
 
-`zelto run` 的守卫在它的 `finally` 里释放了（`core-slice.ts` 的 `finally`），
+`zelto run` 的守卫在它的 `finally` 里释放了（只读
+`src/cli/commands/core-slice.ts` 的 `finally`），
 提问挂起时 `zelto run` **正常退出** → `finally` 跑掉 → 钩子被撤掉。
 `zelto answer` 是**另一个进程**。
 
