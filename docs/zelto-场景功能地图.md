@@ -1,4 +1,4 @@
-﻿# zelto 场景功能地图
+# zelto 场景功能地图
 
 > 版本: v0.3.0 · 最后更新: 2026-11-04（文档同步至代码当前状态）
 > 项目定位与目标见 `docs/zelto-项目目标.md`
@@ -241,6 +241,35 @@ worktree 与写集预约都保留，**现场交回给人**。
 用 `zelto halt --rollback` 强制回退。判定是确定性的：
 状态是 `running`，且持有写集预约的进程已经死了。详见 `docs/adr-020-halt.md`。
 
+### 2.7 ACP 执行语义 —— 协议层的四条纪律
+
+ACP（Agent Client Protocol）路线与 hook 路线最大的不同：
+**判定发生在协议回调里**，而不是 agent 侧装钩子（ADR-133）。
+C9 的主判定点因此从「agent 每次写文件前问 zelto」变成
+「agent 通过 `session/request_permission` 向 zelto 请求授权」。
+
+这带来四个协议层的问题，四条纪律各由一份 ADR 定案：
+
+| 场景 | 问题 | 纪律 | ADR |
+|---|---|---|---|
+| **续跑**（`zelto answer`） | ACP 的 `resume()` 原来发的是 `session/new` —— 上下文整个丢了，而人看到的是「续跑成功」 | 续跑**必须续同一个会话**：按 agent 声明的能力选 `session/resume`（优先）→ `session/load`（次选）→ `session/new`（退回，且**明确告知人「上下文已丢失」**） | 140 |
+| **终止**（超时 / 人手停 / 进程退出） | 正在等答的 `session/request_permission` 悬着 —— 事件流里既没有 decision 也没有文件变化，事后审计会推断「没发生过」 | 终止路径**先结算再杀**：主动回一个明确的拒绝并写 `policy.decision`（`basis: 'acp:terminated'`）；「谁写事件」用**归属权**决定，保证**恰好一条** | 141 |
+| **配额耗尽** | 上游 429 / quota 混在普通失败里，zelto **自动重试** —— 重试解决不了配额问题，只是白烧 token 并把重试预算耗光 | `usage_limit` 是**独立停机类**，**不可自动恢复**；「什么时候恢复」原样告诉人（解析不出就明说「不知道」，**不猜**） | 142 |
+| **启动很慢** | ACP agent 的启动阶段不发 `tool_call`（初始化模型连接、加 MCP server、鉴权、读上下文都是 agent **进程内部**的事）—— 慢启动与真卡住在信号上完全一样，zelto 区分不了 | 维护显式的 `startupPhase`（`launch` / `initialize` / `session` / `authenticating`），**只从协议里程碑推进，绝不用计时器**；启动阶段**完全豁免**空转超时 | 143 |
+
+**豁免的代价由两道兜底补上**：握手请求级超时（挡「协议卡住」）
++ 启动阶段上界（挡「启动卡住」）。单靠请求级超时不够 ——
+握手完了但 agent 一个字都不说，那个空档里没有任何请求在等待。
+
+**启动阶段要「对人可见」**：`zelto run` 的进度行实时显示
+「它现在卡在握手上还是鉴权上」，会话文件（`.zelto/sessions/<id>.json`）
+也记着 —— 让人事后能回答「那一轮启动花了多久」。
+
+**为什么这四条不是「放宽判定」**：判定内核（写集匹配、保护域、策略规则）
+仍然只在 `src/hook/` 里，这四条改的是**协议层怎么跟 agent 说话**、
+以及**什么时候把 agent 的沉默当成异常**。豁免的是「空转超时」这个
+**运行健康度**信号，判定本身一次没少。
+
 ---
 
 ## 3. 功能清单
@@ -255,7 +284,8 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Event Stream** | `src/core/events/stream.ts` | 68 种事件的 append-only JSONL 流 |
 | **Gate Executor** | `src/core/gate/executor.ts` | Shell 命令执行器（门禁②） |
 | **Sign Manager** | `src/core/gate/sign.ts` | 签名请求、审批/拒绝工作流 |
-| **Stall Classifier** | `src/core/stall/classifier.ts` | 9 类停机分类 |
+| **Stall Classifier** | `src/core/stall/classifier.ts` | 10 类停机分类 |
+| **Usage Limit Detector** | `src/core/stall/usage-limit.ts` | 配额/限流识别（纯文本 → 停机类 + 重置时间，ADR-142） |
 | **Scheduler** | `src/core/sched/engine.ts` | 并行准入、写集冲突检测、约束分发 |
 | **Clarify Engine** | `src/core/clarify/engine.ts` | 5 类结构化问题生成、自动回答 |
 | **Budget Collector** | `src/core/budget/collector.ts` | 预算跟踪（getSpent, getLimit, isExhausted） |
@@ -281,6 +311,7 @@ worktree 与写集预约都保留，**现场交回给人**。
 | **Project Scanner** | `src/core/project/scanner.ts` | 既有项目扫描，生成项目地图 |
 | **Architecture Scan** | `src/core/arch/` | 架构偏离检查：设计模块图 vs 实际 import 图；只读报告（G-4/B）+ policy 可配置护栏 `arch:`（G-4/A，ADR-027） |
 | **Ports** | `src/core/ports/index.ts` | SessionPort / BudgetPort / EventSinkPort / HarnessMetaPort |
+| **ACP Adapter** | `src/adapters/acp/` | ACP 执行器：协议握手、会话建立与续跑、permission 判定、启动阶段（ADR-133 / 140 / 141 / 143） |
 
 ### 3.2 CLI 命令
 
@@ -397,9 +428,20 @@ worktree 与写集预约都保留，**现场交回给人**。
 | gate_retry | 门禁重试耗尽 | ❌ |
 | agent_question | agent 提问，等人回答（ADR-013） | ❌ |
 | human_halt | 人工拉闸，等人处理现场（ADR-020） | ❌ |
+| usage_limit | agent 服务端配额/限流耗尽（ADR-142） | ❌ |
 
 `human_halt` 是拉闸回退后打上的停机标记 —— 它不可自动恢复，
 因为人喊停要的就是「停下来等人」（ADR-020 §3.5）。
+
+`usage_limit` 同样不可自动恢复（ADR-142）—— 配额墙**不会**因为重试而恢复，
+重试只是再撞一次同样的墙，还要重新起一个 agent 会话重新烧 token，
+并且会把重试预算烧光。
+
+它与 `budget_exhausted` 是**两件事**：那是**账号**（zelto 自己的预算闸门，
+ADR-035），这是**配额**（上游服务商的额度）。配额识别靠**输出文本**
+（退出码说不了这件事），判定是纯函数（C3）：
+`src/core/stall/usage-limit.ts` 的 `detectUsageLimit(output)`。
+取不到重置时间就**如实留空**，不编。
 
 ---
 
@@ -496,7 +538,7 @@ zelto/
 │   ├── cli/               CLI 命令实现（59 个命令）
 │   ├── hook/              独立可执行判定进程（+ PreToolUse 钩子）
 │   ├── llm/               AI 流水线草案生成（仅产出草稿，不参与判定）
-│   └── adapters/          执行器适配器（claude-agent / claude-agent-sdk）
+│   └── adapters/          执行器适配器（acp / claude-agent / claude-agent-sdk / cursor-agent / ai-chat / web）
 ├── contracts/schemas/     JSON Schema 真源（6 个）
 ├── policy/                policy.yaml + lock.json
 ├── docs/                  目标 / 场景地图 / 技术架构 / 开工包 / ADR
