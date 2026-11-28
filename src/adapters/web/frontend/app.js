@@ -243,6 +243,23 @@ function setValue(parent, value) {
  * **为什么用 data 属性而不是改可见结构**：
  * 不改 DOM 结构 = 不改 XSS 防线（前端只用 textContent）、
  * 不改事件流契约、不改 API 契约。
+ *
+ * ── 键盘可达（2026-11-28 实测补齐）──────────────────────────────────
+ *
+ * 实测：驾驶舱列表页有 **154 个可点击行**，但一个都没有 `tabindex`、
+ * 一个都没有 `role` —— 也就是说**键盘用户和读屏用户完全进不去**。
+ *
+ * 驾驶舱的主交互恰恰是键盘（签字 / 拒签 / 拉闸 / 回答提问，
+ * 全是「Tab 到某个按钮 → 回车」）。行不可聚焦 = 列表页对键盘用户
+ * 只是一堆静态文字。
+ *
+ * 修法（不改 DOM 结构，不改视觉）：
+ *   - `tabindex="0"` —— 让行进入 Tab 序列
+ *   - `role="button"` —— 让读屏软件念出「按钮」
+ *   - Enter / Space 触发 —— 与原生按钮同款语义
+ *
+ * 为什么用 `role="button"` 而不是 `role="link"`：
+ * 行点击是**就地动作**（打开详情页），不是导航到别处 —— 语义上是按钮。
  */
 function table(headers, rows) {
   const t = el('table');
@@ -257,6 +274,18 @@ function table(headers, rows) {
     if (r.onClick) {
       tr.className = 'clickable';
       tr.addEventListener('click', r.onClick);
+      // ── 键盘可达 ──
+      tr.setAttribute('tabindex', '0');
+      tr.setAttribute('role', 'button');
+      // Enter 与 Space 都要能触发 —— 原生按钮两者都支持，
+      // 只接 Enter 会让「空格键触发」的习惯落空。
+      tr.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+          // Space 会让页面滚动 —— 必须 preventDefault，否则按空格会「一边触发一边滚」
+          ev.preventDefault();
+          r.onClick(ev);
+        }
+      });
     }
     r.cells.forEach(function (cell, i) {
       const td = el('td');
@@ -1175,14 +1204,26 @@ async function viewOverview(target) {
 }
 
 async function viewSlices(target) {
-  const slices = await apiGet('/api/slices');
-  // ADR-114：计划索引（id → {version, plannedState, ...}）—— 拿不到就不出「计划」列
-  var planIndex = null;
-  try {
-    planIndex = buildPlanIndex(await apiGet('/api/plan-coverage'));
-  } catch (err) {
-    planIndex = null;
-  }
+  // ── 三个接口并发取（2026-11-28）────────────────────────────────────
+  //
+  // 原来这里是**串行**的：`slices` → `plan-coverage` → `worktrees`，
+  // 实测三者相加约 840ms（197 + 539 + 100），一个接一个等。
+  //
+  // 但这三个接口**互不依赖** —— 切片列表不需要计划索引才能渲染，
+  // 工作区脉络也不需要切片列表。所以直接并发。
+  //
+  // 口径与总览页一致（viewOverview 已经是 Promise.all）：
+  // **能并发就并发**，不要把三个独立请求串成一条链。
+  //
+  // 注意「失败就当没有」的语义保持不变 —— 计划索引拿不到就不出「计划」列，
+  // 工作区脉络拿不到就整节不显示（不编）。
+  const [slices, planCoverage, worktrees] = await Promise.all([
+    apiGet('/api/slices'),
+    // ADR-114：计划索引（id → {version, plannedState, ...}）—— 拿不到就不出「计划」列
+    apiGet('/api/plan-coverage').catch(function () { return null; }),
+    apiGet('/api/worktrees').catch(function () { return null; }),
+  ]);
+  var planIndex = planCoverage ? buildPlanIndex(planCoverage) : null;
   clear(target);
   target.appendChild(el('h2', null, '全部切片（' + slices.length + '）'));
 
@@ -1192,12 +1233,7 @@ async function viewSlices(target) {
   // （zelto run 建的执行目录、git 额外工作区）。先把「几条战线」摆出来，
   // 每条战线附上它名下的切片与分支/HEAD —— 再往下才是逐片明细。
   // 拿不到就整节不显示（不编）。
-  var worktreeMap = null;
-  try {
-    worktreeMap = await apiGet('/api/worktrees');
-  } catch (err) {
-    worktreeMap = null;
-  }
+  var worktreeMap = worktrees;
   renderWorktreeMap(target, worktreeMap);
 
   // ── ADR-112：按「根」分组 ────────────────────────────────────────
@@ -1666,24 +1702,32 @@ async function showSliceDetail(id, forSign, loc) {
   main.appendChild(back);
 
   let d;
-  try {
-    d = await apiGet('/api/slices/' + encodeURIComponent(id) + locQuery(currentLocation));
-  } catch (err) {
-    main.appendChild(el('p', 'notice bad', '加载失败：' + friendlyError(err)));
-    if (isConnectionError(err)) noteDisconnected(err);
+  let planIndexForDetail = null;
+  // 切片详情与计划索引**互不依赖** —— 并发取（实测各约 200ms / 539ms）。
+  // 口径与 viewSlices / viewOverview 一致：能并发就并发。
+  //
+  // 计划索引拿不到就**不显示那一行**（不编）—— 与原来的 try/catch 同语义。
+  const [detailResult, planCoverage] = await Promise.all([
+    apiGet('/api/slices/' + encodeURIComponent(id) + locQuery(currentLocation))
+      .then(function (v) { return { ok: true, v: v }; })
+      .catch(function (err) { return { ok: false, err: err }; }),
+    apiGet('/api/plan-coverage')
+      .then(function (v) { return v; })
+      .catch(function () { return null; }),
+  ]);
+  if (!detailResult.ok) {
+    main.appendChild(el('p', 'notice bad', '加载失败：' + friendlyError(detailResult.err)));
+    if (isConnectionError(detailResult.err)) noteDisconnected(detailResult.err);
     return;
   }
-
+  d = detailResult.v;
   const slice = d.slice;
   main.appendChild(el('h2', null, id + ' — ' + slice.title));
 
   // ADR-126：产物证据需要计划索引（所属版本分支从计划来）——
   // 拿不到就不显示这一行（不编）。
-  var planIndexForDetail = null;
-  try {
-    planIndexForDetail = buildPlanIndex(await apiGet('/api/plan-coverage'));
-  } catch (err) {
-    planIndexForDetail = null;
+  if (planCoverage) {
+    planIndexForDetail = buildPlanIndex(planCoverage);
   }
   // ADR-112：说清这片看的是哪个根 —— 同一个 id 可能在好几个根里都有副本
   if (d.summary && d.summary.scope) {
@@ -2500,8 +2544,17 @@ async function render(view) {
   // 用户主动切换视图 → 旧提示过期，清掉。
   // （轮询刷新走 refreshSilently，不经过这里 —— 提示要活过轮询。）
   clearBanner();
-  for (const b of document.querySelectorAll('nav button')) {
+  // 视图按钮的高亮 —— 范围是 `#nav-list button[data-view]`。
+  // 不能用 `nav button`：折叠后 nav 里还有 `#nav-current` 与 `#nav-toggle`，
+  // 它们没有 data-view，会被这一句把 className 清空（连「当前视图名」都清掉）。
+  for (const b of document.querySelectorAll('#nav-list button[data-view]')) {
     b.className = b.getAttribute('data-view') === view ? 'active' : '';
+  }
+  // 窄屏折叠态的「当前视图名」—— 人得知道自己站在哪个视图，
+  // 否则展开菜单之前是盲的。
+  if (navCurrent) {
+    var activeBtn = document.querySelector('#nav-list button[data-view].active');
+    navCurrent.textContent = activeBtn ? activeBtn.textContent : view;
   }
   clear(main);
   main.appendChild(el('p', 'muted', '加载中…'));
@@ -2798,8 +2851,59 @@ async function loadProjectInfo() {
   }
 }
 
-for (const b of document.querySelectorAll('nav button')) {
-  b.addEventListener('click', function () { render(b.getAttribute('data-view')); });
+// 视图按钮的绑定范围是 `#nav-list button[data-view]` —— **不是** `nav button`。
+//
+// 为什么（2026-11-28 窄屏导航折叠时踩到的坑）：
+// 折叠后 nav 里多了两个按钮 —— `#nav-current`（当前视图名）与 `#nav-toggle`（☰ 菜单）。
+// 它们**没有 data-view**，如果用 `nav button` 选中它们，
+// 点击就会 `render(null)` —— 直接把视图渲染搞崩。
+const viewButtons = document.querySelectorAll('#nav-list button[data-view]');
+for (const b of viewButtons) {
+  b.addEventListener('click', function () {
+    render(b.getAttribute('data-view'));
+    // 窄屏下选完视图就收起菜单 —— 否则菜单一直占着屏幕，
+    // 把刚选中的视图内容顶到屏幕外。
+    closeNavMenu();
+  });
+}
+
+// ── 窄屏导航折叠（ADR-109 决策四补充，2026-11-28）────────────────────
+//
+// 实测（390px）：9 个视图按钮 + 拉闸占 **3 行**（约 145px），
+// 首屏内容被挤没了。所以窄屏折成「当前视图名 + ☰ 菜单」。
+//
+// 桌面端（≥721px）：`#nav-toggle` / `#nav-current` 被 CSS 隐藏，
+// `#nav-list` 是普通 flex —— **排版与改动前完全一致**。
+// 这里的 JS 只是把状态同步好，不影响桌面观感。
+const nav = document.getElementById('nav');
+const navToggle = document.getElementById('nav-toggle');
+const navCurrent = document.getElementById('nav-current');
+
+function closeNavMenu() {
+  if (!nav) return;
+  nav.classList.remove('open');
+  if (navToggle) {
+    navToggle.setAttribute('aria-expanded', 'false');
+    navToggle.setAttribute('aria-label', '展开视图菜单');
+  }
+}
+
+if (navToggle && nav) {
+  navToggle.addEventListener('click', function () {
+    var open = nav.classList.toggle('open');
+    navToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    navToggle.setAttribute('aria-label', open ? '收起视图菜单' : '展开视图菜单');
+  });
+  // 点菜单外面就收起 —— 手机上没有「点外面」这个概念太别扭了。
+  document.addEventListener('click', function (ev) {
+    if (!nav.classList.contains('open')) return;
+    if (nav.contains(ev.target)) return;
+    closeNavMenu();
+  });
+  // Esc 也收起 —— 键盘用户的惯例。
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape') closeNavMenu();
+  });
 }
 
 // ADR-084：顶栏的拉闸按钮 —— 交回控制权是**随时可能需要**的动作，

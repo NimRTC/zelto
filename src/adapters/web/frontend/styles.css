@@ -11,6 +11,35 @@
   --bad: #f85149;
 }
 * { box-sizing: border-box; }
+/* ── 键盘焦点可见性 ───────────────────────────────────────────────────
+ *
+ * 为什么全站要有（实测 2026-11-28：整份 CSS 里一条 `:focus-visible` 都没有）：
+ *
+ * 驾驶舱的**主交互就是键盘** —— 签字、拒签、拉闸、回答提问，
+ * 全是「Tab 到某个按钮 → 回车」。但按钮默认样式被覆盖成了
+ * `border: 1px solid var(--border)` 这种低调外观，
+ * 而浏览器的默认焦点环在深色背景上**几乎看不见** ——
+ * 于是键盘用户 Tab 过去，**不知道自己在哪**。
+ *
+ * 用 `:focus-visible` 而不是 `:focus`：
+ * `:focus` 在鼠标点击时也会亮 —— 那样鼠标用户每点一下都看到一圈高亮，
+ * 很吵。`:focus-visible` 只在**键盘导航**时亮（鼠标点击不亮），
+ * 这正是可访问性指南推荐的做法。
+ *
+ * 用 `outline` 而不是 `box-shadow`：outline 不影响布局，
+ * 且在 Windows 高对比度模式下会被系统接管（不会被抹掉）。
+ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* 表格行是可聚焦的（见 app.js 的 table() 助手）——
+ * 焦点环要贴着行，别被 overflow 裁掉。 */
+tr.clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -62,6 +91,21 @@ h1 small { color: var(--muted); font-weight: 400; font-size: 12px; }
 }
 .progress-line::before { content: '▶ '; color: var(--accent); }
 nav { display: flex; gap: 6px; }
+/* 导航折叠（ADR-109 决策四补充，2026-11-28）──────────────────────────
+ *
+ * 窄屏下 9 个视图按钮 + 拉闸要占 3 行（实测 390px 视口），
+ * 把首屏内容挤没了。所以窄屏改成「当前视图 + ☰ 菜单」。
+ *
+ * 桌面端**一像素不变**：折叠按钮在 ≥721px 时不显示，
+ * 菜单容器也是普通 flex 排布 —— 与改动前完全一致。
+ *
+ * `#nav-current` 是「当前视图」指示器 —— 折叠状态下人得知道自己
+ * 在哪个视图，否则展开菜单之前是盲的。
+ */
+#nav-toggle, #nav-current { display: none; }
+#nav-list { display: flex; gap: 6px; }
+/* 拉闸按钮在 `#nav-list` 之外（见 frontend.ts 的说明）：
+   桌面端靠 `margin-left: auto` 顶到最右；窄屏折叠态下它留在原位可见。 */
 nav button {
   background: transparent;
   color: var(--muted);
@@ -193,7 +237,9 @@ nav button.danger:hover { background: #3d1d1d; color: var(--fg); }
   padding: 6px 10px;
   font: inherit;
 }
-.answer-input:focus { outline: none; border-color: var(--accent); }
+/* 输入框聚焦：边框变色 + 焦点环（与全站 :focus-visible 一致）。
+   原来只有 border-color 变化 —— 键盘用户能看见，但比按钮的焦点环弱。 */
+.answer-input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
 
 /* ── 提问卡片（ADR-084）──────────────────────────────────────────────
  *
@@ -448,11 +494,35 @@ pre {
     text-overflow: clip;
   }
 
-  /* ── 导航：允许换行，不横向溢出 ─────────────────────────────────
+  /* ── 导航：折叠成「当前视图 + ☰ 菜单」──────────────────────────
    * 9 个按钮 + 拉闸按钮一行放不下 —— 挤成横向滚动条的话，
    * 人不知道右边还有按钮，就以为没有「停机」「策略」这些视图。
+   *
+   * 2026-11-28 实测：即使允许换行，390px 下仍占 **3 行**（约 145px），
+   * 首屏内容被挤到屏幕外。所以改成折叠：
+   *   - `#nav-current` 显示当前视图名（人知道自己在哪）
+   *   - `#nav-toggle` 是 ☰ 菜单按钮
+   *   - `#nav-list` 默认隐藏，展开后才显示全部
    */
   nav { flex-wrap: wrap; gap: 5px; }
+  #nav-toggle, #nav-current {
+    display: block;
+    flex: 1 1 auto;
+    text-align: center;
+  }
+  /* 当前视图名占位，拉闸按钮在它右边 */
+  #nav-current { text-align: left; }
+  /* 展开状态：菜单铺开，占满一行 */
+  #nav-list {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    gap: 5px;
+    order: 3;
+  }
+  /* 折叠状态：菜单不显示 —— 用 hidden 而不是 display:none，
+     因为它还在 DOM 里（读屏软件会跳过 display:none 的内容，
+     这正是我们要的）。 */
+  #nav:not(.open) #nav-list { display: none; }
   nav button {
     /* 内边距按「触摸目标 ≥ 44px」倒推：
      * 内容高 22.8px（13px 字 × 1.6 行高 + 2px 边框）
@@ -461,8 +531,10 @@ pre {
     /* 拉闸按钮的 margin-left:auto 会在换行后产生诡异的空隙 */
     margin-left: 0;
   }
-  /* 拉闸是「刹车」，单独占一行更醒目，也避免它被挤到换行中间 */
-  nav button.danger { margin-top: 2px; }
+  /* 拉闸是「刹车」，单独占一行更醒目，也避免它被挤到换行中间。
+     窄屏下它**不在** `#nav-list` 里（见 frontend.ts），所以折叠态也可见 ——
+     真出事时要能一眼看到、一键点到。 */
+  nav button.danger { margin-top: 2px; margin-left: auto; }
 
   /* ── 按钮：触摸目标 ≥ 44px（iOS HIG 的下限）──────────────────────
    * 13px 的等宽字在手机上偏小，按钮内边距要加。
@@ -518,6 +590,49 @@ pre {
   .kv { grid-template-columns: 1fr; gap: 0; }
   .kv dt { margin-top: 8px; font-size: 11px; }
   .kv dd { margin-bottom: 2px; word-break: break-word; }
+
+  /* ── 提问卡片（ADR-084）：手机上最常点的就是它 ───────────────────
+   *
+   * 实测（390px 视口，2026-11-28）：`.q-option` 只有 57×27px ——
+   * 而它恰恰是「回答 agent 提问」时**最常点的元素**（点一下填进输入框）。
+   * 27px 高在手机上等于点不准。
+   *
+   * 内边距按实测倒推：内容高 12px×1.6=19.2px + 上下各 11px = 41.2px，
+   * 加上边框 2px = 43.2px —— 差点不够，再给 12px → 45.2px ✓
+   */
+  .q-option {
+    padding: 12px 14px;
+    font-size: 13px;
+  }
+  .q-options { gap: 8px; }
+  /* 回答行：手机上输入框与提交按钮各占一行，别挤成窄条 */
+  .answer-row { flex-wrap: wrap; }
+  .answer-input {
+    flex: 1 1 100%;
+    min-height: 44px;
+    /* 16px 以下 iOS Safari 会自动放大页面 —— 13px 的等宽字会触发它 */
+    font-size: 16px;
+  }
+  .answer-row .btn { flex: 1 1 100%; }
+
+  /* ── 返回按钮 ───────────────────────────────────────────────────
+   * 实测只有 42×31px —— 手机上「看完详情要退回列表」是高频动作。
+   */
+  .back {
+    padding: 11px 0;
+    min-height: 44px;
+  }
+
+  /* ── 待办里的命令行（点一下复制）─────────────────────────────────
+   * 实测 37.2px 高 —— 低于下限，且它是「点一下复制命令」这个
+   * 极需要点准的动作。
+   */
+  .next-cmd {
+    padding: 11px 10px;
+    font-size: 13px;
+  }
+  .next-item { padding: 8px 0; }
+  .next-item .id { font-size: 13px; }
 
   /* ── 确认项（签字四项）竖排 ─────────────────────────────────────── */
   .check { flex-wrap: wrap; }

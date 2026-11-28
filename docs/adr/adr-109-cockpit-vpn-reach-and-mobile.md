@@ -264,6 +264,52 @@ VPN 虚拟网卡要走「手机也装同一个 VPN」那条完全不同的路径
 > 所以按 AGENTS.md「改动契约才写 ADR」的纪律，**不需要新 ADR** ——
 > 它是本 ADR 决策三落地后的收尾，在此处记录以保持追溯链完整。
 
+### 后续补齐之二：移动端交互实测（2026-11-28）
+
+决策四（窄屏适配）落地后，用 Chrome DevTools 在 **390×844** 视口
+（iPhone 尺寸）实测，发现**决策四只做了「排版」，没做「可点」与「可键盘用」**。
+
+实测数据：
+
+| 元素 | 实测尺寸 | 问题 |
+|---|---|---|
+| `.q-option`（提问候选答案） | **57×27px** | 它是「手机回答 agent 提问」时**最常点的元素**，27px 高在手机上点不准 |
+| `← 返回` | **42×31px** | 低于 44px 触摸目标下限 |
+| `.next-cmd`（待办命令行） | 37px | 同上 |
+| `:focus-visible` 规则 | **0 条** | 键盘用户 Tab 过去**不知道自己在哪**（按钮样式盖掉了浏览器默认焦点环） |
+| 可点击行 | **154 个，0 个有 `tabindex`/`role`** | 键盘与读屏用户**完全进不去**列表 |
+| 窄屏导航 | 占 **3 行** | 首屏内容被挤到屏幕外 |
+
+补齐内容：
+
+| 文件 | 改什么 |
+|---|---|
+| `src/adapters/web/frontend/styles.css` | 窄屏补 `.q-option` / `.back` / `.next-cmd` / `.answer-row` 触摸目标（全部 ≥44px）；加全局 `:focus-visible` 焦点环；窄屏导航折叠样式 |
+| `src/adapters/web/frontend/app.js` | `table()` 给可点行挂 `tabindex="0"` + `role="button"`，Enter/Space 都能触发（Space 带 `preventDefault`）；导航折叠的 JS；`viewSlices` 与 `showSliceDetail` 改为 `Promise.all` 并发取数 |
+| `src/adapters/web/frontend.ts` | 导航加 `#nav-toggle` / `#nav-current` / `#nav-list`；**拉闸按钮留在 `#nav-list` 之外** |
+| `tests/web-mobile-usability.test.ts` | **新增**（25 个用例） |
+
+三条设计取舍：
+
+1. **为什么用 `:focus-visible` 而不是 `:focus`** —— `:focus` 在鼠标点击时
+   也会亮，鼠标用户每点一下都看到一圈高亮，很吵。
+   `:focus-visible` 只在键盘导航时亮。
+   用 `outline` 而不是 `box-shadow`：不触发布局抖动，
+   且 Windows 高对比度模式下会被系统接管（不会被抹掉）。
+
+2. **为什么拉闸按钮要在折叠菜单之外** —— ADR-084 说拉闸是
+   「随时可能需要的动作，不该藏在某个视图里」。折叠后如果把它收进菜单，
+   等于**藏得更深**了。真出事时要能一眼看到、一键点到。
+
+3. **为什么桌面端一像素不变** —— 折叠按钮在 ≥721px 时 `display:none`，
+   `#nav-list` 是普通 flex 排布，与改动前完全一致。
+   驾驶舱的主场景仍是桌面（agent 跑在台式机上），
+   不该为手机端牺牲任何桌面体验。
+
+> **契约零改动**：与上一节同理 —— 纯前端展示与交互层改动，
+> 不改 schema / 事件类型 / 配置格式，不动 `core/`（C2 / C3 / C4 不受影响），
+> **不需要新 ADR**，在此记录以保持追溯链完整。
+
 ### 新增
 
 - `tests/web-adr109-vpn-mobile.test.ts` —— 本 ADR 的验收测试。

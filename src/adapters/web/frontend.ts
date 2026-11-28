@@ -42,7 +42,16 @@ ${renderStyles()}
       <span id="crash-line" class="muted small"></span>
       <span id="project-root" class="muted small"></span>
     </div>
-    <nav>
+    <nav id="nav">
+      <!-- ADR-109 决策四补充（2026-11-28）：窄屏导航折叠。
+           9 个视图按钮 + 拉闸在 390px 宽的屏幕上要占 **3 行**（实测截图），
+           把首屏内容挤到屏幕外。改成「当前视图 + ☰ 菜单」：
+           窄屏只显示当前视图名与菜单按钮，点 ☰ 展开全部。
+           桌面端 nav 完全不变（#nav-toggle 在 >=721px 时 display:none）。
+           注意：这里不能写反引号 —— 本段在模板字符串里，反引号会终止它。 -->
+      <button id="nav-current" type="button" aria-expanded="false" aria-controls="nav-list">总览</button>
+      <button id="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-list" aria-label="展开视图菜单">☰ 视图</button>
+      <div id="nav-list">
       <button data-view="overview" class="active">总览</button>
       <button data-view="slices">切片</button>
       <button data-view="signs">待签字</button>
@@ -52,9 +61,14 @@ ${renderStyles()}
       <button data-view="pipeline">全链</button>
       <button data-view="budget">预算</button>
       <button data-view="policy">策略</button>
+      </div>
       <!-- ADR-084：拉闸按钮放在导航末尾 ——
            「交回控制权」是一个**随时可能需要**的动作，
-           不该藏在某个视图里让人先找到那个视图。 -->
+           不该藏在某个视图里让人先找到那个视图。
+
+           2026-11-28：窄屏折叠后它**留在 #nav-list 之外** ——
+           折叠态下菜单是收起的，而拉闸是「刹车」：
+           真出事时人要能**一眼看到、一键点到**，不能先展开菜单再找。 -->
       <button id="halt-btn" class="danger" title="暂停批次并交回控制权">⏸ 拉闸</button>
     </nav>
   </header>

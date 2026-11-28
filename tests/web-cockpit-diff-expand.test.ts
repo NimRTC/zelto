@@ -70,6 +70,13 @@ interface ShimNode {
   remove(): void;
   addEventListener(type: string, fn: () => void): void;
   querySelectorAll(sel: string): ShimNode[];
+  /** classList —— 真 DOM 有，app.js 的导航折叠用它切 `.open`。 */
+  classList: {
+    add(c: string): void;
+    remove(c: string): void;
+    contains(c: string): boolean;
+    toggle(c: string): boolean;
+  };
   /** 点击（触发监听器）。 */
   click(): void;
   /** 递归取文本（含后代）。 */
@@ -98,6 +105,36 @@ function makeNode(tagName: string): ShimNode {
     },
     addEventListener(_type: string, fn: () => void) {
       node.listeners.push(fn);
+    },
+    classList: {
+      add(c: string) {
+        const parts = node.className.split(/\s+/).filter(Boolean);
+        if (!parts.includes(c)) parts.push(c);
+        node.className = parts.join(' ');
+      },
+      remove(c: string) {
+        node.className = node.className
+          .split(/\s+/)
+          .filter((x) => x && x !== c)
+          .join(' ');
+      },
+      contains(c: string) {
+        return node.className.split(/\s+/).includes(c);
+      },
+      toggle(c: string) {
+        const has = node.className.split(/\s+/).includes(c);
+        if (has) {
+          node.className = node.className
+            .split(/\s+/)
+            .filter((x) => x && x !== c)
+            .join(' ');
+        } else {
+          const parts = node.className.split(/\s+/).filter(Boolean);
+          parts.push(c);
+          node.className = parts.join(' ');
+        }
+        return !has;
+      },
     },
     querySelectorAll(sel: string) {
       // 支持两种：`tag` 与 `.class` —— 这一段用到两者
@@ -174,6 +211,12 @@ function loadAppJs(): Record<string, unknown> {
         return n;
       },
       body: makeNode('body'),
+      // 真 DOM 一定有这两个 —— app.js 的导航折叠在**加载时**就注册
+      // 「点外面收起」与「Esc 收起」两个 document 级监听器。
+      // 少了 addEventListener，整个脚本会在加载时就炸，
+      // 掩盖掉真正的断言失败。
+      addEventListener: () => {},
+      removeEventListener: () => {},
     },
     window: {},
     setInterval: () => 0,
