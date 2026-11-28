@@ -31,17 +31,53 @@ const REPO = findRepoRoot(ROOT);
 const DOCS = path.join(REPO, 'docs');
 const PLAN = path.join(DOCS, 'plan-0.7.0-verifiability.md');
 
-function listDocsFiles() {
+/**
+ * 列出 `docs/` 下所有 markdown 文件，并**顺手把内容读出来**。
+ *
+ * 为什么不是「先列清单、再逐个读」：
+ * 那两步之间文件可能消失 —— 并行会话正在按 ADR-116 删扁平的 ADR 影子
+ * （`docs/adr-102-*.md` → 家在 `docs/adr/adr-102-*.md`），
+ * 于是 `readFileSync` 抛 ENOENT，整个套件假失败。
+ *
+ * 实证（2026-11-28）：`v3-docs` 单跑全绿，全量跑时
+ * 「ADR 记录哈希链」报 `ENOENT: docs/adr-102-agent-env-placeholder-strip.md`。
+ *
+ * 所以：**读不到的文件就跳过**（它正在被搬走，不是「文档缺失」）。
+ * 判据要的是「**至少有一份** ADR 写明了某件事」，漏掉正在搬走的那份
+ * 不影响结论 —— 真正的 ADR 家在 `docs/adr/` 下，搬不走。
+ */
+function readDocsFiles() {
   const out = [];
   const walk = (dir) => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // 目录正被搬走 —— 跳过
+    }
+    for (const e of entries) {
       const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (/\.md$/i.test(e.name)) out.push(p);
+      if (e.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!/\.md$/i.test(e.name)) continue;
+      let text;
+      try {
+        text = fs.readFileSync(p, 'utf8');
+      } catch {
+        continue; // 正在被搬走/删除 —— 不是「文档缺失」
+      }
+      out.push({ path: p, text });
     }
   };
   walk(DOCS);
   return out;
+}
+
+/** 只要文件清单（不再读内容）。 */
+function listDocsFiles() {
+  return readDocsFiles().map((f) => f.path);
 }
 
 function gitOut(args) {
@@ -51,7 +87,7 @@ function gitOut(args) {
 
 // ─── 标准1：0.7.0 规划文档五个小节 ──────────────────────────────
 test('0.7.0 规划文档含五个主题小节且正文非空', () => {
-  const withTag = listDocsFiles().filter((f) => fs.readFileSync(f, 'utf8').includes('0.7.0'));
+  const withTag = readDocsFiles().filter((f) => f.text.includes('0.7.0')).map((f) => f.path);
   assert.ok(withTag.includes(PLAN), `规划文档须含 0.7.0 标记：${PLAN}`);
   const text = fs.readFileSync(PLAN, 'utf8');
   const sections = [
@@ -76,21 +112,21 @@ test('0.7.0 规划文档含五个主题小节且正文非空', () => {
 
 // ─── 标准2：ADR 哈希链 ──────────────────────────────────────────
 test('ADR 记录哈希链：stream.ts 扩展 + 追加/校验语义', () => {
-  const files = listDocsFiles().filter((f) => /adr-.*\.md$/i.test(f));
+  const files = readDocsFiles().filter((f) => /adr-.*\.md$/i.test(f.path));
   const hits = files.filter((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     if (!/src\/core\/events\/stream/.test(t)) return false;
     if (!(/哈希链|hash chain/i.test(t))) return false;
     return /追加|校验|append|verify/i.test(t);
   });
-  assert.ok(hits.length >= 1, `ADR 须写明基于 src/core/events/stream.ts 的哈希链扩展：${hits.join(',') || '(无)'}`);
+  assert.ok(hits.length >= 1, `ADR 须写明基于 src/core/events/stream.ts 的哈希链扩展：${hits.map((f) => f.path).join(',') || '(无)'}`);
 });
 
 // ─── 标准3：audit verify 只读 ───────────────────────────────────
 test('ADR 记录 audit verify 为只读路径', () => {
-  const files = listDocsFiles().filter((f) => /adr-.*\.md$/i.test(f));
+  const files = readDocsFiles().filter((f) => /adr-.*\.md$/i.test(f.path));
   const hits = files.filter((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     if (!/audit verify/i.test(t)) return false;
     if (!(/read-only|只读/i.test(t))) return false;
     return /不修改审计日志|不修改.*状态|不写任何文件|不修改审计|只读保证|只调.*verifyChain/i.test(t);
@@ -100,9 +136,9 @@ test('ADR 记录 audit verify 为只读路径', () => {
 
 // ─── 标准4：写保护 e2e ──────────────────────────────────────────
 test('ADR 记录写保护 e2e 验证策略与拒绝场景', () => {
-  const files = listDocsFiles().filter((f) => /adr-.*\.md$/i.test(f));
+  const files = readDocsFiles().filter((f) => /adr-.*\.md$/i.test(f.path));
   const hits = files.filter((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     if (!(/e2e|端到端/i.test(t))) return false;
     // 至少列出两个拒绝/验证场景关键词
     const keys = ['deny', '拒绝', 'violations', 'reservation:missing', 'policy.violation', '审计兜底'];
@@ -113,9 +149,9 @@ test('ADR 记录写保护 e2e 验证策略与拒绝场景', () => {
 
 // ─── 标准5：帮助分层 ────────────────────────────────────────────
 test('ADR 记录帮助分层与各层入口', () => {
-  const files = listDocsFiles().filter((f) => /adr-.*\.md$/i.test(f));
+  const files = readDocsFiles().filter((f) => /adr-.*\.md$/i.test(f.path));
   const hits = files.filter((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     return /顶层帮助/.test(t) && /命令帮助/.test(t) && /子命令\/参数帮助|参数帮助/.test(t)
       && /zelto help/.test(t);
   });
@@ -124,9 +160,9 @@ test('ADR 记录帮助分层与各层入口', () => {
 
 // ─── 标准6：Windows CI 双平台 ────────────────────────────────────
 test('ADR 记录 Windows CI 双平台决策', () => {
-  const files = listDocsFiles().filter((f) => /adr-.*\.md$/i.test(f));
+  const files = readDocsFiles().filter((f) => /adr-.*\.md$/i.test(f.path));
   const hits = files.filter((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     if (!/Windows/.test(t)) return false;
     if (!(/Linux|ubuntu/i.test(t))) return false;
     return /双平台|同时纳入|都纳入|都跑|纳入 CI/i.test(t);
@@ -136,11 +172,11 @@ test('ADR 记录 Windows CI 双平台决策', () => {
 
 // ─── 标准7：zelto why 用户文档 ──────────────────────────────────
 test('docs 存在 zelto why 用户文档（含用途/输出/示例）', () => {
-  const files = listDocsFiles();
-  const hits = files.filter((f) => /zelto why/.test(fs.readFileSync(f, 'utf8')));
+  const files = readDocsFiles();
+  const hits = files.filter((f) => /zelto why/.test(f.text));
   assert.ok(hits.length >= 1, 'docs 须有含 zelto why 的用户文档');
   const ok = hits.some((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     return /用途/.test(t) && /输出/.test(t) && /示例/.test(t) && /zelto why src\//.test(t);
   });
   assert.ok(ok, 'why 用户文档须含命令用途、输出说明和至少一个示例');
@@ -148,11 +184,11 @@ test('docs 存在 zelto why 用户文档（含用途/输出/示例）', () => {
 
 // ─── 标准8：分层帮助用户文档 ────────────────────────────────────
 test('docs 存在分层帮助用户文档（各层获取方式）', () => {
-  const files = listDocsFiles();
-  const hits = files.filter((f) => /帮助|help/i.test(fs.readFileSync(f, 'utf8')));
+  const files = readDocsFiles();
+  const hits = files.filter((f) => /帮助|help/i.test(f.text));
   assert.ok(hits.length >= 1, 'docs 须有帮助/help 用户文档');
   const ok = hits.some((f) => {
-    const t = fs.readFileSync(f, 'utf8');
+    const t = f.text;
     return /zelto --help|zelto help/.test(t) && /zelto <command> --help|zelto help <command>/.test(t);
   });
   assert.ok(ok, '帮助用户文档须说明如何获取各层帮助（如 zelto --help、zelto <command> --help）');
