@@ -15,12 +15,9 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Scheduler } from '../../core/sched/engine.js';
-import { listFilesUnder } from '../../core/sched/audit.js';
 import { makeRunId } from '../../core/sched/run-id.js';
-import { pathInWriteSet } from '../../core/pathspec/index.js';
 import { HaltStore, rollbackHaltedSlice } from '../../core/halt/index.js';
 import { classifyStall } from '../../core/stall/classifier.js';
-import type { SliceData } from '../../core/slice/store.js';
 import type { WorktreeInfo } from '../../core/worktree/index.js';
 import type { ExecutorAdapter } from '../../core/ports/executor.js';
 
@@ -37,6 +34,7 @@ import {
   writeGuardForAdapter,
   resolveAgentCommand,
   buildSpecIntegrity,
+  zeltoOwnedPaths,
 } from './shared.js';
 import { autoGateAfterRun, checkBudget, handleAgentFailure, resolveWriteSet, settleRunCost, gateCommandsForSlice, gateScopeForSlice, markSliceStalled, revertRunAbortedBeforeStart, createRuntimeBudgetGuard, readBudgetLimit } from './run-support.js';
 import { RuntimeBudgetGuard } from '../../core/budget/index.js';
@@ -131,71 +129,18 @@ export interface ParallelExecutionResult {
 
 // ─── zelto 自己写进 worktree 的文件 ──────────────────────────────────────────
 
-/**
- * zelto 自己写进 worktree 的文件（相对 worktree 的路径）。
- *
- * 规格副本、验收目录副本、约束包镜像 —— 这些是 zelto 放进去的，不是 agent 写的。
- * 审计时它们不能算成「agent 越界写入」（否则每次运行都会被自己的文件拦下）；
- * 但内容被改动就是篡改：改了规格副本等于自动改规格（AGENTS.md 禁区）。
- *
- * **例外（ADR-046）**：验收目录里那些**在写集里**的文件不是「zelto 托管」的
- * —— 它们是 agent 该改的东西（验收骨架里的 `test.todo` 必须被换成真断言）。
- * 把它们同时登记成托管文件，等于一边叫 agent 改、一边拦它改。
- *
- * **例外（ADR-106）**：**规格文件**同样按写集判 —— 写集里有 → agent 的
- * 地盘（不托管）；写集里没有 → zelto 的地盘（托管，内容被改 = 篡改）。
- *
- * 为什么规格也要按写集判（ADR-046 只给验收目录开了这个口子）：
- * 人把规格列进写集，就是说「这片要改它」。zelto 一边在约束包里告诉
- * agent「You may only modify these paths」，一边在运行结束时因为它改了
- * 规格而把整轮判成篡改 —— 那是**自相矛盾**（实测 nimrtc-v14
- * `v1-call-state-surface`，2026-11-24：agent 把规格里 ADR 状态从
- * `Proposed` 改成 `Accepted`，整轮运行被拦，gate 都没跑）。
- *
- * 豁免不是无条件放行：审计时另有一道「冻结需求仍在」的校验
- * （`auditWorktreeWrites` 的 `specIntegrity`），少了任何一条冻结时
- * 物化的需求 → 仍然判篡改。详见 ADR-106 §2。
- *
- * 判据是**写集**：写集里有的 → agent 的地盘；没在写集里的 →
- * zelto 的地盘，agent 不该动。
- */
-export function zeltoOwnedPaths(worktreePath: string | null, slice: SliceData): string[] {
-  if (!worktreePath) return [];
+// ADR-139：`zeltoOwnedPaths` 搬到了 `shared.ts`。
+//
+// 为什么搬：它原先住在这里，而**本文件 import 了 `question.ts`**
+// （并行路径要检测提问）。于是 `question.ts` 无法 import 它（成环）——
+// 提问回路的续跑段就拿不到托管文件清单（ADR-139 修的正是那条路）。
+//
+// `shared.ts` 不 import 任何 CLI 命令文件，所以它谁都能 import。
+//
+// 这里保留 re-export：既有调用点（`core-slice.ts`、`supervisor.ts`）
+// 从本文件 import 的写法不用改，判定仍然只有**一份**。
+export { zeltoOwnedPaths };
 
-  const paths: string[] = [];
-
-  // ADR-106：规格在写集里 → agent 的地盘，不登记为托管。
-  // 不在写集里 → 照旧托管（内容被改 = 篡改）。
-  //
-  // **判据必须与 C9 运行时一致**（`pathInWriteSet`，与
-  // `auditWorktreeWrites` 用的是同一个匹配器）——
-  //
-  // 之前这里用的是 `writeSet.has(specRel)`（严格相等），那与 C9 的
-  // `pathInWriteSet` **判得不一样**：C9 认 glob（`specs/slices/*.md`）
-  // 与目录前缀（`specs/`），严格相等**不认**。
-  //
-  // 后果（实测四种写法都中招：glob / 目录前缀 / 裸目录 / 父目录前缀）：
-  //   人用 `specs/` 写写集 → C9 允许 agent 改这个规格
-  //   → 但这里判「不在写集」→ 登记成托管 → agent 一改就判篡改
-  //   → **zelto 一边让 agent 改、一边因它改而拦下** ——
-  //   正是 ADR-106 要修的那个矛盾，只是换了种写法没修掉。
-  //
-  // 「同一件事两套判据」是 D-11（合并的两条路径判据不一致）的老教训。
-  if (slice.spec.path) {
-    const specRel = slice.spec.path.replace(/\\/g, '/');
-    if (!pathInWriteSet(specRel, slice.writes)) paths.push(specRel);
-  }
-  if (slice.acceptance.dir) {
-    for (const file of listFilesUnder(worktreePath, slice.acceptance.dir)) {
-      // ADR-046：写集里的验收文件是 agent 该改的（骨架里的 `test.todo`
-      // 必须被换成真断言）。**同样用 `pathInWriteSet`**（理由同上）。
-      if (pathInWriteSet(file, slice.writes)) continue;
-      paths.push(file);
-    }
-  }
-  paths.push(join(ZELTO_DIR, `${slice.id}-bundle.json`));
-  return paths;
-}
 
 /**
  * 打印批次小结（完成 / 停机 / 提问三类）。

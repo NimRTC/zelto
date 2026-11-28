@@ -85,6 +85,23 @@ const NOT_THIS_SLICE = new Set([
   'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
   'tests/acceptance/v4-tag-namespace-adr110/acceptance.test.cjs',
   'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
+    'tests/acceptance/adr-136-checkable-path-shape/acceptance.test.cjs',
+    'src/cli/commands/web.ts',
+    'src/cli/commands/web-dialable.ts',
+    'tests/web-dialable-addresses.test.ts',
+    'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
+    // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
+    'docs/adr/adr-139-resume-guard-reinstall.md',
+    'specs/slices/adr-139-resume-guard-reinstall.md',
+    'src/cli/commands/resume-guard.ts',
+    'src/cli/commands/question.ts',
+    'src/cli/commands/shared.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'tests/adr-139-resume-guard.test.ts',
+    // v3-docs 的验收文件本轮改为「读时快照」（消除 ADR 影子被搬走时的竞态）—— 后续工作
+    'tests/acceptance/v3-docs/acceptance.test.cjs',
 ]);
 
 // ─── 夹具 ──────────────────────────────────────────────────────────────

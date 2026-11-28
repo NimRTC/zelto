@@ -16,6 +16,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
@@ -89,17 +90,99 @@ function parseTrace(text) {
   return fields;
 }
 
-/** 运行 adr-trace-check.mjs，返回 { exit, out }。 */
-function runScript() {
-  const script = path.join(ROOT, 'scripts', 'adr-trace-check.mjs');
-  assert.ok(fs.existsSync(script), 'scripts/adr-trace-check.mjs 必须存在');
+// ─── 隔离沙箱：在副本上跑脚本，而不是在真树上 ──────────────────────────
+//
+// **为什么**（ADR-075 的「读状态不读历史」在验收侧的延伸）：
+//
+// 本片要验「脚本对**坏**的 ADR 报错」。验法有两条路：
+//   ① 直接把真树里的 ADR 改坏 → 验完改回来（原做法）
+//   ② 在副本里改坏 → 副本用完就删
+//
+// ①在**并发**下是不安全的：两个验收进程（另一个并行会话、或同一台机器上
+// 的两次 `npm test`）同时跑本套件时，A 正在把 `adr-102` 的版本号改成 `abc`，
+// B 读到的就是被改坏的那份 —— 于是 B 的「齐全态」断言假失败，
+// 而 A 的 finally 恢复还会把 B 的修改覆盖掉。
+//
+// 实证（2026-11-28）：并发跑时 `v2-adr-trace` 反复报
+// 「三份 ADR 均有「版本追溯」小节…」失败，且 `docs/adr/adr-102-*.md`
+// 在工作区里留下 `| 所属版本号 | abc |` 的残留。
+//
+// ②彻底没有这个问题：沙箱是本进程私有的目录，改坏的是副本，
+// 真树一个字都不动 —— 所以「不越界」断言也不会被本片自己弄脏。
+//
+// 沙箱怎么搭：脚本按**自己所在位置**解析仓库根（`join(dirname(script), '..')`），
+// 所以只要在副本里保留 `scripts/adr-trace-check.mjs` 这个相对布局即可。
+// 脚本还会跑 `git ls-files`（按版本库判定引用断链），所以副本必须是个 git 仓。
+const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'zelto-adr-trace-'));
+
+/** 把真树里脚本要读的东西复制进沙箱（docs/ 与 scripts/），并 init 一个 git 仓。 */
+function buildSandbox() {
+  fs.cpSync(path.join(ROOT, 'docs'), path.join(SANDBOX, 'docs'), { recursive: true });
+  fs.mkdirSync(path.join(SANDBOX, 'scripts'), { recursive: true });
+  fs.cpSync(
+    path.join(ROOT, 'scripts', 'adr-trace-check.mjs'),
+    path.join(SANDBOX, 'scripts', 'adr-trace-check.mjs'),
+  );
+  // 脚本的引用检查按**版本库**（git ls-files）判定 —— 沙箱必须是 git 仓，
+  // 否则 `tracked` 为空，所有 `docs/…adr….md` 引用都会误报断链。
+  const g = (args) =>
+    spawnSync('git', args, { cwd: SANDBOX, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  g(['init', '-q']);
+  g(['config', 'user.email', 'sandbox@example.invalid']);
+  g(['config', 'user.name', 'sandbox']);
+  g(['add', '-A']);
+  return SANDBOX;
+}
+
+/** 在沙箱里跑脚本。 */
+function runSandboxScript() {
+  const script = path.join(SANDBOX, 'scripts', 'adr-trace-check.mjs');
   const r = spawnSync(process.execPath, [script], {
-    cwd: ROOT,
+    cwd: SANDBOX,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   return { exit: r.status ?? 1, out: (r.stdout || '') + (r.stderr || '') };
 }
+
+/**
+ * 在**沙箱副本**里临时篡改一份 ADR，跑回调，finally 里恢复原样。
+ *
+ * 真树不受影响 —— 这是与真树解耦的关键（见上面「隔离沙箱」的说明）。
+ */
+function withCorruptedAdrInSandbox(rel, transform, fn) {
+  const p = path.join(SANDBOX, rel);
+  const orig = fs.readFileSync(p, 'utf8');
+  const bad = transform(orig);
+  assert.notEqual(bad, orig, '篡改变换必须实际改变文件内容');
+  fs.writeFileSync(p, bad, 'utf8');
+  try {
+    fn();
+  } finally {
+    fs.writeFileSync(p, orig, 'utf8');
+  }
+}
+
+/**
+ * 在**沙箱**的扁平侧造一份与目录版不一致的 ADR-102；fn 跑完后删掉。
+ *
+ * 真树的扁平侧从不被动过 —— 所以本片不会在工作区留下「影子 ADR」。
+ */
+function withFlatShadowInSandbox(transform, fn) {
+  const flat = path.join(SANDBOX, 'docs', 'adr-102-agent-env-placeholder-strip.md');
+  const dirCopy = fs.readFileSync(path.join(SANDBOX, ADR_FILES[0].file), 'utf8');
+  fs.writeFileSync(flat, transform(dirCopy), 'utf8');
+  try {
+    fn();
+  } finally {
+    fs.rmSync(flat, { force: true });
+  }
+}
+
+buildSandbox();
+test.after(() => {
+  fs.rmSync(SANDBOX, { recursive: true, force: true });
+});
 
 function gitOut(args) {
   const r = spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
@@ -112,69 +195,40 @@ function gitOut(args) {
 // 本片删掉了扁平侧的 102/103/104（目录版是逐字超集）。假设没有这条检查：
 // 再有人手抄一份到扁平侧、少抄一个「版本追溯」小节，追溯脚本照样通过 ——
 // 读者打开的是影子。这里用一个临时造出来的「假 ADR-102」验证脚本会报错。
-
-const FLAT_102 = path.join(ROOT, 'docs', 'adr-102-agent-env-placeholder-strip.md');
-
-/** 在扁平侧造一份与目录版不一致的 ADR-102；fn 跑完后删掉。 */
-function withFlatShadow(transform, fn) {
-  const dirCopy = fs.readFileSync(path.join(ROOT, ADR_FILES[0].file), 'utf8');
-  fs.writeFileSync(FLAT_102, transform(dirCopy), 'utf8');
-  try {
-    fn();
-  } finally {
-    fs.rmSync(FLAT_102, { force: true });
-  }
-}
+//
+// **注意**：造影子 / 改坏 ADR 一律在**沙箱副本**里做（见上面的「隔离沙箱」）——
+// 真树一个字都不动，所以本片不会污染工作区，也不会与并发跑的另一个进程互相踩。
 
 test('ADR 单家检查：同号两处存在 + 副本不一致 → 脚本退出非零', () => {
   // 现状（只有目录版）→ 通过
-  assert.equal(runScript().exit, 0);
+  assert.equal(runSandboxScript().exit, 0);
 
   // 扁平侧出现影子且缺「版本追溯」小节 → 必须报错
-  withFlatShadow((t) => t.replace(/\n## 版本追溯[\s\S]*$/, '\n'), () => {
-    const r = runScript();
+  withFlatShadowInSandbox((t) => t.replace(/\n## 版本追溯[\s\S]*$/, '\n'), () => {
+    const r = runSandboxScript();
     assert.notEqual(r.exit, 0, `同号两处存在时必须退出非零，输出：${r.out}`);
     assert.ok(/adr-102/i.test(r.out), `必须报告是哪一号重复，输出：${r.out}`);
   });
-  assert.equal(runScript().exit, 0, '删掉影子后必须恢复通过');
+  assert.equal(runSandboxScript().exit, 0, '删掉影子后必须恢复通过');
 
   // 扁平侧是完整逐字副本 → 允许（ADR-116 决策二：副本逐字一致即可）
-  withFlatShadow((t) => t, () => {
-    assert.equal(runScript().exit, 0, '逐字副本不应报错');
+  withFlatShadowInSandbox((t) => t, () => {
+    assert.equal(runSandboxScript().exit, 0, '逐字副本不应报错');
   });
-  assert.equal(runScript().exit, 0);
+  assert.equal(runSandboxScript().exit, 0);
 
   // 断链引用（ADR-116 决策三）：文档里写了不存在的 docs/adr/…md 必须报错
-  withCorruptedAdr(
+  withCorruptedAdrInSandbox(
     'docs/adr/adr-104-sign-review-scope-evidence.md',
     (t) => `${t}\n\n见 \`docs/adr/adr-999-no-such-decision.md\`。\n`,
     () => {
-      const r = runScript();
+      const r = runSandboxScript();
       assert.notEqual(r.exit, 0, `断链引用必须退出非零，输出：${r.out}`);
       assert.ok(r.out.includes('adr-999-no-such-decision'), `必须报告断链路径，输出：${r.out}`);
     },
   );
-  assert.equal(runScript().exit, 0);
+  assert.equal(runSandboxScript().exit, 0);
 });
-
-/**
- * 临时篡改一份 ADR 文件，跑回调，finally 里恢复原样。
- * @param {string} rel 相对仓库根的文件路径
- * @param {(text: string) => string} transform 篡改变换（必须改变内容）
- * @param {() => void} fn 回调
- */
-function withCorruptedAdr(rel, transform, fn) {
-  const p = path.join(ROOT, rel);
-  const orig = fs.readFileSync(p, 'utf8');
-  const bad = transform(orig);
-  assert.notEqual(bad, orig, '篡改变换必须实际改变文件内容');
-  fs.writeFileSync(p, bad, 'utf8');
-  try {
-    fn();
-  } finally {
-    fs.writeFileSync(p, orig, 'utf8');
-  }
-}
 
 // ─── 写集匹配（glob 语义：* 匹配单层内任意字符，不跨 /）────────────────
 function globToRegex(pattern) {
@@ -274,7 +328,7 @@ test('ADR-102/103/104 分别对应 agent 占位符剥离/submodule 离线同步/
 // ═══ 验收标准 3：脚本可扫描三份 ADR、区分字段齐全/缺失、齐全时退出 0 ════
 test('脚本输出每份 ADR 追溯字段状态；全部齐全退出 0，任一缺失退出非零并区分', () => {
   // 齐全态：退出 0，且逐份报告
-  const ok = runScript();
+  const ok = runSandboxScript();
   assert.equal(ok.exit, 0, `全部字段齐全应退出 0，实际退出 ${ok.exit}，输出：${ok.out}`);
   for (const { file } of ADR_FILES) {
     assert.ok(
@@ -285,8 +339,8 @@ test('脚本输出每份 ADR 追溯字段状态；全部齐全退出 0，任一�
   assert.ok(ok.out.includes('字段齐全') || ok.out.includes('通过'), '齐全态输出须有「字段齐全/通过」字样');
 
   // 缺失态：删掉一份 ADR 的追溯小节 → 非零退出 + 区分出是哪份、缺什么
-  withCorruptedAdr(ADR_FILES[0].file, (t) => t.slice(0, t.search(/^## 版本追溯/m)), () => {
-    const bad = runScript();
+  withCorruptedAdrInSandbox(ADR_FILES[0].file, (t) => t.slice(0, t.search(/^## 版本追溯/m)), () => {
+    const bad = runSandboxScript();
     assert.notEqual(bad.exit, 0, '存在缺失字段时必须退出非零');
     assert.ok(bad.out.includes('adr-102'), `必须报告是哪份 ADR 缺失，输出：${bad.out}`);
     assert.ok(
@@ -296,49 +350,49 @@ test('脚本输出每份 ADR 追溯字段状态；全部齐全退出 0，任一�
   });
 
   // 恢复后回到齐全态
-  assert.equal(runScript().exit, 0, '恢复后脚本必须重新通过');
+  assert.equal(runSandboxScript().exit, 0, '恢复后脚本必须重新通过');
 });
 
 // ═══ 验收标准 4：脚本校验版本号/提交哈希/验证方式格式 ══════════════════
 test('版本号改为 abc / 哈希非 40 位十六进制 / 验证方式无括号时脚本报错并退出非零', () => {
   // 版本号 → abc
-  withCorruptedAdr(
+  withCorruptedAdrInSandbox(
     ADR_FILES[0].file,
     (t) => t.replace(/\|\s*v\d+\.\d+\.\d+\s*\|/, '| abc |'),
     () => {
-      const r = runScript();
+      const r = runSandboxScript();
       assert.notEqual(r.exit, 0, '版本号改为 abc 必须退出非零');
       assert.ok(r.out.includes('abc'), `必须报告版本号错误，输出：${r.out}`);
       assert.ok(/vX\.Y\.Z|格式|不符合/.test(r.out), `必须说明版本号格式错误，输出：${r.out}`);
     },
   );
   // 恢复后通过
-  assert.equal(runScript().exit, 0, '恢复正确版本号后必须通过');
+  assert.equal(runSandboxScript().exit, 0, '恢复正确版本号后必须通过');
 
   // 提交哈希 → 非 40 位十六进制
-  withCorruptedAdr(
+  withCorruptedAdrInSandbox(
     ADR_FILES[1].file,
     (t) => t.replace(/[0-9a-f]{40}/, 'deadbeef'),
     () => {
-      const r = runScript();
+      const r = runSandboxScript();
       assert.notEqual(r.exit, 0, '哈希改为 deadbeef 必须退出非零');
       assert.ok(r.out.includes('deadbeef'), `必须报告哈希错误，输出：${r.out}`);
       assert.ok(/40 位十六进制|十六进制|不符合/.test(r.out), `必须说明哈希格式错误，输出：${r.out}`);
     },
   );
-  assert.equal(runScript().exit, 0, '恢复正确哈希后必须通过');
+  assert.equal(runSandboxScript().exit, 0, '恢复正确哈希后必须通过');
 
   // 验证方式 → 无方括号
-  withCorruptedAdr(
+  withCorruptedAdrInSandbox(
     ADR_FILES[2].file,
     (t) => t.replace(/\|\s*\[[^\n]*?\]\s*\|/, '| 人工查阅 |'),
     () => {
-      const r = runScript();
+      const r = runSandboxScript();
       assert.notEqual(r.exit, 0, '验证方式无方括号必须退出非零');
       assert.ok(/验证方式|\[|]/.test(r.out), `必须报告验证方式错误，输出：${r.out}`);
     },
   );
-  assert.equal(runScript().exit, 0, '恢复正确验证方式后必须通过');
+  assert.equal(runSandboxScript().exit, 0, '恢复正确验证方式后必须通过');
 });
 
 // ═══ 验收标准 5：docs/*.md 索引为 ADR-102/103/104 标记「已回填」 ═════════
@@ -353,7 +407,7 @@ test('docs 索引登记表中 ADR-102/103/104 均带「已回填」标记，且�
     assert.ok(row.includes(hash), `${num} 行必须带提交哈希`);
   }
   // 标记与脚本输出一致：脚本通过时标记「已回填」
-  assert.equal(runScript().exit, 0, '索引标记「已回填」须与脚本通过一致');
+  assert.equal(runSandboxScript().exit, 0, '索引标记「已回填」须与脚本通过一致');
 });
 
 // ═══ 验收标准 6：不修改写集之外的任何文件 ══════════════════════════════
@@ -466,10 +520,28 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
     'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
+    'tests/acceptance/adr-136-checkable-path-shape/acceptance.test.cjs',
+    'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
+    'src/cli/commands/web.ts',
+    'src/cli/commands/web-dialable.ts',
+    'tests/web-dialable-addresses.test.ts',
     'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
-    'tests/acceptance/v2-adr-trace/acceptance.test.cjs',]);
+    'tests/acceptance/v2-adr-trace/acceptance.test.cjs',
+    // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
+    'docs/adr/adr-139-resume-guard-reinstall.md',
+    'specs/slices/adr-139-resume-guard-reinstall.md',
+    'src/cli/commands/resume-guard.ts',
+    'src/cli/commands/question.ts',
+    'src/cli/commands/shared.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'tests/adr-139-resume-guard.test.ts',
+    // v3-docs 的验收文件本轮改为「读时快照」（消除 ADR 影子被搬走时的竞态）—— 后续工作
+    'tests/acceptance/v3-docs/acceptance.test.cjs',
+]);
 
   const offenders = [];
   for (const p of changedPaths()) {

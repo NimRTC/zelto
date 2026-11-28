@@ -21,6 +21,11 @@ import {
 import { autoGateAfterRun, settleRunCost, markSliceStalled } from './run-support.js';
 import { classifyStall } from '../../core/stall/classifier.js';
 import { budgetExhaustedMessage, printOutcome } from './run-messages.js';
+// ADR-139：续跑段要重新装运行时守卫（C9 的主防线）。
+// 装法在独立模块里 —— 它要的 `zeltoOwnedPaths` 住在 parallel-executor.ts，
+// 而那个文件 import 了本文件（并行路径要检测提问），直接 import 会成环。
+import { installResumeGuard } from './resume-guard.js';
+import { enforceWriteSet, type RuntimeGuard } from './runtime-guard.js';
 
 const QUESTIONS_DIR = join(ZELTO_DIR, 'questions');
 
@@ -308,6 +313,34 @@ register('answer', async (args) => {
   // 单次读取快照 —— 读时 `run.resumed` 还没写，不存在「读到自己刚写的」。
   const runId = resumeRunIdForAnswer(sliceId, await events.read(sliceId));
 
+  // ── 运行时守卫（ADR-139）────────────────────────────────────────────
+  //
+  // **续跑前必须重新装守卫** —— `zelto run` 的守卫在它自己的 `finally` 里
+  // 释放了（提问挂起时 `zelto run` 正常退出 → `finally` 跑掉 → 钩子被撤掉、
+  // 预约被释放）。`zelto answer` 是**另一个进程**。
+  //
+  // 不装的后果：续跑段 agent 写的文件**没有经过任何运行时逐写判定** ——
+  // C9 的主防线消失，只剩事后审计（那时越界的文件已经写出去了）。
+  //
+  // 实测证据（探针切片 `probe-claude-smoke`，2026-11-28）：
+  // `reservation.released`（00:33:18）**早于** `run.resumed`（00:33:30）。
+  let guard: RuntimeGuard | null = null;
+  try {
+    guard = await installResumeGuard({
+      sliceId,
+      adapterType: record.adapterName ?? cfg.agent.adapter,
+      projectRoot: process.cwd(),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // C9：**预约缺失时 fail closed（一律拒绝）**。
+    // 拿不到判据就放行 = 让 agent 在没人看着的时候改文件。
+    console.error(`❌ 无法取得写集预约: ${msg}`);
+    console.error(`   agent 不能在无守卫状态下续跑 —— 默认拒绝。`);
+    console.error(`   排掉冲突后重试，或先修环境（zelto reservation list）。`);
+    return 1;
+  }
+
   let newSessionId: string;
   try {
     const resumed = await adapter.resume(
@@ -320,13 +353,47 @@ register('answer', async (args) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`❌ Could not resume the agent session: ${msg}`);
     console.error(`   Fallback: zelto run ${sliceId}`);
+    // 起跑失败 → 守卫必须释放（预约悬空 → 下片撞写集冲突）。
+    await guard.release();
     return 1;
   }
 
   const exitCode = await adapter.waitForExit(newSessionId);
 
+  // 守卫在**续跑结束**时释放（ADR-139 决策三）—— 不是「门禁之前」。
+  //
+  // 为什么在 `waitForExit` 之后：agent 还在跑的时候撤钩子，
+  // 续跑段的后半程就没有运行时判定了 —— 那等于只守了一半。
+  //
+  // 为什么不在「门禁之前」：续跑后 agent **又提了新问题**时，
+  // 切片**再次挂起** —— 挂起是跨进程的，这时守卫也该释放
+  // （否则预约悬空 → 下片撞写集冲突）。
+  //
+  // `release()` 自带幂等（`released` 标志），重复调用安全。
+  await guard.release();
+
   // 记账（ADR-041 §3.1 / ADR-092）：续跑也是一次运行 —— agent 又跑了一遍。
   await store.recordRun(sliceId, { ok: exitCode === 0, exitCode, phase: 'resume' });
+
+  // ── 写集审计（ADR-139 决策三之二）────────────────────────────────────
+  //
+  // 正常路径（`run-finish.ts` 的 `finishRun`）是：
+  //   记账 → enforceWriteSet（审计）→ 提问检测 → 状态迁移 → 门禁 → 签字
+  // 续跑路径原来**没有审计** —— 只剩钩子这一道主防线。
+  //
+  // 补上它有两个理由：
+  //   1. 钩子只拦「agent 通过工具写文件」。`git checkout`、
+  //      `node -e "fs.writeFileSync(...)"`、子进程写文件都绕过钩子 ——
+  //      **审计是唯一兜住这些的防线**。
+  //   2. 门禁②跑的是验收测试，**它不看写集** —— 越界的文件不会让验收失败，
+  //      只会**被合进主干**。
+  //
+  // 判据与 `finishRun` 完全一致（同一个 `enforceWriteSet`）。
+  //
+  // **为什么在「又提问」分支之前**：续跑后 agent 又提问时切片会再次挂起，
+  // 那时切片不进 gate、不进签字 —— 但**越界的事实仍然成立**，不能因为
+  // 「这一轮没走完」就当没发生过。审计判成越界 → 退回 frozen + 留痕。
+  const withinBounds = await enforceWriteSet(sliceId, guard);
 
   if (exitCode !== 0) {
     const elapsedNote = `exit ${exitCode ?? 'signal'}`;
@@ -343,6 +410,18 @@ register('answer', async (args) => {
       exitCode,
       reason: `agent failed after answer: ${exitCode ?? 'signal'}`,
     });
+    return 1;
+  }
+
+  // 越界 → 不进 gate、不进签字，等人处理（ADR-014 §5）。
+  //
+  // `enforceWriteSet` 已经把切片退回 frozen 并写了 `run.aborted` 事件。
+  if (!withinBounds.ok) {
+    console.error('');
+    printOutcome(
+      [`写集越界：agent 写了写集之外的文件。`, ...withinBounds.violations.map((v) => `  ${v}`)],
+    );
+    console.error('   状态: → frozen（等人扩写集后重跑）');
     return 1;
   }
 

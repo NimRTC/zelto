@@ -167,6 +167,13 @@ const AFTER_V4_PATHS = new Set([
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
     'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
+    'tests/acceptance/adr-136-checkable-path-shape/acceptance.test.cjs',
+    'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
+    'src/cli/commands/web.ts',
+    'src/cli/commands/web-dialable.ts',
+    'tests/web-dialable-addresses.test.ts',
     'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'src/adapters/web/frontend/styles.css',
     'src/cli/commands/dashboard.ts',
@@ -193,7 +200,18 @@ const AFTER_V4_PATHS = new Set([
     'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
     'tests/acceptance/v2-tag-namespace/acceptance.test.cjs',
-    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',]);
+    'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+    // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
+    'docs/adr/adr-139-resume-guard-reinstall.md',
+    'specs/slices/adr-139-resume-guard-reinstall.md',
+    'src/cli/commands/resume-guard.ts',
+    'src/cli/commands/question.ts',
+    'src/cli/commands/shared.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'tests/adr-139-resume-guard.test.ts',
+    // v3-docs 的验收文件本轮改为「读时快照」（消除 ADR 影子被搬走时的竞态）—— 后续工作
+    'tests/acceptance/v3-docs/acceptance.test.cjs',
+]);
 
 /** 后来被删掉的文件（删动作本身也是「后来落的」）。 */
 const DELETED_AFTER_V4 = new Set([

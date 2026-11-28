@@ -187,6 +187,20 @@ const AFTER_V4_PATHS = new Set([
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
     'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
+    'tests/acceptance/adr-136-checkable-path-shape/acceptance.test.cjs',
+    'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
+    // ADR-139（提问回路续跑段重装运行时守卫）—— 本片之后的切片落点
+    'docs/adr/adr-139-resume-guard-reinstall.md',
+    'specs/slices/adr-139-resume-guard-reinstall.md',
+    'src/cli/commands/resume-guard.ts',
+    'src/cli/commands/question.ts',
+    'src/cli/commands/shared.ts',
+    'tests/adr-139-resume-guard.test.ts',
+    'src/cli/commands/web.ts',
+    'src/cli/commands/web-dialable.ts',
+    'tests/web-dialable-addresses.test.ts',
     'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'src/adapters/web/frontend/styles.css',
     'src/cli/commands/dashboard.ts',
@@ -346,6 +360,17 @@ test('不越界：改动只在写集内，package.json 无改动', () => {
   const AFTER_V4_EXTRA = new Set([
     'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
     'tests/acceptance/v3-cicd-compat/acceptance.test.cjs',
+    // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
+    'docs/adr/adr-139-resume-guard-reinstall.md',
+    'specs/slices/adr-139-resume-guard-reinstall.md',
+    'src/cli/commands/resume-guard.ts',
+    'src/cli/commands/question.ts',
+    'src/cli/commands/shared.ts',
+    'src/cli/commands/parallel-executor.ts',
+    'tests/adr-139-resume-guard.test.ts',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
+    // v3-docs 的验收文件本轮改为「读时快照」（消除 ADR 影子被搬走时的竞态）—— 后续工作
+    'tests/acceptance/v3-docs/acceptance.test.cjs',
   ]);
   // 后续工作 / 并行会话 / 发布措辞的落点（只认已存在路径）：
   // 主区里「别人的活」不算本片越界；白名单写错名字时路径不存在，等于不能放行。

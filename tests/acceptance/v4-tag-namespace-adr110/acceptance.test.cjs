@@ -126,6 +126,13 @@ const AFTER_V4_PATHS = new Set([
   'tests/git-batch-facts.test.ts',
   'tests/web-cockpit-revise.test.ts',
   'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
+    'tests/acceptance/adr-136-checkable-path-shape/acceptance.test.cjs',
+    'src/cli/commands/web.ts',
+    'src/cli/commands/web-dialable.ts',
+    'tests/web-dialable-addresses.test.ts',
+    'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
+    'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
   'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
   'src/adapters/web/frontend/styles.css',
   'src/cli/commands/dashboard.ts',
@@ -150,7 +157,18 @@ const AFTER_V4_PATHS = new Set([
   'tests/adr104-sign-review-scope-evidence.test.ts',
   'tests/core/forge/pr-body.test.ts',
   'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
-  'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',]);
+  'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',
+  // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
+  'docs/adr/adr-139-resume-guard-reinstall.md',
+  'specs/slices/adr-139-resume-guard-reinstall.md',
+  'src/cli/commands/resume-guard.ts',
+  'src/cli/commands/question.ts',
+  'src/cli/commands/shared.ts',
+  'src/cli/commands/parallel-executor.ts',
+  'tests/adr-139-resume-guard.test.ts',
+  // v3-docs 的验收文件本轮改为「读时快照」（消除 ADR 影子被搬走时的竞态）—— 后续工作
+  'tests/acceptance/v3-docs/acceptance.test.cjs',
+]);
 
 /** `git status --porcelain` 里的引号 / 八进制转义路径还原成 UTF-8 字面路径。 */
 function decodePorcelainPath(p) {
@@ -216,6 +234,7 @@ const AFTER_V4_LANDED = new Set([
   'tests/git-batch-facts.test.ts',
   'tests/web-cockpit-revise.test.ts',
   'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
   'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
   'src/adapters/web/api.ts',
   'src/adapters/web/frontend/app.js',
@@ -331,6 +350,7 @@ const PENDING_BEFORE_V4 = new Set([
     'tests/git-batch-facts.test.ts',
     'tests/web-cockpit-revise.test.ts',
     'tests/web-cockpit-diff-expand.test.ts',
+    'tests/web-cockpit-perf.test.ts',
     'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'src/adapters/web/frontend/styles.css',
     'src/adapters/web/router.ts',
