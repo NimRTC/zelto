@@ -28,6 +28,27 @@
     **纯 CSS 断点、内容只有一份**，桌面端排版一像素不变。
   - 新增 `tests/web-adr109-vpn-mobile.test.ts`（22 个用例）——
     同源判据的纯函数单测 + CSRF 防线不退 + 绑定面三条 + 窄屏四条。
+  - **启动横幅直接给出手机上能拨的地址**（ADR-109 落地后的实测缺口补齐）。
+    原来 `--host 0.0.0.0` 时横幅只印 `http://0.0.0.0:4321` ——
+    **这个地址手机拨不通**（`0.0.0.0` 是「绑定到所有网卡」的**服务端**通配，
+    不是客户端可拨的目标地址；实测拨它连接失败，拨物理网卡 200）。
+    于是人必须自己知道台式机的局域网 IP 才能连上。现在横幅会列出
+    **本机物理网卡的地址**（手机连同一个 Wi-Fi 即可），并标注网卡名。
+      - **只列物理网卡**，虚拟网卡（VPN / Hyper-V / WSL / Docker）不列 ——
+        手机连同一个 Wi-Fi 只能用到物理网卡那个地址；VPN 虚拟网卡要走
+        「手机也装同一个 VPN」那条完全不同的路径，混在一张清单里会误导人。
+      - **物理/虚拟用系统权威判据，不按名字猜**：
+        Windows 用 `Get-NetAdapter` 的 `Virtual` 属性，Linux 看
+        `/sys/class/net/<if>/device` 是否存在，macOS 用
+        `networksetup -listallhardwareports`。
+        名字关键字不可靠 —— ZeroTier 的虚拟口就叫「ZeroTier One」，
+        不含任何「虚拟」字样；且 `Win32_NetworkAdapter.PhysicalAdapter`
+        会把 ZeroTier 误报成 `TRUE`。
+      - **探测失败时如实说「未能确认」**，并用名字关键字**保守排除**
+        （宁可漏列，也不把虚拟网卡说成物理）。
+  - 新增 `tests/web-dialable-addresses.test.ts`（20 个用例）——
+    筛选逻辑抽成纯函数（喂合成输入测，不依赖运行机器的网卡配置）、
+    物理/虚拟标记、渲染措辞、端到端横幅。
 - **Events are now a hash chain — tampering is verifiable from the outside**
   (ADR-100). The event stream was append-only (C4), but "append-only" only
   meant *zelto* wouldn't rewrite it; an external reader had no way to tell

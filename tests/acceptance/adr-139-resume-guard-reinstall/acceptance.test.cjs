@@ -87,6 +87,8 @@ const NOT_THIS_SLICE = new Set([
   'tests/web-cockpit-perf.test.ts',
   'tests/web-cockpit-diff-expand.test.ts',
   'tests/web-dialable-addresses.test.ts',
+    'docs/adr/adr-109-cockpit-vpn-reach-and-mobile.md',
+    'CHANGELOG.md',
   'tests/.tmp-arch-check.test.ts',
   'tests/acceptance/v1-acceptance-triage/acceptance.test.cjs',
   'tests/acceptance/v2-adr-trace/acceptance.test.cjs',

@@ -527,6 +527,8 @@ test('改动文件严格落在写集内（git status 越界检查 + 产物存在
     'src/cli/commands/web.ts',
     'src/cli/commands/web-dialable.ts',
     'tests/web-dialable-addresses.test.ts',
+    'docs/adr/adr-109-cockpit-vpn-reach-and-mobile.md',
+    'CHANGELOG.md',
     'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-cli/acceptance.test.cjs',
     'tests/acceptance/v1-sign-review-core/acceptance.test.cjs',

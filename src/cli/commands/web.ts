@@ -14,6 +14,7 @@
 // 理由见 ADR-072 §4。
 
 import { WebServer, installCockpitCrashGuard, isLoopbackHost } from '../../adapters/web/index.js';
+import { listDialableAddresses, formatDialableAddresses } from './web-dialable.js';
 import { register } from './shared.js';
 
 const DEFAULT_PORT = 4321;
@@ -249,6 +250,30 @@ register('web', async (args) => {
     console.log('      同一网络内的任何设备都能访问这个驾驶舱，拿到会话 token 后');
     console.log('      可以替你签字、拉闸、开跑 agent（烧 token）。');
     console.log('      只想要本机访问就别加 --host（默认就是 127.0.0.1）。');
+
+    // ── 手机能拨的地址（ADR-109 落地后的实测缺口）────────────────────────
+    //
+    // 上面打印的是 `0.0.0.0` —— **手机拨不通这个地址**。
+    // `0.0.0.0` 是「绑定到所有网卡」的**服务端**通配，
+    // 不是客户端可拨的目标地址（实测：拨 0.0.0.0 → 连接失败）。
+    //
+    // 所以这里把本机**真正能拨**的地址列出来。
+    // **物理网卡排在最前面** —— 手机连同一个 Wi-Fi 就能用的那个。
+    //
+    // 为什么物理优先：人在家用 Wi-Fi 时，手机与台式机同网段，
+    // 物理网卡地址就是**直接可用**的那个；而 VPN 虚拟网卡
+    // 要手机也装上同一个 VPN 才通 —— 那是另一条路径。
+    const actualPort = Number(new URL(server.url).port);
+    const dialable = formatDialableAddresses(listDialableAddresses(), actualPort);
+    if (dialable.length > 0) {
+      console.log('');
+      console.log('   📱 手机上打开（手机连同一个 Wi-Fi 就用第一个）：');
+      for (const line of dialable) console.log(line);
+    } else {
+      console.log('');
+      console.log('   📱 本机没有可对外的网卡地址 —— 手机暂时连不上。');
+      console.log('      （如果预期手机能连：检查 VPN 是否已连上、网卡是否被禁用）');
+    }
   }
   // 打出 pid —— 人判断「服务还在不在」的第一手依据。
   // 之前只有一个 URL：URL 在服务死后依然能复制粘贴，

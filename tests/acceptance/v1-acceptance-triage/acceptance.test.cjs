@@ -112,6 +112,8 @@ const AFTER_V4_PATHS = new Set([
     'src/cli/commands/web.ts',
     'src/cli/commands/web-dialable.ts',
     'tests/web-dialable-addresses.test.ts',
+    'docs/adr/adr-109-cockpit-vpn-reach-and-mobile.md',
+    'CHANGELOG.md',
     'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
     'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
   'tests/acceptance/adr-134-symlink-containment/acceptance.test.cjs',

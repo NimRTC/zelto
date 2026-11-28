@@ -230,6 +230,40 @@ zelto web --host 192.168.1.50 # 只绑一张网卡
 | `CHANGELOG.md` | 记一条 `Unreleased / Added` |
 | `tests/web-adr109-vpn-mobile.test.ts` | **新增**（22 个用例）：同源判据的纯函数单测 + CSRF 防线不退 + 绑定面三条 + 窄屏四条 |
 
+### 后续补齐（落地后实测发现，本 ADR 追加）
+
+上面这套实现**落地后**实测发现一个缺口：决策三的链路是
+「人显式 `--host` → 驾驶舱对外可达 → 手机连得上」，
+但**最后一步「手机连哪个地址」没有落地** ——
+横幅只印 `http://0.0.0.0:4321`，而 `0.0.0.0` 是「绑定到所有网卡」的
+**服务端**通配，**手机拨不通**（实测：拨 `0.0.0.0` 连接失败，
+拨物理网卡 200）。于是人必须自己知道台式机的局域网 IP 才能连上。
+
+补齐内容（2026-11-28）：
+
+| 文件 | 改什么 |
+|---|---|
+| `src/cli/commands/web-dialable.ts` | **新增**：枚举本机**物理网卡**地址 + 渲染成横幅行。物理/虚拟用**系统权威判据**（Windows `Get-NetAdapter.Virtual` / Linux `/sys/class/net/<if>/device` / macOS `networksetup -listallhardwareports`），**不按名字猜** |
+| `src/cli/commands/web.ts` | 绑定面放开时，额外打印「📱 手机上打开」与可拨地址清单 |
+| `tests/web-dialable-addresses.test.ts` | **新增**（20 个用例） |
+
+**为什么物理/虚拟不按名字猜**：名字是厂商自由发挥的 ——
+ZeroTier 的虚拟口就叫「ZeroTier One」，不含任何「虚拟」字样；
+且 `Win32_NetworkAdapter.PhysicalAdapter` 会把 ZeroTier 误报成 `TRUE`。
+只有 `Get-NetAdapter.Virtual` 是权威的。
+
+**为什么只列物理网卡**：手机连同一个 Wi-Fi 只能用到物理网卡那个地址；
+VPN 虚拟网卡要走「手机也装同一个 VPN」那条完全不同的路径，
+混在一张「连这个就行」的清单里会误导人。
+
+**探测失败时**：如实标「未能确认是否物理网卡」，并用名字关键字**保守排除**
+（宁可漏列，也不把虚拟网卡说成物理）。
+
+> **契约零改动**：本补充是**纯展示层**改动 —— 不改 schema、不改事件类型、
+> 不改配置格式、不动 `core/`（C2 / C3 / C4 均不受影响）。
+> 所以按 AGENTS.md「改动契约才写 ADR」的纪律，**不需要新 ADR** ——
+> 它是本 ADR 决策三落地后的收尾，在此处记录以保持追溯链完整。
+
 ### 新增
 
 - `tests/web-adr109-vpn-mobile.test.ts` —— 本 ADR 的验收测试。

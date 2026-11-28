@@ -90,6 +90,8 @@ const NOT_THIS_SLICE = new Set([
     'src/cli/commands/web.ts',
     'src/cli/commands/web-dialable.ts',
     'tests/web-dialable-addresses.test.ts',
+    'docs/adr/adr-109-cockpit-vpn-reach-and-mobile.md',
+    'CHANGELOG.md',
     'tests/acceptance/adr-135-incomplete-changeset/acceptance.test.cjs',
     'tests/acceptance/adr-139-resume-guard-reinstall/acceptance.test.cjs',
     // ADR-139（续跑守卫重装）并行会话的落点 —— 本片没碰过
