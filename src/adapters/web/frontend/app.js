@@ -253,13 +253,30 @@ function setValue(parent, value) {
  * 全是「Tab 到某个按钮 → 回车」）。行不可聚焦 = 列表页对键盘用户
  * 只是一堆静态文字。
  *
- * 修法（不改 DOM 结构，不改视觉）：
- *   - `tabindex="0"` —— 让行进入 Tab 序列
- *   - `role="button"` —— 让读屏软件念出「按钮」
- *   - Enter / Space 触发 —— 与原生按钮同款语义
+ * ── 2026-11-28 修正：不要在 `<tr>` 上挂 `role="button"` ──────────────
  *
- * 为什么用 `role="button"` 而不是 `role="link"`：
- * 行点击是**就地动作**（打开详情页），不是导航到别处 —— 语义上是按钮。
+ * 第一版修法是「`tabindex="0"` + `role="button"` 挂在 `<tr>` 上」。
+ * 实测**这是错的，而且错得很隐蔽**：
+ *
+ * `role="button"` 会**顶掉** `<tr>` 原生的 `row` 角色。
+ * 无障碍树实测（CDP `Accessibility.getFullAXTree`）：
+ *   改动前：row=6,  cell=15,   columnheader=23,  table=3
+ *   改动后：row=6,  cell=15,   button=164,        table=3
+ * 154 个可点击行全部变成了「按钮」，而表格的**行/单元格结构几乎消失**
+ * （cell 只剩 15 个 —— 读屏软件再也没法按行按列浏览表格）。
+ *
+ * 也就是说：第一版修法把「键盘用户进不去」换成了
+ * 「**读屏用户没法浏览表格**」—— 一个换另一个，没修好。
+ *
+ * 正确做法（W3C 的标准建议）：**在第一格里放一个真 `<button>`**。
+ *   - 原生按钮自带焦点、Enter/Space 触发、role=button ——
+ *     不用手写任何键盘语义
+ *   - `<tr>` 保持原生 `row` 角色 → 表格结构完好，读屏可按行按列浏览
+ *   - 整行仍然可点（鼠标用户的肌肉记忆不丢）
+ *
+ * 为什么放**第一格**：第一格是「标识列」（切片 id / 版本号 / 路径），
+ * 它本来就是这一行唯一需要「点进去」的东西 ——
+ * 语义上与 W3C 建议一致，也符合「每行一个主链接」的表格惯例。
  */
 function table(headers, rows) {
   const t = el('table');
@@ -273,19 +290,14 @@ function table(headers, rows) {
     const tr = el('tr');
     if (r.onClick) {
       tr.className = 'clickable';
-      tr.addEventListener('click', r.onClick);
-      // ── 键盘可达 ──
-      tr.setAttribute('tabindex', '0');
-      tr.setAttribute('role', 'button');
-      // Enter 与 Space 都要能触发 —— 原生按钮两者都支持，
-      // 只接 Enter 会让「空格键触发」的习惯落空。
-      tr.addEventListener('keydown', function (ev) {
-        if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
-          // Space 会让页面滚动 —— 必须 preventDefault，否则按空格会「一边触发一边滚」
-          ev.preventDefault();
-          r.onClick(ev);
-        }
+      // 整行可点（鼠标）。但**第一格里的真按钮**自己处理点击 ——
+      // 否则行处理器与按钮处理器会**各触发一次**（点一下打开两次）。
+      tr.addEventListener('click', function (ev) {
+        if (ev.target && ev.target.closest && ev.target.closest('.row-open')) return;
+        r.onClick(ev);
       });
+      // 注意：`<tr>` 上**不挂** tabindex / role / keydown ——
+      // 键盘语义由第一格里的真按钮承担（见上面的说明）。
     }
     r.cells.forEach(function (cell, i) {
       const td = el('td');
@@ -293,6 +305,26 @@ function table(headers, rows) {
       if (headers[i] !== undefined) td.setAttribute('data-label', String(headers[i]));
       if (cell instanceof Node) td.appendChild(cell);
       else td.textContent = cell === null || cell === undefined ? '' : String(cell);
+      // 第一格 → 包一个真按钮（键盘可达 + 读屏可辨）。
+      // 按钮里放原本的单元格内容 —— 不改内容，只改「怎么触达它」。
+      if (r.onClick && i === 0) {
+        const btn = el('button', 'row-open');
+        btn.type = 'button';
+        if (td.firstChild) {
+          while (td.firstChild) btn.appendChild(td.firstChild);
+        } else {
+          btn.textContent = td.textContent;
+        }
+        if (!btn.textContent.trim() && !btn.firstChild) {
+          // 标识列是空的 —— 给个能念出来的名字
+          btn.textContent = '打开详情';
+        }
+        btn.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          r.onClick(ev);
+        });
+        td.appendChild(btn);
+      }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
@@ -2552,9 +2584,18 @@ async function render(view) {
   }
   // 窄屏折叠态的「当前视图名」—— 人得知道自己站在哪个视图，
   // 否则展开菜单之前是盲的。
+  //
+  // 它是 `<span aria-live="polite">`（不是按钮）——
+  // 2026-11-28 修正：它是**状态播报**，切视图时读屏软件念出新名字。
+  // 但 aria-live 只播报「变化」，不解释「这是什么」——
+  // 所以还要一个视觉隐藏的前缀（sr-only），让播报变成
+  // 「当前视图：总览」而不是干巴巴一个「总览」。
   if (navCurrent) {
     var activeBtn = document.querySelector('#nav-list button[data-view].active');
-    navCurrent.textContent = activeBtn ? activeBtn.textContent : view;
+    var label = activeBtn ? activeBtn.textContent : view;
+    clear(navCurrent);
+    navCurrent.appendChild(el('span', 'sr-only', '当前视图：'));
+    navCurrent.appendChild(document.createTextNode(label));
   }
   clear(main);
   main.appendChild(el('p', 'muted', '加载中…'));
@@ -2579,7 +2620,76 @@ async function render(view) {
  *
  * 这里改成：先把新内容构建到**离屏容器**里，成功了再整体替换。
  * 失败就保留旧内容 —— 一次网络抖动不该把屏幕清空。
+ *
+ * 但整体替换有个副作用：**焦点会丢**（旧节点被丢弃）。
+ * 所以替换前后要把焦点放回同一个位置 —— 见下面的 preserveFocus。
  */
+/**
+ * 记住「焦点落在哪个元素上」—— 用**路径**而不是元素引用。
+ *
+ * 为什么不用元素引用：轮询会把整块内容重建（clear(main) + 重新 append），
+ * 重建后的元素是**新对象** —— 旧引用指向的是已被丢弃的节点。
+ * 所以记引用没有意义，要记「位置」。
+ *
+ * 路径怎么算：从 main 往下数第几个子节点、每个节点第几个子节点。
+ * 人正在看的那个表格行、那个按钮，重建后位置不变 ——
+ * 于是可以把焦点放回**同一个位置的新节点**上。
+ */
+function focusPath(node) {
+  if (!node || node === document.body) return null;
+  const path = [];
+  let cur = node;
+  while (cur && cur !== document.body && cur.parentNode) {
+    const parent = cur.parentNode;
+    const idx = Array.prototype.indexOf.call(parent.childNodes, cur);
+    path.unshift(idx);
+    cur = parent;
+  }
+  return path.length ? path : null;
+}
+
+/** 按路径找回节点（重建后用）。 */
+function nodeAtPath(path) {
+  let cur = document.body;
+  for (const idx of path) {
+    if (!cur || !cur.childNodes || !cur.childNodes[idx]) return null;
+    cur = cur.childNodes[idx];
+  }
+  return cur && cur !== document.body ? cur : null;
+}
+
+/**
+ * 轮询刷新时**保住焦点**。
+ *
+ * 为什么必须做（2026-11-28 实测）：
+ * 轮询每 5 秒把整块内容重建一次（clear(main) + 重新渲染）。
+ * 重建 = 旧的 DOM 节点全被丢弃 —— 焦点跟着节点一起没了，
+ * 浏览器把焦点退回 body。
+ *
+ * 实测后果：键盘用户 Tab 到第 12 个切片行，正准备回车打开详情，
+ * 5 秒后焦点没了 —— 得重新 Tab 12 次。
+ * 更糟的是**读屏用户**：焦点一丢，读屏软件直接停止朗读当前内容。
+ *
+ * 所以这里在替换内容**之前**记住焦点位置，替换**之后**放回去。
+ *
+ * 放不回去也没关系（页面结构变了）—— 那时焦点落回 body，
+ * 与不加这段代码的现状一样，不算退步。
+ */
+function preserveFocus() {
+  const path = focusPath(document.activeElement);
+  return function restore() {
+    if (!path) return;
+    const node = nodeAtPath(path);
+    if (!node || typeof node.focus !== 'function') return;
+    try {
+      node.focus({ preventScroll: true });
+    } catch {
+      // 老浏览器不支持 options —— 不带参数再试一次
+      try { node.focus(); } catch { /* 放弃就算了 */ }
+    }
+  };
+}
+
 async function refreshSilently(view) {
   const holder = document.createElement('div');
   try {
@@ -2589,8 +2699,10 @@ async function refreshSilently(view) {
     noteDisconnected(err);
     return;
   }
+  const restoreFocus = preserveFocus();
   clear(main);
   while (holder.firstChild) main.appendChild(holder.firstChild);
+  restoreFocus();
   noteConnected();
   await refreshSummary();
 }

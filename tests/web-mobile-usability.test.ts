@@ -155,38 +155,52 @@ describe('驾驶舱 · 移动端可用性', () => {
   });
 
   describe('表格行的键盘可达', () => {
-    it('可点击行挂 tabindex="0" —— 实测 154 个行一个都没有', () => {
+    it('可点击行里有**真按钮** —— 不用在 <tr> 上挂 role=button', () => {
+      // 2026-11-28 修正：上一版在 <tr> 上挂 role="button"，
+      // 结果把 154 个行变成 154 个「按钮」，表格的行/列结构
+      // 在无障碍树里几乎消失（实测 cell 从几百掉到 15）。
+      // 正确做法是第一格放真 <button>（W3C 建议）。
       assert.match(
         APP_JS,
-        /setAttribute\('tabindex',\s*'0'\)/,
-        'table() 必须给可点击行挂 tabindex',
+        /el\('button',\s*'row-open'\)/,
+        'table() 必须在第一格放一个真按钮',
       );
-    });
-
-    it('可点击行挂 role="button" —— 读屏软件要念出「按钮」', () => {
-      assert.match(
+      assert.doesNotMatch(
         APP_JS,
         /setAttribute\('role',\s*'button'\)/,
-        'table() 必须给可点击行挂 role=button',
+        '不能在 <tr> 上挂 role=button —— 会顶掉原生 row 角色',
       );
     });
 
-    it('Enter 与 Space 都能触发 —— 只接 Enter 会让空格键习惯落空', () => {
-      // 定位表格行的 keydown 处理器（不是页面上那个 Esc 收菜单的）
-      const m = APP_JS.match(
-        /tr\.addEventListener\('keydown'[\s\S]{0,400}?\}\);/,
+    it('行本身不再挂 tabindex —— 键盘语义归真按钮', () => {
+      assert.doesNotMatch(
+        APP_JS,
+        /setAttribute\('tabindex',\s*'0'\)/,
+        '不该在 <tr> 上挂 tabindex —— 那是上一版的做法',
       );
-      assert.ok(m, '必须有表格行的 keydown 处理器');
-      assert.match(m[0], /'Enter'/, '必须处理 Enter');
-      assert.match(m[0], /' '|'Spacebar'/, '必须处理 Space');
     });
 
-    it('Space 触发时 preventDefault —— 否则页面会一边触发一边滚', () => {
-      const m = APP_JS.match(
-        /tr\.addEventListener\('keydown'[\s\S]{0,400}?\}\);/,
+    it('真按钮自带键盘语义 —— 不用手写 keydown 处理 Enter/Space', () => {
+      // 原生按钮自带 Enter/Space 触发与 focus ——
+      // 手写 keydown 反而容易漏掉 preventDefault（Space 会滚页面）。
+      assert.doesNotMatch(
+        APP_JS,
+        /tr\.addEventListener\('keydown'/,
+        '不该在 <tr> 上手写 keydown',
       );
-      assert.ok(m, '必须有表格行的 keydown 处理器');
-      assert.match(m[0], /preventDefault/, 'Space 必须 preventDefault');
+    });
+
+    it('按钮的点击不会**同时**触发行处理器 —— 否则点一下打开两次', () => {
+      assert.match(
+        APP_JS,
+        /ev\.stopPropagation\(\)/,
+        '按钮点击必须 stopPropagation',
+      );
+      assert.match(
+        APP_JS,
+        /closest\('\.row-open'\)/,
+        '行处理器必须放行来自 .row-open 的点击',
+      );
     });
   });
 
@@ -216,8 +230,13 @@ describe('驾驶舱 · 移动端可用性', () => {
     it('折叠按钮在桌面端隐藏 —— 桌面端一像素不变', () => {
       assert.match(
         CSS,
-        /#nav-toggle,\s*#nav-current\s*\{\s*display:\s*none/,
+        /#nav-toggle\s*\{\s*display:\s*none/,
         '桌面端必须隐藏折叠按钮',
+      );
+      assert.match(
+        CSS,
+        /#nav-current\s*\{\s*display:\s*none/,
+        '桌面端必须隐藏当前视图指示器',
       );
     });
 
@@ -289,6 +308,109 @@ describe('驾驶舱 · 移动端可用性', () => {
         /apiGet\('\/api\/plan-coverage'\)\s*\.catch\([\s\S]{0,80}?return null/,
         '计划索引失败必须返回 null（而不是抛出去）',
       );
+    });
+  });
+
+  // ── 2026-11-28 第二轮：上一轮修完之后才发现的三个真问题 ──────────
+  describe('轮询不能吃掉键盘焦点', () => {
+    it('refreshSilently 替换内容前后要保存/恢复焦点', () => {
+      // 实测：轮询每 5 秒 clear(main) + 重建 —— 旧节点被丢弃，
+      // 焦点跟着没了，浏览器退回 body。
+      // 键盘用户 Tab 到第 12 行正要回车，5 秒后得重新 Tab 12 次；
+      // 读屏用户更糟：焦点一丢，读屏直接停止朗读当前内容。
+      const start = APP_JS.indexOf('async function refreshSilently');
+      assert.ok(start > -1, '必须有 refreshSilently');
+      const body = APP_JS.slice(start, start + 900);
+      assert.match(body, /preserveFocus/, 'refreshSilently 必须保存并恢复焦点');
+      assert.match(body, /restoreFocus\(\)/, '替换内容后必须恢复焦点');
+    });
+
+    it('焦点位置用**路径**记 —— 元素引用在重建后无效', () => {
+      assert.match(APP_JS, /function focusPath/, '必须有 focusPath');
+      assert.match(APP_JS, /function nodeAtPath/, '必须有 nodeAtPath');
+      assert.match(
+        APP_JS,
+        /childNodes/,
+        '焦点路径必须基于 childNodes（重建后位置不变）',
+      );
+    });
+
+    it('恢复焦点用 preventScroll —— 否则页面会跳回顶部', () => {
+      assert.match(
+        APP_JS,
+        /preventScroll:\s*true/,
+        '恢复焦点必须带 preventScroll（否则滚动位置被拉回焦点处）',
+      );
+    });
+  });
+
+  describe('当前视图指示器不是控件', () => {
+    it('#nav-current 是 <span> 不是 <button>', () => {
+      // 它只是「我在哪个视图」的状态播报。
+      // 做成按钮的话：Tab 到它、按回车毫无反应 —— 是个坏控件。
+      assert.match(
+        FRONTEND_TS,
+        /<span id="nav-current"/,
+        '#nav-current 必须是 span（不是 button）',
+      );
+      assert.doesNotMatch(
+        FRONTEND_TS,
+        /<button id="nav-current"/,
+        '#nav-current 不能是 button —— 它不是控件',
+      );
+    });
+
+    it('#nav-current 不带 aria-expanded —— 折叠语义归 #nav-toggle 独占', () => {
+      // 上一版把它做成 aria-expanded=false 的按钮 ——
+      // 读屏软件播报「已折叠」，但按回车毫无反应（实测：菜单不动）。
+      const m = FRONTEND_TS.match(/<[^>]*id="nav-current"[^>]*>/);
+      assert.ok(m, '必须有 #nav-current 元素');
+      assert.doesNotMatch(
+        m[0],
+        /aria-expanded/,
+        '#nav-current 不能有 aria-expanded（它不是折叠控件）',
+      );
+      assert.doesNotMatch(
+        m[0],
+        /aria-controls/,
+        '#nav-current 不能有 aria-controls（它不控制任何东西）',
+      );
+    });
+
+    it('#nav-current 用 aria-live 播报 —— 切视图时读屏会念出视图名', () => {
+      const m = FRONTEND_TS.match(/<[^>]*id="nav-current"[^>]*>/);
+      assert.ok(m);
+      assert.match(m[0], /aria-live="polite"/, '#nav-current 必须有 aria-live');
+    });
+
+    it('播报带「当前视图：」前缀 —— 否则读屏只念一个孤零零的「总览」', () => {
+      assert.match(
+        APP_JS,
+        /当前视图：/,
+        '必须给 aria-live 的内容加前缀',
+      );
+      assert.match(
+        CSS,
+        /\.sr-only/,
+        '必须有 .sr-only 类（视觉隐藏但读屏可读）',
+      );
+    });
+  });
+
+  describe('状态变化要能被告警', () => {
+    it('连接状态条是 aria-live —— 读屏用户要知道服务断了', () => {
+      // 实测：aria-live 区域数为 0 —— 读屏用户完全不知道
+      // 「连接已断开」这件事发生过。
+      const m = FRONTEND_TS.match(/<[^>]*id="conn"[^>]*>/);
+      assert.ok(m, '必须有 #conn');
+      assert.match(m[0], /aria-live/, '#conn 必须有 aria-live');
+      assert.match(m[0], /role="alert"/, '#conn 必须是 alert（最要紧的事立刻说）');
+    });
+
+    it('动作横幅是 aria-live —— 签字成功/失败要说得出来', () => {
+      const m = FRONTEND_TS.match(/<[^>]*id="banner"[^>]*>/);
+      assert.ok(m, '必须有 #banner');
+      assert.match(m[0], /aria-live="polite"/, '#banner 必须有 aria-live');
     });
   });
 });

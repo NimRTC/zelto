@@ -40,6 +40,27 @@ tr.clickable:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
+/* 视觉隐藏但读屏可读 —— 「只给读屏软件看」的标准做法。
+ *
+ * 为什么要它（2026-11-28）：`aria-live` 只会播报**变化的内容**。
+ * 「当前视图」指示器里只有「总览」两个字时，读屏念出来是
+ * 「总览」—— 人不知道这是当前位置还是别的什么。
+ * 加一段视觉隐藏的「当前视图：」前缀，播报才完整。
+ *
+ * 用 clip-path / clip 而不是 display:none —— 后者会把它从无障碍树里
+ * 摘掉，那就白加了。
+ */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 body {
   margin: 0;
   background: var(--bg);
@@ -101,8 +122,14 @@ nav { display: flex; gap: 6px; }
  *
  * `#nav-current` 是「当前视图」指示器 —— 折叠状态下人得知道自己
  * 在哪个视图，否则展开菜单之前是盲的。
+ *
+ * 2026-11-28 修正：它是 `<span>` 不是 `<button>` —— 它是**状态播报**，
+ * 不是控件。所以：
+ *   - 不进 Tab 序列（键盘用户不该 Tab 到一个按了没反应的东西）
+ *   - 没有按钮外观（没有边框、没有 hover 效果 —— 那会暗示它可点）
  */
-#nav-toggle, #nav-current { display: none; }
+#nav-toggle { display: none; }
+#nav-current { display: none; }
 #nav-list { display: flex; gap: 6px; }
 /* 拉闸按钮在 `#nav-list` 之外（见 frontend.ts 的说明）：
    桌面端靠 `margin-left: auto` 顶到最右；窄屏折叠态下它留在原位可见。 */
@@ -141,6 +168,32 @@ th, td {
 th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
 tr.clickable { cursor: pointer; }
 tr.clickable:hover td { background: #161b22; }
+/* 标识列里的「打开」按钮 —— 键盘可达的入口。
+ *
+ * 为什么它**看起来**不像按钮：它是标识列的内容（切片 id / 版本号），
+ * 人一眼要读的是那串 id，不是「一个按钮」。
+ * 所以外观保持成普通文本（继承单元格样式），只留：
+ *   - 悬停/聚焦时的下划线与焦点环（让人知道它可点）
+ *   - 文本对齐跟着单元格走
+ *
+ * 2026-11-28：替代「在 `<tr>` 上挂 role=button」那种做法 ——
+ * 那种做法会把 154 个行变成 154 个按钮，表格的行/列结构在
+ * 无障碍树里几乎消失（实测 cell 从几百掉到 15）。
+ */
+.row-open {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 2px;
+}
+.row-open:hover { text-decoration-color: currentColor; }
+.row-open:focus-visible { text-decoration-color: currentColor; }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
 /* 「服务出过错」的提示行 —— 与「连接断开」是两件事：
@@ -505,13 +558,21 @@ pre {
    *   - `#nav-list` 默认隐藏，展开后才显示全部
    */
   nav { flex-wrap: wrap; gap: 5px; }
-  #nav-toggle, #nav-current {
+  #nav-toggle {
     display: block;
     flex: 1 1 auto;
     text-align: center;
   }
-  /* 当前视图名占位，拉闸按钮在它右边 */
-  #nav-current { text-align: left; }
+  /* 当前视图名占位，拉闸按钮在它右边。
+     它是 `<span>` 不是按钮 —— 所以没有边框、没有按钮外观，
+     但要撑开与按钮对齐的内边距（视觉上跟按钮一样高）。 */
+  #nav-current {
+    display: block;
+    flex: 1 1 auto;
+    text-align: left;
+    padding: 11px 12px;
+    color: var(--fg);
+  }
   /* 展开状态：菜单铺开，占满一行 */
   #nav-list {
     flex: 1 1 100%;
